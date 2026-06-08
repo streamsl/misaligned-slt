@@ -346,8 +346,12 @@ class BlockDiffusionDecoder(nn.Module):
         loss_mask = masked_mask.float()         # (B, L)
         weighted_nll = token_nll * loss_weights * loss_mask  # Zero out unmasked positions
 
-        # Normalize by total maskable tokens (dLLM "token" normalization)
-        translation_loss = weighted_nll.sum() / loss_mask.sum().clamp(min=1)
+        # Normalize by total MASKABLE tokens (label != -100), matching dLLM "token" norm.
+        # FIX (verified vs dllm/core/trainers/mdlm.py:200-202 & bd3lm.py:230, arXiv 2602.22661):
+        # dllm divides by maskable_mask.sum() (all non-pad/non-BOS target positions), NOT by the
+        # masked-count. Using loss_mask.sum() (masked only) over-scales the loss and adds per-batch
+        # variance. text_mask is the maskable set (valid, non-BOS) defined above.
+        translation_loss = weighted_nll.sum() / text_mask.float().sum().clamp(min=1)
         return {'translation_loss': translation_loss}
 
     # ── Inference (dLLM BD3LMSampler) ───────────────────────────────────────

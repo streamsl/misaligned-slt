@@ -1,6 +1,3 @@
-from .preprocessing import *
-from .augmentation import *
-
 # -- Pose Preprocessing (CoSign Inspired) -----------------------------------
 # Define keypoint groups based on COCO-WholeBody (133 points: body 0-16, left foot 17-19, right foot 20-22, face 23-90, left hand 91-111, right hand 112-132)
 # Upper body (9): nose(0), left eye(1), right eye(2), left shoulder(5), right shoulder(6), left elbow(7), right elbow(8), left wrist(9), right wrist(10)
@@ -12,7 +9,6 @@ RIGHT_HAND_IDS = list(range(112, 133))  # 21 points
 MOUTH_IDS = list(range(83, 91))  # Inner mouth 8 points
 FACE_IDS = list(range(23, 40)) + [53]  # First 18 as cheek/lower approx
 ALL_SELECTED_IDS = BODY_IDS + LEFT_HAND_IDS + RIGHT_HAND_IDS + MOUTH_IDS + FACE_IDS  # Total 9+21+21+8+18=77
-CONF_THRESHOLD = 0.5  # From supp: Keypoints with conf > 0.5 considered valid
 NUM_KEYPOINTS = len(ALL_SELECTED_IDS)
 KPS_MODULES = {
     'body': {'kps_ids': BODY_IDS, 'kps_rel_range': (0, 9)},
@@ -21,3 +17,9 @@ KPS_MODULES = {
     'mouth': {'kps_ids': MOUTH_IDS, 'kps_rel_range': (51, 59)},
     'face': {'kps_ids': FACE_IDS, 'kps_rel_range': (59, 77)},
 }
+CONF_THRESHOLD = 0.5  # From supp: Keypoints with conf > 0.5 considered valid
+WIDTH, HEIGHT = 1920, 1080
+FPS = 25.0
+
+from .preprocessing import *
+from .augmentation import *

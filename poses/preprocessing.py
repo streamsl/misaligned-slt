@@ -2,7 +2,7 @@ import numpy as np
 from . import *
 
 
-def normalize_keypoints(keypoints: np.ndarray, width: int, height: int) -> np.ndarray:
+def normalize_keypoints(keypoints: np.ndarray, width: int | None = None, height: int | None = None) -> np.ndarray:
     '''
     CoSign keypoints normalize: Group-specific centralization (subtract root per group).
     

@@ -23,3 +23,4 @@ FPS = 25.0
 
 from .preprocessing import *
 from .augmentation import *
+from .pose_io import *

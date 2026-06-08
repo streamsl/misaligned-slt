@@ -11,7 +11,6 @@ BIO_IGNORE_INDEX = BIO["UNK"]
 ModeName = Literal["mode1", "mode2", "mode3", "mode4"]
 Mode2Subcase = Literal["right", "left", "both"]
 
-
 @dataclass(frozen=True)
 class SentenceSpan:
     video_id: str
@@ -23,7 +22,6 @@ class SentenceSpan:
     def duration_s(self) -> float:
         return float(self.end_s - self.start_s)
 
-
 @dataclass(frozen=True)
 class WindowSpec:
     video_id: str
@@ -32,7 +30,6 @@ class WindowSpec:
     mode: ModeName
     anchor_index: int | None = None
     subcase: Mode2Subcase | None = None
-
 
 @dataclass
 class WindowSample:
@@ -83,7 +80,6 @@ def first_complete_span(
         if has_b and has_closing_o: return span
     return None
 
-
 def classify_anchor_visibility(span: SentenceSpan, start_s: float, end_s: float) -> str:
     has_start = span.start_s >= start_s and span.start_s < end_s
     has_end = span.end_s > start_s and span.end_s < end_s
@@ -92,7 +88,6 @@ def classify_anchor_visibility(span: SentenceSpan, start_s: float, end_s: float)
     if not has_start and has_end: return "left"
     if span.start_s < start_s and span.end_s > end_s: return "both"
     return "outside"
-
 
 def count_complete_spans(
     spans: tuple[SentenceSpan, ...],

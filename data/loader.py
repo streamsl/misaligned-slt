@@ -5,9 +5,9 @@ from typing import Any, Iterable
 from pathlib import Path
 
 from torch.utils.data import Dataset
+from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
 from train.sampler import WindowSampler
-from .windowing import SentenceSpan
 
 
 TIMESTAMP_RE = re.compile(

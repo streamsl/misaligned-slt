@@ -50,24 +50,24 @@ def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_thresho
     return {"precision": precision, "recall": recall, "f1": f1, "matches": float(tp)}
 
 
-def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Tensor | list[float]) -> list[Segment]:
-    if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
-    if not isinstance(timestamps_s, torch.Tensor): timestamps_s = torch.as_tensor(timestamps_s, dtype=torch.float32)
-    tags_list = tags.tolist()
-    times = timestamps_s.tolist()
-    segments: list[Segment] = []
-    start: float | None = None
-    for idx, tag in enumerate(tags_list):
-        if tag == BIO["B"]:
-            if start is not None: segments.append(Segment(start, times[idx]))
-            start = times[idx]
-        elif tag == BIO["O"] and start is not None:
-            segments.append(Segment(start, times[idx]))
-            start = None
-    if start is not None and times:
-        step = (times[-1] - times[-2]) if len(times) > 1 else 0.04 # Assume 25 FPS if only 1 timestamp is present, to give segments with some duration.
-        segments.append(Segment(start, times[-1] + step))
-    return segments
+def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "bio") -> dict[str, float]:
+    # Frame-level BIO precision/recall/F1 over signing frames, ignoring UNK.
+    pred = logits.argmax(dim=-1)
+    valid = labels != BIO["UNK"]
+    gold_pos = valid & ((labels == BIO["B"]) | (labels == BIO["I"]))
+    pred_pos = valid & ((pred == BIO["B"]) | (pred == BIO["I"]))
+    tp = (gold_pos & pred_pos).sum().float()
+    precision = tp / pred_pos.sum().clamp(min=1)
+    recall = tp / gold_pos.sum().clamp(min=1)
+    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
+    acc = ((pred == labels) & valid).sum().float() / valid.sum().clamp(min=1)
+    return {
+        f"{prefix}_precision": float(precision.detach().cpu().item()),
+        f"{prefix}_recall": float(recall.detach().cpu().item()),
+        f"{prefix}_f1": float(f1.detach().cpu().item()),
+        f"{prefix}_frame_acc": float(acc.detach().cpu().item()),
+        f"{prefix}_valid_frames": float(valid.sum().detach().cpu().item()),
+    }
 
 
 @lru_cache(maxsize=8)
@@ -91,8 +91,8 @@ def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tok
 
 
 def compute_text_metrics(
-    predictions: list[str], references: list[str],
-    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = None,
+    predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a", 
+    bleurt_checkpoint: str | None = None, prefix: str = "translation"
 ) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
     if not predictions: return {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0, "chrf": 0.0}
     refs_nested = [[ref] for ref in references]
@@ -135,4 +135,19 @@ def compute_text_metrics(
             bleurt_scores = BleurtScorer(bleurt_checkpoint).score(candidates=predictions, references=references)
             scores["bleurt"] = float(sum(bleurt_scores) / max(1, len(bleurt_scores)))
         except Exception: pass
-    return scores
+    return {f"{prefix}_{key}": float(value) for key, value in scores.items()}
+
+
+def token_accuracy(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "translation") -> dict[str, float]:
+    # Teacher-forced token accuracy, ignoring -100 labels.
+    valid = labels != -100
+    if logits.shape[1] != labels.shape[1]:
+        labels = labels[:, : logits.shape[1]]
+        valid = valid[:, : logits.shape[1]]
+    pred = logits.argmax(dim=-1)
+    correct = ((pred == labels) & valid).sum().float()
+    total = valid.sum().clamp(min=1)
+    return {
+        f"{prefix}_token_acc": float((correct / total).detach().cpu().item()),
+        f"{prefix}_tokens": float(valid.sum().detach().cpu().item()),
+    }

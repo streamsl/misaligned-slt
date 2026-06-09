@@ -113,7 +113,7 @@ class RoPEBIOHead(nn.Module):
             hidden_dim=hidden_dim, nhead=nhead,
             dim_feedforward=hidden_dim * ff_mult, dropout=dropout,
         ) for _ in range(depth)])
-        self.phrase_head = ClassifierHead(hidden_dim, num_classes)
+        self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
         x = self.input_norm(self.input_proj(features))
@@ -132,5 +132,5 @@ class RoPEBIOHead(nn.Module):
 
     def forward(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> BIOHeadOutput:
         hidden = self.encode(features, timestamps_s=timestamps_s)
-        phrase_logits = self.phrase_head(hidden)
+        phrase_logits = self.phrase_bio_head(hidden)
         return BIOHeadOutput(phrase_logits=phrase_logits, logits=phrase_logits, hidden_states=hidden)

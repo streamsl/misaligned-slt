@@ -7,8 +7,6 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
-from train.sampler import WindowSampler
-
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -184,6 +182,10 @@ class StreamingWindowDataset(Dataset):
         stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
         steps_per_epoch: int | None = None, include_full_evidence: bool = True,
     ):
+        # `WindowSampler` is imported lazily inside StreamingWindowDataset.__init__ to break the 
+        # data.loader <-> train.sampler import cycle (train.sampler needs VideoRecord, defined below, for type hints).
+        from train.sampler import WindowSampler
+
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
         self.sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)

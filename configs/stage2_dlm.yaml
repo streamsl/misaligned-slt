@@ -1,0 +1,102 @@
+seed: 42
+language: asf
+checkpoint_vlp: checkpoints/vlp/asf
+output_dir: checkpoints/stage2_dlm/asf
+decoder: dlm
+log_every: 10               # console line every N steps (no timestamps)
+wandb:
+  enabled: true
+  project: misaligned-slt
+  name: stage2_dlm_asf
+  mode: online             # offline / disabled if no network or key
+use_temporal_conv: false
+visual_padding: gfslt
+training_distribution: misalignment_sampler
+lambda_trans: 1.0
+oput:
+  # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
+  # [0,1] wastes steps on near-trivial (t->0) and near-degenerate (t->1) masking.
+  t_low: 0.3
+  t_high: 0.8
+  sample_t: uniform
+  # DMax train_llada2_bd_oput.py corrupts on-policy with argmax (the greedy token
+  # SPD commits at temperature 0). false = argmax (faithful default); true =
+  # sampled-rollout ablation.
+  sample_rollout: false
+  loss_over_all_positions: true
+confidence_bound:
+  # §6.3 right-truncated (Mode 2a) term. The full-evidence decode is a no-grad
+  # stop-grad self-target; the gate reads the real SPD+DCD decode's confidence;
+  # the CE gradient flows through ONE cheap marginal forward (not the ~64-step
+  # decode). See models/streaming_slt.py + dlm_decoder.truncated_marginal_logits.
+  enabled: true
+  verified_full_evidence_gate: true   # penalize only where full-evidence decode == reference
+  tau_cb: 0.75
+  lambda: 0.3            # λ_cb; prior de-risk found ~0.3 stable
+  warmup_epochs: 1       # hold CB off until the full-evidence self-target is trustworthy
+  allow_disable_for_ablation: true
+mode_ratios:
+  source: outputs/a_mode_ratios_asf.json
+  fallback:
+    mode1: 0.55
+    mode2: 0.20
+    mode3: 0.20
+    mode4: 0.05
+# Within Mode 2, each over-segmentation event yields one right-trunc + one
+# left-trunc window (§5.5), so right~=left dominate; both-truncated (§5.2c) is
+# rare and "falls out of the sampler naturally". Uniform 1/3 over-represents the
+# no-translation-supervision "both" case and dilutes the linchpin Mode-2a signal.
+mode2_subcase_weights:
+  right: 0.45
+  left: 0.45
+  both: 0.10
+jitter:
+  source: outputs/a_jitter_asf.json
+  fallback_laplace:
+    head_loc_s: 0.0
+    head_scale_s: 0.6
+    tail_loc_s: 0.0
+    tail_scale_s: 0.8
+batch_size: 4
+learning_rate: 3.0e-5
+weight_decay: 1.0e-4
+epochs: 20
+eval_every_epochs: 3
+early_stopping:
+  monitor: val_loss
+  mode: min
+  patience: 5
+  min_delta: 0.0
+  restore_best: true
+scheduler:
+  type: cosine
+  eta_min: 1.0e-6
+max_grad_norm: 1.0
+max_text_tokens: 128
+validation:
+  max_translation_samples: 0   # 0 = score translation on ALL dev windows
+  diffusion_steps: 32
+block_size: 8
+diffusion_steps: 64
+dcd:
+  window_type: sliding
+  tau_dec: 0.75
+  initial_window_length: 8
+  max_window_length: 64
+  temperature: 0.0
+  top_k:
+  top_p:
+  decode_algo: threshold    # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
+  decode_param: 0.75
+  cache_type: none          # none is exact; prefix is implemented only when window_type: static.
+  refresh_count: 16
+spd:
+  top_k: 1                  # DMax SPD top-k token/mask embedding mixture.
+  renormalize: true         # DMax Eq. 10 norm restoration.
+  # DMax self-revision (decode_uniform update_mask): committed tokens inside the
+  # current DCD window are refreshed with each step's prediction — the recovery
+  # behaviour OPUT's L_pred trains. false = commit-only ablation (pure DCD).
+  revision: true
+inference_cache:
+  enabled: false            # Cross-stride cache remains forbidden.
+  scope: intra_decode_only

@@ -1,0 +1,23 @@
+seed: 42
+language: asf
+stride_s: 1.0
+buffer_cap_s: 18.0  # Placeholder until Analysis 8.3 writes the measured elbow.
+boundary_stability:
+  delta_enc_frames: 3
+  hysteresis_strides: 2
+translation:
+  commit_confidence_tau: 0.75
+  max_text_tokens: 128
+  diffusion_steps: 64
+  block_size: 8
+  dcd:
+    window_type: sliding
+    tau_dec: 0.75
+    initial_window_length: 8
+    max_window_length: 64
+    decode_algo: threshold  # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
+    decode_param: 0.75
+    cache_type: none      # prefix cache is available only with window_type: static.
+    refresh_count: 16
+recompute_each_stride: true
+carry_decoder_state_across_strides: false

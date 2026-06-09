@@ -1,0 +1,47 @@
+seed: 42
+language: asf
+output_dir: checkpoints/segmenter/asf
+log_every: 20
+wandb:
+  enabled: true
+  project: misaligned-slt
+  name: segmenter_asf
+  mode: online
+batch_size: 8
+num_frames: 1024
+velocity: true          # Moryossef 2026 repo default: append fps-normalized velocity.
+hidden_dim: 384
+encoder_depth: 4
+attn_nhead: 8
+attn_ff_mult: 2
+attn_dropout: 0.1
+dice_loss_weight: 1.5  # Moryossef 2026 README: Dice weight 1.5 helped.
+# Phrase BIO only by default: YouTube-SL-25 captions do not provide sign/gloss spans.
+fps_aug:
+  enabled: true         # Moryossef 2026 README: random 25-50 fps essential.
+  min_fps: 25.0
+  max_fps: 50.0
+frame_dropout: 0.15    # Public repo default: drop 0-15% middle frames during train.
+body_part_dropout: 0.1 # Public repo default: zero each hand independently during train.
+speed_aug:
+  enabled: false        # Moryossef 2026 README: speed augmentation hurts.
+attention_padding_mask:
+  enabled: false        # Moryossef 2026 README: padding attention mask hurt.
+match_tiou_threshold: 0.1
+optimizer:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 500
+eval_every_epochs: 1
+early_stopping:
+  monitor: val_phrase_f1
+  mode: max
+  patience: 100
+  min_delta: 0.0
+  restore_best: true
+scheduler:
+  type: onecycle        # Moryossef 2026 repo default optimizer is adamw-onecycle.
+  max_lr: 1.0e-3
+  pct_start: 0.1
+  div_factor: 25.0
+  final_div_factor: 10000.0

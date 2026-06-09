@@ -1,0 +1,44 @@
+seed: 42
+language: asf
+log_every: 10
+wandb:
+  enabled: true
+  project: misaligned-slt
+  name: stage1_vlp_asf
+  mode: online
+mbart_name: facebook/mbart-large-cc25
+trimmed_mbart_dir: checkpoints/trimmed_mbart_asf
+trimmed_tokenizer_dir: checkpoints/trimmed_mbart_asf
+output_dir: checkpoints/vlp/asf
+embed_dim: 1024
+hidden_size: 1024
+temporal_kernel: 3
+use_temporal_conv: false  # Keep per-frame features aligned with the BIO/streaming contract.
+visual_padding: gfslt     # GFSLT-VLP repeats boundary frames with 8-frame halos.
+# GFSLT-VLP VLP = contrastive (SLRCLIP) + masked-text decoder reconstruction
+# (Text_Decoder / CMLM). The CMLM half pretrains the mBART decoder reused by both
+# the AR baseline (Analysis B) and our DLM; omitting it leaves the decoder at raw
+# mBART init and makes the GFSLT baseline unfaithful. Ref: GFSLT-VLP train_vlp_v2.py.
+cmlm:
+  enabled: true
+  lambda: 1.0           # args.loss_lambda in train_vlp_v2.py
+  noise_rate: 0.15      # utils.NoiseInjecting default
+  noise_type: omit_last # {omit_last, omit}; GFSLT default omit_last
+  random_shuffle: false
+  label_smoothing: 0.2  # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
+batch_size: 16
+learning_rate: 5.0e-4
+weight_decay: 1.0e-4
+epochs: 50
+eval_every_epochs: 5
+early_stopping:
+  monitor: val_loss
+  mode: min
+  patience: 10
+  min_delta: 0.0
+  restore_best: true
+scheduler:
+  type: cosine
+  eta_min: 1.0e-6
+max_grad_norm: 1.0
+freeze_backbone: false

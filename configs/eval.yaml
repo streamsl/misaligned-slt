@@ -1,0 +1,15 @@
+seed: 42
+languages: [asf]
+rq1:
+  severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0]
+  smoke_num_sentences: 10
+  smoke_grid_s: [-1.0, 0.0, 1.0]
+rq2:
+  tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
+  smoke_num_videos: 3
+metrics:
+  bleu4: true
+  rouge_l: true
+  meteor: true
+  cider: true
+  bleurt: false

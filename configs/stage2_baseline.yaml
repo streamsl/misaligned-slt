@@ -1,0 +1,33 @@
+seed: 42
+language: asf
+checkpoint_vlp: checkpoints/vlp/asf
+output_dir: checkpoints/stage2_baseline/asf
+decoder: ar
+log_every: 10
+wandb:
+  enabled: true
+  project: misaligned-slt
+  name: stage2_baseline_asf
+  mode: online
+use_temporal_conv: false
+visual_padding: gfslt
+training_distribution: clean_pretrimmed
+batch_size: 16
+learning_rate: 5.0e-4
+weight_decay: 1.0e-4
+epochs: 50
+eval_every_epochs: 5
+early_stopping:
+  monitor: val_loss
+  mode: min
+  patience: 10
+  min_delta: 0.0
+  restore_best: true
+scheduler:
+  type: cosine
+  eta_min: 1.0e-6
+max_grad_norm: 1.0
+max_text_tokens: 128
+validation:
+  max_translation_samples: 0   # 0 = score translation on ALL dev sentences
+  max_text_tokens: 128

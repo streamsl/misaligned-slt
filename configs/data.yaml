@@ -1,0 +1,46 @@
+seed: 42
+active_languages: [asf]
+
+languages:
+  asf:
+    name: Auslan
+    target_lang: en_XX
+    root: data/youtube-sl-25/asf
+    pose_fps: 25.0
+    video_fps_fallback: 25.0
+  bfi:
+    name: BSL
+    target_lang: en_XX
+    root: data/youtube-sl-25/bfi
+    pose_fps: 25.0
+    video_fps_fallback: 25.0
+  ase:
+    name: ASL
+    target_lang: en_XX
+    root: data/youtube-sl-25/ase
+    pose_fps: 25.0
+    video_fps_fallback: 25.0
+
+splits:
+  signverse_csv: data/SignVerse-2M-metadata_split.csv
+  fallback_seed: 42
+  fallback_train: 0.8
+  fallback_dev: 0.1
+  fallback_test: 0.1
+
+subtitles:
+  preferred_suffixes:
+    - .en-GB.vtt
+    - .en-en-GB.vtt
+    - .en-en.vtt
+    - .en.vtt
+  reject_suffixes:
+    - .en-orig.vtt
+    - .orig.vtt
+  min_caption_chars: 2
+  min_duration_s: 0.20
+  max_duration_s: 60.0
+
+pose:
+  confidence_threshold: 0.5
+  selected_keypoints: cosign_77

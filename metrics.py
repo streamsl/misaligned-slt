@@ -6,6 +6,116 @@ from data.windowing import BIO
 import torch
 
 
+def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "bio") -> dict[str, float]:
+    # Frame-level BIO precision/recall/F1 over signing frames, ignoring UNK.
+    pred = logits.argmax(dim=-1)
+    valid = labels != BIO["UNK"]
+    gold_pos = valid & ((labels == BIO["B"]) | (labels == BIO["I"]))
+    pred_pos = valid & ((pred == BIO["B"]) | (pred == BIO["I"]))
+    tp = (gold_pos & pred_pos).sum().float()
+    precision = tp / pred_pos.sum().clamp(min=1)
+    recall = tp / gold_pos.sum().clamp(min=1)
+    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
+    acc = ((pred == labels) & valid).sum().float() / valid.sum().clamp(min=1)
+    return {
+        f"{prefix}_precision": float(precision.detach().cpu().item()),
+        f"{prefix}_recall": float(recall.detach().cpu().item()),
+        f"{prefix}_f1": float(f1.detach().cpu().item()),
+        f"{prefix}_frame_acc": float(acc.detach().cpu().item()),
+        f"{prefix}_valid_frames": float(valid.sum().detach().cpu().item()),
+    }
+
+
+def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
+    # BIO label tensor -> [{start,end}] frame segments (Moryossef metrics.py).
+    labels = bio.detach().cpu().numpy()
+    segments, seg_start = [], None
+    for j, label in enumerate(labels):
+        if label == BIO["B"]:
+            if seg_start is not None: segments.append({"start": seg_start, "end": j - 1})
+            seg_start = j
+        elif label == BIO["O"] and seg_start is not None:
+            segments.append({"start": seg_start, "end": j - 1}); seg_start = None
+    if seg_start is not None: segments.append({"start": seg_start, "end": len(labels) - 1})
+    return segments
+
+
+def likeliest_segments(logits: torch.Tensor) -> list[dict]:
+    # Argmax decode -> contiguous B/I runs (Moryossef likeliest_probs_to_segments).
+    preds = logits.detach().cpu().argmax(dim=-1).numpy()
+    segments, seg_start = [], None
+    for i, p in enumerate(preds):
+        if p in (BIO["B"], BIO["I"]):
+            if seg_start is None: seg_start = i
+        elif seg_start is not None:
+            segments.append({"start": seg_start, "end": i - 1}); seg_start = None
+    if seg_start is not None: segments.append({"start": seg_start, "end": len(preds) - 1})
+    return segments
+
+
+def _segment_iou_frames(pred: list[dict], gold: list[dict], max_len: int) -> float:
+    import numpy as _np
+    pv, gv = _np.zeros(max_len), _np.zeros(max_len)
+    for s in pred: pv[s["start"]:s["end"] + 1] = 1
+    for s in gold: gv[s["start"]:s["end"] + 1] = 1
+    inter = _np.logical_and(pv, gv).sum(); union = _np.logical_or(pv, gv).sum()
+    if union == 0: return 1.0 if inter == 0 else 0.0
+    return float(inter / union)
+
+
+def _segment_recall(segments: list[dict], gold: list[dict], allowed_shift: int = 17) -> float:
+    # Moryossef _segment_recall: a gold segment is hit if any pred overlaps it within +/-allowed_shift frames (~0.68s @25fps).
+    if not gold: return 1.0 if not segments else 0.0
+    hit = 0
+    for sg in gold:
+        start, end = sg["start"] - allowed_shift, sg["end"] + allowed_shift
+        if any(s["start"] <= end and s["end"] >= start for s in segments): hit += 1
+    return hit / len(gold)
+
+
+def _segment_f1(pred: list[dict], gold: list[dict]) -> float:
+    if not gold or not pred: return 1.0 if len(pred) == len(gold) else 0.0
+    precision = _segment_recall(gold, pred); recall = _segment_recall(pred, gold)
+    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+
+def _macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], BIO["B"], BIO["I"])) -> float:
+    f1s = []
+    for c in classes:
+        tp = ((pred == c) & (gold == c)).sum().float()
+        fp = ((pred == c) & (gold != c)).sum().float()
+        fn = ((pred != c) & (gold == c)).sum().float()
+        denom = (2 * tp + fp + fn)
+        if denom > 0: f1s.append(float((2 * tp / denom).item()))
+    return sum(f1s) / len(f1s) if f1s else 0.0
+
+
+def moryossef_segment_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase") -> dict[str, float]:
+    """Per-item Moryossef segmentation metrics (frame macro-F1, frame-IoU, segment-F1).
+
+    Faithful to segmentation/.../metrics.py + evaluate.py: for each sequence, mask out UNK, argmax-decode predicted segments,  
+    build gold segments, and average frame-F1 / segment-IoU / segment-F1 over items. Phrase level only (no sign head).
+    """
+    frame_f1s, ious, seg_f1s = [], [], []
+    for i in range(labels.shape[0]):
+        gold = labels[i]
+        valid = gold != BIO["UNK"]
+        n = int(valid.sum())
+        if n == 0: continue
+
+        gold_v = gold[:n]
+        logit_v = logits[i, :n]
+        frame_f1s.append(_macro_frame_f1(logit_v.argmax(dim=-1), gold_v))
+
+        pred_segs = likeliest_segments(logit_v)
+        gold_segs = bio_labels_to_segments(gold_v)
+        ious.append(_segment_iou_frames(pred_segs, gold_segs, n))
+        seg_f1s.append(_segment_f1(pred_segs, gold_segs))
+
+    avg = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
+    return {f"{prefix}_frame_f1": avg(frame_f1s), f"{prefix}_seg_iou": avg(ious), f"{prefix}_seg_f1": avg(seg_f1s)}
+
+    
 @dataclass(frozen=True)
 class Segment:
     start_s: float
@@ -48,26 +158,6 @@ def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_thresho
     recall = tp / len(gold) if gold else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {"precision": precision, "recall": recall, "f1": f1, "matches": float(tp)}
-
-
-def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "bio") -> dict[str, float]:
-    # Frame-level BIO precision/recall/F1 over signing frames, ignoring UNK.
-    pred = logits.argmax(dim=-1)
-    valid = labels != BIO["UNK"]
-    gold_pos = valid & ((labels == BIO["B"]) | (labels == BIO["I"]))
-    pred_pos = valid & ((pred == BIO["B"]) | (pred == BIO["I"]))
-    tp = (gold_pos & pred_pos).sum().float()
-    precision = tp / pred_pos.sum().clamp(min=1)
-    recall = tp / gold_pos.sum().clamp(min=1)
-    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
-    acc = ((pred == labels) & valid).sum().float() / valid.sum().clamp(min=1)
-    return {
-        f"{prefix}_precision": float(precision.detach().cpu().item()),
-        f"{prefix}_recall": float(recall.detach().cpu().item()),
-        f"{prefix}_f1": float(f1.detach().cpu().item()),
-        f"{prefix}_frame_acc": float(acc.detach().cpu().item()),
-        f"{prefix}_valid_frames": float(valid.sum().detach().cpu().item()),
-    }
 
 
 @lru_cache(maxsize=8)

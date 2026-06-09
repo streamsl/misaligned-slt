@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .gcn_utils import Graph
 from .stgcn_block import get_stgcn_chain
-from config import *
+from poses import KPS_MODULES
 
 
 class CoSign1s(nn.Module):

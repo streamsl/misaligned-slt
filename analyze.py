@@ -6,9 +6,9 @@ import json, argparse
 
 import torch
 from data.loader import load_language_records
-from eval.tiou import Segment, match_segments, temporal_iou
-from seg.infer import load_prediction_file, load_segmenter_for_inference, predict_phrase_segments, save_prediction_file
-from seg.trainer import build_segmenter
+from moryossef26.infer import load_prediction_file, load_segmenter_for_inference, predict_phrase_segments, save_prediction_file
+from moryossef26.trainer import build_segmenter
+from metrics import Segment, match_segments, temporal_iou
 from utils import load_yaml
 
 

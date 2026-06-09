@@ -6,47 +6,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from transformers.modeling_outputs import BaseModelOutput
 
 from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
-from models.baseline import CleanARSLTModel
 from models.checkpointing import load_visual_backbone
-from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart
+from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel
+
 from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
 from utils import load_yaml
 
-
-class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
-    def __init__(self, config: GFSLTConfig):
-        super().__init__()
-        mbart = load_gfslt_mbart(config.mbart_name)
-        self.visual = GFSLTVisualBackbone(config, mbart=mbart)
-        self.mbart = self.visual.mbart
-
-    def forward(
-        self, poses: torch.Tensor, frame_mask: torch.Tensor,
-        labels: torch.Tensor, timestamps_s: torch.Tensor | None = None,
-    ):
-        _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
-        return self.mbart(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-            attention_mask=enc_mask, labels=labels, return_dict=True,
-        )
-
-    @torch.no_grad()
-    def generate(
-        self, poses: torch.Tensor, frame_mask: torch.Tensor,
-        timestamps_s: torch.Tensor | None = None, max_new_tokens: int = 128,
-        decoder_start_token_id: int | None = None, **kwargs,
-    ) -> torch.Tensor:
-        _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
-        return self.mbart.generate(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-            attention_mask=enc_mask, max_new_tokens=max_new_tokens,
-            decoder_start_token_id=decoder_start_token_id, **kwargs,
-        )
 
 @dataclass
 class BaselineComponents:

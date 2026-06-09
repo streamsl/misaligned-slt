@@ -1,33 +1,37 @@
 from __future__ import annotations
 from pathlib import Path
 import json
-import torch
 
+import torch
+import numpy as np
 from data.loader import VideoRecord
+from data.windowing import BIO, make_bio_labels
 from poses import load_pose_window
+
 from models.checkpointing import load_model_checkpoint
 from moryossef26.dataset import append_velocity
 from moryossef26.model import MoryossefSegmenter
-from metrics import Segment
+from metrics import Segment, bio_frame_metrics, bio_labels_to_segments, moryossef_segment_metrics
 
 
 def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Tensor | list[float]) -> list[Segment]:
+    """Time-domain wrapper over `metrics.bio_labels_to_segments` (one splitting rule).
+
+    B-aware: a new B closes the previous span, so adjacent predicted sentences stay separate — Analysis A's  
+    over/under-segmentation counts depend on this (Moryossef's own `likeliest_probs_to_segments` merges contiguous 
+    B/I and is used only for their IoU/segment-F1 metrics, not for our event taxonomy). End time = onset of the frame 
+    after the last in-span frame (the closing O / next B), extrapolating 1 frame step past the sequence end for still-open spans.
+    """
     if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
-    if not isinstance(timestamps_s, torch.Tensor): timestamps_s = torch.as_tensor(timestamps_s, dtype=torch.float32)
-    tags_list = tags.tolist()
-    times = timestamps_s.tolist()
+    times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
+    if not times: return []
+
+    step = (times[-1] - times[-2]) if len(times) > 1 else 0.04  # assume 25fps when a single frame
     segments: list[Segment] = []
-    start: float | None = None
-    for idx, tag in enumerate(tags_list):
-        if tag == BIO["B"]:
-            if start is not None: segments.append(Segment(start, times[idx]))
-            start = times[idx]
-        elif tag == BIO["O"] and start is not None:
-            segments.append(Segment(start, times[idx]))
-            start = None
-    if start is not None and times: # Assume 25 FPS if only 1 timestamp is present, to give segments with some duration.
-        step = (times[-1] - times[-2]) if len(times) > 1 else 0.04 
-        segments.append(Segment(start, times[-1] + step))
+    for seg in bio_labels_to_segments(tags):
+        end_idx = int(seg["end"]) + 1
+        end_t = times[end_idx] if end_idx < len(times) else times[-1] + step
+        segments.append(Segment(times[int(seg["start"])], end_t))
     return segments
 
     
@@ -85,3 +89,37 @@ def predict_phrase_segments(
         segments = bio_tags_to_segments(tags, timestamps)
         predictions[record.video_id] = segments
     return predictions
+
+
+@torch.no_grad()
+def evaluate_segmenter_whole_video(
+    model: MoryossefSegmenter, records: list[VideoRecord],
+    device: torch.device, velocity: bool = True,
+) -> dict[str, float]:
+    """Moryossef evaluate.py-style metrics on the held-out split: process each video whole (the encoder chunks internally), 
+    build GT phrase BIO from caption spans, and average frame-F1 / segment-IoU / segment-F1 + frame P/R/F1 over videos.
+
+    This is the faithful test-set protocol — phrase level only (no sign head) — as
+    opposed to the random-chunk dev loss used inside the training loop.
+    """
+    was_training = model.training
+    model.eval()
+    rows: list[dict[str, float]] = []
+    for record in records:
+        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+        if poses.shape[0] == 0: continue
+        gold = make_bio_labels(timestamps, record.sentences, 0.0, float(record.pose.duration_s))
+        if velocity: poses = append_velocity(poses, timestamps)
+        
+        poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)
+        timestamps_t = torch.as_tensor(timestamps, dtype=torch.float32, device=device).unsqueeze(0)
+        logits = model(poses_t, timestamps_s=timestamps_t)["phrase"].detach().cpu()
+        labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
+        rows.append({
+            **bio_frame_metrics(logits, labels, prefix="phrase"),
+            **moryossef_segment_metrics(logits, labels, prefix="phrase"),
+        })
+    if was_training: model.train()
+    if not rows: return {}
+    keys = rows[0].keys()
+    return {k: float(sum(r[k] for r in rows) / len(rows)) for k in keys}

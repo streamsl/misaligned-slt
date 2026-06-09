@@ -9,7 +9,7 @@ from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter
 from train.losses import bio_nll_dice_loss
 from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
-from metrics import bio_frame_metrics
+from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
 
@@ -74,7 +74,11 @@ def evaluate_segmenter(
         labels = batch["phrase_bio"].to(device)
         outputs = model(poses, timestamps_s=timestamps)
         loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight)
-        row = {"loss": float(loss.detach().cpu().item()), **bio_frame_metrics(outputs["phrase"], labels)}
+        row = {
+            "loss": float(loss.detach().cpu().item()),
+            **bio_frame_metrics(outputs["phrase"], labels),
+            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase"),
+        }
         rows.append(row)
     if was_training: model.train()
     return mean_logs(rows, prefix="val")

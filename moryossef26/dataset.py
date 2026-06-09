@@ -21,12 +21,13 @@ def apply_fps_aug(
     selected source indices, so RoPE receives relative time in seconds rather than an absolute frame index.
     """
     if rng is None: rng = np.random.default_rng()
-    if num_frames <= 0: return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32), source_fps
+    num_frames = int(poses.shape[0])
+    if num_frames <= 0: return poses, np.zeros((0,), dtype=np.float32), source_fps
 
     target_fps = float(rng.uniform(min_fps, max_fps))
     if source_fps <= target_fps * 1.05:
         indices = np.arange(num_frames, dtype=np.int64)
-        return indices, indices.astype(np.float32) / float(source_fps), float(source_fps)
+        return poses, indices.astype(np.float32) / float(source_fps), float(source_fps)
 
     target_len = max(1, round(num_frames * target_fps / float(source_fps)))
     indices = np.round(np.arange(target_len) * (num_frames - 1) / max(1, target_len - 1))

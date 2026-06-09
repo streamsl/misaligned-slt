@@ -75,12 +75,36 @@ class RoPETransformerEncoderLayer(nn.Module):
         return x + self.ffn(self.norm2(x))
 
 
-class ClassifierHead(nn.Module):
-    """Two-layer MLP classifier: hidden_dim → hidden_dim → num_classes.
+def chunked_rope_encode(
+    layers: nn.ModuleList, x: torch.Tensor, 
+    timestamps_s: torch.Tensor | None, chunk_size: int | None,
+) -> torch.Tensor:
+    """Run pre-norm RoPE layers over fixed-size chunks (Moryossef chunked inference).
 
-    Decouples the sign and phrase heads so they don't share a linear map
-    that would force a direct trade-off between their outputs.
+    Shared by `RoPEBIOHead` and `MoryossefSegmenter`. Each chunk attends only within itself; RoPE relative time in seconds keeps 
+    positions consistent across chunk boundaries, which is what makes train-size chunked eval match the training distribution. 
+    `chunk_size=None` (or T <= chunk_size) is a single full pass. Timestamps are dim-normalized up front so 1-D inputs are not 
+    silently dropped on the chunked path (which would fall back to the 50fps index assumption and break fps-augmented inputs).
     """
+    if timestamps_s is not None:
+        if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(x.shape[0], -1)
+        timestamps_s = timestamps_s.to(device=x.device)
+
+    if chunk_size is None or x.shape[1] <= int(chunk_size):
+        for layer in layers: x = layer(x, timestamps_s)
+        return x
+
+    chunks: list[torch.Tensor] = []
+    for start in range(0, x.shape[1], int(chunk_size)):
+        end = min(x.shape[1], start + int(chunk_size))
+        chunk = x[:, start:end]
+        chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None else None
+        for layer in layers: chunk = layer(chunk, chunk_ts)
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=1)
+
+
+class ClassifierHead(nn.Module): # Two-layer MLP classifier: hidden_dim → hidden_dim → num_classes.
     def __init__(self, hidden_dim: int, num_classes: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -117,18 +141,7 @@ class RoPEBIOHead(nn.Module):
 
     def encode(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
         x = self.input_norm(self.input_proj(features))
-        if self.chunk_size is None or x.shape[1] <= self.chunk_size:
-            for layer in self.layers: x = layer(x, timestamps_s)
-            return x
-            
-        chunks: list[torch.Tensor] = []
-        for start in range(0, x.shape[1], self.chunk_size):
-            end = min(x.shape[1], start + self.chunk_size)
-            chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None and timestamps_s.dim() == 2 else None
-            chunk = x[:, start:end]
-            for layer in self.layers: chunk = layer(chunk, chunk_ts)
-            chunks.append(chunk)
-        return torch.cat(chunks, dim=1)
+        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size)
 
     def forward(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> BIOHeadOutput:
         hidden = self.encode(features, timestamps_s=timestamps_s)

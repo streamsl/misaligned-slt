@@ -5,7 +5,7 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.bio_head import ClassifierHead, RoPETransformerEncoderLayer
+from models.bio_head import ClassifierHead, RoPETransformerEncoderLayer, chunked_rope_encode
 
 ConvDef = namedtuple("ConvDef", ["in_channels", "out_channels", "kernel_size", "stride"])
 
@@ -114,30 +114,10 @@ class MoryossefSegmenter(nn.Module):
 
     def encode(self, pose_data: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
         x = self.input_norm(self.frame_cnn(pose_data))
-        batch, frames, _ = x.shape
-        if timestamps_s is None:
-            # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
-            timestamps_s = torch.arange(frames, device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
-            timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
-        elif timestamps_s.dim() == 1:
-            timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
-
-        # Process in training-size chunks so eval context matches training distribution.
-        # All chunks are stacked into a single batch and processed in one forward pass
-        # through the transformer — much faster than sequential chunk processing for
-        # long videos (e.g. 10 chunks → 1 batched call instead of 10 serial calls).
-        if frames <= self.num_frames:
-            for layer in self.encoder_attn: x = layer(x, timestamps_s)
-            return x
-
-        chunks: list[torch.Tensor] = []
-        for start in range(0, frames, self.num_frames):
-            end = min(frames, start + self.num_frames)
-            chunk = x[:, start:end]
-            chunk_ts = timestamps_s[:, start:end]
-            for layer in self.encoder_attn: chunk = layer(chunk, chunk_ts)
-            chunks.append(chunk)
-        return torch.cat(chunks, dim=1)
+        if timestamps_s is None: # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
+            timestamps_s = torch.arange(x.shape[1], device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
+        # Process in training-size chunks so eval context matches the training distribution.
+        return chunked_rope_encode(self.encoder_attn, x, timestamps_s, self.num_frames)
 
     def forward(self, pose_data: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)

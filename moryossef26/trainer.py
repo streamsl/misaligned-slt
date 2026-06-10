@@ -95,10 +95,11 @@ def train_segmenter_epochs(
     model.train()
     logs: list[dict[str, float]] = []
     cfg = cfg or {}
+    
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
-    control = TrainControl.from_config(cfg, default_monitor="val_phrase_f1", default_mode="max")
+    control = TrainControl.from_config(cfg, default_monitor="val_phrase_seg_iou", default_mode="max")
     attach_save_best(control, cfg, "segmenter", save_model_checkpoint)
-    logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), console_keys=["phrase_bio_loss"])
+    logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
     
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []
@@ -122,18 +123,19 @@ def train_segmenter_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
-
         scheduler.step_epoch()
-        epoch_summary = mean_logs(epoch_logs)
-        logger.log_epoch(epoch, {**epoch_summary, "lr": scheduler.lr(optimizer)}, tag="train")
+        train_means = mean_logs(epoch_logs)
+
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_segmenter(model, dev_loader, device, dice_weight=dice_weight)
-            control.update(model, metrics, epoch)
-            logger.log_epoch(epoch, {**metrics, **control.summary()}, tag="val")
-            logs.append({"epoch": float(epoch), **epoch_summary, **metrics, **control.summary()})
+            improved = control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 print(f"segmenter | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
+        else: logger.epoch_summary(epoch, train=train_means)
+
     control.restore(model)
     logger.finish()
     return SegmenterTrainOutput(logs=logs)

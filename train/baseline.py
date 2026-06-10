@@ -14,7 +14,7 @@ from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
 from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
-from utils import load_yaml
+from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
 
 
 @dataclass
@@ -37,7 +37,7 @@ def build_baseline_components(
 
     language = str(base_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    tokenizer_dir = str(stage1_cfg.get("trimmed_tokenizer_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25")))
+    tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
 
     records, _ = load_language_records(data_cfg, language, split="train")
@@ -63,11 +63,11 @@ def build_baseline_components(
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=str(stage1_cfg.get("trimmed_mbart_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25"))),
+        mbart_name=mbart_trimmed_dir(stage1_cfg),
         use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
     model = CleanARSLTModel(gfslt_cfg)
-    checkpoint = base_cfg.get("checkpoint_vlp")
+    checkpoint = vlp_checkpoint(base_cfg)
     if checkpoint:
         path = str(checkpoint)
         try: load_visual_backbone(model.visual, path, strict=False)
@@ -134,8 +134,8 @@ def train_baseline_epochs(
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
     attach_save_best(control, cfg, "baseline", save_model_checkpoint)
-    logger = TrainLogger("baseline", cfg, epochs=int(epochs), steps_per_epoch=len(loader), console_keys=["baseline_ce_loss"])
-
+    logger = TrainLogger("baseline", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
+    
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):
@@ -159,19 +159,19 @@ def train_baseline_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
-
         scheduler.step_epoch()
-        epoch_summary = mean_logs(epoch_logs)
-        logger.log_epoch(epoch, {**epoch_summary, "lr": scheduler.lr(optimizer)}, tag="train")
-        
+        train_means = mean_logs(epoch_logs)
+
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_baseline(model, dev_loader, device, tokenizer=tokenizer, cfg=cfg)
-            control.update(model, metrics, epoch)
-            logger.log_epoch(epoch, {**metrics, **control.summary()}, tag="val")
-            logs.append({"epoch": float(epoch), **epoch_summary, **metrics, **control.summary()})
+            improved = control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 print(f"baseline | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
+        else: logger.epoch_summary(epoch, train=train_means)
+
     control.restore(model)
     logger.finish()
     return logs

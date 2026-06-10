@@ -3,15 +3,20 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 from pathlib import Path
 import copy, json, time
-import torch
 
+import torch
+import pandas as pd
+from utils import checkpoint_dir, save_best_enabled
+
+
+_NUM_COL_W = 10   # epoch-table numeric column width: holds "2.800e-05" / "-12.300" / "0.000"
+SchedulerInterval = Literal["step", "epoch", "none"]
 
 def _fmt_duration(seconds: float) -> str:
     seconds = max(0, int(round(float(seconds))))
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
-
 
 def _fmt_metric(value) -> str:
     # Fixed-shape number for table columns: 3 decimals in the normal range, 3-sig sci at the
@@ -26,44 +31,17 @@ def _fmt_metric(value) -> str:
     return f"{v:.3f}"
 
 
-# Short column headers for the step table (full names stay on W&B). Falls back to stripping `_loss`.
-_HEADER_ABBREV = {
-    "total_loss": "total", "bio_loss": "bio", "translation_loss": "transl",
-    "confidence_bound_loss": "cb", "oput_loss": "oput", "baseline_ce_loss": "ce",
-    "vlp_loss": "vlp", "contrastive_loss": "contr", "cmlm_loss": "cmlm", "phrase_bio_loss": "bio",
-}
-def _short_header(key: str) -> str:
-    if key in _HEADER_ABBREV: return _HEADER_ABBREV[key]
-    return key[:-5] if key.endswith("_loss") else key
-
-
-# Step-line keys hidden from the console when no explicit console_keys list is given.
-# These are per-mode diagnostics that belong on W&B, not in the terminal.
-_CONSOLE_HIDDEN_SUBSTRINGS = ("_count", "masked_fraction", "mask_loss", "pred_loss", "cb_active")
-_NUM_COL_W = 10   # numeric column width: holds "2.800e-05" / "-12.300" / "0.000"
-_VAL_COL_W = 11   # value column width for the epoch key/value summary table
-SchedulerInterval = Literal["step", "epoch", "none"]
-
-
 class TrainLogger:
     """Unified console + Weights & Biases logger for the training loops.
 
-    Console: a per-epoch banner, then a **fixed-width table** — a header + separator printed once when
-    the epoch starts, then one right-aligned row every `log_every` steps. Columns are `step`, the headline
-    metrics (`console_keys` argument or `console_keys:` in the config; everything else stays on W&B), `lr`,
-    `s/it`, and an epoch `eta`. Numbers use a consistent per-column form (3 decimals normally, 3-sig sci at
-    the extremes) so decimal points line up down each column. Epoch summaries ([train]/[val]) print as an
-    aligned key/value table. ASCII only (Windows consoles choke on box-drawing characters).
-
-    W&B: every step (and per epoch) under a `<stage>/` namespace, with ALL numeric keys. Enable via the
-    config `wandb:` block (`enabled`, `project`, `name`, `group`, `mode`). Login uses wandb's own
-    interactive console flow: when no API key is configured, `wandb.init` prompts in the terminal
-    (create account / paste existing API key via browser / don't visualize) instead of silently
-    degrading. Only a missing wandb *installation* degrades to console-only.
+    Console output is epoch-level only: one pandas-backed ledger with one row per epoch,
+    all train/val metrics as columns, `eta` estimated from observed epoch time, and `*`
+    marking new best checkpoints. There is intentionally no step-level console output:
+    step metrics still go to W&B, but the terminal stays readable and table-only.
     """
     def __init__(
-        self, stage: str, cfg: dict | None = None, epochs: int = 0, steps_per_epoch: int = 0, 
-        log_every: int | None = None, console_keys: list[str] | None = None,
+        self, stage: str, cfg: dict | None = None, epochs: int = 0, 
+        steps_per_epoch: int = 0, monitor: str = "val_loss",
     ):
         self.stage = str(stage)
         self.epochs = int(epochs)
@@ -71,94 +49,165 @@ class TrainLogger:
         cfg = cfg or {}
         wandb_cfg = dict(cfg.get("wandb", {}) or {})
 
-        self.log_every = int(log_every if log_every is not None else cfg.get("log_every", wandb_cfg.get("log_every", 10)) or 1)
-        self.console_keys = [str(k) for k in (console_keys or cfg.get("console_keys") or [])]
+        self.monitor = str(monitor)  # surfaced first among the val columns of the epoch table
         self._global_step = 0
         self._epoch: int | None = None
         self._epoch_t0 = 0.0
-        self._epoch_step0 = 0
-
-        self._step_keys: list[str] = []
-        self._step_specs_cache: list[tuple[str, str, int]] = []
+        self._rows: list[dict] = []            # accumulated epoch results -> pandas DataFrame
+        self._header_printed = False
+        self._columns: list[str] = []
+        self._history_csv: Path | None = None
+        self._history_html: Path | None = None
         self._wandb = None
-        
+        self._configure_history_paths(cfg)
+
         if bool(wandb_cfg.get("enabled", False)):
             try: import wandb
             except ImportError:
                 print(f"{self.stage} | wandb enabled in config but not installed (pip install wandb); console only", flush=True)
-            else:
-                if wandb.run is None: wandb.init(
-                    project=str(wandb_cfg.get("project", "misaligned-slt")), name=str(wandb_cfg.get("name") or self.stage),
-                    group=wandb_cfg.get("group"), mode=str(wandb_cfg.get("mode", "online")), config=cfg,
-                )
-                self._wandb = wandb
+            else: self._init_wandb(wandb, wandb_cfg, cfg)
+
+
+    def _init_wandb(self, wandb, wandb_cfg: dict, cfg: dict) -> None:
+        if wandb.run is not None: self._wandb = wandb; return
+        init_kwargs = dict(
+            project=str(wandb_cfg.get("project", "misaligned-slt")),
+            name=str(wandb_cfg.get("name") or self.stage),
+            group=wandb_cfg.get("group"), config=cfg,
+        )
+        mode = wandb_cfg.get("mode")
+        if mode and str(mode) != "online": init_kwargs["mode"] = str(mode)
+        try:
+            wandb.init(**init_kwargs)
+            self._wandb = wandb
+        except Exception as exc:  # noqa: BLE001 - login declined / unavailable → continue without W&B
+            print(f"{self.stage} | wandb not active ({type(exc).__name__}: {exc}); console table only", flush=True)
+            self._wandb = None
+            try: wandb.finish()
+            except Exception: pass  # noqa: BLE001
+
 
     @staticmethod
     def _numeric(row: dict) -> dict:
         return {k: v for k, v in row.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
-    def _resolve_step_keys(self, numeric: dict) -> list[str]:
-        # Freeze the step table's metric columns at the start of each epoch (stable headers).
-        skip = {"epoch", "step", "lr"}
-        if self.console_keys: return [k for k in self.console_keys if k not in skip]
-        return [k for k in numeric if k not in skip and not any(h in k for h in _CONSOLE_HIDDEN_SUBSTRINGS)]
-
-    def _step_specs(self) -> list[tuple[str, str, int]]:
-        # (value_key, header_label, width). Trailing __rate/__eta are computed, not metrics.
-        step_w = max(len("step"), len(f"{self.steps_per_epoch}/{self.steps_per_epoch}"))
-        specs = [("step", "step", step_w)]
-        for key in self._step_keys:
-            head = _short_header(key)
-            specs.append((key, head, max(len(head), _NUM_COL_W)))
-        specs.append(("lr", "lr", _NUM_COL_W))
-        specs.append(("__rate", "s/it", 8))
-        specs.append(("__eta", "eta", 7))
-        return specs
-
-    def _print_table_header(self, specs: list[tuple[str, str, int]]) -> None:
-        print("  " + "  ".join(f"{head:>{w}}" for _, head, w in specs), flush=True)
-        print("  " + "  ".join("-" * w for _, _, w in specs), flush=True)
-
     def log_step(self, epoch: int, step: int, row: dict) -> None:
         self._global_step += 1
         numeric = self._numeric(row)
         if self._wandb is not None: self._wandb.log({f"{self.stage}/{k}": v for k, v in numeric.items()}, step=self._global_step)
-
-        now = time.monotonic()
         if epoch != self._epoch:
             self._epoch = int(epoch)
-            self._epoch_t0 = now
-            self._epoch_step0 = int(step)
-            self._step_keys = self._resolve_step_keys(numeric)
-            self._step_specs_cache = self._step_specs()
-            print(f"\n{self.stage}  epoch {epoch}/{self.epochs}  ({self.steps_per_epoch} steps)", flush=True)
-            self._print_table_header(self._step_specs_cache)
+            self._epoch_t0 = time.monotonic()
 
-        if self.log_every > 0 and (step % self.log_every == 0 or step == self.steps_per_epoch):
-            done = step - self._epoch_step0
-            rate = (now - self._epoch_t0) / done if done > 0 else None
-            values: dict[str, str] = {k: _fmt_metric(v) for k, v in numeric.items()}
-            values["step"] = f"{step}/{self.steps_per_epoch}"
-            values["__rate"] = f"{rate:.2f}s" if rate else "--"
-            values["__eta"] = _fmt_duration((self.steps_per_epoch - step) * rate) if rate else "--"
-            cells = [f"{values.get(key, ''):>{w}}" for key, _, w in self._step_specs_cache]
-            print("  " + "  ".join(cells), flush=True)
+    def _order_columns(self, keys) -> list[str]:
+        keys = list(keys)
+        train = sorted(k for k in keys if k.startswith("train_"))
+        val = sorted(k for k in keys if k.startswith("val_"))
+        for metric in (self.monitor, "val_loss"):
+            if metric in val: val.remove(metric); val.insert(0, metric)
+        tail = [k for k in ("took", "eta", "ckpt", "best") if k in keys]
+        other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
+        return ["epoch", *train, *val, *other, *tail]
 
-    def log_epoch(self, epoch: int, metrics: dict, tag: str = "epoch") -> None:
-        numeric = self._numeric(metrics)
+    def history_dataframe(self) -> pd.DataFrame:
+        if not self._rows: return pd.DataFrame()
+        df = pd.DataFrame(self._rows)
+        return df[self._order_columns(df.columns)]
+
+    def _display_dataframe(self) -> pd.DataFrame:
+        df = self.history_dataframe()
+        disp = df.copy()
+        for col in disp.columns:
+            if col in ("epoch", "best"): continue
+            fmt = _fmt_duration if col == "took" else _fmt_metric
+            disp[col] = [fmt(v) if pd.notna(v) else "-" for v in disp[col]]
+        return disp.fillna("-")
+
+    def _table_text(self) -> str:
+        disp = self._display_dataframe()
+        if disp.empty: return ""
+        return disp.to_string(index=False)
+
+    def _row_text(self, row: dict, columns: list[str]) -> str:
+        text = self._table_text()
+        if not text: return ""
+        return text.splitlines()[-1]
+
+
+    def epoch_summary(
+        self, epoch: int, train: dict, val: dict | None = None, 
+        is_best: bool = False, saved_path: str | None = None
+    ) -> None:
+        """Record one epoch and append one line to the pandas-backed console table.
+
+        ALL train/val metrics become columns; epochs without an eval show `-`. A `*` marks
+        the best epoch, `ckpt` records a save event, and `eta` estimates remaining training time
+        from the mean completed-epoch duration. No progress bar or step output can interrupt it.
+        """
+        took = (time.monotonic() - self._epoch_t0) if (self._epoch == epoch and self._epoch_t0) else None
+        train_num, val_num = self._numeric(train or {}), self._numeric(val or {})
         if self._wandb is not None:
-            self._wandb.log({f"{self.stage}/{tag}/{k}": v for k, v in numeric.items()}, step=self._global_step)
+            payload = {f"{self.stage}/epoch/{k}": v for k, v in {**train_num, **val_num}.items()}
+            if payload: self._wandb.log(payload, step=self._global_step)
 
-        suffix = ""
-        if tag == "train" and self._epoch == epoch and self._epoch_t0:
-            suffix = f"  (took {_fmt_duration(time.monotonic() - self._epoch_t0)})"
-        print(f"{self.stage}  epoch {epoch}/{self.epochs}  [{tag}]{suffix}", flush=True)
-        if not numeric: return
+        elapsed_epochs = [float(r["took"]) for r in self._rows if isinstance(r.get("took"), (int, float))]
+        if took is not None: elapsed_epochs.append(float(took))
+        mean_epoch_s = sum(elapsed_epochs) / max(1, len(elapsed_epochs))
+        remaining_s = max(0, int(self.epochs) - int(epoch)) * mean_epoch_s
 
-        # Aligned key/value table, sorted so related metrics (best_*, val_*) group and scan cleanly.
-        name_width = max(len(k) for k in numeric)
-        for key in sorted(numeric):
-            print(f"    {key:<{name_width}}  {_fmt_metric(numeric[key]):>{_VAL_COL_W}}", flush=True)
+        row: dict = {"epoch": f"{epoch}/{self.epochs}", **train_num, **val_num}
+        if took is not None: row["took"] = took
+        row["eta"] = remaining_s
+        row["best"] = "*" if is_best else ""
+        row["ckpt"] = "saved" if saved_path else ""
+        self._rows.append(row)
+        self._emit_epoch_row(row)
+        self._save_history_files()
+
+
+    def _emit_epoch_row(self, row: dict) -> None:
+        df = self.history_dataframe()
+        columns = list(df.columns)
+        columns_changed = columns != self._columns
+        if columns != self._columns:
+            self._columns = columns
+            self._header_printed = False
+
+        if not self._header_printed:
+            text = self._table_text()
+            if columns_changed and len(self._rows) > 1: print(text, flush=True)
+            else:
+                lines = text.splitlines()
+                if len(lines) <= 2: print(text, flush=True)
+                else: print("\n".join(lines[:1] + [lines[-1]]), flush=True)
+            self._header_printed = True
+        else: print(self._row_text(row, self._columns), flush=True)
+        
+
+    def _configure_history_paths(self, cfg: dict) -> None:
+        root = checkpoint_dir(cfg)
+        logging_cfg = dict(cfg.get("logging", {}) or {})
+        if logging_cfg.get("history", True) is False: return
+        out_dir = logging_cfg.get("dir") or root
+        if not out_dir: return
+        out_dir = Path(out_dir)
+        self._history_csv = out_dir / "history.csv"
+        self._history_html = out_dir / "history.html"
+
+    def _save_history_files(self) -> None:
+        df = self.history_dataframe()
+        if df.empty or self._history_csv is None or self._history_html is None: return
+        self._history_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(self._history_csv, index=False)
+        try: df.to_html(self._history_html, index=False, float_format=lambda x: _fmt_metric(x))
+        except TypeError: df.to_html(self._history_html, index=False)
+
+    def save_history(self, path: str | Path) -> Path | None:
+        df = self.history_dataframe()
+        if df.empty: return None
+        path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+        return path
 
     def finish(self) -> None:
         if self._wandb is not None and self._wandb.run is not None:
@@ -194,6 +243,8 @@ class TrainControl:
     # still runs (after restore_best it rewrites the same state). Wire via `attach_save_best`.
     name: str = "train"
     save_fn: Callable[[torch.nn.Module], Path | None] | None = None
+    last_saved_path: str | None = None  # Set on the epoch a new best is saved (for the logger to report)
+    _warned_missing_monitor: bool = False
 
     @classmethod
     def from_config(cls, cfg: dict, default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min") -> "TrainControl":
@@ -218,26 +269,36 @@ class TrainControl:
         return value < self.best_value - self.early_stopping_min_delta
 
     def update(self, model: torch.nn.Module, metrics: dict[str, float], epoch: int) -> bool:
-        if self.monitor not in metrics: return False
+        if self.monitor not in metrics:
+            # Loudly surface a monitor/metric-key mismatch once. This was previously silent: a wrong
+            # monitor name (e.g. segmenter "val_phrase_f1" when eval emits "val_phrase_seg_iou") left
+            # best_epoch=0 and never saved a best checkpoint, with no warning.
+            if not self._warned_missing_monitor:
+                self._warned_missing_monitor = True
+                available = ", ".join(sorted(metrics)) or "(no metrics returned)"
+                print(f"{self.name} | WARNING: monitor '{self.monitor}' not in eval metrics — best-checkpoint "
+                      f"tracking and early stopping are DISABLED. Available keys: {available}", flush=True)
+            return False
+
         value = float(metrics[self.monitor])
+        self.last_saved_path = None
         if self._is_better(value):
-            previous = self.best_value
             self.best_value = value
             self.best_epoch = int(epoch)
             self.bad_epochs = 0
+
             if self.restore_best: self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if self.save_fn is not None:
                 path = self.save_fn(model)
-                prev = "first eval" if previous is None else f"prev {previous:.6g}"
-                where = f" -> saved {path}" if path is not None else ""
-                print(f"{self.name} | * new best {self.monitor}={value:.6g} @ epoch {epoch} ({prev}){where}", flush=True)
                 if path is not None:
+                    self.last_saved_path = str(path)
                     meta = {
                         "monitor": self.monitor, "mode": self.monitor_mode,
                         "value": value, "epoch": int(epoch), "checkpoint": str(path),
                     }
                     Path(path).parent.joinpath("best.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
             return True
+
         self.bad_epochs += 1
         if self.early_stopping_patience > 0 and self.bad_epochs >= self.early_stopping_patience: self.stopped_early = True
         return False
@@ -257,16 +318,15 @@ def attach_save_best(
     control: TrainControl, cfg: dict, name: str,
     saver: Callable[[torch.nn.Module, str | Path], Path],
 ) -> TrainControl:
-    """Wire save-on-best into a TrainControl from the config's `checkpoint:` block.
+    """Wire save-on-best into a TrainControl from the consolidated `checkpoint:` block.
 
-    `checkpoint.dir` (falling back to `output_dir`) is where the best checkpoint and `best.json`
+    `checkpoint.dir` (falling back to legacy `output_dir`) is where the best checkpoint and `best.json`
     land; `checkpoint.save_best: false` disables mid-training saves (end-of-training save only).
     `saver(model, dir)` performs the stage-appropriate write (full model vs visual backbone).
     """
     control.name = str(name)
-    ckpt_cfg = dict(cfg.get("checkpoint", {}) or {})
-    ckpt_dir = ckpt_cfg.get("dir") or cfg.get("output_dir")
-    if bool(ckpt_cfg.get("save_best", True)) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir)
+    ckpt_dir = checkpoint_dir(cfg)
+    if save_best_enabled(cfg) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir)
     return control
 
 

@@ -16,7 +16,7 @@ from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
 from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, compute_text_metrics
-from utils import load_yaml
+from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
 
 
 @dataclass
@@ -43,7 +43,7 @@ def build_gfslt_config(stage1_cfg: dict, stage2_cfg: dict) -> GFSLTConfig:
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=str(stage1_cfg.get("trimmed_mbart_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25"))),
+        mbart_name=mbart_trimmed_dir(stage1_cfg),
         use_temporal_conv=bool(stage2_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
 
@@ -61,7 +61,7 @@ def build_stage2_components(
     inference_cfg = load_yaml(inference_config)
     language = str(stage2_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
 
-    tokenizer_dir = str(stage1_cfg.get("trimmed_tokenizer_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25")))
+    tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
 
@@ -90,7 +90,7 @@ def build_stage2_components(
         bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         block_size=int(stage2_cfg.get("block_size", 8)),
     )
-    checkpoint = stage2_cfg.get("checkpoint_vlp")
+    checkpoint = vlp_checkpoint(stage2_cfg)
     if checkpoint:
         try: load_visual_backbone(model.visual, checkpoint, strict=False)
         except (FileNotFoundError, OSError): pass
@@ -218,10 +218,8 @@ def train_stage2_epochs(
     # found that w/o warmup the term collapses early training (the f==r gate fixes collapse at convergence; warmup fixes early instability).
     cb_warmup_epochs = int(confidence_cfg.get("warmup_epochs", 1))
     cb_lambda = float(confidence_cfg.get("lambda", 0.3))
-    logger = TrainLogger(
-        f"stage2-{decoder_name}", stage2_cfg, epochs=int(epochs), steps_per_epoch=len(loader),
-        console_keys=["total_loss", "bio_loss", "translation_loss", "confidence_bound_loss"],
-    )
+    logger = TrainLogger(f"stage2-{decoder_name}", stage2_cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
+    
     for epoch in range(1, int(epochs) + 1):
         cb_active = epoch > cb_warmup_epochs
         epoch_logs: list[dict[str, float]] = []
@@ -264,20 +262,19 @@ def train_stage2_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
-
         scheduler.step_epoch()
-        epoch_summary = mean_logs(epoch_logs)
-        logger.log_epoch(epoch, {**epoch_summary, "lr": scheduler.lr(optimizer)}, tag="train")
+        train_means = mean_logs(epoch_logs)
 
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_stage2(model, dev_loader, device, stage2_cfg=stage2_cfg, segmenter_cfg=segmenter_cfg)
-            control.update(model, metrics, epoch)
-            logger.log_epoch(epoch, {**metrics, **control.summary()}, tag="val")
-            logs.append({"epoch": float(epoch), **epoch_summary, **metrics, **control.summary()})
+            improved = control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 print(f"stage2-{decoder_name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
-            
+        else: logger.epoch_summary(epoch, train=train_means)
+
     control.restore(model)
     logger.finish()
     return logs

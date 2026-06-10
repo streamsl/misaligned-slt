@@ -12,7 +12,7 @@ from models.gfslt import GFSLTConfig
 from models.vlp import PoseTextCLIP
 from models.checkpointing import save_visual_backbone
 from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
-from utils import load_yaml
+from utils import load_yaml, mbart_trimmed_dir
 
 
 @dataclass
@@ -31,7 +31,7 @@ def build_stage1_components(
     cfg = load_yaml(stage1_config)
     language = str(cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    tokenizer_dir = str(cfg.get("trimmed_tokenizer_dir", cfg.get("mbart_name", "facebook/mbart-large-cc25")))
+    tokenizer_dir = mbart_trimmed_dir(cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
 
     records, _ = load_language_records(data_cfg, language, split="train")
@@ -75,7 +75,7 @@ def build_stage1_components(
         embed_dim=int(cfg.get("embed_dim", 1024)),
         hidden_size=int(cfg.get("hidden_size", 1024)),
         temporal_kernel=int(cfg.get("temporal_kernel", 3)),
-        mbart_name=str(cfg.get("trimmed_mbart_dir", cfg.get("mbart_name", "facebook/mbart-large-cc25"))),
+        mbart_name=mbart_trimmed_dir(cfg),
         use_temporal_conv=bool(cfg.get("use_temporal_conv", False)),
     )
     model = PoseTextCLIP(
@@ -134,10 +134,8 @@ def train_stage1_epochs(
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
     # Save-on-best writes the VLP deliverable (visual backbone — what stage 2 / the baseline load).
     attach_save_best(control, cfg, "stage1-vlp", lambda model, out_dir: save_visual_backbone(model.visual, out_dir))
-    logger = TrainLogger(
-        "stage1-vlp", cfg, epochs=int(epochs), steps_per_epoch=len(loader),
-        console_keys=["vlp_loss", "contrastive_loss", "cmlm_loss"],
-    )
+    logger = TrainLogger("stage1-vlp", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
+    
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):
@@ -171,20 +169,19 @@ def train_stage1_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
-
         scheduler.step_epoch()
-        epoch_summary = mean_logs(epoch_logs)
-        logger.log_epoch(epoch, {**epoch_summary, "lr": scheduler.lr(optimizer)}, tag="train")
+        train_means = mean_logs(epoch_logs)
 
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_stage1(model, dev_loader, device)
-            control.update(model, metrics, epoch)
-            logger.log_epoch(epoch, {**metrics, **control.summary()}, tag="val")
-            logs.append({"epoch": float(epoch), **epoch_summary, **metrics, **control.summary()})
+            improved = control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 print(f"stage1-vlp | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
-            
+        else: logger.epoch_summary(epoch, train=train_means)
+
     control.restore(model)
     logger.finish()
     return logs

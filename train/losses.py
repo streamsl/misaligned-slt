@@ -51,10 +51,32 @@ def bio_nll_dice_loss(
     return ce_weight * ce + dice_weight * dice
 
 
+def confidence_bound_gate(
+    full_tokens: torch.Tensor, trunc_tokens: torch.Tensor, trunc_confidence: torch.Tensor,
+    reference_tokens: torch.Tensor | None = None, valid_mask: torch.Tensor | None = None,
+    tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, pad_token_id: int | None = None,
+) -> torch.Tensor:
+    """§6.3 active-slot gate, decoupled from the CE so the caller can re-mask the
+    gated slots before the grad-bearing forward: (π_i > τ) & (t_i != f_i)
+    [& (f_i == r_i) when the verified gate is on], minus padding/invalid slots."""
+    active = trunc_confidence > float(tau_cb)
+    active = active & (trunc_tokens != full_tokens)
+    if verified_full_evidence_gate:
+        if reference_tokens is None: raise ValueError("reference_tokens is required when verified_full_evidence_gate=True")
+        active = active & (full_tokens == reference_tokens)
+
+    if valid_mask is not None: active = active & valid_mask.to(device=active.device, dtype=torch.bool)
+    if pad_token_id is not None:
+        active = active & (full_tokens != int(pad_token_id))
+        if reference_tokens is not None: active = active & (reference_tokens != int(pad_token_id))
+    return active
+
+
 def confidence_bound_loss(
     trunc_logits: torch.Tensor, full_tokens: torch.Tensor, reference_tokens: torch.Tensor | None = None,
     valid_mask: torch.Tensor | None = None, trunc_tokens: torch.Tensor | None = None, trunc_confidence: torch.Tensor | None = None,
     tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, enabled: bool = True, pad_token_id: int | None = None,
+    active_mask: torch.Tensor | None = None,
 ) -> ConfidenceBoundStats:
     """Confidence-bound loss for right-truncated Mode 2a windows.
 
@@ -85,22 +107,16 @@ def confidence_bound_loss(
     if trunc_confidence is not None: trunc_conf = trunc_confidence[:, :seq_len].to(device=logits.device)
     else: trunc_conf = logits_conf
 
-    active = trunc_conf > float(tau_cb)
-    active = active & (trunc_pred != full)
-    if verified_full_evidence_gate:
-        if ref is None: raise ValueError("reference_tokens is required when verified_full_evidence_gate=True")
-        active = active & (full == ref)
-
-    if valid_mask is not None: active = active & valid_mask[:, :seq_len].to(device=logits.device, dtype=torch.bool)
-    if pad_token_id is not None:
-        active = active & (full != int(pad_token_id))
-        if ref is not None: active = active & (ref != int(pad_token_id))
-
+    if active_mask is not None: active = active_mask[:, :seq_len].to(device=logits.device, dtype=torch.bool)
+    else: active = confidence_bound_gate(
+        full_tokens=full, trunc_tokens=trunc_pred, trunc_confidence=trunc_conf,
+        reference_tokens=ref, valid_mask=valid_mask[:, :seq_len] if valid_mask is not None else None,
+        tau_cb=tau_cb, verified_full_evidence_gate=verified_full_evidence_gate, pad_token_id=pad_token_id,
+    )
     if not active.any(): loss = logits.sum() * 0.0
     else:
         token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), full.reshape(-1), reduction="none").reshape_as(full)
         loss = (token_loss * active.to(token_loss.dtype)).sum() / active.sum().clamp(min=1)
-
     return ConfidenceBoundStats(
         loss=loss, active_positions=active, active_count=active.sum(),
         trunc_tokens=trunc_pred, trunc_confidence=trunc_conf,

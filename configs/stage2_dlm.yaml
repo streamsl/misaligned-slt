@@ -27,8 +27,9 @@ oput:
 confidence_bound:
   # §6.3 right-truncated (Mode 2a) term. The full-evidence decode is a no-grad
   # stop-grad self-target; the gate reads the real SPD+DCD decode's confidence;
-  # the CE gradient flows through ONE cheap marginal forward (not the ~64-step
-  # decode). See models/streaming_slt.py + dlm_decoder.truncated_marginal_logits.
+  # the CE gradient flows through ONE cheap forward on the decoded sequence with
+  # the gated slots re-masked (the DCD deferral counterfactual), not the
+  # ~64-step decode. See models/streaming_slt.py + dlm_decoder.remasked_logits.
   enabled: true
   verified_full_evidence_gate: true   # penalize only where full-evidence decode == reference
   tau_cb: 0.75
@@ -50,6 +51,13 @@ mode2_subcase_weights:
   right: 0.45
   left: 0.45
   both: 0.10
+# Hard Rule §1.4.4 / Moryossef 2026: fps_aug essential (0.58→0.49 without),
+# speed_aug forbidden. Applied to sampled training windows (BIO labels rebuilt
+# from resampled timestamps); the Mode-2a full-evidence view stays native-fps.
+fps_aug:
+  enabled: true
+  min_fps: 25.0
+  max_fps: 50.0
 jitter:
   source: outputs/a_jitter_asf.json
   fallback_laplace:
@@ -90,6 +98,9 @@ dcd:
   decode_param: 0.75
   cache_type: none          # none is exact; prefix is implemented only when window_type: static.
   refresh_count: 16
+  # NOTE: the DCD window is automatically clipped to the BD3LM attention block
+  # (DCD window_causal_decode semantics for block-causal models) — structural,
+  # not tunable here; ablate via decode_spd_dcd(window_block_clip=False).
 spd:
   top_k: 1                  # DMax SPD top-k token/mask embedding mixture.
   renormalize: true         # DMax Eq. 10 norm restoration.

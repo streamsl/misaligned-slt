@@ -11,7 +11,7 @@ from data.windowing import BIO
 
 from models.checkpointing import save_model_checkpoint, save_visual_backbone
 from train.sampler import WindowSampler
-from utils import load_yaml
+from utils import checkpoint_dir, load_yaml, mbart_name, mbart_trimmed_dir
 
 
 def smoke_data(args: argparse.Namespace) -> dict:
@@ -67,11 +67,11 @@ if __name__ == "__main__":
         stage1_cfg = load_yaml(args.stage1_config)
         language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
         target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
+        trimmed_dir = mbart_trimmed_dir(stage1_cfg)
         result = trim_MBartForConditionalGeneration(
             data_config=args.data_config, language=language,
-            mbart_name=str(stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25")), target_lang=target_lang,
-            tokenizer_out=str(stage1_cfg.get("trimmed_tokenizer_dir", f"captioners/trimmed_mbart_{language}")),
-            model_out=str(stage1_cfg.get("trimmed_mbart_dir", f"captioners/trimmed_mbart_{language}")),
+            mbart_name=mbart_name(stage1_cfg), target_lang=target_lang,
+            tokenizer_out=trimmed_dir, model_out=trimmed_dir,
         )
     elif args.stage == "smoke-data": result = smoke_data(args)
 
@@ -92,7 +92,7 @@ if __name__ == "__main__":
             components.model, components.train_loader, optimizer, device=device, 
             epochs=epochs, cfg=stage1_cfg, dev_loader=components.dev_loader,
         )
-        output_dir = Path(stage1_cfg.get("output_dir", f"checkpoints/vlp/{stage1_cfg.get('language', args.language)}"))
+        output_dir = Path(checkpoint_dir(stage1_cfg, default=f"checkpoints/vlp/{stage1_cfg.get('language', args.language)}"))
         path = save_visual_backbone(components.model.visual, output_dir)
         print({"device": str(device), "visual_backbone": str(path), "logs": logs})
 
@@ -113,7 +113,7 @@ if __name__ == "__main__":
             components.model, components.train_loader, optimizer, device=device, epochs=epochs, 
             cfg=base_cfg, dev_loader=components.dev_loader, tokenizer=components.tokenizer,
         )
-        path = save_model_checkpoint(components.model, base_cfg.get("output_dir", "checkpoints/stage2_baseline"))
+        path = save_model_checkpoint(components.model, checkpoint_dir(base_cfg, default="checkpoints/stage2_baseline"))
         print({"device": str(device), "checkpoint": str(path), "logs": logs})
 
     elif args.stage == "train-stage2":
@@ -138,7 +138,7 @@ if __name__ == "__main__":
             components.model, components.train_loader, optimizer, device=device, epochs=epochs,
             stage2_cfg=stage2_cfg, segmenter_cfg=segmenter_cfg, dev_loader=components.dev_loader,
         )
-        path = save_model_checkpoint(components.model, stage2_cfg.get("output_dir", "checkpoints/stage2"))
+        path = save_model_checkpoint(components.model, checkpoint_dir(stage2_cfg, default="checkpoints/stage2"))
         print({"device": str(device), "checkpoint": str(path), "logs": logs})
 
     elif args.stage == "train-segmenter":
@@ -160,7 +160,7 @@ if __name__ == "__main__":
             dice_weight=float(segmenter_cfg.get("dice_loss_weight", 1.5)),
             cfg=segmenter_cfg, dev_loader=dev_loader,
         )
-        path = save_model_checkpoint(model, segmenter_cfg.get("output_dir", "checkpoints/segmenter"))
+        path = save_model_checkpoint(model, checkpoint_dir(segmenter_cfg, default="checkpoints/segmenter"))
         print({"device": str(device), "checkpoint": str(path), "logs": output.logs})
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 

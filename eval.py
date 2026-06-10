@@ -15,7 +15,7 @@ from models.gfslt import GFSLTConfig, CleanARSLTModel
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
-from utils import load_yaml
+from utils import checkpoint_dir, load_yaml, mbart_trimmed_dir
 
 
 @dataclass(frozen=True)
@@ -194,8 +194,7 @@ def _method_config_path(args: argparse.Namespace) -> str:
 def _load_tokenizer(stage1_cfg: dict, data_cfg: dict, language: str):
     from transformers import AutoTokenizer
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    tokenizer_dir = str(stage1_cfg.get("trimmed_tokenizer_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25")))
-    return AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
+    return AutoTokenizer.from_pretrained(mbart_trimmed_dir(stage1_cfg), src_lang=target_lang, tgt_lang=target_lang)
 
 
 def _gfslt_config(stage1_cfg: dict, method_cfg: dict) -> GFSLTConfig:
@@ -203,7 +202,7 @@ def _gfslt_config(stage1_cfg: dict, method_cfg: dict) -> GFSLTConfig:
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=str(stage1_cfg.get("trimmed_mbart_dir", stage1_cfg.get("mbart_name", "facebook/mbart-large-cc25"))),
+        mbart_name=mbart_trimmed_dir(stage1_cfg),
         use_temporal_conv=bool(method_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
 
@@ -220,7 +219,7 @@ def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict
             bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
             block_size=int(method_cfg.get("block_size", 8)),
         )
-    checkpoint = Path(args.checkpoint or method_cfg.get("output_dir", ""))
+    checkpoint = Path(args.checkpoint or checkpoint_dir(method_cfg, default="") or "")
     if not checkpoint.exists():
         raise FileNotFoundError(f"Missing checkpoint for {args.method}: {checkpoint}. Train the method first or pass --checkpoint.")
     load_model_checkpoint(model, checkpoint, strict=False)

@@ -20,7 +20,7 @@ def trim_MBartForConditionalGeneration(
 ) -> dict[str, str | int]:
     subtitles = collect_training_subtitles(data_config, language)
     if not subtitles: raise RuntimeError(f"No train subtitles found for language={language}")
-    tokenizer = AutoTokenizer.from_pretrained(=mbart_name, src_lang=target_lang, tgt_lang=target_lang, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(mbart_name, src_lang=target_lang, tgt_lang=target_lang, use_fast=False)
     tokenizer_trimmer = TokenizerTrimmer(tokenizer)
     tokenizer_trimmer.make_vocab(subtitles)
     tokenizer_trimmer.make_tokenizer()

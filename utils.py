@@ -2,6 +2,31 @@ from __future__ import annotations
 from pathlib import Path
 import yaml
 
+def cfg_get(cfg: dict, *path: str, default=None):
+    cur = cfg
+    for key in path: # Nested lookup: cfg_get(cfg, "checkpoint", "dir"). Returns `default` if any level is missing.
+        if not isinstance(cur, dict) or key not in cur or cur[key] is None: return default
+        cur = cur[key]
+    return cur
+
+# Single source of truth for the consolidated `checkpoint:` / `mbart:` config blocks (§12).
+# Each reader falls back to the pre-consolidation flat keys so older configs keep working.
+def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
+    return cfg_get(cfg, "checkpoint", "dir", default=cfg.get("output_dir", default))
+
+def vlp_checkpoint(cfg: dict, default: str | None = None) -> str | None:
+    return cfg_get(cfg, "checkpoint", "from_vlp", default=cfg.get("checkpoint_vlp", default))
+
+def save_best_enabled(cfg: dict, default: bool = True) -> bool:
+    return bool(cfg_get(cfg, "checkpoint", "save_best", default=default))
+
+def mbart_name(cfg: dict) -> str:
+    return str(cfg_get(cfg, "mbart", "name", default=cfg.get("mbart_name", "facebook/mbart-large-cc25")))
+
+def mbart_trimmed_dir(cfg: dict) -> str:
+    # trim_mbart writes one directory holding both the trimmed model and tokenizer.
+    fallback = cfg.get("trimmed_mbart_dir", cfg.get("trimmed_tokenizer_dir", mbart_name(cfg)))
+    return str(cfg_get(cfg, "mbart", "trimmed_dir", default=fallback))
 
 def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
     out = dict(base)
@@ -9,7 +34,6 @@ def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `overri
         if key in out and isinstance(out[key], dict) and isinstance(value, dict): out[key] = _deep_merge(out[key], value)
         else: out[key] = value
     return out
-
 
 def load_yaml(path: str | Path) -> dict:
     """Load a YAML config, resolving an optional `extends:` key.

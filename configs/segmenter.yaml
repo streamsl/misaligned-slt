@@ -1,7 +1,8 @@
 seed: 42
 language: asf
-output_dir: checkpoints/segmenter/asf
-log_every: 20
+checkpoint:
+  dir: checkpoints/segmenter/asf   # best model.pt + best.json saved here
+  save_best: true                  # write on every new best val_phrase_seg_iou
 wandb:
   enabled: true
   project: misaligned-slt
@@ -27,14 +28,14 @@ speed_aug:
   enabled: false        # Moryossef 2026 README: speed augmentation hurts.
 attention_padding_mask:
   enabled: false        # Moryossef 2026 README: padding attention mask hurt.
-match_tiou_threshold: 0.1
 optimizer:
   lr: 1.0e-3
   weight_decay: 1.0e-4
   epochs: 500
 eval_every_epochs: 1
 early_stopping:
-  monitor: val_phrase_f1
+  # Moryossef 2026 headline metric is Phrase IoU; evaluate_segmenter emits val_phrase_seg_iou.
+  monitor: val_phrase_seg_iou
   mode: max
   patience: 100
   min_delta: 0.0
@@ -45,3 +46,4 @@ scheduler:
   pct_start: 0.1
   div_factor: 25.0
   final_div_factor: 10000.0
+match_tiou_threshold: 0.9

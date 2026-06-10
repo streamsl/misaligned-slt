@@ -10,6 +10,7 @@
 # simply unused by the AR path).
 extends: stage2_dlm.yaml
 decoder: ar
-output_dir: checkpoints/stage2_ar/asf
+checkpoint:
+  dir: checkpoints/stage2_ar/asf   # override only the save dir; from_vlp + save_best inherited from stage2_dlm
 wandb:
   name: stage2_ar_asf

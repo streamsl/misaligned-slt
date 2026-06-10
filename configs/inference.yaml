@@ -7,6 +7,11 @@ boundary_stability:
   hysteresis_strides: 2
 translation:
   commit_confidence_tau: 0.75
+  # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
+  # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the
+  # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces
+  # except at the zero-jitter corner; kept as an ablation.
+  decode_conditioning: window
   max_text_tokens: 128
   diffusion_steps: 64
   block_size: 8

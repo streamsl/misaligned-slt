@@ -1,9 +1,10 @@
 seed: 42
 language: asf
-checkpoint_vlp: checkpoints/vlp/asf
-output_dir: checkpoints/stage2_dlm/asf
+checkpoint:
+  dir: checkpoints/stage2_dlm/asf   # best model.pt + best.json saved here
+  from_vlp: checkpoints/vlp/asf     # stage-1 visual backbone to initialise from
+  save_best: true                   # write on every new best dev value (not just end of training)
 decoder: dlm
-log_every: 10               # console line every N steps (no timestamps)
 wandb:
   enabled: true
   project: misaligned-slt
@@ -19,11 +20,21 @@ oput:
   t_low: 0.3
   t_high: 0.8
   sample_t: uniform
-  # DMax train_llada2_bd_oput.py corrupts on-policy with argmax (the greedy token
-  # SPD commits at temperature 0). false = argmax (faithful default); true =
-  # sampled-rollout ablation.
+  # DMax train_llada2_bd_oput.py corrupts on-policy with argmax (the greedy token SPD commits 
+  # at temperature 0). false = argmax (faithful default); true = sampled-rollout ablation.
   sample_rollout: false
   loss_over_all_positions: true
+  # DMax computes the rollout under model.eval() + no_grad (train_llada2_bd_oput.py)
+  # so the corruption is drawn dropout-free — the distribution inference sees.
+  # true = faithful (one extra no-grad decoder forward on Mode 1/3 batches);
+  # false = reuse the dropout-noised L_mask logits (cheaper approximation).
+  rollout_eval_mode: true
+  # Supervise the first K canvas slots after [.., eos, lang] with EOS targets.
+  # dLLM AppendEOSBlockWrapper pads labels to the block boundary with eos;
+  # DMax data_transform keeps loss on the first 32 trailing eos. Without this the
+  # post-sentence canvas is never trained and decodes to confident garbage before
+  # EOS commits (hallucinated tails; corrupted commit-gate confidence). 0 disables.
+  eos_supervision_tokens: 32
 confidence_bound:
   # §6.3 right-truncated (Mode 2a) term. The full-evidence decode is a no-grad
   # stop-grad self-target; the gate reads the real SPD+DCD decode's confidence;

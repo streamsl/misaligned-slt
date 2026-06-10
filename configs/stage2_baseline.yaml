@@ -1,9 +1,10 @@
 seed: 42
 language: asf
-checkpoint_vlp: checkpoints/vlp/asf
-output_dir: checkpoints/stage2_baseline/asf
+checkpoint:
+  dir: checkpoints/stage2_baseline/asf   # best model.pt + best.json saved here
+  from_vlp: checkpoints/vlp/asf          # stage-1 visual backbone to initialise from
+  save_best: true
 decoder: ar
-log_every: 10
 wandb:
   enabled: true
   project: misaligned-slt

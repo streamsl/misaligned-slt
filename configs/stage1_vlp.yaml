@@ -1,15 +1,18 @@
 seed: 42
 language: asf
-log_every: 10
 wandb:
   enabled: true
   project: misaligned-slt
   name: stage1_vlp_asf
   mode: online
-mbart_name: facebook/mbart-large-cc25
-trimmed_mbart_dir: checkpoints/trimmed_mbart_asf
-trimmed_tokenizer_dir: checkpoints/trimmed_mbart_asf
-output_dir: checkpoints/vlp/asf
+mbart:
+  name: facebook/mbart-large-cc25
+  trimmed_dir: checkpoints/trimmed_mbart_asf   # trim_mbart output; holds both the trimmed model and tokenizer
+checkpoint:
+  # Best VLP visual backbone (visual_backbone.pt + best.json), written the moment a new best dev value
+  # is found — not only at the end. The GFSLT baseline and stage 2 load it via their checkpoint.from_vlp.
+  dir: checkpoints/vlp/asf
+  save_best: true
 embed_dim: 1024
 hidden_size: 1024
 temporal_kernel: 3

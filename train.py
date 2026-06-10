@@ -6,7 +6,7 @@ import json
 
 import torch
 from data.batch import collate_windows
-from data.loader import load_language_records, load_yaml
+from data.loader import load_language_records
 from data.windowing import BIO
 
 from models.checkpointing import save_model_checkpoint, save_visual_backbone
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         )
         output_dir = Path(stage1_cfg.get("output_dir", f"checkpoints/vlp/{stage1_cfg.get('language', args.language)}"))
         path = save_visual_backbone(components.model.visual, output_dir)
-        return {"device": str(device), "visual_backbone": str(path), "logs": logs}
+        print({"device": str(device), "visual_backbone": str(path), "logs": logs})
 
     elif args.stage == "train-baseline":
         from train.baseline import build_baseline_components, train_baseline_epochs
@@ -114,7 +114,7 @@ if __name__ == "__main__":
             cfg=base_cfg, dev_loader=components.dev_loader, tokenizer=components.tokenizer,
         )
         path = save_model_checkpoint(components.model, base_cfg.get("output_dir", "checkpoints/stage2_baseline"))
-        return {"device": str(device), "checkpoint": str(path), "logs": logs}
+        print({"device": str(device), "checkpoint": str(path), "logs": logs})
 
     elif args.stage == "train-stage2":
         from train.stage2 import build_stage2_components, train_stage2_epochs
@@ -139,7 +139,7 @@ if __name__ == "__main__":
             stage2_cfg=stage2_cfg, segmenter_cfg=segmenter_cfg, dev_loader=components.dev_loader,
         )
         path = save_model_checkpoint(components.model, stage2_cfg.get("output_dir", "checkpoints/stage2"))
-        return {"device": str(device), "checkpoint": str(path), "logs": logs}
+        print({"device": str(device), "checkpoint": str(path), "logs": logs})
 
     elif args.stage == "train-segmenter":
         from moryossef26.trainer import build_segmenter, build_segmenter_loader, train_segmenter_epochs
@@ -161,7 +161,7 @@ if __name__ == "__main__":
             cfg=segmenter_cfg, dev_loader=dev_loader,
         )
         path = save_model_checkpoint(model, segmenter_cfg.get("output_dir", "checkpoints/segmenter"))
-        return {"device": str(device), "checkpoint": str(path), "logs": output.logs}
+        print({"device": str(device), "checkpoint": str(path), "logs": output.logs})
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 
     text = json.dumps(result, indent=2, sort_keys=True)

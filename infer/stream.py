@@ -41,7 +41,16 @@ class StreamingSLTRunner:
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
         dcd_top_p: float | None = None, dcd_cache_type: str = "none", dcd_refresh_count: int = 16,
+        decode_conditioning: str = "window",
     ):
+        # decode_conditioning: "window" (default) decodes under the FULL buffer's features — exactly the
+        # training conditioning, where Mode 1/3 windows feed the whole jittered window to the encoder and
+        # OPUT supervises the first-complete-span text under it (§5.1/§5.3: right-context is *learned to be
+        # disregarded*, not cropped away). "span" crops conditioning to the predicted BIO span (the spec §7.1
+        # pseudocode's `enc[span]`), which the trained conditional never sees except at the zero-jitter corner
+        # of the CDF — kept as an ablation. The BIO span still defines the emitted boundaries either way.
+        if decode_conditioning not in {"window", "span"}: raise ValueError(f"Unknown decode_conditioning: {decode_conditioning}")
+        self.decode_conditioning = str(decode_conditioning)
         self.model = model
         self.stride_s = float(stride_s)
         self.buffer_cap_s = float(buffer_cap_s)
@@ -71,8 +80,9 @@ class StreamingSLTRunner:
         )
 
     def _decode_span(self, post_vlp: torch.Tensor, mask: torch.Tensor, span_slice: slice):
+        if self.decode_conditioning == "span": post_vlp, mask = post_vlp[:, span_slice], mask[:, span_slice]
         return self.model.generate_from_post_vlp(
-            post_vlp[:, span_slice], mask[:, span_slice],
+            post_vlp, mask,
             max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,

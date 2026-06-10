@@ -11,8 +11,7 @@ from data.loader import VideoRecord, load_language_records
 from data.windowing import SentenceSpan
 from poses import load_pose_window
 
-from models.gfslt import GFSLTConfig
-from models.baseline import CleanARSLTModel
+from models.gfslt import GFSLTConfig, CleanARSLTModel
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
@@ -25,6 +24,8 @@ class PredictionEvent:
     start_s: float
     end_s: float
     text: str | None = None
+    flagged_partial: bool = False
+    commit_time_s: float | None = None  # stride time the commit fired (streaming only)
 
     @property
     def segment(self) -> Segment:
@@ -58,9 +59,12 @@ def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEven
     if isinstance(value, dict):
         vid = str(value.get("video_id", video_id or ""))
         text = value.get("text", value.get("prediction", value.get("translation")))
+        commit = value.get("commit_time_s")
         return PredictionEvent(
             video_id=vid, start_s=float(value["start_s"]), end_s=float(value["end_s"]),
             text=str(text) if text is not None else None,
+            flagged_partial=bool(value.get("flagged_partial", False)),
+            commit_time_s=float(commit) if commit is not None else None,
         )
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         if video_id is None: raise ValueError("Tuple/list prediction rows require an enclosing video_id")
@@ -88,7 +92,7 @@ def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]
     return out
 
 
-def controlled_windows(=records: list[VideoRecord], grid_s: list[float], max_sentences: int | None = None) -> list[ControlledWindow]:
+def controlled_windows(records: list[VideoRecord], grid_s: list[float], max_sentences: int | None = None) -> list[ControlledWindow]:
     """Build RQ1 signed-offset windows.
 
     Analysis A defines deltas as predicted boundary minus GT boundary, so the perturbed window uses start = gt_start + delta_head and 
@@ -125,6 +129,7 @@ def evaluate_predicted_events(
         total_pred, total_gold = 0, 0
         pred_texts: list[str] = []
         ref_texts: list[str] = []
+        latencies: list[float] = []
         matched_pairs = 0
 
         for video_id in all_video_ids:
@@ -138,15 +143,25 @@ def evaluate_predicted_events(
             matches = match_segments(pred_by_idx, gold_by_idx, threshold=float(threshold))
             matched_pairs += len(matches)
             for pred_idx, gold_idx, _ in matches:
-                pred_text = pred_events[pred_idx].text
+                pred_event = pred_events[pred_idx]
                 gold_text = gold_events[gold_idx].text
-                if pred_text is not None and gold_text is not None:
-                    pred_texts.append(pred_text)
+                if pred_event.text is not None and gold_text is not None:
+                    pred_texts.append(pred_event.text)
                     ref_texts.append(gold_text)
+                if pred_event.commit_time_s is not None: # Emission latency: commit time minus GT sentence end (spec §9.2).
+                    latencies.append(float(pred_event.commit_time_s) - float(gold_events[gold_idx].end_s))
 
         precision = matched_pairs / total_pred if total_pred else 0.0
         recall = matched_pairs / total_gold if total_gold else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        latency_block = {}
+        if latencies:
+            arr = np.sort(np.asarray(latencies, dtype=np.float64))
+            latency_block = {
+                "median_latency_s": float(np.median(arr)),
+                "p90_latency_s": float(arr[min(len(arr) - 1, int(round(0.9 * (len(arr) - 1))))]),
+                "n": len(arr),
+            }
         results.append({
             "tiou_threshold": float(threshold),
             "segmentation": {
@@ -156,6 +171,7 @@ def evaluate_predicted_events(
             "matched_segments": matched_pairs,
             "matched_translation_pairs": len(pred_texts),
             "translation_metrics": compute_text_metrics(pred_texts, ref_texts),
+            "emission_latency": latency_block,
         })
     return {"thresholds": results}
 
@@ -234,8 +250,9 @@ def _translate_window(
             poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, max_text_tokens=max_tokens,
             diffusion_steps=int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
             tau_dec=float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
-            spd_top_k=int(spd_cfg.get("top_k", 1)), 
+            spd_top_k=int(spd_cfg.get("top_k", 1)),
             spd_renormalize=bool(spd_cfg.get("renormalize", True)),
+            spd_revision=bool(spd_cfg.get("revision", True)),
             temperature=float(dcd_cfg.get("temperature", 0.0)),
             dcd_window_length=int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
             dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
@@ -306,17 +323,96 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
+    from infer.stream import StreamingSLTRunner
+    trans = inference_cfg.get("translation", {})
+    dcd = trans.get("dcd", {})
+    spd = method_cfg.get("spd", {})
+    boundary = inference_cfg.get("boundary_stability", {})
+
+    return StreamingSLTRunner(
+        model,
+        stride_s=float(inference_cfg.get("stride_s", 1.0)),
+        buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
+        delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
+        hysteresis_strides=int(boundary.get("hysteresis_strides", 2)),
+        token_confidence_tau=float(trans.get("commit_confidence_tau", 0.75)),
+        max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 128))),
+        diffusion_steps=int(trans.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
+        tau_dec=float(dcd.get("tau_dec", trans.get("commit_confidence_tau", 0.75))),
+        spd_top_k=int(spd.get("top_k", 1)),
+        spd_renormalize=bool(spd.get("renormalize", True)),
+        spd_revision=bool(spd.get("revision", True)),
+        temperature=float(dcd.get("temperature", 0.0)),
+        dcd_window_length=int(dcd.get("initial_window_length", trans.get("block_size", 8))),
+        dcd_max_window_length=int(dcd.get("max_window_length", 64)),
+        dcd_window_type=str(dcd.get("window_type", "sliding")),
+        dcd_decode_algo=str(dcd.get("decode_algo", "threshold")),
+        dcd_decode_param=dcd.get("decode_param", trans.get("commit_confidence_tau", 0.75)),
+        dcd_cache_type=str(dcd.get("cache_type", "none")),
+        dcd_refresh_count=int(dcd.get("refresh_count", 16)),
+    )
+
+
+@torch.no_grad()
+def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
+    """Drive the sawtooth FSM end-to-end over each video → committed events.
+
+    This is the *usable inference engine* for RQ2: a raw pose stream in, committed `(start, end, text, flagged_partial, commit_time)` 
+    events out — our own BIO head and commit gate, recompute-each-stride, no cross-stride decoder state (§7). Only valid for the FSM 
+    methods (stage2_dlm / stage2_ar); the clean baseline's RQ2 is the segment-then-translate pipeline floor (use --predictions).
+    """
+    if args.method == "stage2_baseline":
+        raise SystemExit("Streaming RQ2 uses the FSM (stage2_dlm/stage2_ar). For the baseline pipeline-floor, pass --predictions.")
+    data_cfg = load_yaml(args.data_config)
+    stage1_cfg = load_yaml(args.stage1_config)
+    method_cfg = load_yaml(_method_config_path(args))
+    inference_cfg = load_yaml(args.inference_config)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
+    runner = _build_streaming_runner(model, inference_cfg, method_cfg)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+
+    predicted: dict[str, list[PredictionEvent]] = {}
+    for record in records:
+        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+        if poses.shape[0] == 0:
+            predicted[record.video_id] = []
+            continue
+
+        events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps))
+        predicted[record.video_id] = [PredictionEvent(
+            video_id=record.video_id, start_s=float(ev.start_s), end_s=float(ev.end_s),
+            text=tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True).strip(),
+            flagged_partial=bool(ev.flagged_partial), commit_time_s=float(ev.commit_time_s),
+        ) for ev in events]
+    return predicted
+
+
 def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ2 on test without --allow-test")
-    if not args.predictions: raise SystemExit("--predictions is required for --rq 2")
+    if not args.predictions and not args.stream:
+        raise SystemExit("--rq 2 needs either --stream (run the FSM engine) or --predictions (score an events JSON)")
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
-    predicted = load_event_predictions(args.predictions)
+    if args.stream:
+        predicted = run_streaming(args)
+        events_path = Path(args.events_out or f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        events_path.write_text(json.dumps(
+            {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        source = str(events_path)
+    else:
+        predicted = load_event_predictions(args.predictions)
+        source = args.predictions
+        
     gold = _gold_events(records)
     summary = {
-        "rq": "2", "language": args.language, "split": args.split, "predictions": args.predictions,
+        "rq": "2", "language": args.language, "split": args.split, "method": args.method,
+        "predictions": source, "streamed": bool(args.stream),
         **evaluate_predicted_events(predicted, gold, thresholds),
     }
     output = Path(args.output or f"outputs/rq2_events_{args.language}_{args.split}.json")
@@ -349,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
+    parser.add_argument("--stream", action="store_true", help="RQ2: run the streaming FSM engine to produce events")
+    parser.add_argument("--events-out", default=None, help="Where to write streamed RQ2 events JSON")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)

@@ -191,6 +191,7 @@ class MisalignedSLTModel(nn.Module):
     def forward_loss(
         self, batch: dict, lambda_trans: float = 1.0, dice_weight: float = 1.5,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
+        oput_rollout_eval_mode: bool = True, oput_eos_supervision: int = 32,
         confidence_bound_enabled: bool = True, confidence_bound_active: bool = True, confidence_bound_tau: float = 0.75,
         cb_lambda: float = 0.3, verified_full_evidence_gate: bool = True, cb_decode_steps: int = 64,
         cb_dcd_window_length: int | None = None, cb_dcd_max_window_length: int | None = None, cb_dcd_window_type: str = "sliding",
@@ -275,6 +276,7 @@ class MisalignedSLTModel(nn.Module):
                             input_feature=post_vlp[mode_idx], input_lengths=input_lengths,
                             labels=labels[mode_idx], t_low=oput_t_low, t_high=oput_t_high,
                             loss_over_all_positions=True, sample_rollout=oput_sample_rollout,
+                            rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=oput_eos_supervision,
                         )
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=dlm_out["translation_loss"].dtype).clamp(min=1)
@@ -296,6 +298,7 @@ class MisalignedSLTModel(nn.Module):
                         input_feature=post_vlp[idx], input_lengths=input_lengths,
                         labels=labels[idx], t_low=oput_t_low, t_high=oput_t_high,
                         loss_over_all_positions=True, sample_rollout=oput_sample_rollout,
+                        rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=oput_eos_supervision,
                     )
                     translation_loss = dlm_out["translation_loss"]
                     logs["oput_loss"] = translation_loss.detach()

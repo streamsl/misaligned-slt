@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import EncoderDecoderCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
-from block_diffusion import BlockDiffusionDecoder, build_bd3lm_mask, build_block_causal_mask
+from block_diffusion import BlockDiffusionDecoder, build_bd3lm_mask, build_block_causal_mask, supervise_trailing_eos
 from infer.decode import SPDDecodeResult, spd_dcd_decode
 from train.losses import masked_cross_entropy
 
@@ -37,21 +37,27 @@ def oput_two_pass_loss(
     decode_fn: Callable[[torch.Tensor], torch.Tensor],
     mask_token_id: int, t_low: float = 0.3, t_high: float = 0.8,
     loss_over_all_positions: bool = True, sample_rollout: bool = False,
+    rollout_module: torch.nn.Module | None = None,
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
-    `decode_fn` must close over a fixed, complete visual conditioning tensor. It is called twice: first on masked 
-    target tokens (L_mask), then on an on-policy target corruption derived from the first pass (L_pred). Both passes 
-    supervise recovery of `clean_ids` over all valid positions (DMax §3.1; the OPUT SFT transform leaves the loss 
+    `decode_fn` must close over a fixed, complete visual conditioning tensor. It is called twice: first on masked
+    target tokens (L_mask), then on an on-policy target corruption derived from the rollout pass (L_pred). Both passes
+    supervise recovery of `clean_ids` over all valid positions (DMax §3.1; the OPUT SFT transform leaves the loss
     un-restricted to masked positions — see the commented `labels[~loss_mask] = -100` in DMax dFactory/.../data_transform.py).
 
-    On-policy rollout uses argmax by default. DMax's training loop (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`) 
-    corrupts with the greedy token, i.e. exactly what SPD commits at temperature 0 — so the model is trained to self-correct 
+    On-policy rollout uses argmax by default. DMax's training loop (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`)
+    corrupts with the greedy token, i.e. exactly what SPD commits at temperature 0 — so the model is trained to self-correct
     the same errors it will make at inference. The prompt §6.2 says "sample"; per the spec's own rule that the DMax code is
     ground truth on divergence, argmax is used. `sample_rollout=True` keeps the sampled variant available as an ablation.
 
-    Note: unlike DMax (which gates mask-vs-pred per example via a `flag` and runs one grad pass), this 
-    sums L_mask + L_pred each step. In expectation the two are equivalent up to a scale absorbed by the LR; 
+    Rollout fidelity: DMax computes the rollout under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450–472),
+    i.e. with dropout OFF — the corruption is sampled from the same distribution inference will see. When `rollout_module`
+    is given and is in training mode, the rollout pass re-runs `decode_fn` with the module switched to eval (one extra
+    no-grad forward); otherwise the L_mask training-mode logits are reused (cheaper, dropout-noised approximation).
+
+    Note: unlike DMax (which gates mask-vs-pred per example via a `flag` and runs one grad pass), this
+    sums L_mask + L_pred each step. In expectation the two are equivalent up to a scale absorbed by the LR;
     summing trades 2x decoder forward cost for lower gradient variance, acceptable at this model scale.
     """
     valid_mask = valid_mask.bool()
@@ -61,10 +67,16 @@ def oput_two_pass_loss(
 
     mask_logits = decode_fn(masked_ids)
     with torch.no_grad():
+        if rollout_module is not None and rollout_module.training:
+            rollout_module.eval()
+            try: rollout_logits = decode_fn(masked_ids)
+            finally: rollout_module.train()
+        else: rollout_logits = mask_logits
+
         if sample_rollout:
-            probs = mask_logits.softmax(dim=-1)
+            probs = rollout_logits.softmax(dim=-1)
             rollout = torch.distributions.Categorical(probs=probs).sample()
-        else: rollout = mask_logits.argmax(dim=-1)
+        else: rollout = rollout_logits.argmax(dim=-1)
         pred_ids = torch.where(masked, rollout, masked_ids)
 
     pred_logits = decode_fn(pred_ids)
@@ -209,8 +221,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
 
     def _prepare_x0(
-        self, labels: torch.Tensor,
-        decoder_input_ids: torch.Tensor | None = None, ignore_index: int = -100,
+        self, labels: torch.Tensor, decoder_input_ids: torch.Tensor | None = None, 
+        ignore_index: int = -100, eos_supervision: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch = labels.shape[0]
         x0 = labels.clone()
@@ -226,7 +238,13 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         if x0.shape[1] < aligned_len:
             x0 = F.pad(x0, (0, aligned_len - x0.shape[1]), value=self.pad_index)
             valid = F.pad(valid, (0, aligned_len - valid.shape[1]), value=False)
-        return x0, valid
+        # Supervised EOS tail after [.., eos, lang] (dLLM AppendEOSBlockWrapper / DMax 32-trailing-eos):
+        # without it, slots past the sentence end are never trained and decode to confident garbage
+        # before EOS commits, which the commit gate then reads as hardened. See block_diffusion.supervise_trailing_eos.
+        return supervise_trailing_eos(
+            x0, valid, pad_index=self.pad_index, eos_index=self.eos_index,
+            max_tokens=self.eos_supervision_tokens if eos_supervision is None else int(eos_supervision),
+        )
 
 
     def _bd3lm_logits(
@@ -245,18 +263,19 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
 
     def oput_forward(
-        self, input_feature: torch.Tensor, input_lengths: torch.Tensor, labels: torch.Tensor, 
+        self, input_feature: torch.Tensor, input_lengths: torch.Tensor, labels: torch.Tensor,
         decoder_input_ids: torch.Tensor | None = None, t_low: float = 0.3, t_high: float = 0.8,
         loss_over_all_positions: bool = True, sample_rollout: bool = False,
+        rollout_eval_mode: bool = True, eos_supervision: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """OPUT translation loss for one complete-conditioning (Mode 1/3) batch.
 
         Encodes the (fixed, complete) visual features once, builds the BOS-prefixed clean target `x0`, and runs
-        `oput_two_pass_loss` over a closure that scores a noisy target via the `[noisy | x0]` BD3LM forward. 
+        `oput_two_pass_loss` over a closure that scores a noisy target via the `[noisy | x0]` BD3LM forward.
         The visual conditioning is byte-identical across both OPUT passes (asserted by the closure capturing
         `enc_hidden`). Returns `translation_loss` plus detached per-term diagnostics.
         """
-        x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids)
+        x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids, eos_supervision=eos_supervision)
         enc_hidden, enc_mask = self._encode_visual(input_feature, input_lengths)
 
         out = oput_two_pass_loss(
@@ -265,6 +284,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high,
             loss_over_all_positions=loss_over_all_positions,
             sample_rollout=sample_rollout,
+            rollout_module=self if rollout_eval_mode else None,
         )
         return {
             "translation_loss": out.loss, "oput_mask_loss": out.mask_loss.detach(),

@@ -351,6 +351,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
         dcd_decode_param=dcd.get("decode_param", trans.get("commit_confidence_tau", 0.75)),
         dcd_cache_type=str(dcd.get("cache_type", "none")),
         dcd_refresh_count=int(dcd.get("refresh_count", 16)),
+        decode_conditioning=str(trans.get("decode_conditioning", "window")),
     )
 
 

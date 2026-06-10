@@ -42,6 +42,28 @@ import torch.nn.functional as F
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 
+def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, max_tokens=32):
+    '''Mark the first `max_tokens` padding slots after the sentence as supervised EOS targets.
+
+    Both reference implementations supervise the canvas tail beyond the sentence end:
+      - dLLM AppendEOSBlockWrapper (dllm/core/trainers/bd3lm.py) pads input_ids AND labels with
+        eos_token_id to the block boundary, so the padded tail is maskable and supervised.
+      - DMax process_mdm_sft_example (dFactory/tasks/dataset/data_transform.py) keeps loss on the
+        first 32 EOS of the trailing run and sets labels to -100 only after that.
+    Without this, slots beyond [eos, lang] are never supervised; at inference, masked slots past
+    the true sentence end produce arbitrary high-confidence tokens before EOS commits — hallucinated
+    tails and corrupted commit-gate confidence. Assumes right-padded sequences (no interior pads).
+
+    Returns (x0, valid_mask) with the tail slots replaced by `eos_index` and marked valid.
+    '''
+    if max_tokens <= 0 or eos_index is None: return x0, valid_mask
+    n_content = (x0 != pad_index).long().sum(dim=1)  # includes BOS; right-padding assumed
+    positions = torch.arange(x0.shape[1], device=x0.device).unsqueeze(0)
+    tail = (positions >= n_content.unsqueeze(1)) & (positions < (n_content + int(max_tokens)).unsqueeze(1))
+    x0 = torch.where(tail, torch.full_like(x0, int(eos_index)), x0)
+    return x0, valid_mask | tail
+
+
 def build_bd3lm_mask(seq_len, block_size, dtype, device):
     '''BD3LM training attention mask for concatenated [xt | x0] input.
 
@@ -118,8 +140,8 @@ class BlockDiffusionDecoder(nn.Module):
     '''
     def __init__(
         self, translation_network, block_size=4, sampling_eps_min=1e-3, sampling_eps_max=1.0,
-        antithetic_sampling=True, ignore_bos=True, temperature=0.0, 
-        remasking='low_confidence', steps_per_block=None
+        antithetic_sampling=True, ignore_bos=True, temperature=0.0,
+        remasking='low_confidence', steps_per_block=None, eos_supervision_tokens=32
     ):
         super().__init__()
         mbart = translation_network.model # MBartForConditionalGeneration
@@ -128,6 +150,7 @@ class BlockDiffusionDecoder(nn.Module):
         self.sampling_eps_max = sampling_eps_max
         self.antithetic_sampling = antithetic_sampling
         self.ignore_bos = ignore_bos
+        self.eos_supervision_tokens = int(eos_supervision_tokens)
         self.neg_infinity = -1e9
         
         # ── Inference params (dLLM-style) ─────────────────────────────────────
@@ -303,6 +326,13 @@ class BlockDiffusionDecoder(nn.Module):
             x0 = x0[:, :L_aligned]
             text_mask = text_mask[:, :L_aligned]
         L = L_aligned
+
+        # Supervise the canvas tail after [.., eos, lang] with EOS targets (dLLM AppendEOSBlockWrapper /
+        # DMax 32-trailing-eos recipe) so post-sentence slots are maskable and never confident garbage.
+        x0, text_mask = supervise_trailing_eos(
+            x0, text_mask, pad_index=self.pad_index, eos_index=self.eos_index,
+            max_tokens=self.eos_supervision_tokens,
+        )
 
         # ── 2. Sample noise and create xt (noised tokens) ────────────────────
         t = self._sample_t(B, num_blocks, device) # (B, L) per-block t; mask x0 → xt

@@ -2,14 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 from pathlib import Path
-import copy, json, time
+import copy, csv, json, sys, time
 
 import torch
-import pandas as pd
+from tqdm.auto import tqdm
 from utils import checkpoint_dir, save_best_enabled
 
-
-_NUM_COL_W = 10   # epoch-table numeric column width: holds "2.800e-05" / "-12.300" / "0.000"
 SchedulerInterval = Literal["step", "epoch", "none"]
 
 def _fmt_duration(seconds: float) -> str:
@@ -31,14 +29,7 @@ def _fmt_metric(value) -> str:
     return f"{v:.3f}"
 
 
-class TrainLogger:
-    """Unified console + Weights & Biases logger for the training loops.
-
-    Console output is epoch-level only: one pandas-backed ledger with one row per epoch,
-    all train/val metrics as columns, `eta` estimated from observed epoch time, and `*`
-    marking new best checkpoints. There is intentionally no step-level console output:
-    step metrics still go to W&B, but the terminal stays readable and table-only.
-    """
+class TrainLogger: # Unified console + Weights & Biases logger for the training loops.
     def __init__(
         self, stage: str, cfg: dict | None = None, epochs: int = 0, 
         steps_per_epoch: int = 0, monitor: str = "val_loss",
@@ -53,12 +44,11 @@ class TrainLogger:
         self._global_step = 0
         self._epoch: int | None = None
         self._epoch_t0 = 0.0
-        self._rows: list[dict] = []            # accumulated epoch results -> pandas DataFrame
-        self._header_printed = False
-        self._columns: list[str] = []
-        self._history_csv: Path | None = None
-        self._history_html: Path | None = None
+        self._rows: list[dict] = []
+        self._progress = None
+        self._progress_total = max(0, self.epochs * self.steps_per_epoch)
         self._wandb = None
+        self._history_csv: Path | None = None
         self._configure_history_paths(cfg)
 
         if bool(wandb_cfg.get("enabled", False)):
@@ -91,6 +81,24 @@ class TrainLogger:
     def _numeric(row: dict) -> dict:
         return {k: v for k, v in row.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
+    @staticmethod
+    def _public_key(key: str) -> str:
+        return {
+            "train_total_loss": "train_loss",
+            "train_phrase_bio_loss": "train_loss",
+            "train_baseline_ce_loss": "train_loss",
+            "train_vlp_loss": "train_loss",
+        }.get(key, key)
+
+    @classmethod
+    def _public_metrics(cls, row: dict) -> dict:
+        out = {}
+        for key, value in row.items():
+            public = cls._public_key(str(key))
+            if public in out and public != key: continue # Prefer an explicitly named target over an alias collision.
+            out[public] = value
+        return out
+
     def log_step(self, epoch: int, step: int, row: dict) -> None:
         self._global_step += 1
         numeric = self._numeric(row)
@@ -98,6 +106,30 @@ class TrainLogger:
         if epoch != self._epoch:
             self._epoch = int(epoch)
             self._epoch_t0 = time.monotonic()
+        self._update_progress(epoch, step, numeric)
+
+
+    def _update_progress(self, epoch: int, step: int, numeric: dict) -> None:
+        if self._progress is None:
+            self._progress = tqdm(
+                total=(self._progress_total or None), desc=f"{self.stage} train", 
+                unit="step", dynamic_ncols=True, leave=True, file=sys.stdout,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            )
+
+        absolute_step = (int(epoch) - 1) * self.steps_per_epoch + int(step) if self.steps_per_epoch > 0 else self._global_step
+        delta = max(0, absolute_step - int(self._progress.n))
+        if delta: self._progress.update(delta)
+
+        postfix = {}
+        for key in ("loss", "total_loss", "phrase_bio_loss", "vlp_loss", "baseline_ce_loss"):
+            if key in numeric:
+                postfix["loss"] = _fmt_metric(numeric[key])
+                break
+
+        if "lr" in numeric: postfix["lr"] = _fmt_metric(numeric["lr"])
+        if postfix: self._progress.set_postfix(postfix, refresh=False)
+
 
     def _order_columns(self, keys) -> list[str]:
         keys = list(keys)
@@ -105,44 +137,21 @@ class TrainLogger:
         val = sorted(k for k in keys if k.startswith("val_"))
         for metric in (self.monitor, "val_loss"):
             if metric in val: val.remove(metric); val.insert(0, metric)
-        tail = [k for k in ("took", "eta", "ckpt", "best") if k in keys]
+
+        tail = [k for k in ("took", "eta", "ckpt") if k in keys]
         other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
         return ["epoch", *train, *val, *other, *tail]
-
-    def history_dataframe(self) -> pd.DataFrame:
-        if not self._rows: return pd.DataFrame()
-        df = pd.DataFrame(self._rows)
-        return df[self._order_columns(df.columns)]
-
-    def _display_dataframe(self) -> pd.DataFrame:
-        df = self.history_dataframe()
-        disp = df.copy()
-        for col in disp.columns:
-            if col in ("epoch", "best"): continue
-            fmt = _fmt_duration if col == "took" else _fmt_metric
-            disp[col] = [fmt(v) if pd.notna(v) else "-" for v in disp[col]]
-        return disp.fillna("-")
-
-    def _table_text(self) -> str:
-        disp = self._display_dataframe()
-        if disp.empty: return ""
-        return disp.to_string(index=False)
-
-    def _row_text(self, row: dict, columns: list[str]) -> str:
-        text = self._table_text()
-        if not text: return ""
-        return text.splitlines()[-1]
 
 
     def epoch_summary(
         self, epoch: int, train: dict, val: dict | None = None, 
         is_best: bool = False, saved_path: str | None = None
     ) -> None:
-        """Record one epoch and append one line to the pandas-backed console table.
+        """Record one epoch and append one comma-separated line.
 
-        ALL train/val metrics become columns; epochs without an eval show `-`. A `*` marks
-        the best epoch, `ckpt` records a save event, and `eta` estimates remaining training time
-        from the mean completed-epoch duration. No progress bar or step output can interrupt it.
+        ALL train/val metrics become columns; epochs without an eval show `-`. `ckpt` records a save event, and `eta` 
+        estimates remaining training time from the mean completed-epoch duration. The best epoch is available from
+        `best.json`, so it is not duplicated in the console/history rows.
         """
         took = (time.monotonic() - self._epoch_t0) if (self._epoch == epoch and self._epoch_t0) else None
         train_num, val_num = self._numeric(train or {}), self._numeric(val or {})
@@ -155,35 +164,38 @@ class TrainLogger:
         mean_epoch_s = sum(elapsed_epochs) / max(1, len(elapsed_epochs))
         remaining_s = max(0, int(self.epochs) - int(epoch)) * mean_epoch_s
 
-        row: dict = {"epoch": f"{epoch}/{self.epochs}", **train_num, **val_num}
+        row: dict = {"epoch": f"{epoch}/{self.epochs}", **self._public_metrics({**train_num, **val_num})}
         if took is not None: row["took"] = took
         row["eta"] = remaining_s
-        row["best"] = "*" if is_best else ""
         row["ckpt"] = "saved" if saved_path else ""
         self._rows.append(row)
         self._emit_epoch_row(row)
         self._save_history_files()
 
+        if self._progress is not None:
+            postfix = {"epoch": f"{epoch}/{self.epochs}"}
+            if val_num and self.monitor in val_num: postfix[self.monitor] = _fmt_metric(val_num[self.monitor])
+            self._progress.set_postfix(postfix, refresh=False)
+
 
     def _emit_epoch_row(self, row: dict) -> None:
-        df = self.history_dataframe()
-        columns = list(df.columns)
-        columns_changed = columns != self._columns
-        if columns != self._columns:
-            self._columns = columns
-            self._header_printed = False
+        columns = self._order_columns({key for hist in self._rows for key in hist})
+        self._write_metric_line([f"{col}={self._format_cell(row.get(col, '-'), col)}" for col in columns])
 
-        if not self._header_printed:
-            text = self._table_text()
-            if columns_changed and len(self._rows) > 1: print(text, flush=True)
-            else:
-                lines = text.splitlines()
-                if len(lines) <= 2: print(text, flush=True)
-                else: print("\n".join(lines[:1] + [lines[-1]]), flush=True)
-            self._header_printed = True
-        else: print(self._row_text(row, self._columns), flush=True)
+    def _format_cell(self, value, column: str) -> str:
+        if value is None: return "-"
+        if column in {"epoch", "ckpt"}: return str(value) if str(value) else "-"
+        if column in {"took", "eta"}:
+            try: return _fmt_duration(float(value))
+            except (TypeError, ValueError): return str(value)
+        if isinstance(value, (int, float)): return _fmt_metric(value)
+        return str(value)
+
+    def _write_metric_line(self, values) -> None:
+        text = ", ".join(str(v) for v in values)
+        if self._progress is not None: self._progress.write(text)
+        else: print(text, flush=True)
         
-
     def _configure_history_paths(self, cfg: dict) -> None:
         root = checkpoint_dir(cfg)
         logging_cfg = dict(cfg.get("logging", {}) or {})
@@ -192,24 +204,32 @@ class TrainLogger:
         if not out_dir: return
         out_dir = Path(out_dir)
         self._history_csv = out_dir / "history.csv"
-        self._history_html = out_dir / "history.html"
 
     def _save_history_files(self) -> None:
-        df = self.history_dataframe()
-        if df.empty or self._history_csv is None or self._history_html is None: return
+        if not self._rows or self._history_csv is None: return
         self._history_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(self._history_csv, index=False)
-        try: df.to_html(self._history_html, index=False, float_format=lambda x: _fmt_metric(x))
-        except TypeError: df.to_html(self._history_html, index=False)
+        columns = self._order_columns({key for row in self._rows for key in row})
+        with self._history_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            for row in self._rows: writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
 
     def save_history(self, path: str | Path) -> Path | None:
-        df = self.history_dataframe()
-        if df.empty: return None
+        if not self._rows: return None
         path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(path, index=False)
+        columns = self._order_columns({key for row in self._rows for key in row})
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            for row in self._rows:
+                writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
         return path
 
     def finish(self) -> None:
+        if self._progress is not None:
+            try: self._progress.close()
+            except Exception: pass  # noqa: BLE001
+            self._progress = None
         if self._wandb is not None and self._wandb.run is not None:
             try: self._wandb.finish()
             except Exception: pass # noqa: BLE001

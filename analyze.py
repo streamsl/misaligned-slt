@@ -29,6 +29,12 @@ class SegmenterErrorAnalysis:
     matched_pairs: int
     regular_matches: int
     videos: int
+    # Relative position in (0,1) of each spurious internal cut the segmenter placed inside an
+    # over-segmented GT sentence. This is what Mode 2 needs (where truncation lands), and it is NOT
+    # captured by the matched-pair (Δ_head, Δ_tail) CDF — those are one-to-one boundary noise. The
+    # Mode-2 window sampler draws its cut depth from this distribution (§5.0/§5.2); uniform is only a
+    # last-resort fallback when no over-segmentation was observed.
+    overseg_cut_positions: list[float]
 
 def _laplace_fit(values: list[float]) -> dict[str, float]:
     if not values: return {"loc": 0.0, "scale": 0.0}
@@ -62,6 +68,7 @@ def analyze_segmenter_errors(
     Those are separate window modes, not ordinary boundary noise around a one-to-one segment.
     """
     jitter_samples: list[JitterSample] = []
+    overseg_cut_positions: list[float] = []
     counts = {"matched": 0, "oversegmentation": 0, "undersegmentation": 0, "skipped": 0, "phantom": 0}
     matched_pairs, regular_matches = 0, 0
 
@@ -103,6 +110,18 @@ def analyze_segmenter_errors(
         counts["phantom"] += len(phantom_pred)
         counts["skipped"] += len(set(range(len(gold_segments))) - matched_gold - overseg_gold - underseg_gold)
 
+        # Record where each spurious internal cut fell, relative to the over-segmented GT span.
+        for gold_idx in overseg_gold:
+            gt = gold_segments[gold_idx]
+            dur = gt.end_s - gt.start_s
+            if dur <= 0: continue
+            
+            overlapping = sorted((pred_segments[pi] for pi in overlapping_pred_by_gold[gold_idx]), key=lambda s: s.start_s)
+            for left, right in zip(overlapping, overlapping[1:]):
+                cut = min(max(0.5 * (left.end_s + right.start_s), gt.start_s), gt.end_s)
+                rel = (cut - gt.start_s) / dur
+                if 0.0 < rel < 1.0: overseg_cut_positions.append(float(rel))
+
         for pred_idx, gold_idx, score in matches:
             if gold_idx in overseg_gold or pred_idx in underseg_pred: continue
             pred, gt = pred_segments[pred_idx], gold_segments[gold_idx]
@@ -114,8 +133,9 @@ def analyze_segmenter_errors(
             ))
     mode_counts = mode_weights_from_events(counts)
     return SegmenterErrorAnalysis(
-        jitter_samples=jitter_samples, mode_ratios=normalize_counts(mode_counts), event_counts=counts, 
-        matched_pairs=matched_pairs, regular_matches=regular_matches, videos=len(set(gold) | set(predicted))
+        jitter_samples=jitter_samples, mode_ratios=normalize_counts(mode_counts), event_counts=counts,
+        matched_pairs=matched_pairs, regular_matches=regular_matches, videos=len(set(gold) | set(predicted)),
+        overseg_cut_positions=overseg_cut_positions,
     )
 
 
@@ -128,7 +148,10 @@ def write_analysis_a_outputs(analysis: SegmenterErrorAnalysis, output_dir: str |
     tail = [row["delta_tail_s"] for row in jitter_rows]
     jitter_payload = {
         "language": language, "samples": jitter_rows,
-        "laplace": {"head": _laplace_fit(head), "tail": _laplace_fit(tail)}
+        "laplace": {"head": _laplace_fit(head), "tail": _laplace_fit(tail)},
+        # Mode-2 truncation-depth distribution (relative cut positions of over-segmentation events).
+        # The window sampler reads this; if empty it falls back to a uniform interior cut.
+        "overseg_cut_positions": analysis.overseg_cut_positions,
     }
     mode_payload = {
         "language": language,

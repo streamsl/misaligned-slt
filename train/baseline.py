@@ -9,10 +9,10 @@ from transformers import AutoTokenizer
 
 from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
-from models.checkpointing import load_visual_backbone
 from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel
+from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
-from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
+from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
 from utils import load_yaml
 
@@ -128,12 +128,13 @@ def train_baseline_epochs(
 ) -> list[dict[str, float]]:
     model.to(device)
     model.train()
+    logs: list[dict[str, float]] = []
     cfg = cfg or {}
 
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
-    logger = TrainLogger("baseline", cfg, epochs=int(epochs), steps_per_epoch=len(loader))
-    logs = []
+    attach_save_best(control, cfg, "baseline", save_model_checkpoint)
+    logger = TrainLogger("baseline", cfg, epochs=int(epochs), steps_per_epoch=len(loader), console_keys=["baseline_ce_loss"])
 
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []

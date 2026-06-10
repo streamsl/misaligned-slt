@@ -7,8 +7,10 @@ from data.windowing import BIO
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter
+from models.checkpointing import save_model_checkpoint
+
 from train.losses import bio_nll_dice_loss
-from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
+from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
@@ -95,8 +97,9 @@ def train_segmenter_epochs(
     cfg = cfg or {}
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     control = TrainControl.from_config(cfg, default_monitor="val_phrase_f1", default_mode="max")
-    logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader))
-
+    attach_save_best(control, cfg, "segmenter", save_model_checkpoint)
+    logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), console_keys=["phrase_bio_loss"])
+    
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):

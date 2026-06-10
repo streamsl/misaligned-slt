@@ -10,7 +10,8 @@ from data.clean import CleanSentenceCollator, CleanSentenceDataset
 from data.loader import load_language_records
 from models.gfslt import GFSLTConfig
 from models.vlp import PoseTextCLIP
-from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
+from models.checkpointing import save_visual_backbone
+from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from utils import load_yaml
 
 
@@ -131,8 +132,12 @@ def train_stage1_epochs(
 
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
-    logger = TrainLogger("stage1-vlp", cfg, epochs=int(epochs), steps_per_epoch=len(loader))
-
+    # Save-on-best writes the VLP deliverable (visual backbone — what stage 2 / the baseline load).
+    attach_save_best(control, cfg, "stage1-vlp", lambda model, out_dir: save_visual_backbone(model.visual, out_dir))
+    logger = TrainLogger(
+        "stage1-vlp", cfg, epochs=int(epochs), steps_per_epoch=len(loader),
+        console_keys=["vlp_loss", "contrastive_loss", "cmlm_loss"],
+    )
     for epoch in range(1, int(epochs) + 1):
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):

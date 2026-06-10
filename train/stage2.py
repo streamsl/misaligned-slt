@@ -10,11 +10,11 @@ from transformers import AutoTokenizer
 
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records
-from models.checkpointing import load_visual_backbone
 from models.gfslt import GFSLTConfig
 from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
+from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
-from train.helpers import TrainControl, TrainLogger, build_scheduler, mean_logs
+from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, compute_text_metrics
 from utils import load_yaml
 
@@ -210,15 +210,18 @@ def train_stage2_epochs(
 
     dice_weight = float((segmenter_cfg or {}).get("dice_loss_weight", 1.5))
     scheduler = build_scheduler(optimizer, stage2_cfg, epochs=epochs, steps_per_epoch=len(loader))
+    decoder_name = getattr(model, "decoder_type", "dlm")
     control = TrainControl.from_config(stage2_cfg, default_monitor="val_loss", default_mode="min")
+    attach_save_best(control, stage2_cfg, f"stage2-{decoder_name}", save_model_checkpoint)
 
-    # OPUT warmup: hold the confidence-bound term off until the model's own full-evidence decode is trustworthy. The prior de-risk 
+    # OPUT warmup: hold the confidence-bound term off until the model's own full-evidence decode is trustworthy. The prior de-risk
     # found that w/o warmup the term collapses early training (the f==r gate fixes collapse at convergence; warmup fixes early instability).
     cb_warmup_epochs = int(confidence_cfg.get("warmup_epochs", 1))
     cb_lambda = float(confidence_cfg.get("lambda", 0.3))
-    decoder_name = getattr(model, "decoder_type", "dlm")
-    logger = TrainLogger(f"stage2-{decoder_name}", stage2_cfg, epochs=int(epochs), steps_per_epoch=len(loader))
-
+    logger = TrainLogger(
+        f"stage2-{decoder_name}", stage2_cfg, epochs=int(epochs), steps_per_epoch=len(loader),
+        console_keys=["total_loss", "bio_loss", "translation_loss", "confidence_bound_loss"],
+    )
     for epoch in range(1, int(epochs) + 1):
         cb_active = epoch > cb_warmup_epochs
         epoch_logs: list[dict[str, float]] = []
@@ -230,6 +233,8 @@ def train_stage2_epochs(
                 oput_t_low=float(oput_cfg.get("t_low", 0.3)),
                 oput_t_high=float(oput_cfg.get("t_high", 0.8)),
                 oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
+                oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
+                oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", 32)),
                 confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)),
                 confidence_bound_active=cb_active,
                 confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),

@@ -113,7 +113,8 @@ class MoryossefSegmenter(nn.Module):
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(self, pose_data: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.input_norm(self.frame_cnn(pose_data))
+        feats = self.frame_cnn(pose_data)
+        x = self.input_norm(feats.float()).to(feats.dtype)  # fp32 RMSNorm under autocast (see bio_head note)
         if timestamps_s is None: # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
             timestamps_s = torch.arange(x.shape[1], device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
         # Process in training-size chunks so eval context matches the training distribution.

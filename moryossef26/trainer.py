@@ -101,7 +101,7 @@ def train_segmenter_epochs(
 
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     amp = AmpHelper.from_config(cfg, device)
-    control = TrainControl.from_config(cfg, default_monitor="val_phrase_seg_iou", default_mode="max")
+    control = TrainControl.from_config(cfg, default_monitor="val_phrase_tiou_f1", default_mode="max")
     attach_save_best(control, cfg, "segmenter", save_model_checkpoint)
     logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
     

@@ -38,6 +38,8 @@ class PoseTextCLIP(nn.Module):
     ):
         super().__init__()
         self.visual = GFSLTVisualBackbone(config)
+        # Text encoder is a second instance of the same trimmed mBART (separate weights). GFSLT-VLP
+        # used the full trimmed model here; we use the depth-trimmed one everywhere for speed.
         self.text_mbart = load_gfslt_mbart(config.mbart_name)
         d_model = self.visual.mbart.config.d_model
 

@@ -9,7 +9,7 @@ from transformers.modeling_outputs import BaseModelOutput
 
 from models.bio_head import RoPEBIOHead
 from models.dlm_decoder import OPUTBlockDiffusionDecoder
-from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart
+from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart, resolve_decoder_start_id
 from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss, masked_cross_entropy
 
 
@@ -22,10 +22,21 @@ class Stage2LossOutput:
 
 
 class _TokenizerAdapter:
+    """Tokenizer facade for the BD3LM substrate.
+
+    `sos_index` (the DLM canvas start token) is the target LANGUAGE CODE, not `<s>`: HF mBART's
+    shift_tokens_right maps labels [toks, eos, lang] to decoder inputs [lang, toks, eos], so the
+    pretrained decoder has only ever seen sequences starting with the language code. The dLLM A2D
+    recipe (arXiv 2602.22661) changes the objective and attention mask but keeps the base model's
+    input conventions — and the AR arm already starts from the language code (`_decoder_start_id`),
+    so this also keeps the §9.3 AR-vs-DLM comparison symmetric. Falls back to `<s>` only when no
+    language code can be resolved.
+    """
     def __init__(self, tokenizer):
         self.pad_index = tokenizer.pad_token_id
         self.eos_index = tokenizer.eos_token_id
-        self.sos_index = getattr(tokenizer, "bos_token_id", None) or getattr(tokenizer, "lang_code_to_id", {}).get("en_XX", 0)
+        lang_id = resolve_decoder_start_id(tokenizer)
+        self.sos_index = lang_id if lang_id is not None else (getattr(tokenizer, "bos_token_id", None) or 0)
         self.lang_index = self.sos_index
 
 
@@ -80,20 +91,9 @@ class MisalignedSLTModel(nn.Module):
 
 
     def _decoder_start_id(self) -> int | None:
-        """Language-code decoder start for the AR mBART arm.
-
-        HF's mBART training shift maps labels [toks, eos, lang] to decoder inputs [lang, toks, eos], 
-        so generation must also start from the language code; the trimmed cc25 config carries no 
-        decoder_start_token_id and HF would silently fall back to <s>, a train/inference mismatch.
-        """
-        tok = self.tokenizer
-        lang = getattr(tok, "tgt_lang", None) or getattr(tok, "src_lang", None)
-        if not lang: return None
-
-        mapping = getattr(tok, "lang_code_to_id", None)
-        if mapping and lang in mapping: return int(mapping[lang])
-        lang_id = tok.convert_tokens_to_ids(lang)
-        return int(lang_id) if lang_id is not None and lang_id != tok.unk_token_id else None
+        # Language-code decoder start for the AR mBART arm (see gfslt.resolve_decoder_start_id:
+        # HF shift_tokens_right wraps the trailing lang code to slot 0, so generation must too).
+        return resolve_decoder_start_id(self.tokenizer)
 
 
     def _pad_or_trim_tokens(self, tokens: torch.Tensor, target_len: int) -> torch.Tensor:

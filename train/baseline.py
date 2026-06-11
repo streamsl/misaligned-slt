@@ -9,10 +9,10 @@ from transformers import AutoTokenizer
 
 from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
-from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel
+from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel, resolve_decoder_start_id
 from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
-from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
+from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
 from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
 
@@ -63,10 +63,10 @@ def build_baseline_components(
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(stage1_cfg),
+        mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
         use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
-    model = CleanARSLTModel(gfslt_cfg)
+    model = CleanARSLTModel(gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer))
     checkpoint = vlp_checkpoint(base_cfg)
     if checkpoint:
         path = str(checkpoint)
@@ -132,6 +132,7 @@ def train_baseline_epochs(
     cfg = cfg or {}
 
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
+    amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
     attach_save_best(control, cfg, "baseline", save_model_checkpoint)
     logger = TrainLogger("baseline", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
@@ -141,15 +142,15 @@ def train_baseline_epochs(
         for step, batch in enumerate(loader, start=1):
             optimizer.zero_grad(set_to_none=True)
             tokens = batch["text_tokens"]
-            out = model(
-                poses=batch["poses"].to(device),
-                frame_mask=batch["frame_mask"].to(device),
-                timestamps_s=batch["timestamps_s"].to(device),
-                labels=tokens["labels"].to(device),
-            )
-            out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
-            optimizer.step()
+            with amp.autocast():
+                out = model(
+                    poses=batch["poses"].to(device),
+                    frame_mask=batch["frame_mask"].to(device),
+                    timestamps_s=batch["timestamps_s"].to(device),
+                    labels=tokens["labels"].to(device),
+                )
+            amp.backward(out.loss)
+            amp.clip_and_step(optimizer, model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
             scheduler.step_batch()
             row = {
                 "epoch": float(epoch), "step": float(step),
@@ -159,9 +160,9 @@ def train_baseline_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
+
         scheduler.step_epoch()
         train_means = mean_logs(epoch_logs)
-
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_baseline(model, dev_loader, device, tokenizer=tokenizer, cfg=cfg)
             improved = control.update(model, metrics, epoch)

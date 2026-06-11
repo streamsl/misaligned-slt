@@ -10,7 +10,7 @@ from moryossef26.model import MoryossefSegmenter
 from models.checkpointing import save_model_checkpoint
 
 from train.losses import bio_nll_dice_loss
-from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
+from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
@@ -97,6 +97,7 @@ def train_segmenter_epochs(
     cfg = cfg or {}
     
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
+    amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor="val_phrase_seg_iou", default_mode="max")
     attach_save_best(control, cfg, "segmenter", save_model_checkpoint)
     logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
@@ -109,12 +110,12 @@ def train_segmenter_epochs(
             labels = batch["phrase_bio"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(poses, timestamps_s=timestamps)
-            loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight)
-            loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
-            optimizer.step()
+            with amp.autocast():
+                outputs = model(poses, timestamps_s=timestamps)
+                loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight)
+
+            amp.backward(loss)
+            amp.clip_and_step(optimizer, model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
             scheduler.step_batch()
             row = {
                 "epoch": float(epoch), "step": float(step),
@@ -123,9 +124,9 @@ def train_segmenter_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
+
         scheduler.step_epoch()
         train_means = mean_logs(epoch_logs)
-
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_segmenter(model, dev_loader, device, dice_weight=dice_weight)
             improved = control.update(model, metrics, epoch)

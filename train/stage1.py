@@ -11,7 +11,7 @@ from data.loader import load_language_records
 from models.gfslt import GFSLTConfig
 from models.vlp import PoseTextCLIP
 from models.checkpointing import save_visual_backbone
-from train.helpers import TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
+from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from utils import load_yaml, mbart_trimmed_dir
 
 
@@ -75,7 +75,7 @@ def build_stage1_components(
         embed_dim=int(cfg.get("embed_dim", 1024)),
         hidden_size=int(cfg.get("hidden_size", 1024)),
         temporal_kernel=int(cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(cfg),
+        mbart_name=mbart_trimmed_dir(cfg),  # one trimmed mBART for text encoder + visual side
         use_temporal_conv=bool(cfg.get("use_temporal_conv", False)),
     )
     model = PoseTextCLIP(
@@ -131,6 +131,7 @@ def train_stage1_epochs(
     cfg = cfg or {}
 
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
+    amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor="val_loss", default_mode="min")
     # Save-on-best writes the VLP deliverable (visual backbone — what stage 2 / the baseline load).
     attach_save_best(control, cfg, "stage1-vlp", lambda model, out_dir: save_visual_backbone(model.visual, out_dir))
@@ -146,16 +147,16 @@ def train_stage1_epochs(
             masked = batch.get("masked_text_tokens")
             optimizer.zero_grad(set_to_none=True)
 
-            out = model(
-                poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
-                text_input_ids=tokens["input_ids"].to(device),
-                text_attention_mask=tokens["attention_mask"].to(device),
-                masked_text_input_ids=masked["input_ids"].to(device) if masked is not None else None,
-                masked_text_attention_mask=masked["attention_mask"].to(device) if masked is not None else None,
-            )
-            out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
-            optimizer.step()
+            with amp.autocast():
+                out = model(
+                    poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
+                    text_input_ids=tokens["input_ids"].to(device),
+                    text_attention_mask=tokens["attention_mask"].to(device),
+                    masked_text_input_ids=masked["input_ids"].to(device) if masked is not None else None,
+                    masked_text_attention_mask=masked["attention_mask"].to(device) if masked is not None else None,
+                )
+            amp.backward(out.loss)
+            amp.clip_and_step(optimizer, model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
             scheduler.step_batch()
 
             row = {
@@ -169,9 +170,9 @@ def train_stage1_epochs(
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)
+
         scheduler.step_epoch()
         train_means = mean_logs(epoch_logs)
-
         if dev_loader is not None and control.should_eval(epoch, epochs):
             metrics = evaluate_stage1(model, dev_loader, device)
             improved = control.update(model, metrics, epoch)

@@ -17,10 +17,17 @@ class ConfidenceBoundStats:
     trunc_confidence: torch.Tensor
 
 
-def masked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-    # Plain CE over valid positions; no class weights.
+def masked_cross_entropy(
+    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None,
+    class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # CE over valid positions, optionally per-class weighted. Normalized by valid-frame count
+    # (not by the sum of class weights) so the scale stays comparable to the unweighted loss.
     if logits.ndim != targets.ndim + 1: raise ValueError(f"logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}")
-    token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none").reshape_as(targets)
+    weight = None
+    if class_weights is not None: weight = class_weights.to(dtype=logits.dtype, device=logits.device)
+    token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), weight=weight, reduction="none").reshape_as(targets)
+    
     if valid_mask is None: return token_loss.mean()
     mask = valid_mask.to(dtype=token_loss.dtype, device=token_loss.device)
     return (token_loss * mask).sum() / mask.sum().clamp(min=1.0)
@@ -39,14 +46,36 @@ def binary_sign_dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_in
     return 1.0 - numerator / denominator
 
 
+def bio_class_weight_tensor(class_weights: dict | list | None) -> torch.Tensor | None:
+    """Build a length-4 BIO class-weight tensor (indexed UNK/O/B/I) from config.
+
+    Accepts a {"O":..,"B":..,"I":..} dict or a 4-element list. UNK is forced to 0 (ignored).
+    Returns None when no weights are given (→ plain unweighted CE, Moryossef's default recipe).
+    """
+    if not class_weights: return None
+    if isinstance(class_weights, dict):
+        w = [0.0, float(class_weights.get("O", 1.0)), float(class_weights.get("B", 1.0)), float(class_weights.get("I", 1.0))]
+    else:
+        w = [float(x) for x in class_weights]
+        if len(w) != 4: raise ValueError(f"BIO class_weights list must have 4 entries (UNK,O,B,I); got {w}")
+        w[BIO["UNK"]] = 0.0
+    return torch.tensor(w, dtype=torch.float32)
+
+
 def bio_nll_dice_loss(
     logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = BIO["UNK"],
-    dice_weight: float = 1.5, ce_weight: float = 1.0,
-) -> torch.Tensor: # BIO loss used by default: unweighted CE plus weighted Dice.
-    # The CE term is intentionally not class-weighted. Padding/UNK positions are ignored by both terms and must never be converted to O.
+    dice_weight: float = 1.5, ce_weight: float = 1.0, class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """BIO loss: CE + weighted binary-signing Dice. Padding/UNK is ignored by both terms, never relabelled O.
+
+    `class_weights` (length-4 UNK/O/B/I tensor) upweights the rare boundary/gap classes in the CE term. Moryossef 2026 used UNWEIGHTED CE 
+    because their joint *sign* head gave dense `B` supervision; we dropped the sign head (YouTube-SL-25 has no sign spans) and measured 
+    `B`=0.57% / `O`=18% of frames, where unweighted CE + binary Dice (which gives no B-vs-I signal at all) collapses to predicting all-`I`.
+    Upweighting `B`/`O` is the standard rare-class remedy and a justified, data-driven deviation. None ⇒ Moryossef's exact recipe.
+    """
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0
-    ce = masked_cross_entropy(logits, targets.clamp_min(0), valid) if ce_weight else logits.sum() * 0.0
+    ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights) if ce_weight else logits.sum() * 0.0
     dice = binary_sign_dice_loss(logits, targets, ignore_index=ignore_index)
     return ce_weight * ce + dice_weight * dice
 

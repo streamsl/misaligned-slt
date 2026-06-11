@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Iterable
 from pathlib import Path
 
+import numpy as np
 from torch.utils.data import Dataset
 from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
@@ -198,11 +199,10 @@ class StreamingWindowDataset(Dataset):
     still satisfying PyTorch/HF Trainer's map-style dataset interface.
     """
     def __init__(
-        self, records: list[VideoRecord],
-        stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
-        steps_per_epoch: int | None = None, include_full_evidence: bool = True,
+        self, records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
+        steps_per_epoch: int | None = None, include_full_evidence: bool = True, deterministic: bool = False,
     ):
-        # `WindowSampler` is imported lazily inside StreamingWindowDataset.__init__ to break the 
+        # `WindowSampler` is imported lazily inside StreamingWindowDataset.__init__ to break the
         # data.loader <-> train.sampler import cycle (train.sampler needs VideoRecord, defined below, for type hints).
         from train.sampler import WindowSampler
 
@@ -211,12 +211,16 @@ class StreamingWindowDataset(Dataset):
         self.sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)
         self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
         self.include_full_evidence = bool(include_full_evidence)
+        # Eval loaders set deterministic=True: window `index` then always yields the SAME window
+        # (per-index rng), so the early-stopping monitor scores a fixed dev set every epoch
+        # instead of a fresh random draw (which makes "best epoch" partly a lottery).
+        self.deterministic = bool(deterministic)
+        self.seed = int(stage2_cfg.get("seed", 42))
 
     def __len__(self) -> int:
         return self.steps_per_epoch
 
-    def __getitem__(self, index: int) -> dict:
-        del index
+    def _sample_item(self) -> dict:
         sample = self.sampler.sample()
         item = self.sampler.to_dict(sample)
         if self.include_full_evidence and sample.full_evidence_spec is not None:
@@ -225,6 +229,16 @@ class StreamingWindowDataset(Dataset):
             item["full_evidence"] = self.sampler.to_dict(full)
         else: item["full_evidence"] = None
         return item
+
+    def __getitem__(self, index: int) -> dict:
+        if not self.deterministic: return self._sample_item()
+        rng = np.random.default_rng(self.seed * 100_003 + int(index))
+        saved = (self.sampler.rng, self.sampler._anchor_order, self.sampler._anchor_cursor)
+        self.sampler.rng = rng
+        self.sampler._anchor_order = rng.permutation(len(self.sampler.anchors))
+        self.sampler._anchor_cursor = 0
+        try: return self._sample_item()  # incl. full-evidence materialization, under the per-index rng
+        finally: self.sampler.rng, self.sampler._anchor_order, self.sampler._anchor_cursor = saved
 
 
 def build_streaming_window_dataset(

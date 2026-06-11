@@ -26,14 +26,10 @@ def mbart_name(cfg: dict) -> str:
     return str(cfg_get(cfg, "mbart", "name", default=cfg.get("mbart_name", "facebook/mbart-large-cc25")))
 
 def mbart_trimmed_dir(cfg: dict) -> str:
-    # trim_mbart writes one directory holding both the trimmed model and tokenizer.
+    # trim_mbart writes one directory holding the trimmed tokenizer and the (depth-trimmed)
+    # model used by every stage — text encoder, visual encoder, and AR/DLM decoder all load it.
     fallback = cfg.get("trimmed_mbart_dir", cfg.get("trimmed_tokenizer_dir", mbart_name(cfg)))
     return str(cfg_get(cfg, "mbart", "trimmed_dir", default=fallback))
-
-def mbart_visual_dir(cfg: dict) -> str:
-    # The small GFSLT-VLP "mytran"-style visual-side mBART (trim_mbart --stage builds it).
-    # Falls back to the full trimmed model so older configs keep working.
-    return str(cfg_get(cfg, "mbart", "visual_dir", default=mbart_trimmed_dir(cfg)))
 
 def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
     out = dict(base)

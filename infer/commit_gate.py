@@ -6,23 +6,34 @@ import torch
 from data.windowing import BIO
 
 
-def first_closing_o_index(bio_tags: torch.Tensor | list[int]) -> int | None: 
-    # Return the first O following an active B/I span.
+def first_closing_o_index(bio_tags: torch.Tensor | list[int]) -> int | None:
+    """Index of the first frame that closes an active B/I span: a closing O, or a new B.
+
+    A new B closes the previous span exactly as in Moryossef's bio_labels_to_segments (segmentation/metrics.py) 
+    and our metrics.bio_labels_to_segments. Back-to-back sentences have no O gap; closing only on O would silently 
+    drop the first sentence, while the training-side target rule (windowing.first_complete_span) needs only the
+    sentence end inside the window — Hard Rule §1.4.8 requires the same rule here.
+    """
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     active = False
     for idx, tag in enumerate(bio_tags.tolist()):
-        if tag == BIO["B"]: active = True
+        if tag == BIO["B"]:
+            if active: return idx
+            active = True
         elif active and tag == BIO["O"]: return idx
     return None
 
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
-    # Return complete predicted spans as [start_idx, closing_o_idx].
+    # Complete predicted spans as [start_idx, closing_idx]; a new B closes the previous
+    # span (same rule as first_closing_o_index / metrics.bio_labels_to_segments).
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
     for idx, tag in enumerate(bio_tags.tolist()):
-        if tag == BIO["B"]: start = idx
+        if tag == BIO["B"]:
+            if start is not None: spans.append((start, idx))
+            start = idx
         elif start is not None and tag == BIO["O"]:
             spans.append((start, idx))
             start = None
@@ -69,8 +80,8 @@ class CommitDecision:
 class CommitGate:
     """Two-signal commit gate (spec §7.3); both signals must hold to emit.
 
-    1. **Boundary-stable** — the predicted closing-O index has moved ≤ `delta_enc_frames` over the last 
-       `hysteresis_strides` strides (a hysteresis filter on `BoundaryHistory`, so a single stride's vote never commits).
+    1. **Boundary-stable** — the predicted closing index (closing O, or the B opening the next sentence) has moved ≤ `delta_enc_frames` 
+       over the last `hysteresis_strides` strides (a hysteresis filter on `BoundaryHistory`, so a single stride's vote never commits).
     2. **Translation-hardened** — every output token's DCD confidence ≥ `token_confidence_tau` at the *current* stride 
        (forward-looking, not an edit-distance to previous strides — that would reward the warm-started state the design forbids).
 

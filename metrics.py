@@ -90,11 +90,19 @@ def _macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], B
     return sum(f1s) / len(f1s) if f1s else 0.0
 
 
-def moryossef_segment_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase") -> dict[str, float]:
-    """Per-item Moryossef segmentation metrics (frame macro-F1, frame-IoU, segment-F1).
+def moryossef_segment_metrics(
+    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", decode: str = "bio",
+) -> dict[str, float]:
+    """Per-item segmentation metrics (frame macro-F1, frame-IoU, segment-F1).
 
-    Faithful to segmentation/.../metrics.py + evaluate.py: for each sequence, mask out UNK, argmax-decode predicted segments,  
-    build gold segments, and average frame-F1 / segment-IoU / segment-F1 over items. Phrase level only (no sign head).
+    `decode` controls how predicted segments are extracted from the argmax tags:
+    - "bio" (default): B-required — a span opens only on a predicted `B` and closes on `O` or the next `B`, identical to inference 
+      (`metrics.bio_labels_to_segments` via `infer.bio_tags_to_segments`). This is what the monitor MUST use: an all-`I` collapse 
+      (never predicts `B`) yields zero predicted segments here → seg_iou≈0, so early stopping cannot select it. Moryossef's own 
+      metric is B-agnostic because their model produces reliable `B` and their inference decode is also B-agnostic; ours is 
+      B-required (for the Analysis-A over/under-segmentation taxonomy), so validation must match it.
+    - "likeliest": Moryossef's B-agnostic contiguous-B/I-run decode (reference only; not consistent with our inference, so it 
+      over-scores all-`I` collapses — kept for parity checks, not for the monitor).
     """
     frame_f1s, ious, seg_f1s = [], [], []
     for i in range(labels.shape[0]):
@@ -107,7 +115,8 @@ def moryossef_segment_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix
         logit_v = logits[i, :n]
         frame_f1s.append(_macro_frame_f1(logit_v.argmax(dim=-1), gold_v))
 
-        pred_segs = likeliest_segments(logit_v)
+        if decode == "likeliest": pred_segs = likeliest_segments(logit_v)
+        else: pred_segs = bio_labels_to_segments(logit_v.argmax(dim=-1))
         gold_segs = bio_labels_to_segments(gold_v)
         ious.append(_segment_iou_frames(pred_segs, gold_segs, n))
         seg_f1s.append(_segment_f1(pred_segs, gold_segs))

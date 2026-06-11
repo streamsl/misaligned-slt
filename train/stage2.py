@@ -15,6 +15,7 @@ from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
 from models.checkpointing import load_visual_backbone, save_model_checkpoint
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
+from train.losses import bio_class_weight_tensor
 from metrics import bio_frame_metrics, compute_text_metrics
 from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
 
@@ -81,7 +82,10 @@ def build_stage2_components(
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
-        dev_dataset = StreamingWindowDataset(dev_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg, steps_per_epoch=len(dev_records))
+        dev_dataset = StreamingWindowDataset(
+            dev_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
+            steps_per_epoch=len(dev_records), deterministic=True,  # fixed dev windows across epochs
+        )
         dev_loader = DataLoader(dev_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), collate_fn=collator)
 
     model = MisalignedSLTModel(
@@ -122,6 +126,7 @@ def evaluate_stage2(
         batch = _move_to_device(batch, device)
         output: Stage2LossOutput = model.forward_loss(
             batch, lambda_trans=float(stage2_cfg.get("lambda_trans", 1.0)), dice_weight=dice_weight,
+            bio_class_weights=bio_class_weight_tensor(stage2_cfg.get("bio_class_weights")),
             oput_t_low=float(oput_cfg.get("t_low", 0.3)),
             oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
@@ -229,6 +234,7 @@ def train_stage2_epochs(
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast(): output: Stage2LossOutput = model.forward_loss(
                 batch, lambda_trans=float(stage2_cfg.get("lambda_trans", 1.0)), dice_weight=dice_weight,
+                bio_class_weights=bio_class_weight_tensor(stage2_cfg.get("bio_class_weights")),
                 oput_t_low=float(oput_cfg.get("t_low", 0.3)),
                 oput_t_high=float(oput_cfg.get("t_high", 0.8)),
                 oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),

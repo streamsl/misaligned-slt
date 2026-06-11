@@ -66,35 +66,42 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
         self.training = bool(training)
         self.frame_dropout = max(0.0, float(frame_dropout))
         self.body_part_dropout = max(0.0, float(body_part_dropout))
+        self.seed = int(seed)
         self.rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
         return self.steps_per_epoch
 
-    def _sample_record(self) -> VideoRecord:
-        return self.records[int(self.rng.integers(0, len(self.records)))]
-
     def __getitem__(self, index: int) -> dict:
-        del index
-        rec = self._sample_record()
+        # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from
+        # (seed, index) so the SAME chunks are scored every epoch — a per-epoch-random dev set
+        # makes the early-stopping monitor noise, and the "best epoch" partly a lottery draw.
+        rng = self.rng if self.training else np.random.default_rng(self.seed * 100_003 + int(index))
+        rec = self.records[int(rng.integers(0, len(self.records)))]
         chunk_s = self.num_frames / rec.pose.fps
+
         if rec.pose.duration_s <= chunk_s: start_s = 0.0
-        else: start_s = float(self.rng.uniform(0.0, rec.pose.duration_s - chunk_s))
+        else: start_s = float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))
         end_s = min(rec.pose.duration_s, start_s + chunk_s)
         poses, abs_timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
         if poses.shape[0] > self.num_frames:
             poses = poses[: self.num_frames]
             abs_timestamps = abs_timestamps[: self.num_frames]
-        if self.fps_aug_enabled:
+
+        # All augmentations are train-only (Moryossef load_and_augment gates fps_aug/dropouts on
+        # split==TRAIN; their eval runs at native fps). Eval previously got random fps_aug too —
+        # extra monitor noise on top of the random-chunk draw.
+        if self.training and self.fps_aug_enabled:
             poses, rel_timestamps, _ = apply_fps_aug(
                 poses, source_fps=rec.pose.fps,
-                min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=self.rng,
+                min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=rng,
             )
             abs_timestamps = start_s + rel_timestamps
+            
         if self.training and self.body_part_dropout > 0.0:
-            poses = apply_body_part_dropout(poses, self.body_part_dropout, self.rng)
+            poses = apply_body_part_dropout(poses, self.body_part_dropout, rng)
         if self.training and self.frame_dropout > 0.0:
-            poses, abs_timestamps = apply_frame_dropout(poses, abs_timestamps, self.frame_dropout, self.rng)
+            poses, abs_timestamps = apply_frame_dropout(poses, abs_timestamps, self.frame_dropout, rng)
         if self.velocity:
             poses = append_velocity(poses, abs_timestamps)
         labels = make_bio_labels(abs_timestamps, rec.sentences, start_s, end_s)
@@ -127,13 +134,25 @@ def collate_segmenter_chunks(batch: list[dict]) -> dict:
     }
 
 
-def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray) -> np.ndarray:
-    # Append fps-normalized velocity, matching Moryossef 2026 preprocessing.
+def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray, clip: float = 50.0) -> np.ndarray:
+    """Append units/second velocity (Moryossef 2026 utils/pose.compute_velocity: diff / dt).
+
+    Two guards theirs does not need (their normalize_mean_std input is bounded; our CoSign-normalized
+    keypoints are zeroed when detection drops): a velocity spanning a missing detection — either
+    endpoint keypoint zeroed — is detection flicker, not motion (a 0↔value flip at 25 fps reads as
+    |Δ|×25), so it is masked to 0; and velocities are clipped to ±clip (real signing peaks at ~20
+    group-units/s; beyond that is detector jitter).
+    """
     if poses.shape[0] <= 1: velocity = np.zeros_like(poses, dtype=np.float32)
     else:
         dt = np.diff(timestamps_s.astype(np.float32))
         dt = np.maximum(dt, 1e-6)
         inner = np.diff(poses.astype(np.float32), axis=0) / dt[:, None, None]
+        # Mask flicker: per-keypoint validity = any nonzero channel (invalid points are all-zero).
+        valid = np.any(poses != 0.0, axis=-1)             # (T, K)
+        pair_valid = (valid[1:] & valid[:-1])[..., None]  # (T-1, K, 1)
+        inner = np.where(pair_valid, inner, 0.0)
+        np.clip(inner, -float(clip), float(clip), out=inner)
         velocity = np.concatenate([np.zeros_like(poses[:1], dtype=np.float32), inner], axis=0)
     return np.concatenate([poses.astype(np.float32, copy=False), velocity.astype(np.float32, copy=False)], axis=-1)
 

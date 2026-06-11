@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 from pathlib import Path
@@ -8,7 +9,50 @@ import torch
 from tqdm.auto import tqdm
 from utils import checkpoint_dir, save_best_enabled
 
-SchedulerInterval = Literal["step", "epoch", "none"]
+
+class AmpHelper:
+    """Mixed-precision wrapper shared by all training loops.
+
+    `mixed_precision:` config values: "auto" (default — bf16 when the GPU supports it, else fp16
+    with loss scaling), "bf16", "fp16", or "none". CPU always runs fp32. bf16 needs no GradScaler
+    (same exponent range as fp32); fp16 uses one to prevent gradient underflow. F.cross_entropy /
+    softmax run in fp32 under autocast (PyTorch autocast promote list), so the 1/t-weighted BD3LM
+    loss and SPD/DCD confidences keep full precision.
+    """
+    def __init__(self, mode: str = "auto", device: torch.device | str = "cpu"):
+        device_type = torch.device(device).type
+        mode = str(mode or "auto").lower()
+        if device_type != "cuda" or mode in {"none", "off", "fp32", "float32"}: self.dtype = None
+        elif mode in {"bf16", "bfloat16"}: self.dtype = torch.bfloat16
+        elif mode in {"fp16", "float16"}: self.dtype = torch.float16
+        elif mode == "auto": self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else: raise ValueError(f"Unknown mixed_precision mode: {mode}")
+        self.device_type = device_type
+        self.scaler = torch.amp.GradScaler(device_type, enabled=self.dtype == torch.float16)
+
+    @classmethod
+    def from_config(cls, cfg: dict | None, device: torch.device | str) -> "AmpHelper":
+        return cls(mode=str((cfg or {}).get("mixed_precision", "auto")), device=device)
+
+    def autocast(self):
+        if self.dtype is None: return nullcontext()
+        return torch.autocast(device_type=self.device_type, dtype=self.dtype)
+
+    def backward(self, loss: torch.Tensor) -> None:
+        if self.scaler.is_enabled(): self.scaler.scale(loss).backward()
+        else: loss.backward()
+
+    def clip_and_step(self, optimizer: torch.optim.Optimizer, parameters, max_grad_norm: float) -> None:
+        # fp16: gradients must be unscaled before clipping or the norm is measured on scaled values.
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
+            optimizer.step()
+
 
 def _fmt_duration(seconds: float) -> str:
     seconds = max(0, int(round(float(seconds))))
@@ -349,6 +393,8 @@ def attach_save_best(
     if save_best_enabled(cfg) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir)
     return control
 
+
+SchedulerInterval = Literal["step", "epoch", "none"]
 
 @dataclass
 class SchedulerBundle:

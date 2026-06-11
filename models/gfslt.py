@@ -19,6 +19,9 @@ class GFSLTConfig:
     embed_dim: int = 1024
     hidden_size: int = 1024
     temporal_kernel: int = 3
+    # The trimmed mBART directory (trim_mbart output). One model serves every role: stage-1 text
+    # encoder, the bidirectional visual encoder, and the decoder that becomes the AR/DLM translation
+    # decoder. trim_mbart depth-trims it (default 3 enc / 3 dec) so this is a small, fast model.
     mbart_name: str = "facebook/mbart-large-cc25"
     num_keypoints: int = 77 # Selected keypoints from CoSign
     input_channels: int = 3 # x, y, confidence
@@ -149,12 +152,29 @@ class GFSLTVisualBackbone(nn.Module): # Reusable visual front end: CoSign -> VLP
         return post_vlp, encoder.last_hidden_state, mask.long(), timestamps
 
 
+def resolve_decoder_start_id(tokenizer) -> int | None:
+    """Target-language decoder start for mBART generation.
+
+    HF mBART's shift_tokens_right (transformers/models/mbart/modeling_mbart.py) wraps the LAST non-pad token of the labels 
+    — the language code — to position 0, so the decoder is trained to start from the language code. The trimmed cc25 config 
+    carries no decoder_start_token_id and HF generate would silently fall back to <s>: a train/generation mismatch.
+    """
+    lang = getattr(tokenizer, "tgt_lang", None) or getattr(tokenizer, "src_lang", None)
+    if not lang: return None
+    mapping = getattr(tokenizer, "lang_code_to_id", None)
+    if mapping and lang in mapping: return int(mapping[lang])
+    lang_id = tokenizer.convert_tokens_to_ids(lang)
+    return int(lang_id) if lang_id is not None and lang_id != tokenizer.unk_token_id else None
+
+
 class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
-    def __init__(self, config: GFSLTConfig):
+    def __init__(self, config: GFSLTConfig, decoder_start_token_id: int | None = None):
         super().__init__()
         mbart = load_gfslt_mbart(config.mbart_name)
         self.visual = GFSLTVisualBackbone(config, mbart=mbart)
         self.mbart = self.visual.mbart
+        # Language-code generation start (see resolve_decoder_start_id); None keeps HF defaults.
+        self.decoder_start_token_id = decoder_start_token_id
 
     def forward(
         self, poses: torch.Tensor, frame_mask: torch.Tensor,
@@ -174,7 +194,7 @@ class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
     ) -> torch.Tensor:
         _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
         return self.mbart.generate(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-            attention_mask=enc_mask, max_new_tokens=max_new_tokens,
-            decoder_start_token_id=decoder_start_token_id, **kwargs,
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_new_tokens,
+            decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
+            **kwargs,
         )

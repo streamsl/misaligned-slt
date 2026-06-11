@@ -1,6 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
 import yaml
+import re
+
 
 def cfg_get(cfg: dict, *path: str, default=None):
     cur = cfg
@@ -28,12 +30,18 @@ def mbart_trimmed_dir(cfg: dict) -> str:
     fallback = cfg.get("trimmed_mbart_dir", cfg.get("trimmed_tokenizer_dir", mbart_name(cfg)))
     return str(cfg_get(cfg, "mbart", "trimmed_dir", default=fallback))
 
+def mbart_visual_dir(cfg: dict) -> str:
+    # The small GFSLT-VLP "mytran"-style visual-side mBART (trim_mbart --stage builds it).
+    # Falls back to the full trimmed model so older configs keep working.
+    return str(cfg_get(cfg, "mbart", "visual_dir", default=mbart_trimmed_dir(cfg)))
+
 def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
     out = dict(base)
     for key, value in override.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict): out[key] = _deep_merge(out[key], value)
         else: out[key] = value
     return out
+
 
 def load_yaml(path: str | Path) -> dict:
     """Load a YAML config, resolving an optional `extends:` key.
@@ -55,3 +63,31 @@ def load_yaml(path: str | Path) -> dict:
         if not parent_path.is_absolute(): parent_path = path.parent / parent_path
         merged = _deep_merge(merged, load_yaml(parent_path))
     return _deep_merge(merged, cfg)
+
+
+def update_yaml_scalar(path: str | Path, key_path: tuple[str, ...] | list[str], value) -> bool:
+    """Replace one scalar in a YAML file in place, preserving layout and comments.
+
+    Used by Analysis to write the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires the analysis 
+    to persist the frozen constant). Line-targeted: walks the indentation stack to find `key_path` (e.g. ("buffer_cap_s",) or 
+    ("boundary_stability", "delta_enc_frames")) and rewrites only that line's value, keeping any inline comment.
+    """
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    target = tuple(key_path)
+    stack: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", line)
+        if not match: continue
+
+        indent = len(match.group(1))
+        while stack and stack[-1][0] >= indent: stack.pop()
+        stack.append((indent, match.group(2)))
+        if tuple(key for _, key in stack) != target: continue
+
+        rest = match.group(3)
+        comment = f"  #{rest.split('#', 1)[1]}" if "#" in rest else ""
+        lines[i] = f"{match.group(1)}{match.group(2)}: {value}{comment}"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
+    return False

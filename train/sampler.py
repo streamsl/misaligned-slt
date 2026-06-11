@@ -129,6 +129,26 @@ class WindowSampler:
         return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
 
 
+    def _full_evidence_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec:
+        """Mode-1-equivalent window for the §6.3 full-evidence decode, with 1 extra constraint: the anchor
+        must be the window's FIRST complete span. The full-evidence decode has no explicit target — the model
+        (trained on the first-complete-span rule, §5.3) translates the earliest complete sentence in its
+        conditioning. A plain `_mode1_spec` window whose head jitter pulls in a complete earlier neighbour
+        would therefore yield y_full for the *neighbour*, not the anchor the truncated view shows: the verified
+        gate (f==r) then never fires (dead CB batch), and the unverified ablation would supervise toward the
+        wrong sentence's text. Falls back to the clean anchor clip, where anchor-first is guaranteed (an
+        earlier sentence cannot have its B inside a window that starts at the anchor's start)."""
+        anchor = rec.sentences[anchor_idx]
+        eps = 1.0 / rec.pose.fps
+        for _ in range(20):
+            dh, dt = self.jitter.sample(self.rng)
+            start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
+            if (classify_anchor_visibility(anchor, start_s, end_s) == "complete" and anchor.end_s + eps <= end_s
+                and first_complete_span(rec.sentences, start_s, end_s, eps) is anchor):
+                return WindowSpec(rec.video_id, start_s, end_s, "mode1", anchor_idx)
+        return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
+
+
     def _mode2_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Truncated-anchor window
         """`right` keeps the start, cuts before the end (B, no closing O); `left` cuts after the start, keeps
         the end (no B); `both` is a strictly-interior slice (all I).
@@ -239,7 +259,7 @@ class WindowSampler:
         if spec.mode in {"mode1", "mode3"}: target = first_complete_span(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps)
         elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
             target = None
-            full_evidence_spec = self._mode1_spec(rec, spec.anchor_index)
+            full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s,
             bio_labels=labels, frame_mask=frame_mask, spans=rec.sentences,

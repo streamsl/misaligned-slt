@@ -10,7 +10,7 @@ from transformers.modeling_outputs import BaseModelOutput
 from models.bio_head import RoPEBIOHead
 from models.dlm_decoder import OPUTBlockDiffusionDecoder
 from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart, resolve_decoder_start_id
-from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss, masked_cross_entropy
+from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 
 
 @dataclass
@@ -190,6 +190,7 @@ class MisalignedSLTModel(nn.Module):
 
     def forward_loss(
         self, batch: dict, lambda_trans: float = 1.0, dice_weight: float = 1.5,
+        bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
         oput_rollout_eval_mode: bool = True, oput_eos_supervision: int = 32,
         confidence_bound_enabled: bool = True, confidence_bound_active: bool = True, confidence_bound_tau: float = 0.75,
@@ -217,8 +218,7 @@ class MisalignedSLTModel(nn.Module):
         """
         post_vlp, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
         bio_out = self.bio_head(post_vlp, timestamps_s=timestamps)
-        bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight)
-
+        bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
         translation_loss = post_vlp.sum() * 0.0
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
         target_tokens = batch.get("target_tokens")

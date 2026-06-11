@@ -76,7 +76,7 @@ if __name__ == "__main__":
             mbart_name=mbart_name(stage1_cfg), target_lang=target_lang,
             tokenizer_out=trimmed_dir, model_out=trimmed_dir,
             encoder_layers=layers_cfg.get("encoder"), decoder_layers=layers_cfg.get("decoder"),
-            attention_heads=int(layers_cfg.get("attention_heads", 8)),
+            attention_heads=layers_cfg.get("attention_heads"),
         )
     elif args.stage == "smoke-data": result = smoke_data(args)
 

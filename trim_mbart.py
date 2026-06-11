@@ -18,43 +18,52 @@ def collect_training_subtitles(data_config: str, language: str) -> list[str]:
 
 def shrink_mbart_depth(
     model: MBartForConditionalGeneration,
-    encoder_layers: int = 3, decoder_layers: int = 3, attention_heads: int = 8,
+    encoder_layers: int = 3, decoder_layers: int = 3, attention_heads: int | None = None,
 ) -> MBartForConditionalGeneration:
-    """Shrink a (vocab-trimmed) mBART to fewer layers, keeping its token embeddings.
+    """Shrink a (vocab-trimmed) mBART to fewer layers by TRUNCATION-INIT.
 
-    Same construction as GFSLT-VLP's `mytran` step (tools/trim_model.py, arXiv 2307.14768):
-    a smaller mBART is built RANDOMLY INITIALIZED from the shrunk config and only the trimmed
-    pretrained token embeddings are copied in (`mytran_model.model.shared = trimmed.model.shared`).
-    The deep pretrained transformer layers are NOT inherited — they are pretrained from scratch in
-    stage-1 VLP. We keep mBART's default tie_word_embeddings=True so the copied embeddings double as
-    the output projection (mytran's config left lm_head random by setting it false; tying is cleaner
-    and parameter-free).
+    Builds a shallow mBART and copies every shape-matching pretrained tensor from `model`: the token
+    embeddings, positional embeddings, embedding/final layer norms, and the FIRST `encoder_layers` /
+    `decoder_layers` transformer blocks. Surplus deep layers are dropped; nothing is left random.
 
-    Unlike GFSLT-VLP — which kept the FULL trimmed mBART as the stage-1 text encoder and used the
-    small model only on the visual side — this single shrunk model is used everywhere (text encoder
-    in stage-1 VLP, encoder + AR/DLM decoder downstream). Deliberate speed-motivated simplification.
+    Why not GFSLT-VLP's `mytran` (random-init layers + embeddings only): mytran was random because
+    GFSLT-VLP paired it with a SEPARATE full pretrained mBART as the stage-1 text encoder, which gave
+    the contrastive loss a stable target. We use ONE small model everywhere (text encoder, visual
+    encoder, AR/DLM decoder), so a random-init text encoder leaves the contrastive/CMLM objectives
+    with no pretrained text space to align to and stage-1 VLP val-loss diverges. Truncation-init keeps
+    the model small and fast (layer count is the only size lever at fixed d_model) while retaining
+    pretrained language structure — the standard shallow-from-deep init ("Well-Read Students Learn
+    Better", arXiv 1908.08962). `attention_heads=None` keeps the source head count so the copied
+    attention projections transfer exactly (head count does not change parameter count at fixed d_model).
     """
     config = MBartConfig.from_dict(model.config.to_dict())
     config.encoder_layers = int(encoder_layers)
     config.decoder_layers = int(decoder_layers)
     config.num_hidden_layers = int(encoder_layers)
-    config.encoder_attention_heads = int(attention_heads)
-    config.decoder_attention_heads = int(attention_heads)
+    if attention_heads is not None:
+        config.encoder_attention_heads = int(attention_heads)
+        config.decoder_attention_heads = int(attention_heads)
     config.tie_word_embeddings = True
 
     small = MBartForConditionalGeneration(config)
-    with torch.no_grad():
-        small.model.shared.weight.copy_(model.model.shared.weight)
-        small.model.encoder.embed_tokens.weight.copy_(model.model.shared.weight)
-        small.model.decoder.embed_tokens.weight.copy_(model.model.shared.weight)
+    # Copy every tensor whose name + shape matches: embeddings, layer norms, positional embeddings, and
+    # encoder/decoder layers 0..N-1 (the small model simply has no keys for the dropped deeper layers).
+    small_sd = small.state_dict()
+    copied = 0
+    for name, tensor in model.state_dict().items():
+        if name in small_sd and small_sd[name].shape == tensor.shape:
+            small_sd[name] = tensor.clone()
+            copied += 1
+    small.load_state_dict(small_sd)
     small.tie_weights()
+    small._trim_copied_tensors = copied  # surfaced by trim_MBart for the run log
     return small
 
 
 def trim_MBartForConditionalGeneration(
     data_config: str, language: str, mbart_name: str,
     target_lang: str, tokenizer_out: str, model_out: str,
-    encoder_layers: int | None = None, decoder_layers: int | None = None, attention_heads: int = 8,
+    encoder_layers: int | None = None, decoder_layers: int | None = None, attention_heads: int | None = None,
 ) -> dict[str, str | int]:
     """Trim mBART's vocabulary to the training subtitles, then (optionally) its depth.
 
@@ -89,10 +98,11 @@ def trim_MBartForConditionalGeneration(
             final_model,
             encoder_layers=int(encoder_layers if encoder_layers is not None else final_model.config.encoder_layers),
             decoder_layers=int(decoder_layers if decoder_layers is not None else final_model.config.decoder_layers),
-            attention_heads=int(attention_heads),
+            attention_heads=None if attention_heads is None else int(attention_heads),
         )
         result["encoder_layers"] = int(final_model.config.encoder_layers)
         result["decoder_layers"] = int(final_model.config.decoder_layers)
+        result["truncation_copied_tensors"] = int(getattr(final_model, "_trim_copied_tensors", 0))
 
     Path(model_out).mkdir(parents=True, exist_ok=True)
     final_model.save_pretrained(model_out)
@@ -108,9 +118,12 @@ if __name__ == "__main__":
     parser.add_argument("--target-lang", default="en_XX")
     parser.add_argument("--tokenizer-out", default="checkpoints/trimmed_mbart_asf")
     parser.add_argument("--model-out", default="checkpoints/trimmed_mbart_asf")
-    parser.add_argument("--encoder-layers", type=int, default=None, help="Shrink to N encoder layers (omit to keep full depth)")
-    parser.add_argument("--decoder-layers", type=int, default=None, help="Shrink to N decoder layers (omit to keep full depth)")
-    parser.add_argument("--attention-heads", type=int, default=8)
+    parser.add_argument("--encoder-layers", type=int, default=None, help="Truncate to first N encoder layers (omit to keep full depth)")
+    parser.add_argument("--decoder-layers", type=int, default=None, help="Truncate to first N decoder layers (omit to keep full depth)")
+    parser.add_argument(
+        "--attention-heads", type=int, default=None, 
+        help="Override head count (omit to keep the source's, so pretrained attention transfers exactly)"
+    )
     args = parser.parse_args()
 
     result = trim_MBartForConditionalGeneration(

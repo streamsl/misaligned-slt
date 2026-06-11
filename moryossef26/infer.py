@@ -11,16 +11,19 @@ from poses import load_pose_window
 from models.checkpointing import load_model_checkpoint
 from moryossef26.dataset import append_velocity
 from moryossef26.model import MoryossefSegmenter
-from metrics import Segment, bio_frame_metrics, bio_labels_to_segments, moryossef_segment_metrics
+from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
 def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Tensor | list[float]) -> list[Segment]:
-    """Time-domain wrapper over `metrics.bio_labels_to_segments` (one splitting rule).
+    """Time-domain wrapper over `metrics.signing_runs_with_b_splits` (one splitting rule).
 
-    B-aware: a new B closes the previous span, so adjacent predicted sentences stay separate — Analysis A's  
-    over/under-segmentation counts depend on this (Moryossef's own `likeliest_probs_to_segments` merges contiguous 
-    B/I and is used only for their IoU/segment-F1 metrics, not for our event taxonomy). End time = onset of the frame 
-    after the last in-span frame (the closing O / next B), extrapolating 1 frame step past the sequence end for still-open spans.
+    Prediction decode = contiguous signing runs (Moryossef's `likeliest_probs_to_segments` — his
+    decode never requires a predicted `B`), additionally split at interior `B`s so adjacent predicted
+    sentences stay separate when the model does emit a boundary — Analysis A's over/under-segmentation
+    counts read those splits. A B-required decode yields zero segments whenever the model detects
+    signing but never wins argmax with `B` (one B frame per sentence; 48% of caption boundaries have
+    no visual pause). End time = onset of the frame after the last in-span frame, extrapolating one
+    frame step past the sequence end for still-open spans.
     """
     if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
     times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
@@ -28,7 +31,7 @@ def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Ten
 
     step = (times[-1] - times[-2]) if len(times) > 1 else 0.04  # assume 25fps when a single frame
     segments: list[Segment] = []
-    for seg in bio_labels_to_segments(tags):
+    for seg in signing_runs_with_b_splits(tags):
         end_idx = int(seg["end"]) + 1
         end_t = times[end_idx] if end_idx < len(times) else times[-1] + step
         segments.append(Segment(times[int(seg["start"])], end_t))

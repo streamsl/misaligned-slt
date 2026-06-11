@@ -68,10 +68,15 @@ if __name__ == "__main__":
         language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
         target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
         trimmed_dir = mbart_trimmed_dir(stage1_cfg)
+        # mbart.layers: {encoder, decoder, attention_heads} depth-trims the model in the same step
+        # (omit the block to keep full mBART depth). One model dir serves every stage.
+        layers_cfg = stage1_cfg.get("mbart", {}).get("layers", {})
         result = trim_MBartForConditionalGeneration(
             data_config=args.data_config, language=language,
             mbart_name=mbart_name(stage1_cfg), target_lang=target_lang,
             tokenizer_out=trimmed_dir, model_out=trimmed_dir,
+            encoder_layers=layers_cfg.get("encoder"), decoder_layers=layers_cfg.get("decoder"),
+            attention_heads=int(layers_cfg.get("attention_heads", 8)),
         )
     elif args.stage == "smoke-data": result = smoke_data(args)
 
@@ -94,7 +99,7 @@ if __name__ == "__main__":
         )
         output_dir = Path(checkpoint_dir(stage1_cfg, default=f"checkpoints/vlp/{stage1_cfg.get('language', args.language)}"))
         path = save_visual_backbone(components.model.visual, output_dir)
-        print({"device": str(device), "visual_backbone": str(path), "logs": logs})
+        result = {"stage": args.stage, "device": str(device), "visual_backbone": str(path), "epochs": epochs, "log_rows": len(logs)}
 
     elif args.stage == "train-baseline":
         from train.baseline import build_baseline_components, train_baseline_epochs
@@ -114,7 +119,7 @@ if __name__ == "__main__":
             cfg=base_cfg, dev_loader=components.dev_loader, tokenizer=components.tokenizer,
         )
         path = save_model_checkpoint(components.model, checkpoint_dir(base_cfg, default="checkpoints/stage2_baseline"))
-        print({"device": str(device), "checkpoint": str(path), "logs": logs})
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
 
     elif args.stage == "train-stage2":
         from train.stage2 import build_stage2_components, train_stage2_epochs
@@ -139,7 +144,7 @@ if __name__ == "__main__":
             stage2_cfg=stage2_cfg, segmenter_cfg=segmenter_cfg, dev_loader=components.dev_loader,
         )
         path = save_model_checkpoint(components.model, checkpoint_dir(stage2_cfg, default="checkpoints/stage2"))
-        print({"device": str(device), "checkpoint": str(path), "logs": logs})
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
 
     elif args.stage == "train-segmenter":
         from moryossef26.trainer import build_segmenter, build_segmenter_loader, train_segmenter_epochs
@@ -161,7 +166,7 @@ if __name__ == "__main__":
             cfg=segmenter_cfg, dev_loader=dev_loader,
         )
         path = save_model_checkpoint(model, checkpoint_dir(segmenter_cfg, default="checkpoints/segmenter"))
-        print({"device": str(device), "checkpoint": str(path), "logs": output.logs})
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(output.logs)}
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 
     text = json.dumps(result, indent=2, sort_keys=True)

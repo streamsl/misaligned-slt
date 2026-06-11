@@ -62,6 +62,26 @@ def parse_vtt(path: str | Path) -> list[tuple[float, float, str]]:
     return captions
 
 
+def merge_rolling_captions(captions: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+    """Sort cues and merge rolling-caption duplicates (YouTube auto/scroll subs re-display the same text across overlapping cues). 
+    2 overlapping cues whose texts duplicate or contain 1 another are 1 sentence shown twice, not 2 sentences — left unmerged they produce 
+    overlapping SentenceSpans, which corrupt BIO labels (a neighbour's `I` overwrites the closing `O`) and make the first-complete-span 
+    rule ill-defined. Genuine overlaps with distinct text are kept as-is (GT boundaries are treated as clean; this is caption-format 
+    cleanup, not boundary editing). Downstream also assumes time-ordered spans (`_mode3_spec` uses `anchor_idx + 1` as successor)."""
+    if not captions: return captions
+    merged: list[tuple[float, float, str]] = []
+    for start_s, end_s, text in sorted(captions, key=lambda c: (c[0], c[1])):
+        if merged:
+            prev_start, prev_end, prev_text = merged[-1]
+            overlap = start_s < prev_end
+            duplicate = text == prev_text or text in prev_text or prev_text in text
+            if overlap and duplicate:
+                merged[-1] = (prev_start, max(prev_end, end_s), text if len(text) >= len(prev_text) else prev_text)
+                continue
+        merged.append((start_s, end_s, text))
+    return merged
+
+
 def _subtitle_score(path: Path, preferred_suffixes: list[str], reject_suffixes: list[str]) -> tuple[int, int, str]:
     name = path.name
     for rejected in reject_suffixes:
@@ -158,7 +178,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             min_caption_chars=int(subtitle_cfg.get("min_caption_chars", 2)),
         )
         if subtitle_path is None: continue
-        captions = parse_vtt(subtitle_path)
+        captions = merge_rolling_captions(parse_vtt(subtitle_path))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
         spans = tuple(

@@ -64,7 +64,10 @@ class RoPETransformerEncoderLayer(nn.Module):
         timestamps_s = timestamps_s.to(device=x.device)
         cos, sin = self._compute_rope(timestamps_s)
 
-        h = self.norm1(x)
+        # RMSNorm in fp32 (cast back after): autocast keeps LayerNorm in fp32 but not rms_norm, so a
+        # bf16 input meets the fp32 weight and PyTorch warns + falls back to the unfused kernel.
+        # Computing the norm in fp32 matches autocast's LayerNorm semantics and silences the warning.
+        h = self.norm1(x.float()).to(x.dtype)
         qkv = self.qkv(h).reshape(batch, frames, 3, self.nhead, self.head_dim)
         q, k, v = qkv.unbind(2)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -72,7 +75,7 @@ class RoPETransformerEncoderLayer(nn.Module):
         k = k * cos + self._rotate_half(k) * sin
         attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
         x = x + self.out_proj(attn.transpose(1, 2).reshape(batch, frames, hidden_dim))
-        return x + self.ffn(self.norm2(x))
+        return x + self.ffn(self.norm2(x.float()).to(x.dtype))
 
 
 def chunked_rope_encode(
@@ -140,7 +143,8 @@ class RoPEBIOHead(nn.Module):
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.input_norm(self.input_proj(features))
+        proj = self.input_proj(features)
+        x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm under autocast (see layer note)
         return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size)
 
     def forward(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> BIOHeadOutput:

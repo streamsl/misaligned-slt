@@ -7,7 +7,17 @@ wandb:
   mode: online
 mbart:
   name: facebook/mbart-large-cc25
-  trimmed_dir: checkpoints/trimmed_mbart_asf   # trim_mbart output; holds both the trimmed model and tokenizer
+  trimmed_dir: checkpoints/trimmed_mbart_asf   # trim_mbart output; ONE dir holding the trimmed tokenizer + model
+  # Depth-trim the vocab-trimmed mBART in the same trim-mbart step: keep the first N pretrained encoder /
+  # decoder layers (truncation-init, not random) plus embeddings + layer norms; drop the deeper layers.
+  # This single small model is used everywhere (stage-1 text encoder, visual encoder, AR/DLM decoder).
+  # Truncation-init (vs GFSLT-VLP's random "mytran") is required because our ONE model is also the
+  # stage-1 text encoder: a random text encoder gives the contrastive loss no stable target and VLP
+  # diverges. Head count is left at the source's (omit attention_heads) so pretrained attention transfers
+  # exactly; layer count is the only size lever at fixed d_model. Remove `layers:` to keep full depth.
+  layers:
+    encoder: 3
+    decoder: 3
 checkpoint:
   # Best VLP visual backbone (visual_backbone.pt + best.json), written the moment a new best dev value
   # is found — not only at the end. The GFSLT baseline and stage 2 load it via their checkpoint.from_vlp.
@@ -29,14 +39,20 @@ cmlm:
   noise_type: omit_last # {omit_last, omit}; GFSLT default omit_last
   random_shuffle: false
   label_smoothing: 0.2  # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
-batch_size: 16
+mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+batch_size: 64
 learning_rate: 5.0e-4
 weight_decay: 1.0e-4
 epochs: 50
-eval_every_epochs: 5
+eval_every_epochs: 1
 early_stopping:
-  monitor: val_loss
-  mode: min
+  # Stage-1's deliverable is the aligned pose<->text space; in-batch retrieval accuracy measures it
+  # directly. val_loss mixes in the CMLM term, which overfits fastest on ~18k sentences and drags
+  # the combined loss up while the contrastive alignment is still improving — early-stopping on
+  # val_loss therefore stops too early. (val_loss rising after a few epochs is expected small-data
+  # overfitting, not a bug; the monitor just has to watch the right signal.)
+  monitor: val_image_retrieval_acc
+  mode: max
   patience: 10
   min_delta: 0.0
   restore_best: true

@@ -13,6 +13,7 @@ wandb:
 use_temporal_conv: false
 visual_padding: gfslt
 training_distribution: clean_pretrimmed
+mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
 learning_rate: 5.0e-4
 weight_decay: 1.0e-4

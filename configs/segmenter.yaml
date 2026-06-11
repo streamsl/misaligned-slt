@@ -8,7 +8,8 @@ wandb:
   project: misaligned-slt
   name: segmenter_asf
   mode: online
-batch_size: 8
+mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+batch_size: 128
 num_frames: 1024
 velocity: true          # Moryossef 2026 repo default: append fps-normalized velocity.
 hidden_dim: 384
@@ -17,11 +18,23 @@ attn_nhead: 8
 attn_ff_mult: 2
 attn_dropout: 0.1
 dice_loss_weight: 1.5  # Moryossef 2026 README: Dice weight 1.5 helped.
-# Phrase BIO only by default: YouTube-SL-25 captions do not provide sign/gloss spans.
+# Phrase BIO only: YouTube-SL-25 captions give no sign/gloss spans, so the sign head that gave
+# Moryossef dense B supervision is dropped. Measured Auslan frame balance: B=0.57%, O=18%, I=82%.
+# Unweighted CE + binary Dice (no B-vs-I signal) collapses to predicting all-I (val_bio_recall=1.0,
+# zero predicted segments at inference). Upweight the rare boundary/gap classes. Set to null to
+# recover Moryossef's exact unweighted recipe. Tune B up if under-segmenting, down if spurious cuts.
+bio_class_weights:
+  O: 2.0
+  B: 8.0
+  I: 1.0
 fps_aug:
-  enabled: true         # Moryossef 2026 README: random 25-50 fps essential.
-  min_fps: 25.0
-  max_fps: 50.0
+  enabled: true
+  # Moryossef trains at random 25–50 fps because HIS data is 25–60 fps. Ours is all 25 fps and
+  # apply_fps_aug only DOWNSAMPLES, so [25, 50] was a silent no-op. [12.5, 25] actually varies the
+  # temporal density (RoPE keeps true seconds, so boundaries stay put) — the same robustness the
+  # original ablation calls essential, anchored to our source rate.
+  min_fps: 12.5
+  max_fps: 25.0
 frame_dropout: 0.15    # Public repo default: drop 0-15% middle frames during train.
 body_part_dropout: 0.1 # Public repo default: zero each hand independently during train.
 speed_aug:
@@ -34,8 +47,10 @@ optimizer:
   epochs: 500
 eval_every_epochs: 1
 early_stopping:
-  # Moryossef 2026 headline metric is Phrase IoU; evaluate_segmenter emits val_phrase_seg_iou.
-  monitor: val_phrase_seg_iou
+  # One-to-one tIoU-matched segment F1 (metrics._segment_tiou_f1): count-sensitive, so neither the
+  # all-I collapse (1 giant run → high frame-IoU) nor over-segmentation can game it. Moryossef's
+  # frame-IoU (val_phrase_seg_iou) is still logged for comparison with his published numbers.
+  monitor: val_phrase_tiou_f1
   mode: max
   patience: 100
   min_delta: 0.0
@@ -46,4 +61,8 @@ scheduler:
   pct_start: 0.1
   div_factor: 25.0
   final_div_factor: 10000.0
-match_tiou_threshold: 0.9
+# Analysis A pred->GT matching bar (spec §8.1 Step 3): deliberately LOW so near-misses count as
+# matched pairs (their boundary error feeds the (Δ_head, Δ_tail) CDF) instead of inflating
+# skipped/phantom rates. A high bar (e.g. 0.9) would bias the jitter CDF toward near-zero offsets
+# and miscalibrate the §5.5 mode ratios.
+match_tiou_threshold: 0.1

@@ -65,10 +65,19 @@ mode2_subcase_weights:
 # Hard Rule §1.4.4 / Moryossef 2026: fps_aug essential (0.58→0.49 without),
 # speed_aug forbidden. Applied to sampled training windows (BIO labels rebuilt
 # from resampled timestamps); the Mode-2a full-evidence view stays native-fps.
+# Our poses are all 25 fps and apply_fps_aug only downsamples — [25, 50] was a
+# silent no-op. [12.5, 25] gives real density variation (RoPE keeps true seconds).
 fps_aug:
   enabled: true
-  min_fps: 25.0
-  max_fps: 50.0
+  min_fps: 12.5
+  max_fps: 25.0
+# Same rare-class CE weighting as configs/segmenter.yaml (measured B=0.57%/O=18%/I=82%;
+# binary Dice has no B-vs-I gradient): the stage-2 BIO head faces the identical
+# imbalance and would collapse to all-I the same way. null = unweighted.
+bio_class_weights:
+  O: 2.0
+  B: 8.0
+  I: 1.0
 jitter:
   source: outputs/a_jitter_asf.json
   fallback_laplace:
@@ -76,6 +85,7 @@ jitter:
     head_scale_s: 0.6
     tail_loc_s: 0.0
     tail_scale_s: 0.8
+mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 4
 learning_rate: 3.0e-5
 weight_decay: 1.0e-4

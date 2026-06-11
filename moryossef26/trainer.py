@@ -9,7 +9,7 @@ from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter
 from models.checkpointing import save_model_checkpoint
 
-from train.losses import bio_nll_dice_loss
+from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
@@ -64,8 +64,8 @@ def build_segmenter(segmenter_config: str = "configs/segmenter.yaml") -> Moryoss
 
 @torch.no_grad()
 def evaluate_segmenter(
-    model: MoryossefSegmenter, loader: DataLoader, 
-    device: torch.device, dice_weight: float = 1.5,
+    model: MoryossefSegmenter, loader: DataLoader,
+    device: torch.device, dice_weight: float = 1.5, class_weights: torch.Tensor | None = None,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -75,11 +75,13 @@ def evaluate_segmenter(
         timestamps = batch["timestamps_s"].to(device)
         labels = batch["phrase_bio"].to(device)
         outputs = model(poses, timestamps_s=timestamps)
-        loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight)
+        loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight, class_weights=class_weights)
         row = {
             "loss": float(loss.detach().cpu().item()),
             **bio_frame_metrics(outputs["phrase"], labels),
-            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase"),
+            # decode="bio": B-required segments, identical to inference — so an all-I collapse
+            # (no predicted B) scores seg_iou≈0 here and early stopping cannot select it.
+            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase", decode="bio"),
         }
         rows.append(row)
     if was_training: model.train()
@@ -95,7 +97,8 @@ def train_segmenter_epochs(
     model.train()
     logs: list[dict[str, float]] = []
     cfg = cfg or {}
-    
+    class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
+
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor="val_phrase_seg_iou", default_mode="max")
@@ -112,7 +115,7 @@ def train_segmenter_epochs(
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast():
                 outputs = model(poses, timestamps_s=timestamps)
-                loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight)
+                loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight, class_weights=class_weights)
 
             amp.backward(loss)
             amp.clip_and_step(optimizer, model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
@@ -128,7 +131,7 @@ def train_segmenter_epochs(
         scheduler.step_epoch()
         train_means = mean_logs(epoch_logs)
         if dev_loader is not None and control.should_eval(epoch, epochs):
-            metrics = evaluate_segmenter(model, dev_loader, device, dice_weight=dice_weight)
+            metrics = evaluate_segmenter(model, dev_loader, device, dice_weight=dice_weight, class_weights=class_weights)
             improved = control.update(model, metrics, epoch)
             logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
             logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})

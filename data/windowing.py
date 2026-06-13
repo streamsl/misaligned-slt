@@ -11,6 +11,13 @@ BIO_IGNORE_INDEX = BIO["UNK"]
 ModeName = Literal["mode1", "mode2", "mode3", "mode4"]
 Mode2Subcase = Literal["right", "left", "both"]
 
+# Uncaptioned stretches longer than this carry no trustworthy non-signing evidence (see
+# make_bio_labels). Measured on the Auslan train split: inter-caption gaps have median 0.53s /
+# p90 2.4s (genuine pauses), while video heads/tails have median 4.6s / p90 11.4s and are
+# intros/outros/credits whose signing status is unknown. 8s keeps ~92% of gap time supervised
+# and drops the unknown-status mass. Overridable via data.yaml subtitles.trusted_gap_s.
+TRUSTED_GAP_S = 8.0
+
 @dataclass(frozen=True)
 class SentenceSpan:
     video_id: str
@@ -44,14 +51,39 @@ class WindowSample:
     full_evidence_spec: WindowSpec | None = None
 
 
+def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, trusted_gap_s: float) -> list[tuple[float, float]]:
+    # Uncaptioned stretches (incl. video head/tail) LONGER than trusted_gap_s.
+    bounds: list[tuple[float, float]] = []
+    prev = 0.0
+    for span in sorted(spans, key=lambda s: s.start_s):
+        if span.start_s > prev: bounds.append((prev, span.start_s))
+        prev = max(prev, span.end_s)
+    if duration_s > prev: bounds.append((prev, duration_s))
+    return [(a, b) for a, b in bounds if (b - a) > float(trusted_gap_s)]
+
+
 def make_bio_labels(
     frame_times_s: np.ndarray, spans: tuple[SentenceSpan, ...],
-    window_start_s: float, window_end_s: float,
-    frame_mask: np.ndarray | None = None,
-) -> np.ndarray: # Build BIO labels from GT boundaries; padding is caller-masked as UNK.
-    labels = np.full((len(frame_times_s),), BIO["O"], dtype=np.int64)
-    spans_overlapping_window = [span for span in spans if span.end_s > window_start_s and span.start_s < window_end_s]
+    window_start_s: float, window_end_s: float, frame_mask: np.ndarray | None = None,
+    trusted_gap_s: float | None = TRUSTED_GAP_S, video_duration_s: float | None = None,
+) -> np.ndarray:
+    """Build BIO labels from GT boundaries; padding is caller-masked as UNK.
 
+    `O` is supervised only where caption absence is evidence of a real pause: inside uncaptioned
+    stretches up to `trusted_gap_s` long. Longer stretches (video intros/outros/credits — 42% of
+    all uncaptioned time on the Auslan split) may well contain uncaptioned signing, so labelling
+    them `O` teaches "signing → O" on exactly the frames that look most like signing; they get UNK
+    (no loss) instead. `trusted_gap_s=None` restores the old label-everything-O behaviour.
+    """
+    labels = np.full((len(frame_times_s),), BIO["O"], dtype=np.int64)
+
+    if trusted_gap_s is not None and len(spans):
+        duration = float(video_duration_s) if video_duration_s is not None \
+                                           else max(float(window_end_s), max(span.end_s for span in spans))
+        for a, b in untrusted_o_intervals(spans, duration, trusted_gap_s):
+            labels[(frame_times_s >= a) & (frame_times_s < b)] = BIO["UNK"]
+
+    spans_overlapping_window = [span for span in spans if span.end_s > window_start_s and span.start_s < window_end_s]
     for span in spans_overlapping_window:
         in_span = (frame_times_s >= span.start_s) & (frame_times_s < span.end_s)
         if not in_span.any(): continue

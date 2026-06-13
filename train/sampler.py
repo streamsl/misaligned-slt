@@ -10,7 +10,7 @@ import numpy as np
 from data.jitter import JitterSampler, normalized_mode_ratios
 from data.loader import VideoRecord
 from data.windowing import (
-    BIO, WindowSample, WindowSpec, classify_anchor_visibility,
+    BIO, TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
 )
 from poses import load_pose_window
@@ -214,7 +214,10 @@ class WindowSampler:
             prev = max(prev, span.end_s)
 
         if prev < rec.pose.duration_s: gaps.append((prev, rec.pose.duration_s))
-        gaps = [(s, e) for s, e in gaps if e - s >= 0.5]
+        # Trusted gaps only: long uncaptioned stretches (> TRUSTED_GAP_S, mostly intros/outros)
+        # may contain uncaptioned signing — an "all-gap" window there could be all-signing, the
+        # exact opposite of what Mode 4 trains (stay quiet on non-signing input).
+        gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S]
         if not gaps:
             idx = int(self.rng.integers(0, len(rec.sentences)))
             return self._mode2_spec(rec, idx)
@@ -252,7 +255,10 @@ class WindowSampler:
             timestamps = spec.start_s + rel_timestamps
 
         frame_mask = np.ones((poses.shape[0],), dtype=bool)
-        labels = make_bio_labels(timestamps, rec.sentences, spec.start_s, spec.end_s, frame_mask)
+        labels = make_bio_labels(
+            timestamps, rec.sentences, spec.start_s, spec.end_s, frame_mask,
+            video_duration_s=rec.pose.duration_s,  # long uncaptioned stretches -> UNK (see make_bio_labels)
+        )
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
         target, full_evidence_spec = None, None
 

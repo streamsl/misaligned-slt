@@ -68,10 +68,11 @@ def bio_nll_dice_loss(
 ) -> torch.Tensor:
     """BIO loss: CE + weighted binary-signing Dice. Padding/UNK is ignored by both terms, never relabelled O.
 
-    `class_weights` (length-4 UNK/O/B/I tensor) upweights the rare boundary/gap classes in the CE term. Moryossef 2026 used UNWEIGHTED CE 
-    because their joint *sign* head gave dense `B` supervision; we dropped the sign head (YouTube-SL-25 has no sign spans) and measured 
-    `B`=0.57% / `O`=18% of frames, where unweighted CE + binary Dice (which gives no B-vs-I signal at all) collapses to predicting all-`I`.
-    Upweighting `B`/`O` is the standard rare-class remedy and a justified, data-driven deviation. None ⇒ Moryossef's exact recipe.
+    `class_weights` (length-4 UNK/O/B/I tensor) upweights the rare boundary/gap classes in the CE term. Moryossef 2026 
+    used UNWEIGHTED CE because their joint *sign* head gave dense `B` supervision; we dropped the sign head (YouTube-SL-25 
+    has no sign spans) and measured `B`=1.1% / `O`=11% of frames (corrected per-video-fps timeline), where unweighted CE + 
+    binary Dice (which gives no B-vs-I signal at all) collapses to predicting all-`I`. Upweighting `B`/`O` is the standard 
+    rare-class remedy and a justified, data-driven deviation. None ⇒ Moryossef's exact recipe.
     """
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0

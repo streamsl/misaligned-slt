@@ -112,6 +112,17 @@ class PoseTextCLIP(nn.Module):
         logits_i = scale * image_features @ text_features.t()
         logits_t = logits_i.t()
         labels = torch.arange(logits_i.shape[0], device=logits_i.device)
+
+        # Duplicate captions are FALSE negatives (measured 7.5% exact duplicates in the Auslan train
+        # split — "Hello!" x19 etc.): 2 clips with identical text would be pushed apart by InfoNCE.
+        # Mask off-diagonal pairs with identical token ids out of both softmaxes (multi-positive-safe
+        # variant of CLIP; with no duplicates in batch this is exactly the original loss).
+        same_text = (text_input_ids.unsqueeze(0) == text_input_ids.unsqueeze(1)).all(dim=-1)
+        dup_mask = same_text & ~torch.eye(same_text.shape[0], dtype=torch.bool, device=same_text.device)
+        if dup_mask.any():
+            neg_inf = torch.finfo(logits_i.dtype).min
+            logits_i = logits_i.masked_fill(dup_mask, neg_inf)
+            logits_t = logits_t.masked_fill(dup_mask, neg_inf)
         contrastive = (F.cross_entropy(logits_i, labels) + F.cross_entropy(logits_t, labels)) / 2.0
 
         cmlm, loss = None, contrastive

@@ -59,8 +59,8 @@ def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
     Moryossef's prediction decode (`likeliest_probs_to_segments`, segmentation/metrics.py) never
     requires a predicted `B` — a segment is any contiguous B/I run; his published phrase IoU comes
     from this decode, and `B`-required decoding was never validated even in the original. Requiring
-    `B` to OPEN a segment is fatal on our data: `B` is one frame per sentence (0.57% of frames) and
-    48% of caption boundaries have no visual pause, so a model that detects signing perfectly but
+    `B` to OPEN a segment is fatal on our data: `B` is one frame per sentence (~1% of frames) and
+    68% of caption boundaries have no visual pause, so a model that detects signing perfectly but
     never wins argmax with `B` yields zero segments. Opening on the O→signing transition loses
     nothing (the first signing frame after a gap IS a sentence start by construction); when the
     model *does* emit an interior `B`, we honour it as a split — that refinement is what feeds the

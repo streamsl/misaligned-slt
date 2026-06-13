@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch.utils.data import DataLoader
 
-from data.windowing import BIO
+from data.windowing import BIO, TRUSTED_GAP_S
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter
@@ -30,9 +30,11 @@ def build_segmenter_loader(
     language = str(seg_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
     records, _ = load_language_records(data_cfg, language, split=split)
     fps_cfg = seg_cfg.get("fps_aug", {})
+    trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)
     dataset = SegmenterChunkDataset(
         records=records,
         num_frames=int(seg_cfg.get("num_frames", 1024)),
+        steps_per_epoch=seg_cfg.get("steps_per_epoch") if split == "train" else None,
         fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
         fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
         fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
@@ -41,6 +43,7 @@ def build_segmenter_loader(
         frame_dropout=float(seg_cfg.get("frame_dropout", 0.15)),
         body_part_dropout=float(seg_cfg.get("body_part_dropout", 0.1)),
         seed=int(seg_cfg.get("seed", 42)),
+        trusted_gap_s=None if trusted_gap is None else float(trusted_gap),
     )
     return DataLoader(
         dataset, batch_size=int(seg_cfg.get("batch_size", 8)),

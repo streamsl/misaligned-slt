@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from data.loader import VideoRecord
-from data.windowing import BIO, make_bio_labels
+from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 
 
@@ -54,11 +54,19 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
         fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
         velocity: bool = True, training: bool = True,
         frame_dropout: float = 0.0, body_part_dropout: float = 0.0, seed: int = 42,
+        trusted_gap_s: float | None = TRUSTED_GAP_S,
     ):
         if not records: raise ValueError("SegmenterChunkDataset requires at least one record")
         self.records = records
         self.num_frames = int(num_frames)
+        if steps_per_epoch is None and training:
+            # One epoch = enough random chunks to COVER the corpus once. The old default
+            # (len(records) = one chunk per video) made "epoch" meaningless: at batch 128 it was
+            # 7 optimizer steps, so epoch-based early stopping killed runs after ~150 steps total.
+            total_frames = sum(int(r.pose.total_frames) for r in records)
+            steps_per_epoch = max(len(records), total_frames // max(1, self.num_frames))
         self.steps_per_epoch = int(steps_per_epoch or len(records))
+        self.trusted_gap_s = trusted_gap_s
         self.fps_aug_enabled = bool(fps_aug_enabled)
         self.fps_aug_min = float(fps_aug_min)
         self.fps_aug_max = float(fps_aug_max)
@@ -104,7 +112,10 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
             poses, abs_timestamps = apply_frame_dropout(poses, abs_timestamps, self.frame_dropout, rng)
         if self.velocity:
             poses = append_velocity(poses, abs_timestamps)
-        labels = make_bio_labels(abs_timestamps, rec.sentences, start_s, end_s)
+        labels = make_bio_labels(
+            abs_timestamps, rec.sentences, start_s, end_s,
+            trusted_gap_s=self.trusted_gap_s, video_duration_s=rec.pose.duration_s,
+        )
         return {
             "poses": poses, "timestamps_s": abs_timestamps - start_s,
             "phrase_bio": labels, "frame_mask": np.ones((poses.shape[0],), dtype=bool),

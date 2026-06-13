@@ -21,7 +21,7 @@ def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Ten
     decode never requires a predicted `B`), additionally split at interior `B`s so adjacent predicted
     sentences stay separate when the model does emit a boundary — Analysis A's over/under-segmentation
     counts read those splits. A B-required decode yields zero segments whenever the model detects
-    signing but never wins argmax with `B` (one B frame per sentence; 48% of caption boundaries have
+    signing but never wins argmax with `B` (one B frame per sentence; 68% of caption boundaries have
     no visual pause). End time = onset of the frame after the last in-span frame, extrapolating one
     frame step past the sequence end for still-open spans.
     """
@@ -111,7 +111,10 @@ def evaluate_segmenter_whole_video(
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0: continue
-        gold = make_bio_labels(timestamps, record.sentences, 0.0, float(record.pose.duration_s))
+        gold = make_bio_labels(
+            timestamps, record.sentences, 0.0, float(record.pose.duration_s),
+            video_duration_s=record.pose.duration_s,  # long uncaptioned stretches -> UNK (excluded from eval)
+        )
         if velocity: poses = append_velocity(poses, timestamps)
         
         poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)

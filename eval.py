@@ -11,7 +11,7 @@ from data.loader import VideoRecord, load_language_records
 from data.windowing import SentenceSpan
 from poses import load_pose_window
 
-from models.gfslt import GFSLTConfig, CleanARSLTModel
+from models.gfslt import GFSLTConfig, CleanARSLTModel, resolve_decoder_start_id
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
@@ -202,14 +202,15 @@ def _gfslt_config(stage1_cfg: dict, method_cfg: dict) -> GFSLTConfig:
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(stage1_cfg),
+        mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART training used
         use_temporal_conv=bool(method_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
 
 
 def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict, method_cfg: dict, device: torch.device):
     tokenizer = _load_tokenizer(stage1_cfg, data_cfg, args.language)
-    if args.method == "stage2_baseline": model = CleanARSLTModel(_gfslt_config(stage1_cfg, method_cfg))
+    if args.method == "stage2_baseline":
+        model = CleanARSLTModel(_gfslt_config(stage1_cfg, method_cfg), decoder_start_token_id=resolve_decoder_start_id(tokenizer))
     else:
         decoder = "ar" if args.method == "stage2_ar" else "dlm"
         model = MisalignedSLTModel(
@@ -389,10 +390,50 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     return predicted
 
 
+@torch.no_grad()
+def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
+    """Segment-then-translate pipeline floor (§9.2 baseline; §8.2's realistic-perturbation point).
+
+    The retrained Moryossef segmenter's predicted spans (analyze.py --stage segmenter-infer JSON,
+    via --segments) are cut from the pose stream and translated by the clean-trained GFSLT
+    baseline — the natural pipeline with no robustness training anywhere. Scored by the same
+    tIoU/translation harness as the streaming FSM, so floor and method are directly comparable.
+    """
+    from moryossef26.infer import load_prediction_file
+    data_cfg = load_yaml(args.data_config)
+    stage1_cfg = load_yaml(args.stage1_config)
+    method_cfg = load_yaml(_method_config_path(args))
+    inference_cfg = load_yaml(args.inference_config)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
+
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    records_by_id = {record.video_id: record for record in records}
+    segments = load_prediction_file(args.segments)
+
+    predicted: dict[str, list[PredictionEvent]] = {}
+    for video_id, spans in segments.items():
+        record = records_by_id.get(video_id)
+        if record is None: continue
+        events: list[PredictionEvent] = []
+        for span in spans:
+            poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
+            if poses.shape[0] == 0: continue
+            text, _ = _translate_window(
+                model=model, tokenizer=tokenizer, method=args.method,
+                poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
+                device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
+            )
+            events.append(PredictionEvent(video_id=video_id, start_s=float(span.start_s), end_s=float(span.end_s), text=text))
+        predicted[video_id] = events
+    return predicted
+
+
 def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ2 on test without --allow-test")
-    if not args.predictions and not args.stream:
-        raise SystemExit("--rq 2 needs either --stream (run the FSM engine) or --predictions (score an events JSON)")
+    if not args.predictions and not args.stream and not args.segments: raise SystemExit(
+        "--rq 2 needs --stream (FSM engine), --segments (segment-then-translate pipeline floor), or --predictions (score an events JSON)"
+    )
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
@@ -401,9 +442,17 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
         predicted = run_streaming(args)
         events_path = Path(args.events_out or f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
         events_path.parent.mkdir(parents=True, exist_ok=True)
-        events_path.write_text(json.dumps(
-            {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8")
+        events_path.write_text(json.dumps({
+            vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
+        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        source = str(events_path)
+    elif args.segments:
+        predicted = run_pipeline_floor(args)
+        events_path = Path(args.events_out or f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        events_path.write_text(json.dumps({
+            vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
+        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         source = str(events_path)
     else:
         predicted = load_event_predictions(args.predictions)
@@ -445,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
+    parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
     parser.add_argument("--stream", action="store_true", help="RQ2: run the streaming FSM engine to produce events")
     parser.add_argument("--events-out", default=None, help="Where to write streamed RQ2 events JSON")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")

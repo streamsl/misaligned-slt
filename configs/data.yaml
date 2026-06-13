@@ -1,25 +1,37 @@
 seed: 42
 active_languages: [asf]
 
+# pose_fps is a FALLBACK only. Real pose fps is resolved per video as
+# total_pose_frames / video_duration from <root>/video_meta.csv — generate once with
+# `python -m poses <root> [--format SEL]` (yt-dlp metadata fetch, no video download:
+# whole-second durations ~0.3% drift; width/height resolved through the --format
+# selector — pass the one the language's videos were downloaded with). Poses are
+# extracted at native/2 fps and the NATIVE rate varies per YouTube video (measured on
+# Auslan: 62% eff 12.5, 30% at 15.0, 10% at 12.0, 8% at 25). A constant 25 misplaced
+# every timestamp ~2x (label-motion correlation 0.10 vs 0.26 corrected; ~44% of
+# captions dropped by the duration filter); even a hand-set 12.5 leaves 37.7% of
+# videos with >5% timestamp error (median 26s end-of-video drift).
 languages:
   asf:
     name: Auslan
     target_lang: en_XX
     root: data/youtube-sl-25/asf
     pose_fps: 25.0
-    video_fps_fallback: 25.0
+    # Per-video width/height from video_meta.csv are available, but dividing by them is OFF:
+    # (1) CoSign group normalization is already resolution-independent (coords divided by
+    # body reference lengths); (2) the stored width/height is the mp4 CONTAINER resolution,
+    # which may NOT match DWPose coordinate frame, so the division would not even map to [0,1].
+    normalize_by_resolution: false
   bfi:
     name: BSL
     target_lang: en_XX
     root: data/youtube-sl-25/bfi
     pose_fps: 25.0
-    video_fps_fallback: 25.0
   ase:
     name: ASL
     target_lang: en_XX
     root: data/youtube-sl-25/ase
     pose_fps: 25.0
-    video_fps_fallback: 25.0
 
 splits:
   signverse_csv: data/SignVerse-2M-metadata_split.csv

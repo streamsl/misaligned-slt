@@ -8,6 +8,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
+from poses.pose_io import META_FILENAME, load_video_meta
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -68,7 +69,15 @@ def merge_rolling_captions(captions: list[tuple[float, float, str]]) -> list[tup
     2 overlapping cues whose texts duplicate or contain 1 another are 1 sentence shown twice, not 2 sentences — left unmerged they produce 
     overlapping SentenceSpans, which corrupt BIO labels (a neighbour's `I` overwrites the closing `O`) and make the first-complete-span 
     rule ill-defined. Genuine overlaps with distinct text are kept as-is (GT boundaries are treated as clean; this is caption-format 
-    cleanup, not boundary editing). Downstream also assumes time-ordered spans (`_mode3_spec` uses `anchor_idx + 1` as successor)."""
+    cleanup, not boundary editing). Downstream also assumes time-ordered spans (`_mode3_spec` uses `anchor_idx + 1` as successor).
+    
+    For example, the same text may be shown across 2 cues with a rolling update:
+    0:00:01.000 --> 0:00:05.000
+    HELLO WORLD
+    0:00:04.000 --> 0:00:08.000
+    HELLO WORLD
+    becomes a single span 0:00:01.000 --> 0:00:08.000 HELLO WORLD, instead of 2 overlapping spans with identical text.
+    """
     if not captions: return captions
     merged: list[tuple[float, float, str]] = []
     for start_s, end_s, text in sorted(captions, key=lambda c: (c[0], c[1])):
@@ -86,11 +95,9 @@ def merge_rolling_captions(captions: list[tuple[float, float, str]]) -> list[tup
 def _subtitle_score(path: Path, preferred_suffixes: list[str], reject_suffixes: list[str]) -> tuple[int, int, str]:
     name = path.name
     for rejected in reject_suffixes:
-        if name.endswith(rejected):
-            return (10_000, 0, name)
+        if name.endswith(rejected): return (10_000, 0, name)
     for rank, suffix in enumerate(preferred_suffixes):
-        if name.endswith(suffix):
-            return (rank, 0, name)
+        if name.endswith(suffix): return (rank, 0, name)
     return (len(preferred_suffixes) + 100, 0, name)
 
 
@@ -160,11 +167,22 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
 def load_language_records(data_cfg: dict, language: str, split: str | None = None) -> tuple[list[VideoRecord], dict[str, list[str]]]:
     lang_cfg = data_cfg["languages"][language]
     root = Path(lang_cfg["root"])
+    # Per-video fps from the video_meta.json sidecar (poses were extracted at native/2 fps, which
+    # VARIES per YouTube video: 12.0-15.0 measured). config pose_fps is fallback-only; with no
+    # sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
+    video_meta = load_video_meta(root / META_FILENAME)
     pose_index = build_pose_index(
         root / "poses",
         fps=float(lang_cfg.get("pose_fps", 25.0)),
         width=int(lang_cfg["width"]) if lang_cfg.get("width") is not None else None,
         height=int(lang_cfg["height"]) if lang_cfg.get("height") is not None else None,
+        video_meta=video_meta, resolution_from_meta=bool(lang_cfg.get("normalize_by_resolution", False)),
+    )
+    missing_meta = [vid for vid in pose_index if vid not in video_meta]
+    if missing_meta: print(
+        f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from "
+        f"{root / META_FILENAME}; falling back to pose_fps={lang_cfg.get('pose_fps', 25.0)} "
+        f"for them — run `python -m poses {root}` (yt-dlp metadata fetch, no video download)."
     )
     subtitle_cfg = data_cfg.get("subtitles", {})
     splits = build_splits(sorted(pose_index.keys()), data_cfg.get("splits", {}))

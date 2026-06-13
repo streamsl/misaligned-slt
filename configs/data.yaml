@@ -50,6 +50,15 @@ subtitles:
     - .en-orig.vtt
     - .orig.vtt
   min_caption_chars: 2
+  # Reject VTT variants that flatten the whole transcript into one short cue
+  # (common in *.en-en-GB.vtt sidecars) before selecting the subtitle file.
+  reject_flattened_transcripts: true
+  flattened_max_cues: 2
+  flattened_min_chars: 500
+  flattened_max_chars_per_second: 120.0
+  # Drop only whole-cue stage directions such as "AUDIENCE: (APPLAUSE)" or
+  # "(gentle piano music)"; keep real sentences that merely mention music/social URLs.
+  drop_noise_captions: true
   min_duration_s: 0.20
   max_duration_s: 60.0
 

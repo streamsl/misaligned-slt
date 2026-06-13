@@ -16,6 +16,12 @@ TIMESTAMP_RE = re.compile(
 )
 TAG_RE = re.compile(r"<[^>]+>")
 WORD_TIMING_RE = re.compile(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>")
+SPEAKER_PREFIX_RE = re.compile(r"^[A-Z][A-Z\s_-]{1,30}:\s*")
+NOISE_WORD_RE = re.compile(r"[a-z]+")
+NOISE_CAPTION_WORDS = {
+    "applause", "background", "foreign", "gentle", "inaudible", "laugh", "laughs",
+    "laughter", "music", "piano", "silence", "silent",
+}
 
 
 @dataclass(frozen=True)
@@ -42,7 +48,20 @@ def clean_caption_text(lines: Iterable[str]) -> str:
     return raw
 
 
-def parse_vtt(path: str | Path) -> list[tuple[float, float, str]]:
+def is_noise_caption(text: str) -> bool:
+    """True for captions that are only non-signed stage directions.
+
+    Keep real sentences that merely contain words like "music" or "Facebook"; drop only whole-cue
+    annotations such as "AUDIENCE: (APPLAUSE)" or "(gentle piano music)".
+    """
+    text = SPEAKER_PREFIX_RE.sub("", text.strip())
+    stripped = text.strip("[](){} \t\r\n").casefold()
+    if not stripped: return True
+    words = NOISE_WORD_RE.findall(stripped)
+    return bool(words) and all(word in NOISE_CAPTION_WORDS for word in words)
+
+
+def parse_vtt(path: str | Path, drop_noise: bool = False) -> list[tuple[float, float, str]]:
     lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
     captions: list[tuple[float, float, str]] = []
     i = 0
@@ -59,6 +78,7 @@ def parse_vtt(path: str | Path) -> list[tuple[float, float, str]]:
             if "-->" not in lines[i]: text_lines.append(lines[i])
             i += 1
         text = clean_caption_text(text_lines)
+        if drop_noise and is_noise_caption(text): text = ""
         if text and end_s > start_s: captions.append((start_s, end_s, text))
         i += 1
     return captions
@@ -101,20 +121,51 @@ def _subtitle_score(path: Path, preferred_suffixes: list[str], reject_suffixes: 
     return (len(preferred_suffixes) + 100, 0, name)
 
 
+def looks_flattened_transcript(
+    captions: list[tuple[float, float, str]],
+    max_cues: int = 2,
+    min_chars: int = 500,
+    max_chars_per_second: float = 120.0,
+) -> bool:
+    """Reject YouTube VTT variants that put the whole transcript in one short cue.
+
+    ASF commonly ships paired files where `.en-GB.vtt` has normal cue timing but `.en-en-GB.vtt`
+    contains thousands of characters in the first few seconds and empty cues afterwards. Such files
+    are unusable for pose-text alignment and should lose to any non-flattened candidate.
+    """
+    if not captions or len(captions) > int(max_cues): return False
+    total_chars = sum(len(text) for _, _, text in captions)
+    if total_chars < int(min_chars): return False
+    max_cps = 0.0
+    for start_s, end_s, text in captions:
+        dur = max(float(end_s - start_s), 1e-3)
+        max_cps = max(max_cps, len(text) / dur)
+    return max_cps >= float(max_chars_per_second)
+
+
 def find_best_subtitle(
     subtitle_root: str | Path, video_id: str,
     preferred_suffixes: list[str], reject_suffixes: list[str],
     min_caption_chars: int = 2,
+    reject_flattened_transcripts: bool = True,
+    flattened_max_cues: int = 2,
+    flattened_min_chars: int = 500,
+    flattened_max_chars_per_second: float = 120.0,
+    drop_noise: bool = False,
 ) -> Path | None:
     subtitle_root = Path(subtitle_root)
     candidates = sorted(subtitle_root.glob(f"{video_id}*.vtt"))
     scored: list[tuple[tuple[int, int, str], Path]] = []
     for path in candidates:
-        try: parsed = parse_vtt(path)
+        try: parsed = parse_vtt(path, drop_noise=drop_noise)
         except OSError: continue
 
         char_count = sum(len(text) for _, _, text in parsed)
         if char_count < min_caption_chars: continue
+        if reject_flattened_transcripts and looks_flattened_transcript(
+            parsed, max_cues=flattened_max_cues,
+            min_chars=flattened_min_chars, max_chars_per_second=flattened_max_chars_per_second,
+        ): continue
         score = _subtitle_score(path, preferred_suffixes, reject_suffixes)
         scored.append(((score[0], -char_count, score[2]), path))
     return min(scored, default=(None, None))[1] if scored else None
@@ -187,6 +238,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     subtitle_cfg = data_cfg.get("subtitles", {})
     splits = build_splits(sorted(pose_index.keys()), data_cfg.get("splits", {}))
     selected_ids = splits.get(split, []) if split else sorted(pose_index.keys())
+    drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
     records: list[VideoRecord] = []
     for video_id in selected_ids:
@@ -195,9 +247,14 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
             reject_suffixes=list(subtitle_cfg.get("reject_suffixes", [".en-orig.vtt"])),
             min_caption_chars=int(subtitle_cfg.get("min_caption_chars", 2)),
+            reject_flattened_transcripts=bool(subtitle_cfg.get("reject_flattened_transcripts", True)),
+            flattened_max_cues=int(subtitle_cfg.get("flattened_max_cues", 2)),
+            flattened_min_chars=int(subtitle_cfg.get("flattened_min_chars", 500)),
+            flattened_max_chars_per_second=float(subtitle_cfg.get("flattened_max_chars_per_second", 120.0)),
+            drop_noise=drop_noise,
         )
         if subtitle_path is None: continue
-        captions = merge_rolling_captions(parse_vtt(subtitle_path))
+        captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
         spans = tuple(

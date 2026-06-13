@@ -3,16 +3,19 @@ from dataclasses import dataclass
 
 import torch
 from data.windowing import BIO
-from infer.commit_gate import CommitGate, first_complete_bio_span
+from infer.commit_gate import CommitGate, first_complete_bio_span, _span_opens
 
 
 def active_span_start(bio_tags: torch.Tensor) -> int | None:
-    # Index of the last B that has no closing O after it (an in-progress span).
-    tags = bio_tags.tolist()
+    # Start index of the in-progress span (opened, never closed). Opening matches the shared decode
+    # (commit_gate._span_opens): B anywhere, or a mid-buffer O→I transition; buffer-start I without
+    # B stays closed (left-truncated per Mode-2b training — never translate a headless fragment).
     start: int | None = None
-    for idx, tag in enumerate(tags):
-        if tag == BIO["B"]: start = idx
-        elif start is not None and tag == BIO["O"]: start = None
+    prev: int | None = None
+    for idx, tag in enumerate(bio_tags.tolist()):
+        if start is not None and tag == BIO["O"]: start = None
+        if _span_opens(tag, prev, start is not None): start = idx
+        prev = tag
     return start
 
 

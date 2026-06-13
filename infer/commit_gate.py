@@ -6,37 +6,49 @@ import torch
 from data.windowing import BIO
 
 
-def first_closing_o_index(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Index of the first frame that closes an active B/I span: a closing O, or a new B.
+def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
+    """A span OPENS on a predicted `B`, or on an O→I transition mid-buffer.
 
-    A new B closes the previous span exactly as in Moryossef's bio_labels_to_segments (segmentation/metrics.py) 
-    and our metrics.bio_labels_to_segments. Back-to-back sentences have no O gap; closing only on O would silently 
-    drop the first sentence, while the training-side target rule (windowing.first_complete_span) needs only the
-    sentence end inside the window — Hard Rule §1.4.8 requires the same rule here.
+    Mirrors the prediction decode used everywhere else (`metrics.signing_runs_with_b_splits`): the model rarely 
+    wins argmax with `B` (one B frame per sentence; 68% of caption boundaries have no visual pause), and the first 
+    signing frame after a gap is a sentence start by construction. One deliberate exception: signing at BUFFER START 
+    without a `B` (prev_tag is None) does NOT open a span — Mode-2b training labels a left-truncated sentence as `I` 
+    without `B` precisely so the model can signal "this sentence started before the buffer; do not translate it" 
+    (spec §5.2b). Opening there would translate fragments whose head was discarded.
+    """
+    if tag == BIO["B"]: return True
+    return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
+
+
+def first_closing_o_index(bio_tags: torch.Tensor | list[int]) -> int | None:
+    """Index of the first frame that closes an active span: a closing O, or a new B.
+
+    A new B closes the previous span (back-to-back sentences have no O gap; closing only on O would silently drop 
+    the 1st sentence, while the training-side target rule — windowing.first_complete_span — needs only the sentence 
+    end inside the window; Hard Rule §1.4.8 requires the same rule here). Span opening follows `_span_opens`.
     """
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
-    active = False
+    active, prev = False, None
     for idx, tag in enumerate(bio_tags.tolist()):
-        if tag == BIO["B"]:
-            if active: return idx
-            active = True
-        elif active and tag == BIO["O"]: return idx
+        if active and tag in (BIO["O"], BIO["B"]): return idx
+        if _span_opens(tag, prev, active): active = True
+        prev = tag
     return None
 
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
-    # Complete predicted spans as [start_idx, closing_idx]; a new B closes the previous
-    # span (same rule as first_closing_o_index / metrics.bio_labels_to_segments).
+    # Complete predicted spans as [start_idx, closing_idx]; opening per `_span_opens`
+    # (B anywhere, or mid-buffer O→I), closing on O or on the next span's B.
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
+    prev: int | None = None
     for idx, tag in enumerate(bio_tags.tolist()):
-        if tag == BIO["B"]:
-            if start is not None: spans.append((start, idx))
-            start = idx
-        elif start is not None and tag == BIO["O"]:
+        if start is not None and tag in (BIO["O"], BIO["B"]):
             spans.append((start, idx))
             start = None
+        if _span_opens(tag, prev, start is not None): start = idx
+        prev = tag
     return spans
 
 

@@ -1,15 +1,21 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 from statistics import median
 from pathlib import Path
-import json, argparse
+import json, argparse, math
 
 import torch
+import numpy as np
 from data.loader import load_language_records
+from poses import load_pose_window
 from moryossef26.infer import load_prediction_file, load_segmenter_for_inference, predict_phrase_segments, save_prediction_file
 from moryossef26.trainer import build_segmenter
-from metrics import Segment, match_segments, temporal_iou
-from utils import load_yaml
+
+from infer.commit_gate import first_closing_o_index
+from eval import _build_eval_model, _translate_window
+from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
+from utils import load_yaml, update_yaml_scalar
 
 
 @dataclass(frozen=True)
@@ -238,18 +244,178 @@ def analysis_a(args: argparse.Namespace) -> dict:
     }
 
 
+def _eval_model_for(method: str, args: argparse.Namespace, stage1_cfg: dict, method_cfg: dict, device: torch.device):
+    # Reuse eval.py's checkpoint-loading model builder via a minimal namespace.
+    data_cfg = load_yaml(args.data_config)
+    ns = SimpleNamespace(method=method, checkpoint=args.checkpoint, language=args.language)
+    return _build_eval_model(ns, data_cfg, stage1_cfg, method_cfg, device)
+
+
+def tail_benefit(args: argparse.Namespace) -> dict:
+    """Spec §8.3 — tail-benefit curve sets BUFFER_CAP_S.
+
+    Protocol: clean-trained translator (the Analysis-B GFSLT baseline), dev split, head fixed at the
+    true sentence start (Δ_head = 0), trailing context Δ_tail swept upward; BLEU-4 per Δ_tail. The
+    elbow is the first grid point whose marginal BLEU per extra second drops below the explicit
+    latency/quality coefficient (eval.yaml tail_benefit.latency_quality_coeff_bleu_per_s) — not a
+    hand-picked number and not a %-of-clean threshold.
+
+    Buffer-cap semantics (spec ambiguity resolved, documented): the spec says "this elbow is the
+    buffer cap", but the FSM buffer must hold the WHOLE sentence plus the trailing context, so a
+    1–3 s tail elbow alone cannot be the cap. We persist buffer_cap_s = p99 sentence duration +
+    elbow (both raw values are in the JSON artifact for the paper).
+    """
+    if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
+    data_cfg = load_yaml(args.data_config)
+    eval_cfg = load_yaml(args.eval_config)
+    stage1_cfg = load_yaml(args.stage1_config)
+    base_cfg = load_yaml(args.baseline_config)
+    inference_cfg = load_yaml(args.inference_config)
+    tb_cfg = eval_cfg.get("tail_benefit", {})
+    grid = [float(x) for x in tb_cfg.get("tail_grid_s", [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])]
+    coeff = float(tb_cfg.get("latency_quality_coeff_bleu_per_s", 0.5))
+
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, tokenizer = _eval_model_for("stage2_baseline", args, stage1_cfg, base_cfg, device)
+
+    durations = [span.duration_s for rec in records for span in rec.sentences]
+    p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
+    sentences = [(rec, span) for rec in records for span in rec.sentences]
+    if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
+
+    per_tail: dict[float, dict[str, list[str]]] = {dt: {"predictions": [], "references": []} for dt in grid}
+    for rec, span in sentences:
+        for dt in grid:
+            end_s = min(rec.pose.duration_s, span.end_s + dt)
+            poses, timestamps = load_pose_window(rec.pose, span.start_s, end_s, normalize=True)
+            if poses.shape[0] == 0: continue
+            text, _ = _translate_window(
+                model=model, tokenizer=tokenizer, method="stage2_baseline",
+                poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
+                device=device, inference_cfg=inference_cfg, method_cfg=base_cfg,
+            )
+            per_tail[dt]["predictions"].append(text)
+            per_tail[dt]["references"].append(span.text)
+
+    curve = []
+    for dt in grid:
+        bleu = compute_text_metrics(per_tail[dt]["predictions"], per_tail[dt]["references"])["translation_bleu4"]
+        curve.append({"delta_tail_s": dt, "bleu4": float(bleu), "n": len(per_tail[dt]["predictions"])})
+
+    elbow = grid[-1]
+    for prev, cur in zip(curve, curve[1:]):
+        gap_s = cur["delta_tail_s"] - prev["delta_tail_s"]
+        marginal = (cur["bleu4"] - prev["bleu4"]) / gap_s if gap_s > 0 else 0.0
+        if marginal < coeff:
+            elbow = prev["delta_tail_s"]
+            break
+
+    buffer_cap_s = round(p99_duration + elbow, 2)
+    payload = {
+        "language": args.language, "split": args.split, "sentences": len(sentences),
+        "latency_quality_coeff_bleu_per_s": coeff, "curve": curve,
+        "elbow_tail_s": elbow, "p99_sentence_duration_s": p99_duration, "buffer_cap_s": buffer_cap_s,
+    }
+    output = Path(args.output or f"outputs/tail_benefit_{args.language}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.write_config and update_yaml_scalar(args.inference_config, ("buffer_cap_s",), buffer_cap_s):
+        payload["config_updated"] = args.inference_config
+    payload["output"] = str(output)
+    return payload
+
+
+def delta_enc(args: argparse.Namespace) -> dict:
+    """Spec §8.4 — BIO temporal noise floor sets the commit gate's delta_enc.
+
+    Runs the trained BIO head twice per dev sentence window under small input perturbations and measures how far the predicted 
+    closing index (first_closing_o_index, the same statistic the commit gate tracks) moves. Two perturbation families (the spec 
+    names none, so both are reported): (a) drop the leading frame — the stride-phase misalignment a growing buffer produces; 
+    (b) Gaussian keypoint noise sigma on x/y — pose-estimator jitter. delta_enc = ceil(p90 over both families): boundary movement 
+    below the head's own noise floor must not block a commit.
+    """
+    if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
+    data_cfg = load_yaml(args.data_config)
+    stage1_cfg = load_yaml(args.stage1_config)
+    method_cfg = load_yaml(args.stage2_config)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, _ = _eval_model_for("stage2_dlm", args, stage1_cfg, method_cfg, device)
+    sigma = float(args.noise_sigma)
+
+    sentences = [(rec, span) for rec in records for span in rec.sentences]
+    if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
+    rng = np.random.default_rng(int(args.seed))
+
+    @torch.no_grad()
+    def closing_index(poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float) -> int | None:
+        poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
+        ts = torch.as_tensor(timestamps_np - start_s, dtype=torch.float32, device=device).unsqueeze(0)
+        mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
+        post_vlp, _, ts_out = model.visual.extract_post_vlp(poses, mask, ts)
+        tags = model.bio_head(post_vlp, timestamps_s=ts_out).logits.argmax(dim=-1)[0]
+        return first_closing_o_index(tags)
+
+    shifts: dict[str, list[int]] = {"drop_first_frame": [], "keypoint_noise": []}
+    for rec, span in sentences:
+        start_s = max(0.0, span.start_s - 1.0)
+        end_s = min(rec.pose.duration_s, span.end_s + 1.0)
+        poses, timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
+        if poses.shape[0] < 3: continue
+        base = closing_index(poses, timestamps, start_s)
+        if base is None: continue
+
+        dropped = closing_index(poses[1:], timestamps[1:], start_s)
+        # The dropped buffer's indices sit one frame earlier on the original timeline.
+        if dropped is not None: shifts["drop_first_frame"].append(abs((dropped + 1) - base))
+        noisy = poses.copy()
+        noisy[..., :2] = noisy[..., :2] + rng.normal(0.0, sigma, size=noisy[..., :2].shape).astype(noisy.dtype)
+        perturbed = closing_index(noisy, timestamps, start_s)
+        if perturbed is not None: shifts["keypoint_noise"].append(abs(perturbed - base))
+
+    stats = {family: {
+        "n": len(values), "median": float(np.median(values)) if values else 0.0,
+        "p90": float(np.percentile(values, 90)) if values else 0.0, "max": int(max(values)) if values else 0,
+    } for family, values in shifts.items()}
+    delta = int(math.ceil(max((s["p90"] for s in stats.values()), default=0.0))) or 1
+    payload = {
+        "language": args.language, "split": args.split, "noise_sigma": sigma,
+        "sentences": len(sentences), "families": stats, "delta_enc_frames": delta,
+    }
+    output = Path(args.output or f"outputs/delta_enc_{args.language}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.write_config and update_yaml_scalar(args.inference_config, ("boundary_stability", "delta_enc_frames"), delta):
+        payload["config_updated"] = args.inference_config
+    payload["output"] = str(output)
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
-    parser.add_argument("--stage", default="dataset-summary", choices=["dataset-summary", "segmenter-infer", "analysis-a"])
+    parser.add_argument(
+        "--stage", default="dataset-summary",
+        choices=["dataset-summary", "segmenter-infer", "analysis-a", "tail-benefit", "delta-enc"],
+    )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--segmenter-config", default="configs/segmenter.yaml")
+    parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
+    parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
+    parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
+    parser.add_argument("--inference-config", default="configs/inference.yaml")
+    parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--language", default="asf")
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
-    parser.add_argument("--checkpoint", default="checkpoints/segmenter/asf/model.pt")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--predictions", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--tiou-threshold", type=float, default=None)
+    parser.add_argument("--num-sentences", type=int, default=None)
+    parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--write-config", action="store_true", help="Persist the measured constant into configs/inference.yaml")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")
     return parser
@@ -257,10 +423,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    if args.checkpoint is None and args.stage == "segmenter-infer": args.checkpoint = "checkpoints/segmenter/asf/model.pt"
     if args.stage == "dataset-summary": result = dataset_summary(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
     elif args.stage == "analysis-a":
         if not args.predictions: raise SystemExit("--predictions is required for --stage analysis-a")
         result = analysis_a(args)
+    elif args.stage == "tail-benefit": result = tail_benefit(args)
+    elif args.stage == "delta-enc": result = delta_enc(args)
     else: raise ValueError(f"Unsupported stage: {args.stage}")
     print(json.dumps(result, indent=2, sort_keys=True))

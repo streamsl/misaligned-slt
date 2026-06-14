@@ -27,7 +27,7 @@ def build_segmenter_loader(
 ) -> DataLoader:
     data_cfg = load_yaml(data_config)
     seg_cfg = load_yaml(segmenter_config)
-    language = str(seg_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
+    language = str(seg_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     records, _ = load_language_records(data_cfg, language, split=split)
     fps_cfg = seg_cfg.get("fps_aug", {})
     trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)

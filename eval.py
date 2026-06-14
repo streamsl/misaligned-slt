@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
     parser.add_argument("--method-config", default=None)
-    parser.add_argument("--language", default="asf")
+    parser.add_argument("--language", default="phoenix")
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--method", default="stage2_dlm", choices=["stage2_baseline", "stage2_ar", "stage2_dlm"])
     parser.add_argument("--checkpoint", default=None)

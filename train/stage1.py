@@ -29,7 +29,7 @@ def build_stage1_components(
 ) -> Stage1Components:
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(stage1_config)
-    language = str(cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
+    language = str(cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     tokenizer_dir = mbart_trimmed_dir(cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)

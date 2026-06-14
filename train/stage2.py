@@ -60,7 +60,7 @@ def build_stage2_components(
     stage1_cfg = load_yaml(stage1_config)
     stage2_cfg = load_yaml(stage2_config)
     inference_cfg = load_yaml(inference_config)
-    language = str(stage2_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
+    language = str(stage2_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
 
     tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")

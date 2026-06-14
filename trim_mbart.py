@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, MBartConfig, MBartForConditionalGenerati
 from hftrim.ModelTrimmers import MBartTrimmer
 from hftrim.TokenizerTrimmer import TokenizerTrimmer
 from data.loader import load_language_records
-from utils import load_yaml
+from utils import load_yaml, mbart_name, mbart_trimmed_dir
 
 
 def collect_training_subtitles(data_config: str, language: str) -> list[str]:
@@ -111,25 +111,38 @@ def trim_MBartForConditionalGeneration(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Trim mBART tokenizer/model to local YouTube-SL subtitles")
+    # Prefer `python train.py --stage trim-mbart` (same logic). This standalone CLI resolves every
+    # default from the configs too, so a bare `python trim_mbart.py` is correct for the active dataset
+    # (e.g. phoenix → target_lang de_DE, depth-trim from mbart.layers) — no stale en_XX/asf defaults.
+    parser = argparse.ArgumentParser(description="Trim mBART tokenizer/model to the active dataset's training subtitles")
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument("--language", default="asf")
-    parser.add_argument("--mbart-name", default="facebook/mbart-large-cc25")
-    parser.add_argument("--target-lang", default="en_XX")
-    parser.add_argument("--tokenizer-out", default="checkpoints/trimmed_mbart_asf")
-    parser.add_argument("--model-out", default="checkpoints/trimmed_mbart_asf")
-    parser.add_argument("--encoder-layers", type=int, default=None, help="Truncate to first N encoder layers (omit to keep full depth)")
-    parser.add_argument("--decoder-layers", type=int, default=None, help="Truncate to first N decoder layers (omit to keep full depth)")
+    parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
+    parser.add_argument("--language", default=None, help="Default: stage1-config language / data.yaml active_languages[0]")
+    parser.add_argument("--mbart-name", default=None, help="Default: mbart.name from the stage1 config")
+    parser.add_argument("--target-lang", default=None, help="Default: the language entry's target_lang in data.yaml (e.g. de_DE for phoenix)")
+    parser.add_argument("--tokenizer-out", default=None, help="Default: mbart.trimmed_dir from the stage1 config")
+    parser.add_argument("--model-out", default=None, help="Default: mbart.trimmed_dir from the stage1 config")
+    parser.add_argument("--encoder-layers", type=int, default=None, help="Truncate to first N encoder layers (default: mbart.layers.encoder)")
+    parser.add_argument("--decoder-layers", type=int, default=None, help="Truncate to first N decoder layers (default: mbart.layers.decoder)")
     parser.add_argument(
-        "--attention-heads", type=int, default=None, 
-        help="Override head count (omit to keep the source's, so pretrained attention transfers exactly)"
+        "--attention-heads", type=int, default=None,
+        help="Override head count (default: mbart.layers.attention_heads, else the source's)"
     )
     args = parser.parse_args()
 
+    data_cfg = load_yaml(args.data_config)
+    stage1_cfg = load_yaml(args.stage1_config)
+    language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
+    target_lang = args.target_lang or data_cfg["languages"][language].get("target_lang", "en_XX")
+    trimmed_dir = mbart_trimmed_dir(stage1_cfg)
+    layers_cfg = stage1_cfg.get("mbart", {}).get("layers", {})
     result = trim_MBartForConditionalGeneration(
-        data_config=args.data_config, language=args.language, mbart_name=args.mbart_name,
-        target_lang=args.target_lang, tokenizer_out=args.tokenizer_out, model_out=args.model_out,
-        encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, attention_heads=args.attention_heads,
+        data_config=args.data_config, language=language,
+        mbart_name=args.mbart_name or mbart_name(stage1_cfg), target_lang=target_lang,
+        tokenizer_out=args.tokenizer_out or trimmed_dir, model_out=args.model_out or trimmed_dir,
+        encoder_layers=args.encoder_layers if args.encoder_layers is not None else layers_cfg.get("encoder"),
+        decoder_layers=args.decoder_layers if args.decoder_layers is not None else layers_cfg.get("decoder"),
+        attention_heads=args.attention_heads if args.attention_heads is not None else layers_cfg.get("attention_heads"),
     )
     print(f"Collected {result['subtitles']} subtitles")
     print(f"Trimmed vocab ids: {result['trimmed_vocab_ids']}")

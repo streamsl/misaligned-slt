@@ -18,8 +18,9 @@ def smoke_data(args: argparse.Namespace) -> dict:
     data_cfg = load_yaml(args.data_config)
     stage2_cfg = load_yaml(args.stage2_config)
     inference_cfg = load_yaml(args.inference_config)
-    records, splits = load_language_records(data_cfg, args.language, split=args.split)
-    if not records: raise RuntimeError(f"No records loaded for language={args.language} split={args.split}")
+    language = str(args.language or data_cfg.get("active_languages", ["phoenix"])[0])
+    records, splits = load_language_records(data_cfg, language, split=args.split)
+    if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
 
     sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)
     samples = [sampler.to_dict(sampler.sample()) for _ in range(args.num_samples)]
@@ -31,10 +32,10 @@ def smoke_data(args: argparse.Namespace) -> dict:
     mode2 = Counter(sample["spec"].get("subcase") for sample in samples if sample["spec"]["mode"] == "mode2")
     translated = sum(sample["translation_target"] is not None for sample in samples)
     return {
-        "language": args.language, "split": args.split,
-        "records": len(records), "split_sizes": {k: len(v) for k, v in splits.items()},
-        "samples": args.num_samples, "modes": dict(modes), "mode2_subcases": dict(mode2),
-        "translation_targets": translated, "batch_pose_shape": list(batch["poses"].shape), "padding_label": "UNK",
+        "language": language, "split": args.split, "records": len(records), 
+        "split_sizes": {k: len(v) for k, v in splits.items()}, "samples": args.num_samples, 
+        "modes": dict(modes), "mode2_subcases": dict(mode2), "translation_targets": translated, 
+        "batch_pose_shape": list(batch["poses"].shape), "padding_label": "UNK",
     }
 
 
@@ -44,9 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage", default="smoke-data",
         choices=["trim-mbart", "smoke-data", "train-stage1", "train-baseline", "train-stage2", "train-segmenter"],
     )
-    parser.add_argument("--language", default="asf")
+    parser.add_argument(
+        "--language", default=None, 
+        help="Override active language; default falls back to the config's language / data.yaml active_languages"
+    )
     parser.add_argument("--split", default="train", choices=["train", "dev", "test"])
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--num-samples", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
@@ -65,7 +69,7 @@ if __name__ == "__main__":
         from trim_mbart import trim_MBartForConditionalGeneration
         data_cfg = load_yaml(args.data_config)
         stage1_cfg = load_yaml(args.stage1_config)
-        language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
+        language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
         target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
         trimmed_dir = mbart_trimmed_dir(stage1_cfg)
         # mbart.layers: {encoder, decoder, attention_heads} depth-trims the model in the same step

@@ -405,7 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--eval-config", default="configs/eval.yaml")
-    parser.add_argument("--language", default="asf")
+    parser.add_argument("--language", default="phoenix")
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--predictions", default=None)
@@ -423,7 +423,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    if args.checkpoint is None and args.stage == "segmenter-infer": args.checkpoint = "checkpoints/segmenter/asf/model.pt"
+    if args.checkpoint is None and args.stage == "segmenter-infer":
+        # Derive from the segmenter config's checkpoint dir (e.g. checkpoints/segmenter/phoenix) instead of
+        # a hardcoded language, so it follows the active dataset and `--language` overrides.
+        from utils import checkpoint_dir
+        seg_cfg = load_yaml(args.segmenter_config)
+        args.checkpoint = str(Path(checkpoint_dir(seg_cfg, default=f"checkpoints/segmenter/{args.language}")) / "model.pt")
     if args.stage == "dataset-summary": result = dataset_summary(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
     elif args.stage == "analysis-a":

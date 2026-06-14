@@ -35,7 +35,7 @@ def build_baseline_components(
     stage1_cfg = load_yaml(stage1_config)
     base_cfg = load_yaml(baseline_config)
 
-    language = str(base_cfg.get("language", data_cfg.get("active_languages", ["asf"])[0]))
+    language = str(base_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)

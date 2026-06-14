@@ -1,5 +1,5 @@
 seed: 42
-languages: [asf]
+languages: [phoenix]
 rq1:
   severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0]
   smoke_num_sentences: 10

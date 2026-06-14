@@ -1,5 +1,5 @@
 seed: 42
-language: asf
+language: phoenix
 stride_s: 1.0
 buffer_cap_s: 18.0  # Placeholder until Analysis 8.3 writes the measured elbow.
 boundary_stability:

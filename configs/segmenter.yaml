@@ -1,12 +1,12 @@
 seed: 42
-language: asf
+language: phoenix
 checkpoint:
-  dir: checkpoints/segmenter/asf   # best model.pt + best.json saved here
+  dir: checkpoints/segmenter/phoenix   # best model.pt + best.json saved here
   save_best: true                  # write on every new best monitored value (val_phrase_tiou_f1)
 wandb:
   enabled: true
   project: misaligned-slt
-  name: segmenter_asf
+  name: segmenter_phoenix
   mode: online
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 128
@@ -17,20 +17,20 @@ encoder_depth: 4
 attn_nhead: 8
 attn_ff_mult: 2
 attn_dropout: 0.1
-dice_loss_weight: 1.5  # Moryossef 2026 README: Dice weight 1.5 helped.
-# Phrase BIO only: YouTube-SL-25 captions give no sign/gloss spans, so the sign head that gave
-# Moryossef dense B supervision is dropped. Measured Auslan frame balance (corrected per-video
-# fps timeline): B=1.1%, O=11%, I=83%, UNK=4%.
-# Unweighted CE + binary Dice (no B-vs-I signal) collapses to predicting all-I (val_bio_recall=1.0,
-# zero predicted segments at inference). Upweight the rare boundary/gap classes. Set to null to
-# recover Moryossef's exact unweighted recipe. Tune B up if under-segmenting, down if spurious cuts.
-# O stays 1.0: ~42% of uncaptioned time is long intro/outro stretches whose signing status is
-# unknown (now UNK-masked via trusted_gap_s, see data/windowing.py) — upweighting O amplified that
-# mislabeled supervision and pushed the model toward an all-O collapse. B keeps the split signal.
-bio_class_weights:
-  O: 1.0
-  B: 8.0
-  I: 1.0
+dice_loss_weight: 1.5  # Moryossef 2026 README: Dice weight 1.5 helped (NB: in the repo, Dice is on the
+                       # SIGN head; the phrase head trains on plain unweighted NLL — model.py:277-287).
+# This model IS the Moryossef UNet-CNN arch (moryossef26/model.py), and Moryossef's own ablations show
+# the CNN does NOT want class weighting: the UNet skip connections detect B natively (EXPERIMENTS.md
+# finding 8), and weighting it over-segments and collapses tIoU-F1 — the metric we monitor (findings
+# 7/17/25; E11 unweighted Phrase IoU 0.90 vs E5 light-B=2 Phrase IoU 0.64). The ~35x B-weight recipe is
+# the ORIGINAL paper's *BiLSTM* recipe (finding 11), not the CNN one. So default UNWEIGHTED here.
+# Phrase BIO only: YouTube-SL-25 captions give no sign/gloss spans, so the sign head is dropped.
+# Measured Auslan frame balance (per-video fps timeline): B=1.1%, O=11%, I=83%, UNK=4%.
+#   A/B FALLBACK: if THIS UNet-CNN (not the in-model RoPE head) actually collapses to all-I on dev
+#   (val_bio_recall=1.0, zero predicted segments), try {O:1, B:2, I:1} and compare val_phrase_tiou_f1.
+#   Do not assume the collapse: a UNet CNN should detect B unweighted; an all-I collapse usually means
+#   the *transformer-only* head, not this one.
+bio_class_weights: null
 # Items per training epoch. null = cover the corpus once (sum of video frames / num_frames ≈ 2.9k
 # chunks ≈ 23 optimizer steps at batch 128). The old default was one chunk per video (867 → 7
 # steps/epoch at batch 128), which made epoch-based early stopping kill runs after ~150 total

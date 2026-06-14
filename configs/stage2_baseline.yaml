@@ -1,14 +1,14 @@
 seed: 42
-language: asf
+language: phoenix
 checkpoint:
-  dir: checkpoints/stage2_baseline/asf   # best model.pt + best.json saved here
-  from_vlp: checkpoints/vlp/asf          # stage-1 visual backbone to initialise from
+  dir: checkpoints/stage2_baseline/phoenix   # best model.pt + best.json saved here
+  from_vlp: checkpoints/vlp/phoenix          # stage-1 visual backbone to initialise from
   save_best: true
 decoder: ar
 wandb:
   enabled: true
   project: misaligned-slt
-  name: stage2_baseline_asf
+  name: stage2_baseline_phoenix
   mode: online
 use_temporal_conv: false
 visual_padding: gfslt

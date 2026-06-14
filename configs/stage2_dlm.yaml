@@ -1,14 +1,14 @@
 seed: 42
-language: asf
+language: phoenix
 checkpoint:
-  dir: checkpoints/stage2_dlm/asf   # best model.pt + best.json saved here
-  from_vlp: checkpoints/vlp/asf     # stage-1 visual backbone to initialise from
+  dir: checkpoints/stage2_dlm/phoenix   # best model.pt + best.json saved here
+  from_vlp: checkpoints/vlp/phoenix     # stage-1 visual backbone to initialise from
   save_best: true                   # write on every new best dev value (not just end of training)
 decoder: dlm
 wandb:
   enabled: true
   project: misaligned-slt
-  name: stage2_dlm_asf
+  name: stage2_dlm_phoenix
   mode: online             # offline / disabled if no network or key
 use_temporal_conv: false
 visual_padding: gfslt
@@ -48,7 +48,7 @@ confidence_bound:
   warmup_epochs: 1       # hold CB off until the full-evidence self-target is trustworthy
   allow_disable_for_ablation: true
 mode_ratios:
-  source: outputs/a_mode_ratios_asf.json
+  source: outputs/a_mode_ratios_phoenix.json
   fallback:
     mode1: 0.55
     mode2: 0.20
@@ -62,34 +62,40 @@ mode2_subcase_weights:
   right: 0.45
   left: 0.45
   both: 0.10
-# Hard Rule §1.4.4 / Moryossef 2026: fps_aug essential (0.58→0.49 without),
-# speed_aug forbidden. Applied to sampled training windows (BIO labels rebuilt
-# from resampled timestamps); the Mode-2a full-evidence view stays native-fps.
-# Our poses are all 25 fps and apply_fps_aug only downsamples — [25, 50] was a
-# silent no-op. [12.5, 25] gives real density variation (RoPE keeps true seconds).
+# Moryossef 2026: fps_aug essential (0.58→0.49 without), speed_aug forbidden. Applied to sampled training windows (BIO 
+# labels rebuilt from resampled timestamps); the Mode-2a full-evidence view stays native-fps. Our poses are effectively 
+# 12.0–15.0 fps (native/2 extraction; per-video fps from video_meta.json) and apply_fps_aug only downsamples — the range 
+# must dip below the source rate: [6.25, 25] gives real 0.5–1.0x density variation (RoPE keeps true seconds). max_fps 
+# stays above the sources on purpose: draws >= source fps are no-ops = native-density training, which eval always runs at.
 fps_aug:
   enabled: true
-  min_fps: 12.5
+  min_fps: 6.25
   max_fps: 25.0
-# Same rare-class CE weighting as configs/segmenter.yaml (measured B=0.57%/O=18%/I=82%;
-# binary Dice has no B-vs-I gradient): the stage-2 BIO head faces the identical
-# imbalance and would collapse to all-I the same way. null = unweighted.
+# Same rare-class CE weighting as configs/segmenter.yaml (measured at the corrected
+# per-video-fps timeline: B=1.1%/O=11%/I=83%/UNK=4%; binary Dice has no B-vs-I
+# gradient): the stage-2 BIO head faces the identical imbalance and would collapse
+# to all-I the same way. null = unweighted.
 bio_class_weights:
-  O: 2.0
-  B: 8.0
+  O: 1.0   # not upweighted: long uncaptioned stretches are UNK-masked, residual O labels stay noisy
+  B: 2.0
   I: 1.0
+# In-model BIO head temporal Conv1d stem depth (models/bio_head.py TemporalConvStem). The standalone
+# segmenter keeps the full Moryossef UNet; this head reads post-VLP features directly with no UNet, so
+# a small conv stem restores the local boundary inductive bias (EXPERIMENTS.md findings 8/23) that the
+# commit gate's δ_enc stability and RQ2 tIoU depend on. 0 = ablation (pure transformer, spec §4.4).
+bio_conv_stem_layers: 2
 jitter:
-  source: outputs/a_jitter_asf.json
+  source: outputs/a_jitter_phoenix.json
   fallback_laplace:
     head_loc_s: 0.0
     head_scale_s: 0.6
     tail_loc_s: 0.0
     tail_scale_s: 0.8
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 4
-learning_rate: 3.0e-5
+batch_size: 8
+learning_rate: 5.0e-5
 weight_decay: 1.0e-4
-epochs: 20
+epochs: 50
 eval_every_epochs: 3
 early_stopping:
   monitor: val_loss
@@ -120,8 +126,10 @@ dcd:
   cache_type: none          # none is exact; prefix is implemented only when window_type: static.
   refresh_count: 16
   # NOTE: the DCD window is automatically clipped to the BD3LM attention block
-  # (DCD window_causal_decode semantics for block-causal models) — structural,
-  # not tunable here; ablate via decode_spd_dcd(window_block_clip=False).
+  # (DCD decode_algorithm.py::window_causal_decode semantics for block-causal
+  # models). DCD's optional Dynamic Block Extension is not enabled here because
+  # this mBART-BD3LM substrate is trained with a fixed block_size; ablate via
+  # decode_spd_dcd(window_block_clip=False) only as a controlled non-faithful run.
 spd:
   top_k: 1                  # DMax SPD top-k token/mask embedding mixture.
   renormalize: true         # DMax Eq. 10 norm restoration.

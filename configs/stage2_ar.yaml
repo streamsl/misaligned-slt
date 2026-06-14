@@ -11,6 +11,6 @@
 extends: stage2_dlm.yaml
 decoder: ar
 checkpoint:
-  dir: checkpoints/stage2_ar/asf   # override only the save dir; from_vlp + save_best inherited from stage2_dlm
+  dir: checkpoints/stage2_ar/phoenix   # override only the save dir; from_vlp + save_best inherited from stage2_dlm
 wandb:
-  name: stage2_ar_asf
+  name: stage2_ar_phoenix

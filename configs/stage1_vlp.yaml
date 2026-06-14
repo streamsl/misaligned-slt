@@ -1,13 +1,13 @@
 seed: 42
-language: asf
+language: phoenix
 wandb:
   enabled: true
   project: misaligned-slt
-  name: stage1_vlp_asf
+  name: stage1_vlp_phoenix
   mode: online
 mbart:
   name: facebook/mbart-large-cc25
-  trimmed_dir: checkpoints/trimmed_mbart_asf   # trim_mbart output; ONE dir holding the trimmed tokenizer + model
+  trimmed_dir: checkpoints/trimmed_mbart_phoenix   # trim_mbart output (run with --target-lang de_DE).
   # Depth-trim the vocab-trimmed mBART in the same trim-mbart step: keep the first N pretrained encoder /
   # decoder layers (truncation-init, not random) plus embeddings + layer norms; drop the deeper layers.
   # This single small model is used everywhere (stage-1 text encoder, visual encoder, AR/DLM decoder).
@@ -21,7 +21,7 @@ mbart:
 checkpoint:
   # Best VLP visual backbone (visual_backbone.pt + best.json), written the moment a new best dev value
   # is found — not only at the end. The GFSLT baseline and stage 2 load it via their checkpoint.from_vlp.
-  dir: checkpoints/vlp/asf
+  dir: checkpoints/vlp/phoenix
   save_best: true
 embed_dim: 1024
 hidden_size: 1024
@@ -41,9 +41,9 @@ cmlm:
   label_smoothing: 0.2  # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 64
-learning_rate: 5.0e-4
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-epochs: 50
+epochs: 80
 eval_every_epochs: 1
 early_stopping:
   # Stage-1's deliverable is the aligned pose<->text space; in-batch retrieval accuracy measures it
@@ -58,6 +58,6 @@ early_stopping:
   restore_best: true
 scheduler:
   type: cosine
-  eta_min: 1.0e-6
+  eta_min: 1.0e-5
 max_grad_norm: 1.0
 freeze_backbone: false

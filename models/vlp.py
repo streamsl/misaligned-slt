@@ -33,10 +33,12 @@ class PoseTextCLIP(nn.Module):
     travels with the saved visual backbone into both downstream arms.
     """
     def __init__(
-        self, config: GFSLTConfig, projection_dim: int = 1024, logit_scale_init: float = 0.07, 
-        cmlm_lambda: float = 1.0, cmlm_label_smoothing: float = 0.2,
+        self, config: GFSLTConfig, projection_dim: int = 1024, logit_scale_init: float = 0.07,
+        cmlm_lambda: float = 1.0, cmlm_label_smoothing: float = 0.2, label_temp: float = 10.0,
     ):
         super().__init__()
+        # GFSLT-VLP SLRCLIP target temperature: utils.KLLoss does softmax(label * 10) on the eye target.
+        self.label_temp = float(label_temp)
         self.visual = GFSLTVisualBackbone(config)
         # Text encoder is a second instance of the same trimmed mBART (separate weights). GFSLT-VLP
         # used the full trimmed model here; we use the depth-trimmed one everywhere for speed.
@@ -111,19 +113,24 @@ class PoseTextCLIP(nn.Module):
         scale = self.logit_scale.exp().clamp(max=100.0)
         logits_i = scale * image_features @ text_features.t()
         logits_t = logits_i.t()
-        labels = torch.arange(logits_i.shape[0], device=logits_i.device)
 
-        # Duplicate captions are FALSE negatives (measured 7.5% exact duplicates in the Auslan train
-        # split — "Hello!" x19 etc.): 2 clips with identical text would be pushed apart by InfoNCE.
-        # Mask off-diagonal pairs with identical token ids out of both softmaxes (multi-positive-safe
-        # variant of CLIP; with no duplicates in batch this is exactly the original loss).
+        # GFSLT-VLP SLRCLIP loss (utils.KLLoss): KL( softmax(logits) || softmax(eye * label_temp) ),
+        # symmetric over image/text directions. reduction="batchmean" reproduces GFSLT's
+        # KLDivLoss(size_average=True) * batch_size (= sum/N). The softmax(eye*10) target is near-one-hot
+        # (~0.003 smoothing); with one-hot this equals cross-entropy, so this is the faithful GFSLT form.
+        n = logits_i.shape[0]
+        eye = torch.eye(n, dtype=logits_i.dtype, device=logits_i.device)
+        # Duplicate captions are FALSE negatives (measured 7.5% exact duplicates on Auslan; PHOENIX
+        # weather text is also highly repetitive). Fold them in as ADDITIONAL positives (multi-positive
+        # target) rather than pushing them apart — and unlike masking logits to -inf this keeps the KL
+        # target all-positive/finite (no 0*-inf NaN). No duplicates ⇒ exactly softmax(eye*label_temp).
         same_text = (text_input_ids.unsqueeze(0) == text_input_ids.unsqueeze(1)).all(dim=-1)
-        dup_mask = same_text & ~torch.eye(same_text.shape[0], dtype=torch.bool, device=same_text.device)
-        if dup_mask.any():
-            neg_inf = torch.finfo(logits_i.dtype).min
-            logits_i = logits_i.masked_fill(dup_mask, neg_inf)
-            logits_t = logits_t.masked_fill(dup_mask, neg_inf)
-        contrastive = (F.cross_entropy(logits_i, labels) + F.cross_entropy(logits_t, labels)) / 2.0
+        positives = (eye + same_text.to(logits_i.dtype)).clamp(max=1.0)  # 1 on diagonal OR identical-text pairs
+        target = F.softmax(positives * self.label_temp, dim=1)
+        contrastive = (
+            F.kl_div(F.log_softmax(logits_i, dim=1), target, reduction="batchmean")
+            + F.kl_div(F.log_softmax(logits_t, dim=1), target.t(), reduction="batchmean")
+        ) / 2.0
 
         cmlm, loss = None, contrastive
         if self.cmlm_lambda > 0.0 and masked_text_input_ids is not None:

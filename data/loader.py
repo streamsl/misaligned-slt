@@ -217,6 +217,13 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
 
 def load_language_records(data_cfg: dict, language: str, split: str | None = None) -> tuple[list[VideoRecord], dict[str, list[str]]]:
     lang_cfg = data_cfg["languages"][language]
+    # Synthetic streaming corpora (data_synth: PHOENIX / CSL-Daily / How2Sign / ...) share 1 self-contained layout 
+    # (per-stream npy + vtt, explicit splits, exact fps) — delegate to their shared loader. The YouTube path below 
+    # assumes poses/+subs/, per-video fps calibration, and SignVerse splits.
+    if str(lang_cfg.get("source", "")).lower() in {"streams", "synth_streams", "phoenix"}:
+        from data.synth_streams import load_stream_records
+        return load_stream_records(data_cfg, language, split=split)
+
     root = Path(lang_cfg["root"])
     # Per-video fps from the video_meta.json sidecar (poses were extracted at native/2 fps, which
     # VARIES per YouTube video: 12.0-15.0 measured). config pose_fps is fallback-only; with no
@@ -269,9 +276,8 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
 class StreamingWindowDataset(Dataset):
     """On-the-fly Stage 2 window dataset.
 
-    `__getitem__` samples from the training distribution rather than indexing a
-    fixed window table. This mirrors the intended stochastic window sampler while
-    still satisfying PyTorch/HF Trainer's map-style dataset interface.
+    `__getitem__` samples from the training distribution rather than indexing a fixed window table. This mirrors the intended 
+    stochastic window sampler while still satisfying PyTorch/HF Trainer's map-style dataset interface.
     """
     def __init__(
         self, records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],

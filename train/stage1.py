@@ -91,6 +91,12 @@ def evaluate_stage1(model: PoseTextCLIP, loader: DataLoader, device: torch.devic
     was_training = model.training
     model.eval()
     losses: list[float] = []
+    # Split the two VLP terms so a rising val_loss can be attributed: on small clean corpora the
+    # CMLM term overfits (rises) while the contrastive alignment keeps improving — the monitor is
+    # retrieval acc precisely because the combined loss is the wrong signal. Seeing them apart turns
+    # "is VLP broken?" into a one-glance check (contrastive flat/down + retrieval up = healthy).
+    contrastive_losses: list[float] = []
+    cmlm_losses: list[float] = []
     image_correct, text_correct, total = 0, 0, 0
 
     for batch in loader:
@@ -107,18 +113,22 @@ def evaluate_stage1(model: PoseTextCLIP, loader: DataLoader, device: torch.devic
             masked_text_attention_mask=masked["attention_mask"].to(device) if masked is not None else None,
         )
         losses.append(float(out.loss.detach().cpu().item()))
+        if out.contrastive_loss is not None: contrastive_losses.append(float(out.contrastive_loss.detach().cpu().item()))
+        if out.cmlm_loss is not None: cmlm_losses.append(float(out.cmlm_loss.detach().cpu().item()))
         labels = torch.arange(out.logits_per_image.shape[0], device=device)
         image_correct += int((out.logits_per_image.argmax(dim=1) == labels).sum().item())
         text_correct += int((out.logits_per_text.argmax(dim=1) == labels).sum().item())
         total += int(labels.numel())
 
     if was_training: model.train()
-    loss = sum(losses) / max(1, len(losses))
-    return {
-        "val_loss": loss,
+    metrics = {
+        "val_loss": sum(losses) / max(1, len(losses)),
         "val_image_retrieval_acc": image_correct / max(1, total),
         "val_text_retrieval_acc": text_correct / max(1, total),
     }
+    if contrastive_losses: metrics["val_contrastive_loss"] = sum(contrastive_losses) / len(contrastive_losses)
+    if cmlm_losses: metrics["val_cmlm_loss"] = sum(cmlm_losses) / len(cmlm_losses)
+    return metrics
 
 
 def train_stage1_epochs(

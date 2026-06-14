@@ -248,11 +248,11 @@ class WindowSampler:
         poses, timestamps = load_pose_window(rec.pose, spec.start_s, spec.end_s, normalize=True)
         if fps_aug and poses.shape[0] > 1:
             from moryossef26.dataset import apply_fps_aug
-            poses, rel_timestamps, _ = apply_fps_aug(
+            poses, timestamps, _ = apply_fps_aug(
                 poses, source_fps=rec.pose.fps,
                 min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=self.rng,
+                source_timestamps_s=timestamps,
             )
-            timestamps = spec.start_s + rel_timestamps
 
         frame_mask = np.ones((poses.shape[0],), dtype=bool)
         labels = make_bio_labels(

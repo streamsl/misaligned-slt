@@ -14,25 +14,33 @@ def apply_fps_aug(
     poses: np.ndarray, source_fps: float,
     min_fps: float = 25.0, max_fps: float = 50.0,
     rng: np.random.Generator | None = None,
+    source_timestamps_s: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Sample a Moryossef-style fps augmentation without speed augmentation.
 
-    The returned indices select frames from the original sequence. Timestamps are recomputed from the 
-    selected source indices, so RoPE receives relative time in seconds rather than an absolute frame index.
+    The returned indices select frames from the original sequence. When the caller provides the source timestamps, 
+    the selected timestamps are sliced from that timeline directly. This matters for arbitrary real-timeline windows:
+    `load_pose_window` floors the start frame, so reanchoring to the requested window start can shift BIO/RoPE timing 
+    by up to one frame. Moryossef 2026's fps_aug changes frame density, not the physical time attached to a frame.
     """
     if rng is None: rng = np.random.default_rng()
     num_frames = int(poses.shape[0])
     if num_frames <= 0: return poses, np.zeros((0,), dtype=np.float32), source_fps
+    if source_timestamps_s is not None:
+        source_timestamps_s = np.asarray(source_timestamps_s, dtype=np.float32)
+        if source_timestamps_s.shape[0] != num_frames:
+            raise ValueError("source_timestamps_s must have one timestamp per pose frame")
 
     target_fps = float(rng.uniform(min_fps, max_fps))
     if source_fps <= target_fps * 1.05:
         indices = np.arange(num_frames, dtype=np.int64)
-        return poses, indices.astype(np.float32) / float(source_fps), float(source_fps)
+        timestamps = source_timestamps_s if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
+        return poses, timestamps.astype(np.float32, copy=False), float(source_fps)
 
     target_len = max(1, round(num_frames * target_fps / float(source_fps)))
     indices = np.round(np.arange(target_len) * (num_frames - 1) / max(1, target_len - 1))
     indices = indices.astype(np.int64).clip(0, num_frames - 1)
-    timestamps = indices.astype(np.float32) / float(source_fps)
+    timestamps = source_timestamps_s[indices] if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
     return poses[indices], timestamps, target_fps
 
 
@@ -100,11 +108,11 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
         # split==TRAIN; their eval runs at native fps). Eval previously got random fps_aug too —
         # extra monitor noise on top of the random-chunk draw.
         if self.training and self.fps_aug_enabled:
-            poses, rel_timestamps, _ = apply_fps_aug(
+            poses, abs_timestamps, _ = apply_fps_aug(
                 poses, source_fps=rec.pose.fps,
                 min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=rng,
+                source_timestamps_s=abs_timestamps,
             )
-            abs_timestamps = start_s + rel_timestamps
             
         if self.training and self.body_part_dropout > 0.0:
             poses = apply_body_part_dropout(poses, self.body_part_dropout, rng)

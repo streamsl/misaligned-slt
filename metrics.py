@@ -244,14 +244,14 @@ def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tok
 
 def compute_text_metrics(
     predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a", 
-    bleurt_checkpoint: str | None = None, prefix: str = "translation"
+    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation"
 ) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
-    if not predictions: return {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0, "chrf": 0.0}
+    if not predictions: return {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
     refs_nested = [[ref] for ref in references]
     cjk_predictions = [_char_split_cjk(pred) for pred in predictions]
     cjk_references = [_char_split_cjk(ref) for ref in references]
     cjk_refs_nested = [[ref] for ref in cjk_references]
-    scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0, "chrf": 0.0}
+    scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
 
     bleu = _load_evaluate_metric("sacrebleu")
     if bleu is not None:
@@ -274,11 +274,6 @@ def compute_text_metrics(
     meteor = _load_evaluate_metric("meteor")
     if meteor is not None:
         try: scores["meteor"] = float(meteor.compute(predictions=cjk_predictions, references=cjk_references)["meteor"])
-        except Exception: pass
-
-    chrf = _load_evaluate_metric("chrf")
-    if chrf is not None:
-        try: scores["chrf"] = float(chrf.compute(predictions=predictions, references=refs_nested)["score"])
         except Exception: pass
 
     if bleurt_checkpoint:

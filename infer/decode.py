@@ -213,11 +213,13 @@ def spd_dcd_decode(
     decode confident masked positions inside [window_left, window_right), advance the left edge past fully decoded 
     positions, and extend the right edge according to the remaining masks in the current window.
 
-    `block_size` (when set) clips the DCD window to the attention block that contains `window_left`. Under a 
-    block-causal (BD3LM) model a position cannot attend to later blocks, so deferring a token until a *later block* 
-    resolves is informationless — DCD's own variant for block-attention models (decode_algorithm.py `window_causal_decode`) 
-    clips the window to the current block (`window_right = min(..., block_right)`) for exactly this reason, and DMax's SPD 
-    likewise scopes soft state and self-revision to the current block. Leave `None` only for fully bidirectional decoders.
+    `block_size` (when set) clips the DCD window to the attention block that contains `window_left`. Under a
+    block-causal (BD3LM) model a position cannot attend to later blocks, so deferring a token until a later block
+    resolves is informationless; DCD's `window_causal_decode` clips the window to the current block for this
+    reason, and DMax's SPD likewise scopes soft state and self-revision to the current block. DCD's optional
+    Dynamic Block Extension is deliberately not ported here: this mBART-BD3LM decoder is trained with a fixed
+    block size, so variable-size expansion would be an additional experiment rather than the paper-faithful
+    default. Leave `None` only for fully bidirectional decoders or explicit ablations.
 
     After all masks are committed, if `spd_revision` is on, remaining budget is spent on DMax-style settle passes: 
     revise committed tokens with each pass's argmax until nothing changes or every position's confidence reaches
@@ -234,6 +236,15 @@ def spd_dcd_decode(
         )
     if window_type not in {"sliding", "static"}: raise ValueError(f"Unsupported DCD window_type: {window_type}")
     block = int(block_size) if block_size else None
+
+    def _suppress_mask(logits: torch.Tensor) -> torch.Tensor:
+        # Never let the [MASK] id win argmax/selection at inference. DMax guards this via rm_mask
+        # (parallel_strategy.get_transfer_index_threshold: `mask_index & (x0 != mask_id)`); without it a
+        # high-confidence MASK prediction wastes a decode slot (the write keeps the slot masked) and
+        # pollutes the confidence the commit gate reads. Post-training the MASK logit is near-zero, so
+        # this is cheap insurance, in-place on the fresh per-call logits tensor.
+        logits[..., int(mask_token_id)] = torch.finfo(logits.dtype).min
+        return logits
 
     def _block_end(left: int) -> int: # End of the attention block containing `left` (exclusive).
         if block is None: return 1 << 30
@@ -283,6 +294,7 @@ def spd_dcd_decode(
         if window_right <= window_left: break
         if cache_type != "none" and accepts_window: full_logits = logits_fn(token_ids, soft_embeds, (window_left, window_right))
         else: full_logits = logits_fn(token_ids, soft_embeds)
+        full_logits = _suppress_mask(full_logits)
 
         last_logits = full_logits
         logits = full_logits[:, window_left:window_right]
@@ -390,7 +402,7 @@ def spd_dcd_decode(
     # Step budget exhausted with masks left: fill them in 1 forced pass so no [MASK] id ever reaches the tokenizer or commit gate.
     leftover = (token_ids == int(mask_token_id)) & generated_region
     if fill_leftover_masks and leftover.any():
-        full_logits = _full_forward(token_ids, soft_embeds)
+        full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
         last_logits = full_logits
         conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
         token_ids = torch.where(leftover, pred, token_ids)
@@ -410,7 +422,7 @@ def spd_dcd_decode(
             if pad_id is not None: revisable &= token_ids != int(pad_id)
             if not revisable.any(): break
 
-            full_logits = _full_forward(token_ids, soft_embeds)
+            full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
             last_logits = full_logits
             conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
             changed = revisable & (pred != token_ids)

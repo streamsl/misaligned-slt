@@ -82,9 +82,10 @@ def evaluate_segmenter(
         row = {
             "loss": float(loss.detach().cpu().item()),
             **bio_frame_metrics(outputs["phrase"], labels),
-            # decode="bio": B-required segments, identical to inference — so an all-I collapse
-            # (no predicted B) scores seg_iou≈0 here and early stopping cannot select it.
-            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase", decode="bio"),
+            # Match whole-video inference: Moryossef's prediction decode opens contiguous
+            # signing runs, and our port additionally splits those runs at interior B tags.
+            # The one-to-one tIoU F1 monitor below is still collapse-resistant.
+            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase", decode="runs_bsplit"),
         }
         rows.append(row)
     if was_training: model.train()

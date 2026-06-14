@@ -38,6 +38,7 @@ def oput_two_pass_loss(
     mask_token_id: int, t_low: float = 0.3, t_high: float = 0.8,
     loss_over_all_positions: bool = True, sample_rollout: bool = False,
     rollout_module: torch.nn.Module | None = None,
+    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
@@ -51,14 +52,14 @@ def oput_two_pass_loss(
     the same errors it will make at inference. The prompt §6.2 says "sample"; per the spec's own rule that the DMax code is
     ground truth on divergence, argmax is used. `sample_rollout=True` keeps the sampled variant available as an ablation.
 
-    Rollout fidelity: DMax computes the rollout under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450–472),
-    i.e. with dropout OFF — the corruption is sampled from the same distribution inference will see. When `rollout_module`
-    is given and is in training mode, the rollout pass re-runs `decode_fn` with the module switched to eval (one extra
-    no-grad forward); otherwise the L_mask training-mode logits are reused (cheaper, dropout-noised approximation).
+    Rollout fidelity: DMax computes the rollout under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450-472), i.e. 
+    with dropout OFF — the corruption is sampled from the same distribution inference will see. For a conditional encoder-decoder, 
+    pass `rollout_decode_fn` so the *conditioning path* is also re-run in eval mode; `rollout_module` is the older decoder-only
+    fallback that only toggles the closure's existing module state.
 
-    Note: unlike DMax (which gates mask-vs-pred per example via a `flag` and runs one grad pass), this
-    sums L_mask + L_pred each step. In expectation the two are equivalent up to a scale absorbed by the LR;
-    summing trades 2x decoder forward cost for lower gradient variance, acceptable at this model scale.
+    Note: unlike DMax (which gates mask-vs-pred per example via a `flag` and runs one grad pass), this sums L_mask + L_pred 
+    each step. In expectation the two are equivalent up to a scale absorbed by the LR; summing trades 2x decoder forward cost 
+    for lower gradient variance, acceptable at this model scale.
     """
     valid_mask = valid_mask.bool()
     t = sample_mask_ratio(clean_ids.shape, clean_ids.device, t_low=t_low, t_high=t_high)
@@ -67,7 +68,8 @@ def oput_two_pass_loss(
 
     mask_logits = decode_fn(masked_ids)
     with torch.no_grad():
-        if rollout_module is not None and rollout_module.training:
+        if rollout_decode_fn is not None: rollout_logits = rollout_decode_fn(masked_ids)
+        elif rollout_module is not None and rollout_module.training:
             rollout_module.eval()
             try: rollout_logits = decode_fn(masked_ids)
             finally: rollout_module.train()
@@ -175,6 +177,12 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             if window is None: return self._decode(ids, enc_hidden, enc_mask)
             left, right = int(window[0]), int(window[1])
             if left <= 0: return self._decode(ids, enc_hidden, enc_mask)
+            if left % self.block_size != 0:
+                # BD3LM is bidirectional within each block. If the cached prefix ends inside a block, 
+                # those prefix K/V states were computed w/o later same-block tokens that the exact full 
+                # forward would expose. Prefix cache is exact only at block boundaries; otherwise fall back. 
+                # Ref: DCD window_causal_decode block-local cache split + DMax/dLLM BD3LM block-causal mask.
+                return self._decode(ids, enc_hidden, enc_mask)
 
             prefix_tokens = ids[:, :left].detach()
             cached_tokens = state.get("prefix_tokens")
@@ -277,6 +285,18 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         """
         x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids, eos_supervision=eos_supervision)
         enc_hidden, enc_mask = self._encode_visual(input_feature, input_lengths)
+        rollout_decode_fn = None
+        if rollout_eval_mode:
+            # DMax OPUT samples the on-policy corruption under model.eval() + no_grad. For this conditional mBART port, 
+            # that means re-running the visual conditioning path as well as the decoder with dropout off; the gradient-bearing 
+            # L_mask/L_pred passes below still share the same train-mode `enc_hidden`, so their conditioning remains fixed.
+            def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
+                was_training = self.training
+                self.eval()
+                try:
+                    rollout_enc_hidden, rollout_enc_mask = self._encode_visual(input_feature, input_lengths)
+                    return self._bd3lm_logits(noisy_ids, x0, rollout_enc_hidden, rollout_enc_mask)
+                finally: self.train(was_training)
 
         out = oput_two_pass_loss(
             clean_ids=x0, valid_mask=valid,
@@ -284,7 +304,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high,
             loss_over_all_positions=loss_over_all_positions,
             sample_rollout=sample_rollout,
-            rollout_module=self if rollout_eval_mode else None,
+            rollout_module=None if rollout_decode_fn is not None else (self if rollout_eval_mode else None),
+            rollout_decode_fn=rollout_decode_fn,
         )
         return {
             "translation_loss": out.loss, "oput_mask_loss": out.mask_loss.detach(),

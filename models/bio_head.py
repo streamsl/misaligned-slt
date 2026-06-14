@@ -120,22 +120,61 @@ class ClassifierHead(nn.Module): # Two-layer MLP classifier: hidden_dim → hidd
         return self.net(x)
 
 
+class TemporalConvStem(nn.Module):
+    """Residual stride-1 temporal Conv1d stem restoring the local boundary inductive bias of Moryossef 2026's UNet front-end.
+
+    The standalone segmenter (moryossef26/model.py) keeps the full UNet CNN before its RoPE layers, and Moryossef's ablations 
+    attribute precise boundary placement to exactly those skip-connection convolutions (EXPERIMENTS.md finding 23 "UNet skip 
+    connections are critical for sign boundary precision"; finding 8 "CNN naturally detects B"). This in-model BIO head reads 
+    post-VLP features DIRECTLY with no UNet, so without a conv stem it is structurally a transformer/BiLSTM-style tagger, which 
+    Moryossef shows is weak on B / boundary localization — and that directly feeds the commit gate's I→O δ_enc stability and 
+    RQ2 tIoU. This stem is the cheap middle ground (spec §4.4 wants the head small, so this is 2 conv layers, not the full UNet).
+
+    Stride 1 + odd kernel + 'same' padding keeps the sequence length, so per-frame BIO labels stay aligned. Normalization is per-position 
+    RMSNorm (over channels only): length- and batch-independent, so it introduces no train/inference mismatch over the growing streaming 
+    buffer (unlike BatchNorm running stats or a GroupNorm that pools the time axis). conv_stem_layers=0 disables it (ablation).
+    """
+    def __init__(self, hidden_dim: int, num_layers: int = 2, kernel_size: int = 5, dropout: float = 0.1):
+        super().__init__()
+        if kernel_size % 2 != 1: raise ValueError(f"conv stem kernel must be odd to preserve length; got {kernel_size}")
+        self.convs = nn.ModuleList([
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2) 
+            for _ in range(num_layers)
+        ])
+        self.norms = nn.ModuleList([nn.RMSNorm(hidden_dim) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, T, D)
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(x.transpose(1, 2)).transpose(1, 2)            # (B, T, D): local temporal mix
+            h = self.dropout(F.gelu(norm(h.float()).to(h.dtype)))  # fp32 RMSNorm under autocast (see layer note)
+            x = x + h                                              # residual; length preserved
+        return x
+
+
 class RoPEBIOHead(nn.Module):
     """Phrase-level Moryossef-style BIO head over post-VLP visual features.
 
-    `.logits` aliases the phrase BIO logits, which the FSM consumes. Moryossef 2026 additionally carries a *sign* (sub-sentence) BIO head, 
-    but that head is supervised by sign-level temporal segment annotations. YouTube-SL-25 only provides sentence/caption timestamps, 
-    so there is no signal to train a sign head; it is removed here rather than left as an unsupervised dead branch.
+    `.logits` aliases the phrase BIO logits, which the FSM consumes. Moryossef 2026 additionally carries a *sign* (sub-sentence) BIO head,
+    but that head is supervised by sign-level temporal segment annotations. YouTube-SL-25 only provides sentence/caption timestamps, so 
+    there is no signal to train a sign head; it is removed here rather than left as an unsupervised dead branch.
+
+    A small residual `TemporalConvStem` precedes the RoPE layers to recover the local boundary inductive bias that Moryossef's UNet 
+    front-end provides but this UNet-less head otherwise lacks (see that class).
     """
     def __init__(
-        self, input_dim: int, hidden_dim: int = 384, depth: int = 4, 
+        self, input_dim: int, hidden_dim: int = 384, depth: int = 4,
         nhead: int = 8, ff_mult: int = 2, dropout: float = 0.1,
         num_classes: int = 4, chunk_size: int | None = None,
+        conv_stem_layers: int = 2, conv_stem_kernel: int = 5,
     ):
         super().__init__()
         self.chunk_size = chunk_size
         self.input_proj = nn.Identity() if input_dim == hidden_dim else nn.Linear(input_dim, hidden_dim)
         self.input_norm = nn.RMSNorm(hidden_dim)
+        self.conv_stem = TemporalConvStem(
+            hidden_dim, num_layers=conv_stem_layers, kernel_size=conv_stem_kernel, dropout=dropout,
+        ) if conv_stem_layers > 0 else None
         self.layers = nn.ModuleList([RoPETransformerEncoderLayer(
             hidden_dim=hidden_dim, nhead=nhead,
             dim_feedforward=hidden_dim * ff_mult, dropout=dropout,
@@ -145,6 +184,9 @@ class RoPEBIOHead(nn.Module):
     def encode(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm under autocast (see layer note)
+        # Conv stem runs on the full sequence BEFORE RoPE chunking (it is local/translation-equivariant,
+        # so it does not reintroduce the absolute-position issue chunked RoPE eliminates).
+        if self.conv_stem is not None: x = self.conv_stem(x)
         return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size)
 
     def forward(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> BIOHeadOutput:

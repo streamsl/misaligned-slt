@@ -93,6 +93,7 @@ def build_stage2_components(
         decoder=decoder or str(stage2_cfg.get("decoder", "dlm")),
         bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         block_size=int(stage2_cfg.get("block_size", 8)),
+        bio_conv_stem_layers=int(stage2_cfg.get("bio_conv_stem_layers", 2)),
     )
     checkpoint = vlp_checkpoint(stage2_cfg)
     if checkpoint:

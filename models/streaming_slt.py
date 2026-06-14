@@ -73,7 +73,7 @@ class MisalignedSLTModel(nn.Module):
     def __init__(
         self, gfslt_config: GFSLTConfig, tokenizer, decoder: str = "dlm",
         bio_hidden_dim: int = 384, bio_depth: int = 4, bio_nhead: int = 8,
-        bio_dropout: float = 0.1, block_size: int = 8,
+        bio_dropout: float = 0.1, block_size: int = 8, bio_conv_stem_layers: int = 2,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -83,6 +83,7 @@ class MisalignedSLTModel(nn.Module):
         self.bio_head = RoPEBIOHead(
             input_dim=self.mbart.config.d_model, hidden_dim=bio_hidden_dim,
             depth=bio_depth, nhead=bio_nhead, dropout=bio_dropout, num_classes=4, # 4 classes for B/I/O plus padding/UNK
+            conv_stem_layers=bio_conv_stem_layers,  # local boundary inductive bias the UNet-less head lacks (see RoPEBIOHead)
         )
         if decoder == "dlm":
             adapter = _PostVLPTranslationNetwork(self.mbart, tokenizer)

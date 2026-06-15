@@ -13,15 +13,19 @@ translation:
   # except at the zero-jitter corner; kept as an ablation.
   decode_conditioning: window
   max_text_tokens: 128
-  diffusion_steps: 64
-  block_size: 8
+  # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
+  # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
+  diffusion_steps: 128
+  block_size: 4
   dcd:
     window_type: sliding
-    tau_dec: 0.75
-    initial_window_length: 8
+    # DCD commit threshold = 0.9 (decode_algorithm.py / run_all.sh). decode_param is operative; tau_dec is its
+    # fallback (keep equal). Use ~0.5 only with decode_algo: dmax_prefix (the longest-confident-prefix selector).
+    tau_dec: 0.9
+    initial_window_length: 4
     max_window_length: 64
     decode_algo: threshold  # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
-    decode_param: 0.75
+    decode_param: 0.9
     cache_type: none      # prefix cache is available only with window_type: static.
     refresh_count: 16
 recompute_each_stride: true

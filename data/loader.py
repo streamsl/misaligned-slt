@@ -292,8 +292,8 @@ class StreamingWindowDataset(Dataset):
         self.sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)
         self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
         self.include_full_evidence = bool(include_full_evidence)
-        # Eval loaders set deterministic=True: window `index` then always yields the SAME window
-        # (per-index rng), so the early-stopping monitor scores a fixed dev set every epoch
+        # Eval loaders set deterministic=True: window `index` then always yields the SAME anchor
+        # under a per-index rng, so the early-stopping monitor scores a fixed dev set every epoch
         # instead of a fresh random draw (which makes "best epoch" partly a lottery).
         self.deterministic = bool(deterministic)
         self.seed = int(stage2_cfg.get("seed", 42))
@@ -316,7 +316,11 @@ class StreamingWindowDataset(Dataset):
         rng = np.random.default_rng(self.seed * 100_003 + int(index))
         saved = (self.sampler.rng, self.sampler._anchor_order, self.sampler._anchor_cursor)
         self.sampler.rng = rng
-        self.sampler._anchor_order = rng.permutation(len(self.sampler.anchors))
+        # Validation must enumerate GT sentence anchors. A random permutation per index picks only
+        # the first element of many independent permutations, so anchors can duplicate while others
+        # never appear. Force the chosen anchor and let the per-index rng still draw mode/jitter.
+        anchor_idx = int(index) % len(self.sampler.anchors)
+        self.sampler._anchor_order = np.asarray([anchor_idx], dtype=np.int64)
         self.sampler._anchor_cursor = 0
         try: return self._sample_item()  # incl. full-evidence materialization, under the per-index rng
         finally: self.sampler.rng, self.sampler._anchor_order, self.sampler._anchor_cursor = saved

@@ -36,7 +36,7 @@ oput:
   # EOS commits (hallucinated tails; corrupted commit-gate confidence). 0 disables.
   eos_supervision_tokens: 32
 confidence_bound:
-  # §6.3 right-truncated (Mode 2a) term. The full-evidence decode is a no-grad
+  # Right-truncated (Mode 2a) term. The full-evidence decode is a no-grad
   # stop-grad self-target; the gate reads the real SPD+DCD decode's confidence;
   # the CE gradient flows through ONE cheap forward on the decoded sequence with
   # the gated slots re-masked (the DCD deferral counterfactual), not the
@@ -45,36 +45,41 @@ confidence_bound:
   verified_full_evidence_gate: true   # penalize only where full-evidence decode == reference
   tau_cb: 0.75
   lambda: 0.3            # λ_cb; prior de-risk found ~0.3 stable
-  warmup_epochs: 1       # hold CB off until the full-evidence self-target is trustworthy
+  warmup_epochs: 3       # hold CB off until the full-evidence self-target is trustworthy
   allow_disable_for_ablation: true
 mode_ratios:
   source: outputs/a_mode_ratios_phoenix.json
+  # Designed misalignment distribution used directly when no measured file exists AND auto-substituted
+  # when the measured Analysis-A ratios are DEGENERATE (mode1 >= degenerate_mode1_threshold) — i.e. the
+  # segmenter is too clean (PHOENIX) to produce real misalignment. Without this the sampler would train
+  # ~98% Mode-1 (no robustness). Robustness is still evaluated by the segmenter-agnostic RQ1 sweep.
+  degenerate_mode1_threshold: 0.9
   fallback:
     mode1: 0.55
     mode2: 0.20
     mode3: 0.20
     mode4: 0.05
-# Within Mode 2, each over-segmentation event yields one right-trunc + one
-# left-trunc window (§5.5), so right~=left dominate; both-truncated (§5.2c) is
-# rare and "falls out of the sampler naturally". Uniform 1/3 over-represents the
-# no-translation-supervision "both" case and dilutes the linchpin Mode-2a signal.
+# Within Mode 2, each over-segmentation event yields one right-trunc + one left-trunc window, so right~=left dominate; 
+# both-truncated is rare and "falls out of the sampler naturally". Uniform 1/3 over-represents the no-translation-supervision 
+# "both" case and dilutes the linchpin Mode-2a signal.
 mode2_subcase_weights:
   right: 0.45
   left: 0.45
   both: 0.10
-# Moryossef 2026: fps_aug essential (0.58→0.49 without), speed_aug forbidden. Applied to sampled training windows (BIO 
-# labels rebuilt from resampled timestamps); the Mode-2a full-evidence view stays native-fps. Our poses are effectively 
-# 12.0–15.0 fps (native/2 extraction; per-video fps from video_meta.json) and apply_fps_aug only downsamples — the range 
-# must dip below the source rate: [6.25, 25] gives real 0.5–1.0x density variation (RoPE keeps true seconds). max_fps 
-# stays above the sources on purpose: draws >= source fps are no-ops = native-density training, which eval always runs at.
+# Moryossef 2026: fps_aug essential (0.58→0.49 without), speed_aug forbidden. Applied to sampled training windows (BIO
+# labels rebuilt from resampled timestamps); the Mode-2a full-evidence view stays native-fps. The synthetic streams run at
+# an exact 12.5 fps (manifest.target_fps; the legacy YouTube path is per-video ~12–15 fps from video_meta.csv) and
+# apply_fps_aug only downsamples — the range must dip below the source rate: [6.25, 25] gives real 0.5–1.0x density
+# variation (RoPE keeps true seconds). max_fps stays above the source on purpose: draws >= source fps are no-ops =
+# native-density training, which eval always runs at.
 fps_aug:
   enabled: true
   min_fps: 6.25
   max_fps: 25.0
-# Same rare-class CE weighting as configs/segmenter.yaml (measured at the corrected
-# per-video-fps timeline: B=1.1%/O=11%/I=83%/UNK=4%; binary Dice has no B-vs-I
-# gradient): the stage-2 BIO head faces the identical imbalance and would collapse
-# to all-I the same way. null = unweighted.
+# Rare-class CE weighting for the in-model BIO head, which faces a heavy I-dominant imbalance (PHOENIX streams: B≈1.4% 
+# of frames, signing density ~0.71; binary Dice has no B-vs-I gradient) and would otherwise collapse toward all-I. Unlike 
+# the standalone UNet segmenter (bio_class_weights: null — its skip connections detect B natively and weighting makes that 
+# arch over-segment), this UNet-less transformer head keeps a light B:2. null = unweighted.
 bio_class_weights:
   O: 1.0   # not upweighted: long uncaptioned stretches are UNK-masked, residual O labels stay noisy
   B: 2.0
@@ -92,15 +97,19 @@ jitter:
     tail_loc_s: 0.0
     tail_scale_s: 0.8
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 8
-learning_rate: 5.0e-5
+batch_size: 16
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-epochs: 50
+epochs: 100
 eval_every_epochs: 3
 early_stopping:
-  monitor: val_loss
-  mode: min
-  patience: 5
+  # Select on dev BLEU, not val_loss. The composite val_loss (BIO + OPUT + CB) rises from translation-side
+  # overfitting on the small corpus while BLEU is still climbing, so a min-val_loss monitor restores an
+  # early, low-BLEU checkpoint (GFSLT-VLP likewise selects on dev BLEU, train_slt.py). Generation runs every
+  # eval anyway (max_translation_samples: 0).
+  monitor: val_translation_bleu4
+  mode: max
+  patience: 20
   min_delta: 0.0
   restore_best: true
 scheduler:
@@ -110,19 +119,28 @@ max_grad_norm: 1.0
 max_text_tokens: 128
 validation:
   max_translation_samples: 0   # 0 = score translation on ALL dev windows
-  diffusion_steps: 32
-block_size: 8
-diffusion_steps: 64
+  # No separate validation diffusion_steps: dev decoding uses the single top-level `diffusion_steps`
+  # below (one key for all components — train CB decode, dev eval, and inference all read it).
+block_size: 4
+# diffusion_steps is NOT a fixed denoising-step count: DCD/DMax terminate dynamically (commit until no mask
+# remains, then settle until convergence). infer/decode.py runs the COMMIT phase to completion regardless of
+# this value; diffusion_steps bounds only the DMax convergence-settle phase (Breakflag at 0.9 / no-change),
+# which normally finishes in 1-3 passes. Kept generous purely as a settle safety cap.
+diffusion_steps: 128
 dcd:
   window_type: sliding
-  tau_dec: 0.75
+  # DCD within-decode commit threshold. DCD's released runs (decode_algorithm.py DecodeConfig + run_all.sh)
+  # use decode_param=0.9 with the `threshold` selector everywhere; we match it. (DMax-SPD's 0.3-0.5 goes with
+  # the longest-confident-prefix selector = decode_algo: dmax_prefix, so only use ~0.5 if you switch to that.)
+  # decode_param is the operative selector threshold; tau_dec is its fallback — keep them equal.
+  tau_dec: 0.9
   initial_window_length: 8
   max_window_length: 64
   temperature: 0.0
   top_k:
   top_p:
   decode_algo: threshold    # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
-  decode_param: 0.75
+  decode_param: 0.9
   cache_type: none          # none is exact; prefix is implemented only when window_type: static.
   refresh_count: 16
   # NOTE: the DCD window is automatically clipped to the BD3LM attention block

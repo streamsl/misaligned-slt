@@ -70,15 +70,37 @@ class WindowSampler:
     @classmethod
     def from_stage2_config(cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict) -> "WindowSampler":
         ratios_cfg = stage2_cfg.get("mode_ratios", {})
+        fallback_ratios = ratios_cfg.get("fallback", {})
         source = ratios_cfg.get("source")
+        measured = None
         if source and Path(source).exists():
             loaded = json.loads(Path(source).read_text(encoding="utf-8"))
-            mode_ratios = loaded.get("mode_ratios", loaded)
-        else: mode_ratios = ratios_cfg.get("fallback", {})
+            measured = loaded.get("mode_ratios", loaded)
+
+        jitter_cfg = dict(stage2_cfg.get("jitter", {}))
+        mode_ratios = measured if measured is not None else fallback_ratios
+        # Degenerate-measurement guard. On a clean corpus (e.g. PHOENIX) the retrained segmenter is
+        # near-perfect, so Analysis A measures almost all Mode 1 (mode1~0.98) and a ~0-offset jitter CDF.
+        # Training on that = no misalignment = the robustness method learns nothing — here faithfulness to
+        # the spec's "derive ratios from Analysis A" becomes a bug, because that rule assumed a NONTRIVIAL
+        # measured error distribution. When the measurement is degenerate we fall back to the DESIGNED
+        # distribution (fallback ratios + fallback_laplace jitter) and warn; robustness is then evaluated
+        # by the segmenter-agnostic RQ1 controlled sweep, which never depended on a noisy segmenter.
+        threshold = float(ratios_cfg.get("degenerate_mode1_threshold", 0.9))
+        if measured is not None and normalized_mode_ratios(measured).get("mode1", 0.0) >= threshold:
+            print(
+                f"[sampler] WARNING: measured Analysis-A mode ratios are degenerate "
+                f"(mode1={normalized_mode_ratios(measured).get('mode1', 0.0):.3f} >= {threshold}); the "
+                f"segmenter is too clean to yield a useful misalignment distribution. Using the DESIGNED "
+                f"fallback ratios + jitter (configs/stage2_dlm.yaml: mode_ratios.fallback, jitter."
+                f"fallback_laplace). Robustness is evaluated via the controlled RQ1 sweep.", flush=True,
+            )
+            mode_ratios = fallback_ratios
+            jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
         fps_cfg = stage2_cfg.get("fps_aug", {})
         return cls(
-            records=records, jitter=JitterSampler.from_config(stage2_cfg.get("jitter", {})),
+            records=records, jitter=JitterSampler.from_config(jitter_cfg),
             mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
             seed=int(stage2_cfg.get("seed", 42)), mode2_subcase_weights=stage2_cfg.get("mode2_subcase_weights"),
             fps_aug_enabled=bool(fps_cfg.get("enabled", True)),

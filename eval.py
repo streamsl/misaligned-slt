@@ -132,6 +132,7 @@ def evaluate_predicted_events(
         latencies: list[float] = []
         matched_pairs = 0
 
+        matched_tious: list[float] = []
         for video_id in all_video_ids:
             pred_events = predicted.get(video_id, [])
             gold_events = gold.get(video_id, [])
@@ -142,7 +143,8 @@ def evaluate_predicted_events(
 
             matches = match_segments(pred_by_idx, gold_by_idx, threshold=float(threshold))
             matched_pairs += len(matches)
-            for pred_idx, gold_idx, _ in matches:
+            for pred_idx, gold_idx, match_tiou in matches:
+                matched_tious.append(float(match_tiou))
                 pred_event = pred_events[pred_idx]
                 gold_text = gold_events[gold_idx].text
                 if pred_event.text is not None and gold_text is not None:
@@ -170,6 +172,10 @@ def evaluate_predicted_events(
             },
             "matched_segments": matched_pairs,
             "matched_translation_pairs": len(pred_texts),
+            # Diagnostic: when this is ~1.0 the metrics are (correctly) identical across tIoU thresholds —
+            # the predicted spans localize almost exactly onto gold, so every threshold keeps the same matches.
+            # A flat severity/threshold curve there is a property of the predictions, not an eval bug.
+            "mean_matched_tiou": float(sum(matched_tious) / len(matched_tious)) if matched_tious else 0.0,
             "translation_metrics": compute_text_metrics(pred_texts, ref_texts),
             "emission_latency": latency_block,
         })
@@ -240,7 +246,13 @@ def _translate_window(
     frame_mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     if method == "stage2_baseline":
-        tokens = model.generate(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, max_new_tokens=max_tokens)
+        # Literature-comparison floor decodes with beam search like GFSLT-VLP (num_beams=4, train_slt.py); 
+        # The FSM methods below stay greedy to keep the AR-vs-DLM contrast clean.
+        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+        tokens = model.generate(
+            poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
+            max_new_tokens=max_tokens, num_beams=num_beams,
+        )
         confidence = torch.ones(tokens.shape, dtype=torch.float32, device=device)
     else:
         trans_cfg = inference_cfg.get("translation", {})
@@ -269,6 +281,67 @@ def _translate_window(
     return text, mean_conf
 
 
+@torch.no_grad()
+def _translate_windows_batched(
+    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
+    device: torch.device, inference_cfg: dict, method_cfg: dict,
+) -> list[tuple[str, float]]:
+    """Translate many windows in one forward. Variable-length windows are right-padded and the padding is
+    masked via `frame_mask` (the mBART encoder attends only to real frames; SPD/DCD reads per-row lengths),
+    so each row's result is identical to the unbatched `_translate_window` — this only removes the
+    one-window-at-a-time Python/GPU-launch overhead of the RQ1 sweep."""
+    if not items: return []
+    max_t = max(int(p.shape[0]) for p, _, _ in items)
+    pose_shape = tuple(items[0][0].shape[1:])
+    batch = len(items)
+    poses = torch.zeros((batch, max_t, *pose_shape), dtype=torch.float32)
+    timestamps = torch.zeros((batch, max_t), dtype=torch.float32)
+    frame_mask = torch.zeros((batch, max_t), dtype=torch.bool)
+
+    for i, (p, ts, start_s) in enumerate(items):
+        n = int(p.shape[0])
+        poses[i, :n] = torch.as_tensor(p, dtype=torch.float32)
+        timestamps[i, :n] = torch.as_tensor(ts - float(start_s), dtype=torch.float32)
+        frame_mask[i, :n] = True
+
+    poses, timestamps, frame_mask = poses.to(device), timestamps.to(device), frame_mask.to(device)
+    max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
+    if method == "stage2_baseline":
+        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+        tokens = model.generate(
+            poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
+            max_new_tokens=max_tokens, num_beams=num_beams,
+        )
+        texts = [t.strip() for t in tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)]
+        return [(t, 1.0) for t in texts]
+
+    trans_cfg = inference_cfg.get("translation", {})
+    dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
+    spd_cfg = method_cfg.get("spd", {})
+    _, tokens, confidence = model.generate_from_poses(
+        poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, max_text_tokens=max_tokens,
+        diffusion_steps=int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
+        tau_dec=float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
+        spd_top_k=int(spd_cfg.get("top_k", 1)),
+        spd_renormalize=bool(spd_cfg.get("renormalize", True)),
+        spd_revision=bool(spd_cfg.get("revision", True)),
+        temperature=float(dcd_cfg.get("temperature", 0.0)),
+        dcd_window_length=int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
+        dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
+        dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
+        dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
+        dcd_decode_param=dcd_cfg.get("decode_param", trans_cfg.get("commit_confidence_tau", 0.75)),
+        dcd_sample_top_k=None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
+        dcd_top_p=None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
+        dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
+        dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
+    )
+    texts = [t.strip() for t in tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)]
+    conf = confidence.detach().float().cpu()
+    confs = [float(conf[i].mean().item()) if conf[i].numel() else 0.0 for i in range(batch)]
+    return list(zip(texts, confs))
+
+
 def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ1 on test without --allow-test")
     data_cfg = load_yaml(args.data_config)
@@ -286,23 +359,34 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     inference_cfg = load_yaml(args.inference_config)
     model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
 
-    grouped: dict[tuple[float, float], dict[str, list]] = {}
-    rows = []
+    # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch
+    # near-uniform length so padding — and wasted compute — is minimal). Padding is masked, so batching does
+    # not change any per-window result, only throughput.
+    materialized: list[tuple[ControlledWindow, np.ndarray, np.ndarray]] = []
     for window in windows:
         record = records_by_id[window.video_id]
         poses, timestamps = load_pose_window(record.pose, window.window_start_s, window.window_end_s, normalize=True)
         if poses.shape[0] == 0: continue
-        prediction, confidence = _translate_window(
+        materialized.append((window, poses, timestamps))
+
+    materialized.sort(key=lambda wp: int(wp[1].shape[0]))
+    batch_size = max(1, int(rq_cfg.get("batch_size", 16)))
+    grouped: dict[tuple[float, float], dict[str, list]] = {}
+    rows = []
+    for start in range(0, len(materialized), batch_size):
+        chunk = materialized[start : start + batch_size]
+        results = _translate_windows_batched(
             model=model, tokenizer=tokenizer, method=args.method,
-            poses_np=poses, timestamps_np=timestamps, start_s=window.window_start_s,
+            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk],
             device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
         )
-        key = (window.delta_head_s, window.delta_tail_s)
-        grouped.setdefault(key, {"predictions": [], "references": [], "confidences": []})
-        grouped[key]["predictions"].append(prediction)
-        grouped[key]["references"].append(window.reference)
-        grouped[key]["confidences"].append(confidence)
-        rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence})
+        for (window, _poses, _ts), (prediction, confidence) in zip(chunk, results):
+            key = (window.delta_head_s, window.delta_tail_s)
+            grouped.setdefault(key, {"predictions": [], "references": [], "confidences": []})
+            grouped[key]["predictions"].append(prediction)
+            grouped[key]["references"].append(window.reference)
+            grouped[key]["confidences"].append(confidence)
+            rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence})
 
     severity = []
     for (dh, dt), values in sorted(grouped.items()):

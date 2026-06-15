@@ -8,6 +8,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutput
 
 from models.bio_head import RoPEBIOHead
+from models.checkpointing import load_visual_backbone_checked
 from models.dlm_decoder import OPUTBlockDiffusionDecoder
 from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart, resolve_decoder_start_id
 from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
@@ -74,6 +75,7 @@ class MisalignedSLTModel(nn.Module):
         self, gfslt_config: GFSLTConfig, tokenizer, decoder: str = "dlm",
         bio_hidden_dim: int = 384, bio_depth: int = 4, bio_nhead: int = 8,
         bio_dropout: float = 0.1, block_size: int = 8, bio_conv_stem_layers: int = 2,
+        vlp_checkpoint: str | None = None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -85,6 +87,15 @@ class MisalignedSLTModel(nn.Module):
             depth=bio_depth, nhead=bio_nhead, dropout=bio_dropout, num_classes=4, # 4 classes for B/I/O plus padding/UNK
             conv_stem_layers=bio_conv_stem_layers,  # local boundary inductive bias the UNet-less head lacks (see RoPEBIOHead)
         )
+        # Load the stage-1 VLP visual backbone into the SHARED mBART *before* the DLM MASK-token extension below.
+        # Order is load-bearing for the DLM arm on 2 counts:
+        #   1. The BD3LM substrate grows decoder.embed_tokens to vocab+1 (the MASK row, block_diffusion.py). Loading vocab-sized 
+        #      VLP checkpoint AFTER that raises a size mismatch, which load_state_dict(strict=False) does NOT suppress. 
+        #   2. OPUTBlockDiffusionDecoder.__init__ COPIES mBART's shared embedding + lm_head into its own vocab+1 embed/head at 
+        #      construction, so the VLP-pretrained (CMLM) decoder weights must already be in place to be inherited; otherwise 
+        #      the DLM arm starts from un-finetuned trimmed mBART while the AR arm gets VLP weights, breaking the AR-vs-DLM 
+        #      symmetry. (AR arm is vocab-stable, so order is immaterial for it — loading here ~ old post-construction load.)
+        if vlp_checkpoint: load_visual_backbone_checked(self.visual, vlp_checkpoint, name=f"stage2-{decoder}")
         if decoder == "dlm":
             adapter = _PostVLPTranslationNetwork(self.mbart, tokenizer)
             self.dlm_decoder = OPUTBlockDiffusionDecoder(adapter, block_size=block_size)
@@ -211,8 +222,8 @@ class MisalignedSLTModel(nn.Module):
           (`dlm_decoder.oput_forward`, or plain CE for the AR arm). A hard check raises if any other mode reaches the OPUT path.
         - **Mode 2a** (right-truncated): the **confidence-bound** term only — gated CE toward the model's own no-grad full-evidence decode, 
           at slots where that decode is reference-verified and the truncated decode is confidently disagreeing. Held off during 
-          ``confidence_bound_active=False`` (OPUT warmup) and weighted by ``cb_lambda``. See §6.3 and `dlm_decoder.remasked_logits` 
-          for why the CE gradient uses 1 cheap re-masked forward rather than back-prop through the decode.
+          ``confidence_bound_active=False`` (OPUT warmup) and weighted by ``cb_lambda``. See `dlm_decoder.remasked_logits` for why the CE 
+          gradient uses 1 cheap re-masked forward rather than back-prop through the decode.
         - **Mode 2b / 2c / Mode 4** (left/both-truncated, all-gap): no translation loss (the model must stay silent / not hallucinate text).
 
         Per-mode losses logged separately. Returns `Stage2LossOutput` with the total, the BIO and translation components, and a `logs` dict.
@@ -238,7 +249,7 @@ class MisalignedSLTModel(nn.Module):
                 )
                 for mode in ("mode1", "mode3"):
                     selected = [int(i) for i in idx_list if mode_names[int(i)] == mode]
-                    logs[f"translation_{mode}_count"] = post_vlp.new_tensor(float(len(selected)))
+                    # logs[f"translation_{mode}_count"] = post_vlp.new_tensor(float(len(selected)))
                     if selected: mode_to_indices[mode] = torch.tensor(selected, dtype=torch.long, device=post_vlp.device)
 
             if self.decoder_type == "ar":
@@ -254,18 +265,18 @@ class MisalignedSLTModel(nn.Module):
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=out.loss.dtype).clamp(min=1)
                         weighted_losses.append((out.loss, weight))
-                        logs[f"ar_{mode}_ce_loss"] = out.loss.detach()
+                        # logs[f"ar_{mode}_ce_loss"] = out.loss.detach()
 
                     total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
                     translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
-                    logs["ar_ce_loss"] = translation_loss.detach()
+                    # logs["ar_ce_loss"] = translation_loss.detach()
                 else:
                     out = self.mbart(
                         encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden[idx]),
                         attention_mask=enc_mask[idx], labels=labels[idx], return_dict=True,
                     )
                     translation_loss = out.loss
-                    logs["ar_ce_loss"] = out.loss.detach()
+                    # logs["ar_ce_loss"] = out.loss.detach()
             else:
                 labels = target_tokens["labels"].to(post_vlp.device)
                 if mode_to_indices:
@@ -284,15 +295,15 @@ class MisalignedSLTModel(nn.Module):
                         weighted_losses.append((dlm_out["translation_loss"], weight))
                         masked_weights.append((dlm_out["oput_masked_fraction"], weight))
 
-                        logs[f"oput_{mode}_loss"] = dlm_out["translation_loss"].detach()
-                        logs[f"oput_{mode}_mask_loss"] = dlm_out["oput_mask_loss"]
-                        logs[f"oput_{mode}_pred_loss"] = dlm_out["oput_pred_loss"]
-                        logs[f"oput_{mode}_masked_fraction"] = dlm_out["oput_masked_fraction"]
+                        # logs[f"oput_{mode}_loss"] = dlm_out["translation_loss"].detach()
+                        # logs[f"oput_{mode}_mask_loss"] = dlm_out["oput_mask_loss"]
+                        # logs[f"oput_{mode}_pred_loss"] = dlm_out["oput_pred_loss"]
+                        # logs[f"oput_{mode}_masked_fraction"] = dlm_out["oput_masked_fraction"]
 
                     total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
                     translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
-                    logs["oput_loss"] = translation_loss.detach()
-                    logs["oput_masked_fraction"] = (sum(value * weight for value, weight in masked_weights) / total_weight).detach()
+                    # logs["oput_loss"] = translation_loss.detach()
+                    # logs["oput_masked_fraction"] = (sum(value * weight for value, weight in masked_weights) / total_weight).detach()
                 else:
                     input_lengths = enc_mask[idx].sum(dim=1)
                     dlm_out = self.dlm_decoder.oput_forward(
@@ -302,8 +313,8 @@ class MisalignedSLTModel(nn.Module):
                         rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=oput_eos_supervision,
                     )
                     translation_loss = dlm_out["translation_loss"]
-                    logs["oput_loss"] = translation_loss.detach()
-                    logs["oput_masked_fraction"] = dlm_out["oput_masked_fraction"]
+                    # logs["oput_loss"] = translation_loss.detach()
+                    # logs["oput_masked_fraction"] = dlm_out["oput_masked_fraction"]
 
         if (confidence_bound_enabled and confidence_bound_active and batch.get("full_evidence") is not None
             and batch.get("full_evidence_indices") is not None and batch["full_evidence_indices"].numel() > 0
@@ -364,8 +375,8 @@ class MisalignedSLTModel(nn.Module):
                 )
                 else:
                     trunc_logits = None
-                    logs["confidence_bound_loss"] = post_vlp.new_tensor(0.0)
-                    logs["confidence_bound_active"] = post_vlp.new_tensor(0.0)
+                    # logs["confidence_bound_loss"] = post_vlp.new_tensor(0.0)
+                    # logs["confidence_bound_active"] = post_vlp.new_tensor(0.0)
             else:
                 with torch.no_grad():
                     full_tokens, _ = self.generate_from_post_vlp(full_post_vlp, full_mask, max_text_tokens=max(1, max_len - 1))
@@ -390,8 +401,8 @@ class MisalignedSLTModel(nn.Module):
                     enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
                 )
                 translation_loss = translation_loss + float(cb_lambda) * cb.loss
-                logs["confidence_bound_loss"] = cb.loss.detach()
-                logs["confidence_bound_active"] = cb.active_count.detach().float()
+                # logs["confidence_bound_loss"] = cb.loss.detach()
+                # logs["confidence_bound_active"] = cb.active_count.detach().float()
 
         if confidence_bound_enabled and confidence_bound_active and "trunc_decode_logits" in batch and "full_decode_tokens" in batch:
             cb = confidence_bound_loss(
@@ -403,10 +414,10 @@ class MisalignedSLTModel(nn.Module):
                 enabled=True, pad_token_id=self.tokenizer.pad_token_id,
             )
             translation_loss = translation_loss + float(cb_lambda) * cb.loss
-            logs["confidence_bound_loss"] = cb.loss.detach()
-            logs["confidence_bound_active"] = cb.active_count.detach().float()
+            # logs["confidence_bound_loss"] = cb.loss.detach()
+            # logs["confidence_bound_active"] = cb.active_count.detach().float()
 
         total = bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()
-        logs["total_loss"] = total.detach()
+        logs["loss"] = total.detach()
         return Stage2LossOutput(total, bio_loss, translation_loss, logs)

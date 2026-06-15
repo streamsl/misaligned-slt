@@ -102,6 +102,15 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
             else: self._init_wandb(wandb, wandb_cfg, cfg)
 
 
+    def _configure_history_paths(self, cfg: dict) -> None:
+        root = checkpoint_dir(cfg)
+        logging_cfg = dict(cfg.get("logging", {}) or {})
+        if logging_cfg.get("history", True) is False: return
+        out_dir = logging_cfg.get("dir") or root
+        if not out_dir: return
+        out_dir = Path(out_dir)
+        self._history_csv = out_dir / "history.csv"
+
     def _init_wandb(self, wandb, wandb_cfg: dict, cfg: dict) -> None:
         if wandb.run is not None: self._wandb = wandb; return
         init_kwargs = dict(
@@ -119,7 +128,6 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
             self._wandb = None
             try: wandb.finish()
             except Exception: pass  # noqa: BLE001
-
 
     @staticmethod
     def _numeric(row: dict) -> dict:
@@ -175,18 +183,6 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         if postfix: self._progress.set_postfix(postfix, refresh=False)
 
 
-    def _order_columns(self, keys) -> list[str]:
-        keys = list(keys)
-        train = sorted(k for k in keys if k.startswith("train_"))
-        val = sorted(k for k in keys if k.startswith("val_"))
-        for metric in (self.monitor, "val_loss"):
-            if metric in val: val.remove(metric); val.insert(0, metric)
-
-        tail = [k for k in ("took", "eta", "ckpt") if k in keys]
-        other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
-        return ["epoch", *train, *val, *other, *tail]
-
-
     def epoch_summary(
         self, epoch: int, train: dict, val: dict | None = None, 
         is_best: bool = False, saved_path: str | None = None
@@ -213,18 +209,29 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         row["eta"] = remaining_s
         row["ckpt"] = "saved" if saved_path else ""
         self._rows.append(row)
-        self._emit_epoch_row(row)
-        self._save_history_files()
 
+        text = json.dumps(row)
+        if self._progress is not None: self._progress.write(text)
+        else: print(text, flush=True)
+        self._save_history_files()
+        
         if self._progress is not None:
             postfix = {"epoch": f"{epoch}/{self.epochs}"}
             if val_num and self.monitor in val_num: postfix[self.monitor] = _fmt_metric(val_num[self.monitor])
             self._progress.set_postfix(postfix, refresh=False)
 
 
-    def _emit_epoch_row(self, row: dict) -> None:
-        columns = self._order_columns({key for hist in self._rows for key in hist})
-        self._write_metric_line([f"{col}={self._format_cell(row.get(col, '-'), col)}" for col in columns])
+    def _order_columns(self, keys) -> list[str]:
+        keys = list(keys)
+        train = sorted(k for k in keys if k.startswith("train_"))
+        val = sorted(k for k in keys if k.startswith("val_"))
+
+        train.remove("train_loss"); train.insert(0, "train_loss")
+        val.remove("val_loss"); val.insert(0, "val_loss")
+        tail = [k for k in ("took", "eta", "ckpt") if k in keys]
+        other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
+        return ["epoch", *train, *val, *other, *tail]
+
 
     def _format_cell(self, value, column: str) -> str:
         if value is None: return "-"
@@ -235,39 +242,30 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         if isinstance(value, (int, float)): return _fmt_metric(value)
         return str(value)
 
-    def _write_metric_line(self, values) -> None:
-        text = ", ".join(str(v) for v in values)
-        if self._progress is not None: self._progress.write(text)
-        else: print(text, flush=True)
-        
-    def _configure_history_paths(self, cfg: dict) -> None:
-        root = checkpoint_dir(cfg)
-        logging_cfg = dict(cfg.get("logging", {}) or {})
-        if logging_cfg.get("history", True) is False: return
-        out_dir = logging_cfg.get("dir") or root
-        if not out_dir: return
-        out_dir = Path(out_dir)
-        self._history_csv = out_dir / "history.csv"
 
     def _save_history_files(self) -> None:
         if not self._rows or self._history_csv is None: return
         self._history_csv.parent.mkdir(parents=True, exist_ok=True)
         columns = self._order_columns({key for row in self._rows for key in row})
+
         with self._history_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(columns)
             for row in self._rows: writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
 
+
     def save_history(self, path: str | Path) -> Path | None:
         if not self._rows: return None
         path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
         columns = self._order_columns({key for row in self._rows for key in row})
+
         with path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(columns)
             for row in self._rows:
                 writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
         return path
+
 
     def finish(self) -> None:
         if self._progress is not None:
@@ -281,12 +279,13 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
 
 def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, float]:
     if not rows: return {}
-    keys = sorted({key for row in rows for key in row if key not in {"epoch", "step", "lr"}})
-    out = {}
-    for key in keys:
-        values = [float(row[key]) for row in rows if key in row]
-        if values: out[f"{prefix}_{key}"] = sum(values) / len(values)
-    return out
+    sums, counts = {}, {}
+    for row in rows:
+        for key, value in row.items():
+            if key in {"epoch", "step", "lr"}: continue
+            sums[key] = sums.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+    return {f"{prefix}_{key}": sums[key] / counts[key] for key in sums if counts.get(key, 0) > 0}
 
 
 @dataclass

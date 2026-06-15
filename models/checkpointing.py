@@ -62,6 +62,29 @@ def load_visual_backbone(module: nn.Module, checkpoint: str | Path, strict: bool
     return list(missing), list(unexpected)
 
 
+def load_visual_backbone_checked(module: nn.Module, checkpoint: str | Path, name: str = "model") -> bool:
+    """Load the VLP visual backbone and LOUDLY report how much actually loaded.
+
+    The call sites used to swallow FileNotFoundError silently, so a missing/misnamed VLP checkpoint — or a
+    key-prefix mismatch that matches almost nothing — left the visual backbone RANDOMLY INITIALISED with no
+    signal at all. That is a prime suspect for weak features / overfitting / low BLEU. Returns True iff a
+    substantial fraction of the target params were populated.
+    """
+    target = len(module.state_dict())
+    try: missing, unexpected = load_visual_backbone(module, checkpoint, strict=False)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"{name} | WARNING: VLP checkpoint NOT loaded ({type(exc).__name__}: {exc}); the visual backbone is "
+              f"RANDOMLY INITIALISED — expect weak features and low BLEU. Path: {checkpoint}", flush=True)
+        return False
+    loaded = target - len(missing)
+    if loaded <= max(1, target // 2):
+        print(f"{name} | WARNING: VLP load matched only {loaded}/{target} params (key-prefix mismatch?); most of the "
+              f"visual backbone is RANDOM. unexpected={len(unexpected)}", flush=True)
+        return False
+    print(f"{name} | VLP backbone loaded: {loaded}/{target} params (missing={len(missing)}, unexpected={len(unexpected)}).", flush=True)
+    return True
+
+
 def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: bool = False) -> tuple[list[str], list[str]]:
     raw = _load_state(checkpoint)
     missing, unexpected = module.load_state_dict(raw, strict=strict)

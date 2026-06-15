@@ -121,13 +121,11 @@ def evaluate_stage1(model: PoseTextCLIP, loader: DataLoader, device: torch.devic
         total += int(labels.numel())
 
     if was_training: model.train()
-    metrics = {
-        "val_loss": sum(losses) / max(1, len(losses)),
-        "val_image_retrieval_acc": image_correct / max(1, total),
-        "val_text_retrieval_acc": text_correct / max(1, total),
-    }
+    metrics = {"val_loss": sum(losses) / max(1, len(losses))}
     if contrastive_losses: metrics["val_contrastive_loss"] = sum(contrastive_losses) / len(contrastive_losses)
     if cmlm_losses: metrics["val_cmlm_loss"] = sum(cmlm_losses) / len(cmlm_losses)
+    metrics["val_image_retrieval_acc"] = image_correct / max(1, total)
+    metrics["val_text_retrieval_acc"] = text_correct / max(1, total)
     return metrics
 
 

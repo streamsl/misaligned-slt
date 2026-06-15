@@ -12,11 +12,11 @@ from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records
 from models.gfslt import GFSLTConfig
 from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
-from models.checkpointing import load_visual_backbone, save_model_checkpoint
+from models.checkpointing import save_model_checkpoint
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from train.losses import bio_class_weight_tensor
-from metrics import bio_frame_metrics, compute_text_metrics
+from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
 from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
 
 
@@ -88,17 +88,17 @@ def build_stage2_components(
         )
         dev_loader = DataLoader(dev_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), collate_fn=collator)
 
+    # Pass the VLP checkpoint INTO the constructor so the visual backbone is loaded before the DLM MASK-token
+    # extension (see MisalignedSLTModel.__init__: avoids the 1731-vs-1732 size mismatch and lets the DLM decoder
+    # inherit the CMLM-pretrained mBART weights). For the AR arm this is equivalent to the old post-build load.
     model = MisalignedSLTModel(
         gfslt_config=build_gfslt_config(stage1_cfg, stage2_cfg), tokenizer=tokenizer,
         decoder=decoder or str(stage2_cfg.get("decoder", "dlm")),
         bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         block_size=int(stage2_cfg.get("block_size", 8)),
         bio_conv_stem_layers=int(stage2_cfg.get("bio_conv_stem_layers", 2)),
+        vlp_checkpoint=vlp_checkpoint(stage2_cfg),
     )
-    checkpoint = vlp_checkpoint(stage2_cfg)
-    if checkpoint:
-        try: load_visual_backbone(model.visual, checkpoint, strict=False)
-        except (FileNotFoundError, OSError): pass
     return Stage2Components(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader)
 
 
@@ -152,10 +152,14 @@ def evaluate_stage2(
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
-        row["loss"] = float(output.loss.detach().cpu().item())
+        # row["loss"] = float(output.loss.detach().cpu().item())
         post_vlp, mask, timestamps = model.visual.extract_post_vlp(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
         bio_logits = model.bio_head(post_vlp, timestamps_s=timestamps).logits
         row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
+        # Moryossef-style segmentation metrics on the in-model BIO head (frame macro-F1, frame-IoU, overlap
+        # segment-F1, one-to-one tIoU-matched segment-F1) under the inference decode (runs split at interior Bs),
+        # so stage-2 dev tracks span quality — what RQ2 streaming depends on — not just per-frame BIO accuracy.
+        row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
         rows.append(row)
 
         cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples
@@ -197,7 +201,7 @@ def evaluate_stage2(
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
         metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
-        metrics["val_translation_samples"] = float(len(pred_texts))
+        # metrics["val_translation_samples"] = float(len(pred_texts))
     return metrics
 
 
@@ -264,8 +268,8 @@ def train_stage2_epochs(
             amp.backward(output.loss)
             amp.clip_and_step(optimizer, model.parameters(), float(stage2_cfg.get("max_grad_norm", 1.0)))
             scheduler.step_batch()
-            row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
-            row.update({"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), "cb_active": float(cb_active)})
+            row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer)}
+            row.update({k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1})
             epoch_logs.append(row)
             logs.append(row)
             logger.log_step(epoch, step, row)

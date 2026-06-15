@@ -208,10 +208,15 @@ def spd_dcd_decode(
 ) -> SPDDecodeResult:
     """Cold-start SPD + DCD decode under a fixed-conditioning logits function.
 
-    `logits_fn(token_ids, soft_embeds)` must not change its visual conditioning across iterations. `soft_embeds` 
-    is the SPD state carried only inside this single decode call. DCD follows the original sliding-window update: 
-    decode confident masked positions inside [window_left, window_right), advance the left edge past fully decoded 
+    `logits_fn(token_ids, soft_embeds)` must not change its visual conditioning across iterations. `soft_embeds`
+    is the SPD state carried only inside this single decode call. DCD follows the original sliding-window update:
+    decode confident masked positions inside [window_left, window_right), advance the left edge past fully decoded
     positions, and extend the right edge according to the remaining masks in the current window.
+
+    Termination is DYNAMIC, matching DMax/DCD (neither uses a fixed total step count): the commit loop runs until
+    every generated slot is committed (DCD `window_*_decode` loops `while (tokens == mask).any()`; the threshold
+    rule commits >=1/step so it always terminates), bounded only by a non-termination safety cap. `steps`
+    (a.k.a. diffusion_steps) is NOT the commit budget — it bounds only the DMax convergence-settle phase below.
 
     `block_size` (when set) clips the DCD window to the attention block that contains `window_left`. Under a
     block-causal (BD3LM) model a position cannot attend to later blocks, so deferring a token until a later block
@@ -243,6 +248,13 @@ def spd_dcd_decode(
         # high-confidence MASK prediction wastes a decode slot (the write keeps the slot masked) and
         # pollutes the confidence the commit gate reads. Post-training the MASK logit is near-zero, so
         # this is cheap insurance, in-place on the fresh per-call logits tensor.
+        #
+        # Minor, deliberate divergence from DMax: DMax keeps MASK in the softmax DENOMINATOR (it computes
+        # x0_p over the full vocab and only filters MASK from the argmax/transfer set), whereas setting the
+        # logit to -inf also drops MASK from the denominator, so our reported confidence is fractionally
+        # higher. At the trained vocab (1732, MASK logit driven very negative because MASK is never a CE
+        # target) the excluded mass is ~0, so the difference is negligible; we accept it for the strict
+        # "no [MASK] id can ever be committed" guarantee. (The gap is only visible at toy vocab sizes.)
         logits[..., int(mask_token_id)] = torch.finfo(logits.dtype).min
         return logits
 
@@ -260,6 +272,13 @@ def spd_dcd_decode(
     if prompt_length >= full_length:
         return SPDDecodeResult(sequences=token_ids, confidence=torch.ones_like(token_ids, dtype=torch.float32), steps=0)
 
+    # DCD decodes `while (tokens == mask).any()` with NO step budget (decode_algorithm.py window_*_decode):
+    # the threshold rule commits >=1 token/step, so a decode finishes in <= (#generated slots) forwards.
+    # `steps` (diffusion_steps) is therefore NOT a commit budget here — capping the commit loop by it would
+    # force-fill the tail whenever a hard/long sequence needs more passes than `steps`, the premature
+    # termination DMax/DCD are built to avoid. We bound the commit loop only by a non-termination safety cap
+    # (>= worst-case forwards incl. static-window jumps); `steps` is spent on the DMax settle phase below.
+    commit_cap = 2 * (full_length - prompt_length) + int(window_length or full_length) + 1
     win_len = int(window_length or (full_length - prompt_length))
     win_len = max(1, min(win_len, full_length - prompt_length))
     max_win = int(max_window_length or full_length)
@@ -278,7 +297,7 @@ def spd_dcd_decode(
         accepts_window = len(logits_fn_params) >= 3
     except (TypeError, ValueError): accepts_window = cache_aware
 
-    for step in range(int(steps)):
+    for step in range(commit_cap):
         generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
         if not ((token_ids == int(mask_token_id)) & generated_region).any(): break
 
@@ -413,10 +432,13 @@ def spd_dcd_decode(
         eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, leftover, eos_token_id, pad_id)
         used_steps += 1
 
-    # DMax settle: after every position is committed, keep revising with current argmax until nothing changes or all confidences clear 0.9
-    # — 2 Breakflag conditions in DMax dInfer parallel_strategy.py decode_uniform (arXiv 2604.08302). Bounded by the remaining step budget.
+    # DMax settle: the convergence-stopped revision phase (DMax dInfer parallel_strategy.py decode_uniform
+    # Breakflag, arXiv 2604.08302 — stop when all active confidences clear `settle_confidence`=0.9 OR nothing
+    # changed). `steps` (diffusion_steps) bounds ONLY this phase, counted separately from the commit loop so a
+    # long commit can never starve the settle; in practice it converges in 1-3 passes far below the bound.
+    settle_used, settle_budget = 0, max(1, int(steps))
     if spd_revision and not ((token_ids == int(mask_token_id)) & generated_region).any():
-        while used_steps < int(steps):
+        while settle_used < settle_budget:
             revisable = (token_ids != int(mask_token_id)) & generated_region
             revisable &= positions_row < eos_pos.unsqueeze(1)
             if pad_id is not None: revisable &= token_ids != int(pad_id)
@@ -434,6 +456,7 @@ def spd_dcd_decode(
                 commit_logits = torch.where(changed.unsqueeze(-1), full_logits, commit_logits)
                 eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
 
+            settle_used += 1
             used_steps += 1
             if not changed.any() or bool((conf[revisable] >= float(settle_confidence)).all().item()): break
             soft_embeds, _ = spd_hybrid_embeddings(

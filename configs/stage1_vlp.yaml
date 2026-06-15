@@ -27,6 +27,13 @@ embed_dim: 1024
 hidden_size: 1024
 temporal_kernel: 3
 use_temporal_conv: false  # Keep per-frame features aligned with the BIO/streaming contract.
+# Scale post-VLP pose features by sqrt(d_model) before the mBART encoder, matching GFSLT-VLP's
+# gloss_free_model.embed_scale (models.py:307). HF MBartEncoder does NOT scale `inputs_embeds`, so with
+# false the pretrained encoder receives pose features at positional-embedding magnitude (positions then
+# compete with content). This is the SINGLE source of truth — the baseline / stage-2 / eval all inherit it,
+# so toggling it requires re-running stage-1 VLP and every downstream stage. A/B candidate for the low-BLEU
+# front-end (try true). Ref: arXiv 2307.14768.
+scale_embedding: false
 visual_padding: gfslt     # GFSLT-VLP repeats boundary frames with 8-frame halos.
 # GFSLT-VLP VLP = contrastive (SLRCLIP) + masked-text decoder reconstruction
 # (Text_Decoder / CMLM). The CMLM half pretrains the mBART decoder reused by both
@@ -40,7 +47,7 @@ cmlm:
   random_shuffle: false
   label_smoothing: 0.2  # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 64
+batch_size: 16
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 80
@@ -53,11 +60,11 @@ early_stopping:
   # overfitting, not a bug; the monitor just has to watch the right signal.)
   monitor: val_image_retrieval_acc
   mode: max
-  patience: 10
+  patience: 20
   min_delta: 0.0
   restore_best: true
 scheduler:
   type: cosine
-  eta_min: 1.0e-5
+  eta_min: 1.0e-6
 max_grad_norm: 1.0
 freeze_backbone: false

@@ -1,8 +1,7 @@
 from __future__ import annotations
-
-import math
 from dataclasses import dataclass
 from typing import Callable
+import math
 
 import torch
 import torch.nn.functional as F
@@ -333,12 +332,12 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     ) -> torch.Tensor:
         """Grad-bearing forward on a decoded sequence with selected slots re-masked.
 
-        The on-policy gradient surrogate for the confidence-bound term (§6.3): the gated slots (confident-disagreement under 
-        the no-grad truncated decode) are replaced by `[MASK]` while every other committed token stays in context, then one 
-        block-causal forward yields each gated slot's live conditional belief — exactly the distribution DCD would read had 
-        it deferred those slots. This is strictly closer to the decode's commit-time distribution than an all-`[MASK]` marginal 
-        (which corresponds to t = 1 corruption that OPUT's t ∈ [t_low, t_high] training never visits), and still costs one 
-        forward instead of back-prop through the ~64-step decode. No reference text enters the input, so P1 is preserved.
+        The on-policy gradient surrogate for the confidence-bound term: the gated slots (confident-disagreement under the no-grad 
+        truncated decode) are replaced by `[MASK]` while every other committed token stays in context, then 1 block-causal forward 
+        yields each gated slot's live conditional belief — exactly the distribution DCD would read had it deferred those slots. 
+        This is strictly closer to the decode's commit-time distribution than an all-`[MASK]` marginal (which corresponds to t = 1 
+        corruption that OPUT's t ∈ [t_low, t_high] training never visits), and still costs 1 forward instead of back-prop through 
+        the ~64-step decode. No reference text enters the input, so P1 is preserved.
         """
         enc_hidden, enc_mask = self._encode_visual(input_feature, input_lengths)
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()

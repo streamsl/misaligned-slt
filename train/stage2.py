@@ -46,6 +46,8 @@ def build_gfslt_config(stage1_cfg: dict, stage2_cfg: dict) -> GFSLTConfig:
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
         use_temporal_conv=bool(stage2_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
+        # Inherit from the stage-1 VLP config: the visual input scale must match what the VLP encoder was trained with.
+        scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
     )
 
 def build_stage2_components(
@@ -73,18 +75,19 @@ def build_stage2_components(
         visual_padding=str(stage2_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "gfslt"))),
     )
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(stage2_cfg.get("batch_size", 4)),
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collator,
+        train_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)),
+        shuffle=False, num_workers=0, collate_fn=collator,
     )
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
+        # Dev scoring should cover the same experimental unit as PHOENIX/GFSLT training: one
+        # sentence anchor, not one video. With len(dev_records), validation sampled only one fixed
+        # window per video and could miss most sentences.
+        dev_steps = sum(len(record.sentences) for record in dev_records)
         dev_dataset = StreamingWindowDataset(
             dev_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
-            steps_per_epoch=len(dev_records), deterministic=True,  # fixed dev windows across epochs
+            steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
         )
         dev_loader = DataLoader(dev_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), collate_fn=collator)
 
@@ -99,6 +102,9 @@ def build_stage2_components(
         bio_conv_stem_layers=int(stage2_cfg.get("bio_conv_stem_layers", 2)),
         vlp_checkpoint=vlp_checkpoint(stage2_cfg),
     )
+    if bool(stage2_cfg.get("freeze_backbone", False)):
+        n = model.visual.freeze_pose_backbone(freeze_projection=bool(stage2_cfg.get("freeze_projection", False)))
+        print(f"stage2 | froze pose backbone ({n / 1e6:.2f}M params; spec §4.1)", flush=True)
     return Stage2Components(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader)
 
 

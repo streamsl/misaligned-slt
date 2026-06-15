@@ -25,12 +25,12 @@ class PoseTextCLIP(nn.Module):
     Two objectives, exactly as GFSLT-VLP train_vlp_v2.py (arXiv 2307.14768):
       1. Sign-Text contrastive alignment (SLRCLIP): aligns the visual-encoder and
          text-encoder spaces with a symmetric InfoNCE loss.
-      2. Conditional masked LM (Text_Decoder): the mBART *decoder* reconstructs the clean sentence from the text 
-         encoder's representation of a noise-injected sentence. This is the half that pretrains the decoder reused 
-         at stage 2; the text encoder is detached here so CMLM trains only decoder + lm_head.
+      2. Conditional masked LM (Text_Decoder): the mBART *decoder* reconstructs the clean sentence from the text
+         encoder's representation of a noise-injected sentence. This is the half that pretrains decoder layers reused
+         at stage 2; downstream loading preserves base token/output embeddings to mirror GFSLT-VLP train_slt.py.
 
-    The CMLM decoder is `self.visual.mbart`'s decoder, so the pretrained decoder
-    travels with the saved visual backbone into both downstream arms.
+    The CMLM decoder is `self.visual.mbart`'s decoder, so its layer weights travel
+    with the saved visual backbone into both downstream arms.
     """
     def __init__(
         self, config: GFSLTConfig, projection_dim: int = 1024, logit_scale_init: float = 0.07,

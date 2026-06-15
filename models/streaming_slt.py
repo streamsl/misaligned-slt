@@ -91,11 +91,11 @@ class MisalignedSLTModel(nn.Module):
         # Order is load-bearing for the DLM arm on 2 counts:
         #   1. The BD3LM substrate grows decoder.embed_tokens to vocab+1 (the MASK row, block_diffusion.py). Loading vocab-sized 
         #      VLP checkpoint AFTER that raises a size mismatch, which load_state_dict(strict=False) does NOT suppress. 
-        #   2. OPUTBlockDiffusionDecoder.__init__ COPIES mBART's shared embedding + lm_head into its own vocab+1 embed/head at 
-        #      construction, so the VLP-pretrained (CMLM) decoder weights must already be in place to be inherited; otherwise 
-        #      the DLM arm starts from un-finetuned trimmed mBART while the AR arm gets VLP weights, breaking the AR-vs-DLM 
-        #      symmetry. (AR arm is vocab-stable, so order is immaterial for it — loading here ~ old post-construction load.)
-        if vlp_checkpoint: load_visual_backbone_checked(self.visual, vlp_checkpoint, name=f"stage2-{decoder}")
+        #   2. OPUTBlockDiffusionDecoder.__init__ copies the current mBART decoder into its vocab+1 substrate. We load the
+        #      VLP-trained decoder layers first, while preserving the base token embeddings/lm_head just as GFSLT-VLP
+        #      train_slt.py restores decoder.embed_tokens/embed_positions from the transformer checkpoint.
+        if vlp_checkpoint:
+            load_visual_backbone_checked(self.visual, vlp_checkpoint, name=f"stage2-{decoder}", preserve_decoder_io=True)
         if decoder == "dlm":
             adapter = _PostVLPTranslationNetwork(self.mbart, tokenizer)
             self.dlm_decoder = OPUTBlockDiffusionDecoder(adapter, block_size=block_size)

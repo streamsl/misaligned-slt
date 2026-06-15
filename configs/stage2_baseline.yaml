@@ -13,6 +13,11 @@ wandb:
 use_temporal_conv: false
 visual_padding: gfslt
 training_distribution: clean_pretrimmed
+# Freeze the from-scratch CoSign pose backbone in stage 2. The largest overfitting route on a small corpus is 
+# end-to-end fine-tuning of the from-scratch GCN; freezing it after VLP is the spec-default regularizer. 
+# Tradeoff: it caps stage-2 on the VLP feature quality, so A/B against false when VLP retrieval is weak.
+freeze_backbone: false
+freeze_projection: false # Freezes the VLP sign projection
 # GFSLT-VLP translation CE uses label_smoothing=0.2 (train_slt.py); HF mBART's internal loss has none.
 # Applied to the clean AR baseline so its loss matches the GFSLT recipe it is benchmarked against.
 label_smoothing: 0.2
@@ -25,7 +30,7 @@ eval_every_epochs: 1
 early_stopping:
   monitor: val_translation_bleu4
   mode: max
-  patience: 10
+  patience: 20
   min_delta: 0.0
   restore_best: true
 scheduler:

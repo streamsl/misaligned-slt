@@ -77,6 +77,7 @@ def build_stage1_components(
         temporal_kernel=int(cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(cfg),  # one trimmed mBART for text encoder + visual side
         use_temporal_conv=bool(cfg.get("use_temporal_conv", False)),
+        scale_embedding=bool(cfg.get("scale_embedding", False)),  # stage-1 is the source of truth; stage-2 inherits it
     )
     model = PoseTextCLIP(
         gfslt_cfg, projection_dim=int(cfg.get("embed_dim", 1024)),
@@ -126,6 +127,7 @@ def evaluate_stage1(model: PoseTextCLIP, loader: DataLoader, device: torch.devic
     if cmlm_losses: metrics["val_cmlm_loss"] = sum(cmlm_losses) / len(cmlm_losses)
     metrics["val_image_retrieval_acc"] = image_correct / max(1, total)
     metrics["val_text_retrieval_acc"] = text_correct / max(1, total)
+    metrics["val_logit_scale"] = float(model.logit_scale.detach().exp().clamp(max=100).cpu().item())
     return metrics
 
 
@@ -173,6 +175,7 @@ def train_stage1_epochs(
                 "contrastive_loss": float(out.contrastive_loss.detach().cpu().item())
                 if out.contrastive_loss is not None else float("nan"),
                 "cmlm_loss": float(out.cmlm_loss.detach().cpu().item()) if out.cmlm_loss is not None else float("nan"),
+                "logit_scale": float(model.logit_scale.detach().exp().clamp(max=100).cpu().item()),
                 "lr": scheduler.lr(optimizer),
             }
             epoch_logs.append(row)

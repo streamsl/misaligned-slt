@@ -26,6 +26,14 @@ class GFSLTConfig:
     num_keypoints: int = 77 # Selected keypoints from CoSign
     input_channels: int = 3 # x, y, confidence
     use_temporal_conv: bool = False
+    # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's
+    # gloss_free_model does for its visual sign embeddings (models.py:307, gated by config
+    # ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to `inputs_embeds`
+    # (only to the embed_tokens path), so the pretrained encoder expects pose features at token-
+    # embedding magnitude (~sqrt(d)), not positional-embedding magnitude. False reproduces the prior
+    # 1.0 behaviour. MUST be identical across stage-1 VLP and stage-2 (sourced from the stage-1 config)
+    # or the VLP-trained encoder sees out-of-distribution input magnitude in stage 2.
+    scale_embedding: bool = False
 
 
 def _sanitize_generation_config(model: MBartForConditionalGeneration) -> MBartForConditionalGeneration:
@@ -153,7 +161,22 @@ class GFSLTVisualBackbone(nn.Module): # Reusable visual front end: CoSign -> VLP
         self.mbart = mbart if mbart is not None else load_gfslt_mbart(config.mbart_name)
         self.pose_frontend = PoseFeatureExtractor(config)
         self.sign_emb = VisualEncoder(self.mbart.config.d_model, self.pose_frontend.output_dim)
-        self.input_embed_scale = 1.0
+        # sqrt(d_model) brings pose features into the token-embedding magnitude the pretrained mBART
+        # encoder expects (GFSLT-VLP gloss_free_model.embed_scale); 1.0 = prior behaviour. See GFSLTConfig.
+        self.input_embed_scale = self.mbart.config.d_model**0.5 if config.scale_embedding else 1.0
+
+    def freeze_pose_backbone(self, freeze_projection: bool = False) -> int:
+        """Freeze the from-scratch CoSign pose backbone for stage 2. On a small corpus, end-to-end fine-tuning
+        of the from-scratch GCN can be the main overfitting route. The mBART encoder/decoder stay trainable;
+        `freeze_projection=True` additionally freezes the VLP sign projection. Returns # frozen params."""
+        frozen = 0
+        modules = [self.pose_frontend] + ([self.sign_emb] if freeze_projection else [])
+        for module in modules:
+            for p in module.parameters():
+                if p.requires_grad:
+                    p.requires_grad_(False)
+                    frozen += p.numel()
+        return frozen
 
     def extract_post_vlp(
         self, poses: torch.Tensor, frame_mask: torch.Tensor,

@@ -13,6 +13,8 @@ wandb:
 use_temporal_conv: false
 visual_padding: gfslt
 training_distribution: misalignment_sampler
+freeze_backbone: false  # Freeze the from-scratch CoSign pose backbone in stage 2 as an overfitting regularizer.
+freeze_projection: false
 lambda_trans: 1.0
 oput:
   # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
@@ -101,7 +103,7 @@ batch_size: 16
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100
-eval_every_epochs: 3
+eval_every_epochs: 1
 early_stopping:
   # Select on dev BLEU, not val_loss. The composite val_loss (BIO + OPUT + CB) rises from translation-side
   # overfitting on the small corpus while BLEU is still climbing, so a min-val_loss monitor restores an

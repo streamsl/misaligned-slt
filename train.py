@@ -115,7 +115,8 @@ if __name__ == "__main__":
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(
-            components.model.parameters(), lr=float(base_cfg.get("learning_rate", 5e-4)),
+            [p for p in components.model.parameters() if p.requires_grad],  # skip a frozen backbone
+            lr=float(base_cfg.get("learning_rate", 5e-4)),
             weight_decay=float(base_cfg.get("weight_decay", 1e-4)),
         )
         logs = train_baseline_epochs(
@@ -140,7 +141,8 @@ if __name__ == "__main__":
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(
-            components.model.parameters(), lr=float(stage2_cfg.get("learning_rate", 3e-5)),
+            [p for p in components.model.parameters() if p.requires_grad],  # skip a frozen backbone
+            lr=float(stage2_cfg.get("learning_rate", 3e-5)),
             weight_decay=float(stage2_cfg.get("weight_decay", 1e-4)),
         )
         logs = train_stage2_epochs(

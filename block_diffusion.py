@@ -162,8 +162,15 @@ class BlockDiffusionDecoder(nn.Module):
         self._prepare_feature_inputs = translation_network.prepare_feature_inputs
         self.mbart_encoder = mbart.model.encoder   # MBartEncoder
         self.mbart_decoder = mbart.model.decoder   # MBartDecoder layers + norms
-        self.embed_scale = translation_network.input_embed_scale  # sqrt(d_model)
         self.d_model = mbart.config.d_model
+        # TEXT decoder token-embedding scale MUST follow mBART's own pretraining convention (`config.scale_embedding` 
+        # is True for mbart-large-cc25 -> sqrt(d_model)). The AR arm uses HF's decoder, which applies this internally; 
+        # the DLM decoder bypasses MBartDecoder.forward (see `_decode`) and so must apply it explicitly. Before I read 
+        # translation_network.input_embed_scale (= 1.0), which silently fed token embeddings at ~1/sqrt(d) of the pretrained 
+        # magnitude — out of distribution for the pretrained decoder AND an unfair AR-vs-DLM mismatch (the `# sqrt(d_model)`
+        # comment here recorded the intended value; the adapter supplied 1.0). This is the text-token scale, independent of 
+        # the VISUAL input scale (GFSLTConfig.scale_embedding).
+        self.embed_scale = self.d_model**0.5 if getattr(mbart.config, "scale_embedding", False) else 1.0
 
         # ── Tokenizer info ───────────────────────────────────────────────────
         self.text_tokenizer = translation_network.text_tokenizer

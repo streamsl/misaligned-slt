@@ -65,14 +65,19 @@ def build_baseline_components(
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
         use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
+        # Inherit from the stage-1 VLP config so the baseline encoder sees the same input scale VLP trained.
+        scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
     )
     model = CleanARSLTModel(
         gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer),
         label_smoothing=float(base_cfg.get("label_smoothing", 0.0)),
     )
     checkpoint = vlp_checkpoint(base_cfg)
-    if checkpoint: load_visual_backbone_checked(model.visual, str(checkpoint), name="baseline")
+    if checkpoint: load_visual_backbone_checked(model.visual, str(checkpoint), name="baseline", preserve_decoder_io=True)
     else: print("baseline | WARNING: no checkpoint.from_vlp set; visual backbone trains from scratch.", flush=True)
+    if bool(base_cfg.get("freeze_backbone", False)):
+        n = model.visual.freeze_pose_backbone(freeze_projection=bool(base_cfg.get("freeze_projection", False)))
+        print(f"baseline | froze pose backbone ({n / 1e6:.2f}M params; spec §4.1)", flush=True)
     return BaselineComponents(model=model, tokenizer=tokenizer, train_loader=loader, dev_loader=dev_loader)
 
 

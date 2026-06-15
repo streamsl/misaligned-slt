@@ -81,6 +81,13 @@ class StreamingSLTRunner:
             hysteresis_strides=hysteresis_strides,
             token_confidence_tau=token_confidence_tau,
         )
+        # Why-did-it-(not)-commit counters, accumulated across all run() calls. A low streaming recall with
+        # near-perfect frame BIO is almost always the gate suppressing emission; comparing spans_seen vs
+        # boundary_ok vs translation_ok pinpoints which signal blocks (usually translation_ok on a weak model).
+        self.gate_stats: dict[str, int] = {}
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        self.gate_stats[key] = self.gate_stats.get(key, 0) + int(n)
 
     def _decode_span(self, post_vlp: torch.Tensor, mask: torch.Tensor, span_slice: slice):
         if self.decode_conditioning == "span": post_vlp, mask = post_vlp[:, span_slice], mask[:, span_slice]
@@ -123,6 +130,7 @@ class StreamingSLTRunner:
             b_idx = active_span_start(bio_tags)
             self.commit_gate.reset()
             if b_idx is None: return None
+            self._bump("committed"); self._bump("forced_commit")
 
             s_idx, last_idx = b_idx, int(bio_tags.numel()) - 1
             tokens, confidence = self._decode_span(post_vlp, mask, slice(s_idx, last_idx + 1))
@@ -135,9 +143,14 @@ class StreamingSLTRunner:
         s_idx, closing_o_idx = span
         tokens, confidence = self._decode_span(post_vlp, mask, slice(s_idx, max(s_idx + 1, closing_o_idx)))
         decision = self.commit_gate.update(bio_tags, token_confidence=confidence[0])
+        self._bump("spans_seen")
+        if decision.boundary_stable: self._bump("boundary_ok")
+        if decision.translation_confident: self._bump("translation_ok")
         forced = buffer_full and not decision.should_commit
         if not decision.should_commit and not forced: return None
 
+        self._bump("committed")
+        if forced: self._bump("forced_commit")
         self.commit_gate.reset()
         return StreamingEvent(
             start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, closing_o_idx].item()),

@@ -246,12 +246,12 @@ def compute_text_metrics(
     predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a", 
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation"
 ) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
-    if not predictions: return {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
+    scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
+    if not predictions: return {f"{prefix}_{key}": value for key, value in scores.items()}
     refs_nested = [[ref] for ref in references]
     cjk_predictions = [_char_split_cjk(pred) for pred in predictions]
     cjk_references = [_char_split_cjk(ref) for ref in references]
     cjk_refs_nested = [[ref] for ref in cjk_references]
-    scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
 
     bleu = _load_evaluate_metric("sacrebleu")
     if bleu is not None:

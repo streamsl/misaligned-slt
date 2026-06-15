@@ -164,18 +164,28 @@ def evaluate_predicted_events(
                 "p90_latency_s": float(arr[min(len(arr) - 1, int(round(0.9 * (len(arr) - 1))))]),
                 "n": len(arr),
             }
+        tiou_block = {}
+        if matched_tious:
+            tiou_arr = np.asarray(matched_tious, dtype=np.float64)
+            tiou_block = {
+                "min": float(np.min(tiou_arr)),
+                "p25": float(np.percentile(tiou_arr, 25)),
+                "median": float(np.median(tiou_arr)),
+                "p75": float(np.percentile(tiou_arr, 75)),
+                "max": float(np.max(tiou_arr)),
+            }
         results.append({
             "tiou_threshold": float(threshold),
-            "segmentation": {
-                "precision": precision, "recall": recall,
-                "f1": f1, "matches": float(matched_pairs),
-            },
+            "segmentation": {"precision": precision, "recall": recall, "f1": f1, "matches": float(matched_pairs)},
             "matched_segments": matched_pairs,
+            "unmatched_predicted": total_pred - matched_pairs,
+            "unmatched_gold": total_gold - matched_pairs,
             "matched_translation_pairs": len(pred_texts),
             # Diagnostic: when this is ~1.0 the metrics are (correctly) identical across tIoU thresholds —
             # the predicted spans localize almost exactly onto gold, so every threshold keeps the same matches.
             # A flat severity/threshold curve there is a property of the predictions, not an eval bug.
             "mean_matched_tiou": float(sum(matched_tious) / len(matched_tious)) if matched_tious else 0.0,
+            "matched_tiou_distribution": tiou_block,
             "translation_metrics": compute_text_metrics(pred_texts, ref_texts),
             "emission_latency": latency_block,
         })
@@ -210,6 +220,8 @@ def _gfslt_config(stage1_cfg: dict, method_cfg: dict) -> GFSLTConfig:
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART training used
         use_temporal_conv=bool(method_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
+        # Must match the trained checkpoint: sourced from the stage-1 VLP config like the trainers.
+        scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
     )
 
 
@@ -471,6 +483,17 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             text=tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True).strip(),
             flagged_partial=bool(ev.flagged_partial), commit_time_s=float(ev.commit_time_s),
         ) for ev in events]
+
+    # Why-did-it-(not)-commit summary. Low streaming recall with near-perfect frame BIO is the gate
+    # suppressing emission; this shows which signal blocks. spans_seen = complete spans the FSM saw;
+    # boundary_ok / translation_ok = how many passed each gate signal; committed = actual emissions.
+    s = runner.gate_stats
+    seen = s.get("spans_seen", 0)
+    if seen: print(
+        f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} "
+        f"translation_ok={s.get('translation_ok',0)} committed={s.get('committed',0)} "
+        f"forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
+        f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True)
     return predicted
 
 

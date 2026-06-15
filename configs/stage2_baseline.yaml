@@ -13,15 +13,18 @@ wandb:
 use_temporal_conv: false
 visual_padding: gfslt
 training_distribution: clean_pretrimmed
+# GFSLT-VLP translation CE uses label_smoothing=0.2 (train_slt.py); HF mBART's internal loss has none.
+# Applied to the clean AR baseline so its loss matches the GFSLT recipe it is benchmarked against.
+label_smoothing: 0.2
 mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
 learning_rate: 5.0e-4
 weight_decay: 1.0e-4
 epochs: 50
-eval_every_epochs: 5
+eval_every_epochs: 1
 early_stopping:
-  monitor: val_loss
-  mode: min
+  monitor: val_translation_bleu4
+  mode: max
   patience: 10
   min_delta: 0.0
   restore_best: true
@@ -32,4 +35,7 @@ max_grad_norm: 1.0
 max_text_tokens: 128
 validation:
   max_translation_samples: 0   # 0 = score translation on ALL dev sentences
-  max_text_tokens: 128
+  # GFSLT-VLP reports dev BLEU with beam search (num_beams=4, train_slt.py:430). The 22.12 dev BLEU4 is a
+  # beam-4 number; greedy (the AR-vs-DLM default) costs several BLEU. The standalone clean baseline is
+  # the literature-comparison floor, so it decodes with beams; the stage-2 AR/DLM arms stay greedy.
+  num_beams: 4

@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
 from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel, resolve_decoder_start_id
-from models.checkpointing import load_visual_backbone, save_model_checkpoint
+from models.checkpointing import load_visual_backbone_checked, save_model_checkpoint
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
@@ -66,12 +66,13 @@ def build_baseline_components(
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
         use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
     )
-    model = CleanARSLTModel(gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer))
+    model = CleanARSLTModel(
+        gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer),
+        label_smoothing=float(base_cfg.get("label_smoothing", 0.0)),
+    )
     checkpoint = vlp_checkpoint(base_cfg)
-    if checkpoint:
-        path = str(checkpoint)
-        try: load_visual_backbone(model.visual, path, strict=False)
-        except (FileNotFoundError, OSError): pass
+    if checkpoint: load_visual_backbone_checked(model.visual, str(checkpoint), name="baseline")
+    else: print("baseline | WARNING: no checkpoint.from_vlp set; visual backbone trains from scratch.", flush=True)
     return BaselineComponents(model=model, tokenizer=tokenizer, train_loader=loader, dev_loader=dev_loader)
 
 
@@ -110,6 +111,7 @@ def evaluate_baseline(
                 frame_mask=batch["frame_mask"][:take].to(device),
                 timestamps_s=batch["timestamps_s"][:take].to(device),
                 max_new_tokens=int(validation_cfg.get("max_text_tokens", cfg.get("max_text_tokens", 128))),
+                num_beams=int(validation_cfg.get("num_beams", 4)),  # GFSLT-VLP dev BLEU is beam-4 (train_slt.py)
             )
             pred_texts.extend(tokenizer.batch_decode(generated.detach().cpu(), skip_special_tokens=True))
             ref_texts.extend([str(text) for text in batch["texts"][:take]])
@@ -118,7 +120,7 @@ def evaluate_baseline(
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
         metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
-        metrics["val_translation_samples"] = float(len(pred_texts))
+        # metrics["val_translation_samples"] = float(len(pred_texts))
     return metrics
 
 

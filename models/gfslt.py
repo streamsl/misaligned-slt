@@ -28,10 +28,30 @@ class GFSLTConfig:
     use_temporal_conv: bool = False
 
 
+def _sanitize_generation_config(model: MBartForConditionalGeneration) -> MBartForConditionalGeneration:
+    """Force greedy, deterministic decoding and strip None generation params.
+
+    Two reasons:
+      1. Crash guard — the depth/vocab-trimmed cc25 carries num_beams / num_return_sequences = None in its
+         generation_config; HF generate() evaluates max(num_beams, num_return_sequences)
+         (transformers generation/utils.py), which raises "'>' not supported between 'int' and 'NoneType'".
+      2. Fair AR-vs-DLM comparison — the DLM arm decodes greedily (SPD/DCD at temperature 0), so the AR
+         arm must decode greedily too. Inheriting cc25's beam search (num_beams=5) would confound the
+         diffusion-vs-AR test by handing the AR baseline a free decoding advantage. Beam search can still be
+         requested explicitly per-call (kwargs override generation_config) for a dedicated final-number run.
+    """
+    gen_cfg = model.generation_config
+    gen_cfg.num_beams = 1
+    gen_cfg.num_return_sequences = 1
+    gen_cfg.do_sample = False
+    gen_cfg.early_stopping = False
+    return model
+
+
 def load_gfslt_mbart(model_path: str) -> MBartForConditionalGeneration:
     # Load full mBART even when the trimmed checkpoint was saved decoder-only.
     path = Path(model_path)
-    if not path.exists(): return MBartForConditionalGeneration.from_pretrained(model_path)
+    if not path.exists(): return _sanitize_generation_config(MBartForConditionalGeneration.from_pretrained(model_path))
     config = MBartConfig.from_pretrained(model_path)
     config.is_encoder_decoder = True
     config.is_decoder = False
@@ -41,12 +61,12 @@ def load_gfslt_mbart(model_path: str) -> MBartForConditionalGeneration:
     bin_path = path / "pytorch_model.bin"
     if safetensors_path.exists() and load_safetensors is not None: state_dict = load_safetensors(str(safetensors_path))
     elif bin_path.exists(): state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
-    else: return MBartForConditionalGeneration.from_pretrained(model_path)
+    else: return _sanitize_generation_config(MBartForConditionalGeneration.from_pretrained(model_path))
 
     if "model.decoder.embed_tokens.weight" in state_dict and "model.shared.weight" not in state_dict:
         state_dict["model.shared.weight"] = state_dict["model.decoder.embed_tokens.weight"]
     model.load_state_dict(state_dict, strict=False)
-    return model
+    return _sanitize_generation_config(model)
 
 
 class TemporalConv1D(nn.Module): # Legacy GFSLT temporal convolution, optional in this project.
@@ -168,23 +188,34 @@ def resolve_decoder_start_id(tokenizer) -> int | None:
 
 
 class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
-    def __init__(self, config: GFSLTConfig, decoder_start_token_id: int | None = None):
+    def __init__(self, config: GFSLTConfig, decoder_start_token_id: int | None = None, label_smoothing: float = 0.0):
         super().__init__()
         mbart = load_gfslt_mbart(config.mbart_name)
         self.visual = GFSLTVisualBackbone(config, mbart=mbart)
         self.mbart = self.visual.mbart
         # Language-code generation start (see resolve_decoder_start_id); None keeps HF defaults.
         self.decoder_start_token_id = decoder_start_token_id
+        # GFSLT-VLP's translation CE uses label_smoothing=0.2 (train_slt.py); HF mBART's internal loss has none.
+        self.label_smoothing = float(label_smoothing)
 
     def forward(
         self, poses: torch.Tensor, frame_mask: torch.Tensor,
         labels: torch.Tensor, timestamps_s: torch.Tensor | None = None,
     ):
         _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
-        return self.mbart(
+        out = self.mbart(
             encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
             attention_mask=enc_mask, labels=labels, return_dict=True,
         )
+        if self.label_smoothing > 0.0:
+            # Recompute the CE with label smoothing from the (already label-aligned) logits, matching GFSLT-VLP's
+            # external criterion. -100 is the collator's pad-ignore index, identical to HF's default ignore.
+            out.loss = F.cross_entropy(
+                out.logits.reshape(-1, out.logits.shape[-1]),
+                labels.reshape(-1).to(out.logits.device),
+                ignore_index=-100, label_smoothing=self.label_smoothing,
+            )
+        return out
 
     @torch.no_grad()
     def generate(

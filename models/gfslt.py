@@ -26,12 +26,10 @@ class GFSLTConfig:
     num_keypoints: int = 77 # Selected keypoints from CoSign
     input_channels: int = 3 # x, y, confidence
     use_temporal_conv: bool = False
-    # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's
-    # gloss_free_model does for its visual sign embeddings (models.py:307, gated by config
-    # ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to `inputs_embeds`
-    # (only to the embed_tokens path), so the pretrained encoder expects pose features at token-
-    # embedding magnitude (~sqrt(d)), not positional-embedding magnitude. False reproduces the prior
-    # 1.0 behaviour. MUST be identical across stage-1 VLP and stage-2 (sourced from the stage-1 config)
+    # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's gloss_free_model does for its visual 
+    # sign embeddings (models.py:307, gated by config ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to 
+    # `inputs_embeds` (only to the embed_tokens path), so the pretrained encoder expects pose features at token- embedding magnitude 
+    # (~sqrt(d)), not positional-embedding magnitude. MUST be identical across stage-1 VLP and stage-2 (sourced from stage-1 config)
     # or the VLP-trained encoder sees out-of-distribution input magnitude in stage 2.
     scale_embedding: bool = False
 
@@ -40,13 +38,12 @@ def _sanitize_generation_config(model: MBartForConditionalGeneration) -> MBartFo
     """Force greedy, deterministic decoding and strip None generation params.
 
     Two reasons:
-      1. Crash guard — the depth/vocab-trimmed cc25 carries num_beams / num_return_sequences = None in its
-         generation_config; HF generate() evaluates max(num_beams, num_return_sequences)
-         (transformers generation/utils.py), which raises "'>' not supported between 'int' and 'NoneType'".
-      2. Fair AR-vs-DLM comparison — the DLM arm decodes greedily (SPD/DCD at temperature 0), so the AR
-         arm must decode greedily too. Inheriting cc25's beam search (num_beams=5) would confound the
-         diffusion-vs-AR test by handing the AR baseline a free decoding advantage. Beam search can still be
-         requested explicitly per-call (kwargs override generation_config) for a dedicated final-number run.
+      1. Crash guard — the depth/vocab-trimmed cc25 carries num_beams / num_return_sequences = None in its generation_config; 
+         HF generate() evaluates max(num_beams, num_return_sequences) (transformers generation/utils.py), which raises "'>' 
+         not supported between 'int' and 'NoneType'".
+      2. Fair AR-vs-DLM comparison — the DLM arm decodes greedily (SPD/DCD at temperature 0), so AR arm must decode greedily too. 
+         Inheriting cc25's beam search (num_beams=5) will confound diffusion-vs-AR test by handing AR baseline a free decoding advantage. 
+         Beam search can still be requested explicitly per-call (kwargs override generation_config) for a dedicated final-number run.
     """
     gen_cfg = model.generation_config
     gen_cfg.num_beams = 1
@@ -252,3 +249,32 @@ class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
             decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
             **kwargs,
         )
+
+    @torch.no_grad()
+    def generate_with_confidence(
+        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        max_new_tokens: int = 128, decoder_start_token_id: int | None = None, **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate, then score the model's REAL confidence in its own output.
+
+        Returns (sequences, mean_confidence[B]) where mean_confidence[i] is mean softmax prob the model assigns to tokens it produced 
+        for row i, via 1 teacher-forced pass over generated sequence (decode-strategy-agnostic: identical definition for greedy & beam).
+        """
+        _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
+        sequences = self.mbart.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_new_tokens,
+            decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
+            **kwargs,
+        )
+        if sequences.shape[1] < 2: return sequences, torch.ones(sequences.shape[0], dtype=torch.float32, device=sequences.device)
+        # HF generate() EXPANDS the encoder_outputs it receives to batch*num_beams in place (16 -> 16*4=64),
+        # so it cannot be reused. Build a fresh BaseModelOutput from the un-expanded enc_hidden for this pass.
+        out = self.mbart(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+            decoder_input_ids=sequences[:, :-1], use_cache=False, return_dict=True,
+        )
+        gen = sequences[:, 1:]
+        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, gen.unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
+        valid = (gen != int(self.mbart.config.pad_token_id))
+        mean_conf = (tok_prob * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+        return sequences, mean_conf

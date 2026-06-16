@@ -40,8 +40,8 @@ def normalize_keypoints(
     np.nan_to_num(keypoints, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Guard 1: invalidate low-confidence points BEFORE anything reads their coordinates.
-    invalid_pt = keypoints[:, :, 2] < CONF_THRESHOLD       # (T, 133)
-    keypoints[invalid_pt] = 0.0
+    invalid_pt = keypoints[:, :, 2] < CONF_THRESHOLD  # (T, 133)
+    keypoints[invalid_pt] = 0.0                       # Zero out x,y,conf
 
     # Split into groups
     body_kpts = keypoints[:, BODY_IDS]
@@ -107,17 +107,6 @@ def normalize_keypoints(
     return norm_kpts
 
 
-def threshold_confidence(keypoints: np.ndarray) -> np.ndarray:
-    '''
-    Set low-conf keypoints to 0 (x,y=0, conf=0 if < threshold)
-    Input/Output: keypoints (frames, kpts, 3)
-    '''
-    low_conf_mask = keypoints[:, :, 2] < CONF_THRESHOLD
-    keypoints[low_conf_mask] = 0  # Zero out x,y,conf
-    # print(f'Applied confidence threshold: {np.sum(low_conf_mask)} keypoints zeroed')
-    return keypoints
-
-
 def subsample_frames(keypoints: np.ndarray, target_fps: float) -> np.ndarray:
     '''
     Subsample to lower FPS if needed (e.g., from 12.5 to 5 fps)
@@ -135,5 +124,4 @@ if __name__ == '__main__':
     dummy_keypoints = np.random.rand(100, 133, 3)  # frames, kpts, (x,y,conf)
     dummy_keypoints[:, :, 2] = np.random.uniform(0.4, 1.0, (100, 133))  # Random conf
     normalized = normalize_keypoints(dummy_keypoints)
-    thresholded = threshold_confidence(normalized)
-    subsampled = subsample_frames(thresholded, target_fps=6.0)
+    subsampled = subsample_frames(normalized, target_fps=6.0)

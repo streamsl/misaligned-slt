@@ -3,7 +3,7 @@ import re, csv, json
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
-from .preprocessing import normalize_keypoints, threshold_confidence
+from .preprocessing import normalize_keypoints
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
@@ -233,7 +233,6 @@ def load_pose_window(pose_index: PoseIndex, start_s: float, end_s: float, normal
     poses = load_pose_frames(pose_index, start_frame, end_frame)
     if normalize and poses.shape[1:] == (133, 3):
         poses = normalize_keypoints(poses, width=pose_index.width, height=pose_index.height)
-    poses = threshold_confidence(poses)
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)
     return poses.astype(np.float32, copy=False), timestamps
     

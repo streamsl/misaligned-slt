@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from tqdm import tqdm
 import argparse
 import json
 
@@ -40,8 +41,10 @@ class ControlledWindow:
     gt_end_s: float
     window_start_s: float
     window_end_s: float
-    delta_head_s: float
+    delta_head_s: float     # realized offset in seconds (= grid_head * duration in relative mode)
     delta_tail_s: float
+    grid_head: float = 0.0  # grid coordinate used for grouping (a fraction of duration in relative mode)
+    grid_tail: float = 0.0
 
 
 def _load_segments(path: str | Path) -> list[Segment]:
@@ -53,6 +56,23 @@ def _gold_events(records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]
     return {record.video_id: [PredictionEvent(
         video_id=record.video_id, start_s=float(span.start_s), end_s=float(span.end_s), text=span.text,
     ) for span in record.sentences] for record in records}
+
+
+def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
+    """Emit GT sentence spans in the `--segments` schema (load_prediction_file dict form).
+
+    Feeds the RQ2 oracle-input rows: `eval.py --rq 2 --segments <this> --method {stage2_baseline,stage2_dlm}`
+    gives (clean AR | our DLM) translating GT-trimmed spans offline — the ceiling rows of the RQ2 ladder.
+    Identical translation to RQ1 @ delta=0, but DVC-framed so it sits in the same table as the other rungs.
+    """
+    rows = {record.video_id: [
+        {"start_s": float(span.start_s), "end_s": float(span.end_s), "text": span.text}
+        for span in record.sentences
+    ] for record in tqdm(records, desc="Extracting gold segments")}
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
 
 
 def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEvent:
@@ -92,11 +112,18 @@ def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]
     return out
 
 
-def controlled_windows(records: list[VideoRecord], grid_s: list[float], max_sentences: int | None = None) -> list[ControlledWindow]:
+def controlled_windows(
+    records: list[VideoRecord], grid: list[float], relative: bool = True, max_sentences: int | None = None,
+) -> list[ControlledWindow]:
     """Build RQ1 signed-offset windows.
 
-    Analysis A defines deltas as predicted boundary minus GT boundary, so the perturbed window uses start = gt_start + delta_head and 
-    end = gt_end + delta_tail. Negative delta_tail is therefore the intended right-truncation stress test.
+    Analysis A defines deltas as predicted boundary minus GT boundary, so perturbed window uses start = gt_start + delta_head 
+    and end = gt_end + delta_tail. Negative delta_tail is the intended right-truncation stress test.
+
+    `relative=True` (default): each grid value is a FRACTION of the anchor sentence's own duration, so the realized offset scales 
+    with sentence length (delta_s = grid * duration). Absolute-seconds offsets mix regimes — a 0.3s head cut destroys a 1s sentence 
+    but barely touches a 10s one, so the curve would average 2 different stress levels at one x-point. Relative perturbation keeps 
+    every sentence at the same proportional severity. `relative=False` restores absolute-seconds offsets.
     """
     windows: list[ControlledWindow] = []
     count = 0
@@ -104,16 +131,19 @@ def controlled_windows(records: list[VideoRecord], grid_s: list[float], max_sent
         for span in record.sentences:
             if max_sentences is not None and count >= int(max_sentences): return windows
             count += 1
-            for dh in grid_s:
-                for dt in grid_s:
-                    start_s = max(0.0, float(span.start_s) + float(dh))
-                    end_s = min(float(record.pose.duration_s), float(span.end_s) + float(dt))
+            duration = max(1e-6, float(span.end_s) - float(span.start_s))
+            for gh in grid:
+                for gt in grid:
+                    dh = float(gh) * duration if relative else float(gh)
+                    dt = float(gt) * duration if relative else float(gt)
+                    start_s = max(0.0, float(span.start_s) + dh)
+                    end_s = min(float(record.pose.duration_s), float(span.end_s) + dt)
                     if end_s <= start_s: continue
                     windows.append(ControlledWindow(
                         video_id=record.video_id, reference=span.text,
                         gt_start_s=float(span.start_s), gt_end_s=float(span.end_s),
                         window_start_s=start_s, window_end_s=end_s,
-                        delta_head_s=float(dh), delta_tail_s=float(dt),
+                        delta_head_s=dh, delta_tail_s=dt, grid_head=float(gh), grid_tail=float(gt),
                     ))
     return windows
 
@@ -133,6 +163,10 @@ def evaluate_predicted_events(
         matched_pairs = 0
 
         matched_tious: list[float] = []
+        # Recall-inclusive translation: every gold sentence contributes, missed ones as an empty hypothesis,
+        # so the corpus metric reflects BOTH localisation (did we emit near it) and translation quality —
+        # the matched-only number above hides the misses (it averages over the easy, matched subset only).
+        matched_gold_text: dict[tuple[str, int], str] = {}
         for video_id in all_video_ids:
             pred_events = predicted.get(video_id, [])
             gold_events = gold.get(video_id, [])
@@ -150,8 +184,17 @@ def evaluate_predicted_events(
                 if pred_event.text is not None and gold_text is not None:
                     pred_texts.append(pred_event.text)
                     ref_texts.append(gold_text)
+                    matched_gold_text[(video_id, gold_idx)] = pred_event.text
                 if pred_event.commit_time_s is not None: # Emission latency: commit time minus GT sentence end (spec §9.2).
                     latencies.append(float(pred_event.commit_time_s) - float(gold_events[gold_idx].end_s))
+
+        ri_hyps: list[str] = []
+        ri_refs: list[str] = []
+        for video_id in all_video_ids:
+            for gold_idx, gold_event in enumerate(gold.get(video_id, [])):
+                if gold_event.text is None: continue
+                ri_refs.append(gold_event.text)
+                ri_hyps.append(matched_gold_text.get((video_id, gold_idx), ""))  # missed gold -> empty hypothesis
 
         precision = matched_pairs / total_pred if total_pred else 0.0
         recall = matched_pairs / total_gold if total_gold else 0.0
@@ -187,6 +230,10 @@ def evaluate_predicted_events(
             "mean_matched_tiou": float(sum(matched_tious) / len(matched_tious)) if matched_tious else 0.0,
             "matched_tiou_distribution": tiou_block,
             "translation_metrics": compute_text_metrics(pred_texts, ref_texts),
+            # Recall-inclusive: missed gold sentences scored as empty hypotheses (LOWER than matched-only;
+            # the gap to translation_metrics is exactly the cost of the sentences the FSM never emitted).
+            "translation_metrics_recall_inclusive": compute_text_metrics(ri_hyps, ri_refs),
+            "recall_inclusive_pairs": len(ri_refs),
             "emission_latency": latency_block,
         })
     return {"thresholds": results}
@@ -258,14 +305,15 @@ def _translate_window(
     frame_mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     if method == "stage2_baseline":
-        # Literature-comparison floor decodes with beam search like GFSLT-VLP (num_beams=4, train_slt.py); 
+        # Literature-comparison floor decodes with beam search like GFSLT-VLP (num_beams=4, train_slt.py);
         # The FSM methods below stay greedy to keep the AR-vs-DLM contrast clean.
         num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
-        tokens = model.generate(
+        # REAL output confidence (mean prob the model assigns to its own tokens), not a 1.0 placeholder —
+        # the "confidently wrong" claim must be measured. confidence is per-row mean (shape [B]).
+        tokens, confidence = model.generate_with_confidence(
             poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
             max_new_tokens=max_tokens, num_beams=num_beams,
         )
-        confidence = torch.ones(tokens.shape, dtype=torch.float32, device=device)
     else:
         trans_cfg = inference_cfg.get("translation", {})
         dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
@@ -320,12 +368,12 @@ def _translate_windows_batched(
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     if method == "stage2_baseline":
         num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
-        tokens = model.generate(
+        tokens, mean_conf = model.generate_with_confidence(
             poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
             max_new_tokens=max_tokens, num_beams=num_beams,
         )
         texts = [t.strip() for t in tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)]
-        return [(t, 1.0) for t in texts]
+        return list(zip(texts, [float(c) for c in mean_conf.detach().cpu().tolist()]))
 
     trans_cfg = inference_cfg.get("translation", {})
     dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
@@ -361,11 +409,17 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     stage1_cfg = load_yaml(args.stage1_config)
     method_cfg = load_yaml(_method_config_path(args))
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
+
     rq_cfg = eval_cfg.get("rq1", {})
-    grid = _parse_grid(args.severity_grid_s, rq_cfg.get("smoke_grid_s" if args.smoke else "severity_grid_s", [0.0]))
+    mode = str(args.severity_mode or rq_cfg.get("severity_mode", "relative"))
+    relative = mode == "relative"
+    if relative: default_key = "smoke_grid_rel" if args.smoke else "severity_grid_rel"
+    else: default_key = "smoke_grid_s" if args.smoke else "severity_grid_s"
+    grid = _parse_grid(args.severity_grid_s, rq_cfg.get(default_key, [0.0]))
     max_sentences = args.num_sentences
     if max_sentences is None and args.smoke: max_sentences = int(rq_cfg.get("smoke_num_sentences", 10))
-    windows = controlled_windows(records, grid, max_sentences=max_sentences)
+    windows = controlled_windows(records, grid, relative=relative, max_sentences=max_sentences)
+
     records_by_id = {record.video_id: record for record in records}
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     inference_cfg = load_yaml(args.inference_config)
@@ -385,7 +439,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     batch_size = max(1, int(rq_cfg.get("batch_size", 16)))
     grouped: dict[tuple[float, float], dict[str, list]] = {}
     rows = []
-    for start in range(0, len(materialized), batch_size):
+    for start in tqdm(range(0, len(materialized), batch_size), desc="Translating windows"):
         chunk = materialized[start : start + batch_size]
         results = _translate_windows_batched(
             model=model, tokenizer=tokenizer, method=args.method,
@@ -393,24 +447,31 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
             device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
         )
         for (window, _poses, _ts), (prediction, confidence) in zip(chunk, results):
-            key = (window.delta_head_s, window.delta_tail_s)
-            grouped.setdefault(key, {"predictions": [], "references": [], "confidences": []})
+            key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
+            grouped.setdefault(key, {"predictions": [], "references": [], "confidences": [], "head_s": [], "tail_s": []})
             grouped[key]["predictions"].append(prediction)
             grouped[key]["references"].append(window.reference)
             grouped[key]["confidences"].append(confidence)
+            grouped[key]["head_s"].append(window.delta_head_s)
+            grouped[key]["tail_s"].append(window.delta_tail_s)
             rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence})
 
     severity = []
-    for (dh, dt), values in sorted(grouped.items()):
+    for (gh, gt), values in tqdm(sorted(grouped.items()), desc="Computing severity"):
         confs = values["confidences"]
+        head_s, tail_s = values["head_s"], values["tail_s"]
         severity.append({
-            "delta_head_s": dh, "delta_tail_s": dt, "windows": len(values["predictions"]),
+            "severity_mode": mode,
+            "grid_head": gh, "grid_tail": gt,  # fraction of sentence duration in relative mode, else seconds
+            "delta_head_s_mean": float(sum(head_s) / len(head_s)) if head_s else 0.0,  # realized offset (relative -> varies per sentence)
+            "delta_tail_s_mean": float(sum(tail_s) / len(tail_s)) if tail_s else 0.0,
+            "windows": len(values["predictions"]),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
         })
     summary = {
-        "rq": "1", "language": args.language, "split": args.split, "method": args.method, 
-        "grid_s": grid, "windows": len(rows), "severity": severity,
+        "rq": "1", "language": args.language, "split": args.split, "method": args.method,
+        "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity,
     }
     output = Path(args.output or f"outputs/rq1_{args.method}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -471,7 +532,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     predicted: dict[str, list[PredictionEvent]] = {}
-    for record in records:
+    for record in tqdm(records, desc="Processing records"):
         poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
             predicted[record.video_id] = []
@@ -518,8 +579,19 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     records_by_id = {record.video_id: record for record in records}
     segments = load_prediction_file(args.segments)
 
+    # The split comes from --split, NOT the JSON filename. Mismatched video_ids silently translate nothing and
+    # score all-zero, so fail loud instead (the classic "gold_*_test.json but forgot --split test" footgun).
+    matched = set(segments) & set(records_by_id)
+    if not matched: raise SystemExit(
+        f"--segments has {len(segments)} video_ids, none in the {len(records_by_id)} '{args.split}' records — "
+        f"nothing to translate (output would be all-zero). Pass --split test (+ --allow-test) for test gold spans."
+    )
+    if len(matched) < len(segments): print(
+        f"[pipeline_floor] WARNING: {len(segments) - len(matched)}/{len(segments)} segment video_ids "
+        f"are absent from --split {args.split}; scoring only the {len(matched)} that match.", flush=True)
+
     predicted: dict[str, list[PredictionEvent]] = {}
-    for video_id, spans in segments.items():
+    for video_id, spans in tqdm(segments.items(), desc="Processing segments"):
         record = records_by_id.get(video_id)
         if record is None: continue
         events: list[PredictionEvent] = []
@@ -597,7 +669,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--method", default="stage2_dlm", choices=["stage2_baseline", "stage2_ar", "stage2_dlm"])
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--severity-grid-s", default=None, help="Comma-separated signed RQ1 offset grid in seconds")
+    parser.add_argument(
+        "--severity-grid-s", default=None, 
+        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)"
+    )
+    parser.add_argument(
+        "--severity-mode", default="relative", choices=["relative", "absolute"], 
+        help="RQ1 perturbation: relative (fraction of sentence duration, default) or absolute seconds"
+    )
+    parser.add_argument("--emit-gold-segments", default=None, help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
@@ -616,6 +696,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    if args.emit_gold_segments:
+        records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+        path = write_gold_segments(records, args.emit_gold_segments)
+        result = {"emit_gold_segments": str(path), "videos": len(records), "segments": sum(len(r.sentences) for r in records)}
+        print(json.dumps(result, indent=2, sort_keys=True))
+        raise SystemExit(0)
+
     if args.rq == "1": result = run_rq1(args)
     elif args.rq == "2": result = run_rq2(args)
     else: result = run_segment_prf(args)

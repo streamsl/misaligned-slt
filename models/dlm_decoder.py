@@ -96,18 +96,14 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     Extends the BD3LM substrate (`block_diffusion.BlockDiffusionDecoder`) with the
     three DMax/DCD mechanisms, all under fixed visual conditioning:
 
-    - `oput_forward` — **OPUT** training (`oput_two_pass_loss`): mask the target,
-      and additionally re-decode an on-policy (argmax) corruption, supervising
-      recovery of the clean target over all positions. Trains self-correction.
-    - `decode_spd_dcd` / `generate_spd_dcd` — **SPD+DCD** inference: SPD carries a
-      renormalized soft mask/token embedding state across denoising steps; DCD's
-      sliding window selects which masked slots to commit vs defer. Cold-start per
+    - `oput_forward` — **OPUT** training (`oput_two_pass_loss`): mask the target, and additionally re-decode an on-policy 
+      (argmax) corruption, supervising recovery of the clean target over all positions. Trains self-correction.
+    - `decode_spd_dcd` / `generate_spd_dcd` — **SPD+DCD** inference: SPD carries a renormalized soft mask/token embedding 
+      state across denoising steps; DCD's sliding window selects which masked slots to commit vs defer. Cold-start per
       call — no state crosses streaming strides.
-    - `truncated_marginal_logits` — one cheap grad-bearing forward used by the
-      confidence-bound term instead of back-prop through the full decode.
+    - `truncated_marginal_logits` — Cheap grad-bearing forward used by confidence-bound term instead of backprop via full decode.
 
-    The `[xt | x0]` BD3LM concatenation and block-diffusion mask match DMax's own
-    block-diffusion training loop (`train_llada2_bd_oput.py`).
+    `[xt|x0]` BD3LM concatenation and block-diff mask match DMax's own block-diff training loop (`train_llada2_bd_oput.py`).
     """
     def _decode_from_embeds(
         self, token_ids: torch.Tensor, raw_inputs_embeds: torch.Tensor,
@@ -245,9 +241,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         if x0.shape[1] < aligned_len:
             x0 = F.pad(x0, (0, aligned_len - x0.shape[1]), value=self.pad_index)
             valid = F.pad(valid, (0, aligned_len - valid.shape[1]), value=False)
-        # Supervised EOS tail after [.., eos, lang] (dLLM AppendEOSBlockWrapper / DMax 32-trailing-eos):
-        # without it, slots past the sentence end are never trained and decode to confident garbage
-        # before EOS commits, which the commit gate then reads as hardened. See block_diffusion.supervise_trailing_eos.
+        # Supervised EOS tail after [.., eos, lang] (dLLM AppendEOSBlockWrapper / DMax 32-trailing-eos): without it, slots past 
+        # the sentence end are never trained and decode to confident garbage before EOS commits, which the commit gate then 
+        # reads as hardened. See block_diffusion.supervise_trailing_eos.
         return supervise_trailing_eos(
             x0, valid, pad_index=self.pad_index, eos_index=self.eos_index,
             max_tokens=self.eos_supervision_tokens if eos_supervision is None else int(eos_supervision),

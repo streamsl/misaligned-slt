@@ -55,9 +55,13 @@ def load_visual_backbone(
     raw = _load_state(checkpoint)
     candidates = [raw, _strip_prefix(raw, "visual"), _strip_prefix(raw, "base_module.visual"), _strip_prefix(raw, "model.visual")]
 
-    # GFSLT-VLP downstream transfer (`train_slt.py`) loads VLP visual/decoder layers but restores decoder token + position embeddings 
-    # from the base transformer checkpoint, and it never transfers stage-1 Text_Decoder lm_head. Because this project saves 1 shared 
-    # mBART, all tied token/output aliases are dropped for downstream baseline/stage-2 loading when preserve_decoder_io=True.
+    # GFSLT-VLP train_slt.py explicitly overwrites only decoder.embed_tokens.weight and decoder.embed_positions.weight from the base 
+    # transformer checkpoint (after copying Text_Decoder decoder layers) and never copies Text_Decoder lm_head/final_logits_bias.
+    #
+    # We save 1 full shared mBART instead of GFSLT's assembled new_state_dict. shared/encoder.embed_tokens/decoder.embed_tokens/lm_head 
+    # are the same tied Parameter: loading any alias mutates the same storage. To get same final state as GFSLT's two-key base overwrite, 
+    # drop every tied word-embedding alias that would otherwise re-load the VLP-trained embedding. decoder.embed_positions is the second 
+    # explicit GFSLT overwrite; final_logits_bias is omitted because GFSLT does not transfer the Text_Decoder output head/bias.
     if preserve_decoder_io: candidates = [{key: value for key, value in state.items() if key not in {
         "mbart.model.shared.weight",
         "mbart.model.encoder.embed_tokens.weight",

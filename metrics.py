@@ -1,3 +1,31 @@
+"""Metrics — TWO families, by domain and consumer. They are not interchangeable:
+
+There is ONE segment metric DEFINITION — `segmentation_prf` (greedy one-to-one tIoU-matched P/R/F1) — used by
+BOTH the training monitor and the final eval. tIoU is scale-invariant, so feeding the SAME segments in frame
+units (monitor) or seconds (eval) scores identically. This does NOT make the monitor and the RQ2 eval equal:
+they score DIFFERENT inputs — the monitor decodes the BIO head's raw (ungated) argmax over sampler dev WINDOWS
+and averages per-window F1 (macro); RQ2 `--stream` scores commit-GATED FSM events over whole VIDEOS against GT
+sentences as corpus precision/recall (micro). So `val_phrase_tiou_f1` (BIO-head quality) and the streaming seg
+F1 (end-to-end, after the commit gate) legitimately differ. The only other segmentation signal is a per-FRAME
+score (different granularity, not redundant).
+
+FRAME-DOMAIN entry points (consume BIO logits/labels; the BIO-head TRAINING monitor):
+  bio_frame_metrics          per-frame B/I-vs-O precision/recall/F1/accuracy.
+  moryossef_segment_metrics  per-item `*_frame_f1` (macro O/B/I frame F1) + `*_tiou_f1`/`*_seg_precision`/
+                             `*_seg_recall` from `segmentation_prf` on frame-unit segments (the collapse-proof
+                             monitor; an all-`I`/all-`O` collapse cannot game one-to-one matching). The looser
+                             overlap seg-F1 and frame-IoU flavors were removed (used for no decision).
+  Used by: train/stage2.py (in-model BIO head), moryossef26/{trainer,infer}.py (the standalone segmenter).
+  Segment decoders feeding it: `bio_labels_to_segments` (gold), `signing_runs_with_b_splits` (prediction),
+  `likeliest_segments` (parity) — all three are one parameterized core, `_bio_runs`.
+
+TIME-DOMAIN entry points (consume Segment(start_s, end_s) spans in seconds; the FINAL DVC evaluation + Analysis A):
+  Segment / temporal_iou / match_segments  greedy one-to-one tIoU matching.
+  segmentation_prf                         the SAME P/R/F1 the monitor uses, on seconds spans.
+  Used by: eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
+
+TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT) + token_accuracy.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
@@ -26,102 +54,58 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
     }
 
 
-def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
-    # BIO label tensor -> [{start,end}] frame segments (Moryossef metrics.py).
-    labels = bio.detach().cpu().numpy()
-    segments, seg_start = [], None
-    for j, label in enumerate(labels):
-        if label == BIO["B"]:
-            if seg_start is not None: segments.append({"start": seg_start, "end": j - 1})
-            seg_start = j
-        elif label == BIO["O"] and seg_start is not None:
-            segments.append({"start": seg_start, "end": j - 1}); seg_start = None
-    if seg_start is not None: segments.append({"start": seg_start, "end": len(labels) - 1})
-    return segments
+def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) -> list[dict]:
+    """Unified BIO -> [{start,end}] frame-segment decoder. The three public decoders are parameterizations:
 
+      bio_labels_to_segments     split_on_b=True,  open_on_i=False, close_on_unk=False  (gold, B-required)
+      signing_runs_with_b_splits split_on_b=True,  open_on_i=True,  close_on_unk=True   (prediction/inference)
+      likeliest_segments         split_on_b=False, open_on_i=True,  close_on_unk=True   (pure run, parity ref)
 
-def likeliest_segments(logits: torch.Tensor) -> list[dict]:
-    # Argmax decode -> contiguous B/I runs (Moryossef likeliest_probs_to_segments).
-    preds = logits.detach().cpu().argmax(dim=-1).numpy()
-    segments, seg_start = [], None
-    for i, p in enumerate(preds):
-        if p in (BIO["B"], BIO["I"]):
-            if seg_start is None: seg_start = i
-        elif seg_start is not None:
-            segments.append({"start": seg_start, "end": i - 1}); seg_start = None
-    if seg_start is not None: segments.append({"start": seg_start, "end": len(preds) - 1})
-    return segments
-
-
-def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """PREDICTION decode: contiguous signing runs, additionally split at interior `B`s.
-
-    Moryossef's prediction decode (`likeliest_probs_to_segments`, segmentation/metrics.py) never
-    requires a predicted `B` — a segment is any contiguous B/I run; his published phrase IoU comes
-    from this decode, and `B`-required decoding was never validated even in the original. Requiring
-    `B` to OPEN a segment is fatal on our data: `B` is one frame per sentence (~1% of frames) and
-    68% of caption boundaries have no visual pause, so a model that detects signing perfectly but
-    never wins argmax with `B` yields zero segments. Opening on the O→signing transition loses
-    nothing (the first signing frame after a gap IS a sentence start by construction); when the
-    model *does* emit an interior `B`, we honour it as a split — that refinement is what feeds the
-    Analysis-A over/under-segmentation taxonomy back-to-back boundaries.
+    split_on_b: an interior B closes the open segment and opens a new one (back-to-back sentences with no O gap);
+    when False, B only opens if nothing is open (B behaves like I). open_on_i: an I with nothing open starts a
+    segment (first signing frame after a gap = a sentence start). close_on_unk: UNK closes like O; gold decoding
+    keeps UNK non-closing (gold is pre-sliced to valid frames).
     """
     if isinstance(tags, torch.Tensor): tags = tags.detach().cpu().tolist()
-    segments, seg_start = [], None
-    for i, p in enumerate(tags):
-        if p == BIO["B"]:
-            if seg_start is not None: segments.append({"start": seg_start, "end": i - 1})
-            seg_start = i
-        elif p == BIO["I"]:
-            if seg_start is None: seg_start = i
-        elif seg_start is not None:  # O or UNK closes the run
-            segments.append({"start": seg_start, "end": i - 1}); seg_start = None
-    if seg_start is not None: segments.append({"start": seg_start, "end": len(tags) - 1})
+    segments: list[dict] = []
+    start: int | None = None
+    for i, tag in enumerate(tags):
+        if tag == BIO["B"]:
+            if split_on_b:
+                if start is not None: segments.append({"start": start, "end": i - 1})
+                start = i
+            elif start is None: start = i
+        elif tag == BIO["I"]:
+            if open_on_i and start is None: start = i
+        elif (tag == BIO["O"] or (tag == BIO["UNK"] and close_on_unk)) and start is not None:
+            segments.append({"start": start, "end": i - 1}); start = None
+    if start is not None: segments.append({"start": start, "end": len(tags) - 1})
     return segments
 
 
-def _segment_tiou_f1(pred: list[dict], gold: list[dict], threshold: float = 0.5) -> float:
-    """One-to-one tIoU-matched segment F1 — the collapse-proof monitor metric.
+def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
+    # GOLD decode (Moryossef metrics.py): B-required. Turns GT BIO labels into reference segments.
+    return _bio_runs(bio, split_on_b=True, open_on_i=False, close_on_unk=False)
 
-    Frame-IoU and Moryossef's overlap-based segment-F1 are both fooled by an all-`I` collapse
-    (one giant predicted run covers ~80% of frames → high IoU; it overlaps every gold segment →
-    permissive F1 ≈ 1). One-to-one matching is count-sensitive: 1 predicted run against ~8 gold
-    sentences gives recall ≈ 1/8, so early stopping cannot select a collapsed checkpoint, while
-    genuine segmentation quality still increases the score.
+def likeliest_segments(logits: torch.Tensor) -> list[dict]:
+    # Parity reference: Moryossef's raw argmax run decode (interior B does not split). Takes LOGITS.
+    return _bio_runs(logits.detach().cpu().argmax(dim=-1), split_on_b=False, open_on_i=True, close_on_unk=True)
+
+def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
+    """PREDICTION/inference decode: contiguous signing runs, split at interior `B` (== infer.bio_tags_to_segments).
+
+    Moryossef's prediction decode (`likeliest_probs_to_segments`) never requires a predicted `B` — a segment is
+    any contiguous B/I run; requiring `B` to OPEN is fatal here (`B` is ~1% of frames, 68% of caption boundaries
+    have no visual pause), so a model that detects signing but never wins argmax with `B` yields zero segments.
+    Opening on the O→signing transition loses nothing (first signing frame after a gap IS a sentence start);
+    interior `B`s are honoured as splits, feeding the Analysis-A over/under-segmentation taxonomy.
     """
-    if not gold or not pred: return 1.0 if len(pred) == len(gold) else 0.0
-    pred_s = [Segment(float(s["start"]), float(s["end"]) + 1.0) for s in pred]
-    gold_s = [Segment(float(s["start"]), float(s["end"]) + 1.0) for s in gold]
-    matches = match_segments(pred_s, gold_s, threshold=threshold)
-    precision = len(matches) / len(pred_s)
-    recall = len(matches) / len(gold_s)
-    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return _bio_runs(tags, split_on_b=True, open_on_i=True, close_on_unk=True)
 
-
-def _segment_iou_frames(pred: list[dict], gold: list[dict], max_len: int) -> float:
-    import numpy as _np
-    pv, gv = _np.zeros(max_len), _np.zeros(max_len)
-    for s in pred: pv[s["start"]:s["end"] + 1] = 1
-    for s in gold: gv[s["start"]:s["end"] + 1] = 1
-    inter = _np.logical_and(pv, gv).sum(); union = _np.logical_or(pv, gv).sum()
-    if union == 0: return 1.0 if inter == 0 else 0.0
-    return float(inter / union)
-
-
-def _segment_recall(segments: list[dict], gold: list[dict], allowed_shift: int = 17) -> float:
-    # Moryossef _segment_recall: a gold segment is hit if any pred overlaps it within +/-allowed_shift frames (~0.68s @25fps).
-    if not gold: return 1.0 if not segments else 0.0
-    hit = 0
-    for sg in gold:
-        start, end = sg["start"] - allowed_shift, sg["end"] + allowed_shift
-        if any(s["start"] <= end and s["end"] >= start for s in segments): hit += 1
-    return hit / len(gold)
-
-
-def _segment_f1(pred: list[dict], gold: list[dict]) -> float:
-    if not gold or not pred: return 1.0 if len(pred) == len(gold) else 0.0
-    precision = _segment_recall(gold, pred); recall = _segment_recall(pred, gold)
-    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+def _frame_segments_to_seconds(segs: list[dict]) -> list["Segment"]:
+    # Frame-index segments -> Segment objects (end is exclusive: a 1-frame segment spans [start, start+1)).
+    # tIoU is scale-invariant, so matching in frame units gives the SAME number as matching in seconds.
+    return [Segment(float(s["start"]), float(s["end"]) + 1.0) for s in segs]
 
 
 def _macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], BIO["B"], BIO["I"])) -> float:
@@ -135,23 +119,37 @@ def _macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], B
     return sum(f1s) / len(f1s) if f1s else 0.0
 
 
+def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_threshold: float = 0.1) -> dict[str, float]:
+    """One-to-one tIoU-matched precision/recall/F1/matches — THE canonical segment metric (RQ2 + the BIO-head
+    monitor via `moryossef_segment_metrics`). Unit-agnostic: pass seconds Segments (eval) or frame-unit Segments
+    (monitor); tIoU is scale-invariant. Nothing predicted AND nothing gold = perfect (nothing to find, none emitted)."""
+    if not predicted and not gold: return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "matches": 0.0}
+    matches = match_segments(predicted, gold, threshold=tiou_threshold)
+    tp = len(matches)
+    precision = tp / len(predicted) if predicted else 0.0
+    recall = tp / len(gold) if gold else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1, "matches": float(tp)}
+
+
 def moryossef_segment_metrics(
-    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", decode: str = "runs_bsplit",
+    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase",
+    decode: str = "runs_bsplit", tiou_threshold: float = 0.5,
 ) -> dict[str, float]:
-    """Per-item segmentation metrics (frame macro-F1, frame-IoU, segment-F1, one-to-one tIoU F1).
+    """Per-item BIO-head training monitor: a per-FRAME score and the ONE segment score used everywhere.
 
-    `decode` selects how predicted segments come out of the argmax tags:
-    - "runs_bsplit" (default): contiguous signing runs split at interior `B`s — identical to inference
-      (`infer.bio_tags_to_segments`). See `signing_runs_with_b_splits` for why B-required decoding is
-      wrong on this data.
-    - "bio": B-required (gold-label rule). Kept for diagnostics: `phrase_seg_iou` under "bio" vs
-      "runs_bsplit" shows how much of the segmentation relies on explicit predicted `B`s.
-    - "likeliest": Moryossef's raw run decode without B-splits (parity reference).
+    Returns two complementary granularities, nothing redundant:
+    - `{prefix}_frame_f1`: macro F1 over the O/B/I frame classes (frame classification quality).
+    - `{prefix}_tiou_f1` / `_seg_precision` / `_seg_recall`: one-to-one tIoU-matched segment P/R/F1 via the
+      SAME `segmentation_prf` that scores RQ2 (here on frame-unit segments; tIoU is scale-invariant, so this
+      is identical to the seconds-domain number). This is the collapse-proof early-stopping monitor — neither
+      the all-`I` nor all-`O` collapse can game one-to-one matching. The previous overlap-tolerance `seg_f1`
+      and frame-IoU `seg_iou` flavors were looser, collapse-foolable, and used for no decision; removed.
 
-    `{prefix}_tiou_f1` (one-to-one matched at tIoU 0.5) is the early-stopping monitor: frame-IoU and
-    the overlap-based seg-F1 are both fooled by an all-`I` collapse; one-to-one matching is not.
+    `decode` picks the predicted-segment rule (`runs_bsplit` = inference decode, default; `bio` = B-required;
+    `likeliest` = raw run). `tiou_threshold` (default 0.5) is the monitor's match threshold.
     """
-    frame_f1s, ious, seg_f1s, tiou_f1s = [], [], [], []
+    frame_f1s, tiou_f1s, precisions, recalls = [], [], [], []
     for i in range(labels.shape[0]):
         gold = labels[i]
         valid = gold != BIO["UNK"]
@@ -166,15 +164,16 @@ def moryossef_segment_metrics(
         if decode == "likeliest": pred_segs = likeliest_segments(logit_v)
         elif decode == "bio": pred_segs = bio_labels_to_segments(pred_tags)
         else: pred_segs = signing_runs_with_b_splits(pred_tags)
-        gold_segs = bio_labels_to_segments(gold_v)
-        ious.append(_segment_iou_frames(pred_segs, gold_segs, n))
-        seg_f1s.append(_segment_f1(pred_segs, gold_segs))
-        tiou_f1s.append(_segment_tiou_f1(pred_segs, gold_segs))
+        prf = segmentation_prf(
+            _frame_segments_to_seconds(pred_segs), _frame_segments_to_seconds(bio_labels_to_segments(gold_v)),
+            tiou_threshold=tiou_threshold,
+        )
+        tiou_f1s.append(prf["f1"]); precisions.append(prf["precision"]); recalls.append(prf["recall"])
 
     avg = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
     return {
-        f"{prefix}_frame_f1": avg(frame_f1s), f"{prefix}_seg_iou": avg(ious),
-        f"{prefix}_seg_f1": avg(seg_f1s), f"{prefix}_tiou_f1": avg(tiou_f1s),
+        f"{prefix}_frame_f1": avg(frame_f1s), f"{prefix}_tiou_f1": avg(tiou_f1s),
+        f"{prefix}_seg_precision": avg(precisions), f"{prefix}_seg_recall": avg(recalls),
     }
 
     
@@ -211,15 +210,6 @@ def match_segments(predicted: list[Segment], gold: list[Segment], threshold: flo
         used_gold.add(gi)
         matches.append((pi, gi, score))
     return matches
-
-
-def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_threshold: float = 0.1) -> dict[str, float]:
-    matches = match_segments(predicted, gold, threshold=tiou_threshold)
-    tp = len(matches)
-    precision = tp / len(predicted) if predicted else 0.0
-    recall = tp / len(gold) if gold else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1, "matches": float(tp)}
 
 
 @lru_cache(maxsize=8)

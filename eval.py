@@ -1,15 +1,26 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
+import argparse, json
+
 from tqdm import tqdm
-import argparse
-import json
+from typing import Any
+from pathlib import Path
+from IPython.display import display
 
 import torch
 import numpy as np
+import pandas as pd
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)         # show all columns
+pd.set_option("display.max_colwidth", None)        # don't truncate long text in cells
+pd.set_option("display.width", None)               # auto-detect terminal width
+pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
+pd.set_option("display.float_format", "{:.4f}".format)
+
+
 from data.loader import VideoRecord, load_language_records
 from data.windowing import SentenceSpan
+from data.gfslt_padding import pad_visual_sequence_gfslt
 from poses import load_pose_window
 
 from models.gfslt import GFSLTConfig, CleanARSLTModel, resolve_decoder_start_id
@@ -294,15 +305,32 @@ def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict
     return model, tokenizer
 
 
+def _prep_window(
+    poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float, visual_padding: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Window pose tensor + window-relative timestamps + frame mask, applying the SAME visual padding the
+    model was trained with. The trainers feed `visual_padding: gfslt` (pad_visual_sequence_gfslt: 8 repeated
+    boundary frames each side, marked valid); evaluating on raw windows is a train/inference mismatch that
+    silently drops several BLEU. None/zero = raw window (use for streaming-consistent stage-2)."""
+    poses = torch.as_tensor(poses_np, dtype=torch.float32)
+    ts = torch.as_tensor(np.asarray(timestamps_np, dtype=np.float32) - float(start_s), dtype=torch.float32)
+    if visual_padding == "gfslt": poses, ts, mask, _ = pad_visual_sequence_gfslt(poses, ts)
+    elif visual_padding in {"none", "zero"}: mask = torch.ones(poses.shape[0], dtype=torch.bool)
+    else: raise ValueError(f"Unsupported visual_padding={visual_padding}")
+    return poses, ts, mask
+
+
 @torch.no_grad()
 def _translate_window(
     model, tokenizer, method: str,
     poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float,
     device: torch.device, inference_cfg: dict, method_cfg: dict,
 ) -> tuple[str, float]:
-    poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
-    timestamps = torch.as_tensor(timestamps_np - float(start_s), dtype=torch.float32, device=device).unsqueeze(0)
-    frame_mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
+    visual_padding = str(method_cfg.get("visual_padding", "gfslt"))
+    poses_t, ts_t, mask_t = _prep_window(poses_np, timestamps_np, start_s, visual_padding)
+    poses = poses_t.unsqueeze(0).to(device)
+    timestamps = ts_t.unsqueeze(0).to(device)
+    frame_mask = mask_t.unsqueeze(0).to(device)
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     if method == "stage2_baseline":
         # Literature-comparison floor decodes with beam search like GFSLT-VLP (num_beams=4, train_slt.py);
@@ -351,18 +379,22 @@ def _translate_windows_batched(
     so each row's result is identical to the unbatched `_translate_window` — this only removes the
     one-window-at-a-time Python/GPU-launch overhead of the RQ1 sweep."""
     if not items: return []
-    max_t = max(int(p.shape[0]) for p, _, _ in items)
-    pose_shape = tuple(items[0][0].shape[1:])
+    visual_padding = str(method_cfg.get("visual_padding", "gfslt"))
+    # Apply the model's training visual padding per row FIRST, then batch-pad to the max padded length
+    # (batch padding stays masked). Without this, batched eval mismatches training exactly like the unbatched path.
+    prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
+    max_t = max(int(p.shape[0]) for p, _, _ in prepped)
+    pose_shape = tuple(prepped[0][0].shape[1:])
     batch = len(items)
     poses = torch.zeros((batch, max_t, *pose_shape), dtype=torch.float32)
     timestamps = torch.zeros((batch, max_t), dtype=torch.float32)
     frame_mask = torch.zeros((batch, max_t), dtype=torch.bool)
 
-    for i, (p, ts, start_s) in enumerate(items):
-        n = int(p.shape[0])
-        poses[i, :n] = torch.as_tensor(p, dtype=torch.float32)
-        timestamps[i, :n] = torch.as_tensor(ts - float(start_s), dtype=torch.float32)
-        frame_mask[i, :n] = True
+    for i, (p_t, ts_t, m_t) in enumerate(prepped):
+        n = int(p_t.shape[0])
+        poses[i, :n] = p_t
+        timestamps[i, :n] = ts_t
+        frame_mask[i, :n] = m_t
 
     poses, timestamps, frame_mask = poses.to(device), timestamps.to(device), frame_mask.to(device)
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
@@ -461,23 +493,19 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
         confs = values["confidences"]
         head_s, tail_s = values["head_s"], values["tail_s"]
         severity.append({
-            "severity_mode": mode,
+            # "severity_mode": mode,
+            "windows": len(values["predictions"]),
             "grid_head": gh, "grid_tail": gt,  # fraction of sentence duration in relative mode, else seconds
             "delta_head_s_mean": float(sum(head_s) / len(head_s)) if head_s else 0.0,  # realized offset (relative -> varies per sentence)
             "delta_tail_s_mean": float(sum(tail_s) / len(tail_s)) if tail_s else 0.0,
-            "windows": len(values["predictions"]),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
         })
-    summary = {
-        "rq": "1", "language": args.language, "split": args.split, "method": args.method,
-        "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity,
-    }
-    output = Path(args.output or f"outputs/rq1_{args.method}_{args.language}_{args.split}.json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps({"summary": summary, "rows": rows}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    summary["output"] = str(output)
-    return summary
+    # summary = {
+    #     "rq": "1", "language": args.language, "split": args.split, "method": args.method,
+    #     "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity,
+    # }
+    return pd.json_normalize(severity, sep=".").T # one row per (grid_head, grid_tail) severity point
 
 
 def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
@@ -560,12 +588,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
 @torch.no_grad()
 def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
-    """Segment-then-translate pipeline floor (§9.2 baseline; §8.2's realistic-perturbation point).
-
-    The retrained Moryossef segmenter's predicted spans (analyze.py --stage segmenter-infer JSON,
-    via --segments) are cut from the pose stream and translated by the clean-trained GFSLT
-    baseline — the natural pipeline with no robustness training anywhere. Scored by the same
-    tIoU/translation harness as the streaming FSM, so floor and method are directly comparable.
+    """Segment-then-translate pipeline floor: The retrained Moryossef segmenter's predicted spans (analyze.py --stage segmenter-infer JSON,
+    via --segments) are cut from the pose stream and translated by clean-trained GFSLT baseline — the natural pipeline with no robustness 
+    training anywhere. Scored by the same tIoU/translation harness as the streaming FSM, so floor and method are directly comparable.
     """
     from moryossef26.infer import load_prediction_file
     data_cfg = load_yaml(args.data_config)
@@ -617,37 +642,33 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     eval_cfg = load_yaml(args.eval_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
+
     if args.stream:
         predicted = run_streaming(args)
-        events_path = Path(args.events_out or f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
+        events_path = Path(f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
         events_path.parent.mkdir(parents=True, exist_ok=True)
         events_path.write_text(json.dumps({
             vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
         }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        source = str(events_path)
     elif args.segments:
         predicted = run_pipeline_floor(args)
-        events_path = Path(args.events_out or f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
+        events_path = Path(f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
         events_path.parent.mkdir(parents=True, exist_ok=True)
         events_path.write_text(json.dumps({
             vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
         }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        source = str(events_path)
-    else:
-        predicted = load_event_predictions(args.predictions)
-        source = args.predictions
+    else: predicted = load_event_predictions(args.predictions)
         
     gold = _gold_events(records)
-    summary = {
-        "rq": "2", "language": args.language, "split": args.split, "method": args.method,
-        "predictions": source, "streamed": bool(args.stream),
-        **evaluate_predicted_events(predicted, gold, thresholds),
-    }
-    output = Path(args.output or f"outputs/rq2_events_{args.language}_{args.split}.json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    summary["output"] = str(output)
-    return summary
+    # summary = {
+    #     "rq": "2", "language": args.language, "split": args.split, "method": args.method,
+    #     "predictions": source, "streamed": bool(args.stream),
+    #     **evaluate_predicted_events(predicted, gold, thresholds),
+    # }
+    summary = evaluate_predicted_events(predicted, gold, thresholds).get("thresholds", [])
+    summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
+    summary.set_index("tiou_threshold", inplace=True)
+    return summary.T
 
 
 def run_segment_prf(args: argparse.Namespace) -> dict[str, Any]:
@@ -706,4 +727,4 @@ if __name__ == "__main__":
     if args.rq == "1": result = run_rq1(args)
     elif args.rq == "2": result = run_rq2(args)
     else: result = run_segment_prf(args)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    display(result)

@@ -334,7 +334,7 @@ class TrainControl:
     def update(self, model: torch.nn.Module, metrics: dict[str, float], epoch: int) -> bool:
         if self.monitor not in metrics:
             # Loudly surface a monitor/metric-key mismatch once. This was previously silent: a wrong
-            # monitor name (e.g. segmenter "val_phrase_f1" when eval emits "val_phrase_seg_iou") left
+            # monitor name (e.g. segmenter "val_phrase_f1" when eval emits "val_phrase_tiou_f1") left
             # best_epoch=0 and never saved a best checkpoint, with no warning.
             if not self._warned_missing_monitor:
                 self._warned_missing_monitor = True

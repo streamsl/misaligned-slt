@@ -1,32 +1,30 @@
 seed: 42
 language: phoenix
 stride_s: 1.0
-buffer_cap_s: 18.0  # Placeholder until Analysis 8.3 writes the measured elbow.
+buffer_cap_s: 18.0 # Placeholder until Analysis 8.3 writes the measured elbow.
 boundary_stability:
-  delta_enc_frames: 3
-  hysteresis_strides: 2
+    delta_enc_frames: 3
+    hysteresis_strides: 2
 translation:
-  commit_confidence_tau: 0.75
-  # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
-  # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the
-  # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces
-  # except at the zero-jitter corner; kept as an ablation.
-  decode_conditioning: window
-  max_text_tokens: 128
-  # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
-  # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
-  diffusion_steps: 128
-  block_size: 4
-  dcd:
-    window_type: sliding
-    # DCD commit threshold = 0.9 (decode_algorithm.py / run_all.sh). decode_param is operative; tau_dec is its
-    # fallback (keep equal). Use ~0.5 only with decode_algo: dmax_prefix (the longest-confident-prefix selector).
-    tau_dec: 0.9
-    initial_window_length: 4
-    max_window_length: 64
-    decode_algo: threshold  # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
-    decode_param: 0.9
-    cache_type: none      # prefix cache is available only with window_type: static.
-    refresh_count: 16
-recompute_each_stride: true
-carry_decoder_state_across_strides: false
+    commit_confidence_tau: 0.75
+    # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
+    # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the
+    # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces
+    # except at the zero-jitter corner; kept as an ablation.
+    decode_conditioning: window
+    max_text_tokens: 128
+    # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
+    # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
+    diffusion_steps: 128
+    block_size: 4
+    dcd:
+        window_type: sliding
+        # DCD commit threshold = 0.9 (decode_algorithm.py / run_all.sh). decode_param is operative; tau_dec is its
+        # fallback (keep equal). Use ~0.5 only with decode_algo: dmax_prefix (the longest-confident-prefix selector).
+        tau_dec: 0.9
+        initial_window_length: 4
+        max_window_length: 64
+        decode_algo: threshold # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
+        decode_param: 0.9
+        cache_type: none # prefix cache is available only with window_type: static.
+        refresh_count: 16

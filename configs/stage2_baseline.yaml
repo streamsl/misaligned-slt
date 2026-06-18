@@ -1,46 +1,54 @@
 seed: 42
 language: phoenix
 checkpoint:
-  dir: checkpoints/stage2_baseline/phoenix   # best model.pt + best.json saved here
-  from_vlp: checkpoints/vlp/phoenix          # stage-1 visual backbone to initialise from
-  save_best: true
+    dir: checkpoints/stage2_baseline/phoenix # best model.pt + best.json saved here
+    from_vlp: checkpoints/vlp/phoenix # stage-1 visual backbone to initialise from
+    save_best: true
 decoder: ar
 wandb:
-  enabled: true
-  project: misaligned-slt
-  name: stage2_baseline_phoenix
-  mode: online
+    enabled: true
+    project: misaligned-slt
+    name: stage2_baseline_phoenix
+    mode: online
 use_temporal_conv: false
-visual_padding: gfslt
-training_distribution: clean_pretrimmed
-# Freeze the from-scratch CoSign pose backbone in stage 2. The largest overfitting route on a small corpus is 
-# end-to-end fine-tuning of the from-scratch GCN; freezing it after VLP is the spec-default regularizer. 
+visual_padding: none
+# Freeze the from-scratch CoSign pose backbone in stage 2. The largest overfitting route on a small corpus is
+# end-to-end fine-tuning of the from-scratch GCN; freezing it after VLP is the spec-default regularizer.
 # Tradeoff: it caps stage-2 on the VLP feature quality, so A/B against false when VLP retrieval is weak.
 freeze_backbone: false
 freeze_projection: false # Freezes the VLP sign projection
 # GFSLT-VLP translation CE uses label_smoothing=0.2 (train_slt.py); HF mBART's internal loss has none.
 # Applied to the clean AR baseline so its loss matches the GFSLT recipe it is benchmarked against.
 label_smoothing: 0.2
-mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 16
-learning_rate: 5.0e-4
+# Pose augmentation for the GFSLT-VLP literature-floor baseline (TRAIN only). GFSLT-VLP augments video
+# with RandomHorizontalFlip + RandomResizedCrop, so the pose analogue enables flip + affine; rotation
+# (MSKA) is left off by default here to stay faithful to the GFSLT recipe. Same schema as stage1_vlp.yaml.
+augment:
+    enabled: true
+    rotation: { deg: 15.0, prob: 0.0 }
+    flip: { prob: 0.5 }
+    affine: { prob: 0.5, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
+    spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
+mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+batch_size: 8
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-epochs: 50
+epochs: 100
 eval_every_epochs: 1
 early_stopping:
-  monitor: val_translation_bleu4
-  mode: max
-  patience: 20
-  min_delta: 0.0
-  restore_best: true
+    monitor: val_translation_bleu4
+    mode: max
+    patience: 20
+    min_delta: 0.0
+    restore_best: true
 scheduler:
-  type: cosine
-  eta_min: 1.0e-6
+    type: cosine
+    eta_min: 1.0e-6
 max_grad_norm: 1.0
 max_text_tokens: 128
 validation:
-  max_translation_samples: 0   # 0 = score translation on ALL dev sentences
-  # GFSLT-VLP reports dev BLEU with beam search (num_beams=4, train_slt.py:430). The 22.12 dev BLEU4 is a
-  # beam-4 number; greedy (the AR-vs-DLM default) costs several BLEU. The standalone clean baseline is
-  # the literature-comparison floor, so it decodes with beams; the stage-2 AR/DLM arms stay greedy.
-  num_beams: 4
+    max_translation_samples: 0 # 0 = score translation on ALL dev sentences
+    # GFSLT-VLP reports dev BLEU with beam search (num_beams=4, train_slt.py:430). The 22.12 dev BLEU4 is a
+    # beam-4 number; greedy (the AR-vs-DLM default) costs several BLEU. The standalone clean baseline is
+    # the literature-comparison floor, so it decodes with beams; the stage-2 AR/DLM arms stay greedy.
+    num_beams: 4

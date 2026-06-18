@@ -1,70 +1,90 @@
 seed: 42
 language: phoenix
 wandb:
-  enabled: true
-  project: misaligned-slt
-  name: stage1_vlp_phoenix
-  mode: online
+    enabled: true
+    project: misaligned-slt
+    name: stage1_vlp_phoenix
+    mode: online
 mbart:
-  name: facebook/mbart-large-cc25
-  trimmed_dir: checkpoints/trimmed_mbart_phoenix   # trim_mbart output (run with --target-lang de_DE).
-  # Depth-trim the vocab-trimmed mBART in the same trim-mbart step: keep the first N pretrained encoder /
-  # decoder layers (truncation-init, not random) plus embeddings + layer norms; drop the deeper layers.
-  # This single small model is used everywhere (stage-1 text encoder, visual encoder, AR/DLM decoder).
-  # Truncation-init (vs GFSLT-VLP's random "mytran") is required because our ONE model is also the
-  # stage-1 text encoder: a random text encoder gives the contrastive loss no stable target and VLP
-  # diverges. Head count is left at the source's (omit attention_heads) so pretrained attention transfers
-  # exactly; layer count is the only size lever at fixed d_model. Remove `layers:` to keep full depth.
-  layers:
-    encoder: 3
-    decoder: 3
+    name: facebook/mbart-large-cc25
+    trimmed_dir: checkpoints/trimmed_mbart_phoenix # trim_mbart output (run with --target-lang de_DE).
+    # Depth-trim the vocab-trimmed mBART in the same trim-mbart step: keep the first N pretrained encoder /
+    # decoder layers (truncation-init, not random) plus embeddings + layer norms; drop the deeper layers.
+    # This single small model is used everywhere (stage-1 text encoder, visual encoder, AR/DLM decoder).
+    # Truncation-init (vs GFSLT-VLP's random "mytran") is required because our ONE model is also the
+    # stage-1 text encoder: a random text encoder gives the contrastive loss no stable target and VLP
+    # diverges. Head count is left at the source's (omit attention_heads) so pretrained attention transfers
+    # exactly; layer count is the only size lever at fixed d_model. Remove `layers:` to keep full depth.
+    layers:
+        encoder: 3
+        decoder: 3
 checkpoint:
-  # Best VLP visual backbone (visual_backbone.pt + best.json), written the moment a new best dev value
-  # is found — not only at the end. The GFSLT baseline and stage 2 load it via their checkpoint.from_vlp.
-  dir: checkpoints/vlp/phoenix
-  save_best: true
+    # Best VLP visual backbone (visual_backbone.pt + best.json), written the moment a new best dev value
+    # is found — not only at the end. The GFSLT baseline and stage 2 load it via their checkpoint.from_vlp.
+    dir: checkpoints/vlp/phoenix
+    save_best: true
 embed_dim: 1024
 hidden_size: 1024
 temporal_kernel: 3
-use_temporal_conv: false  # Keep per-frame features aligned with the BIO/streaming contract.
-# Scale post-VLP pose features by sqrt(d_model) before the mBART encoder, matching GFSLT-VLP's
-# gloss_free_model.embed_scale (models.py:307). HF MBartEncoder does NOT scale `inputs_embeds`, so with
-# false the pretrained encoder receives pose features at positional-embedding magnitude (positions then
-# compete with content). This is the SINGLE source of truth — the baseline / stage-2 / eval all inherit it,
-# so toggling it requires re-running stage-1 VLP and every downstream stage. A/B candidate for the low-BLEU
-# front-end (try true). Ref: arXiv 2307.14768.
+use_temporal_conv: false # Keep per-frame features aligned with the BIO/streaming contract.
+# Pose backbone (SINGLE source of truth — baseline / stage-2 / eval all inherit it; the VLP checkpoint
+# carries this architecture's weights, so changing it requires re-running stage-1 VLP + every downstream
+# stage). "cosign" = CoSign1s ST-GCN on 77 group-normalised keypoints (default). "dsta" = MSKA's 4-stream
+# decoupled spatial-temporal attention (backbones/dsta.py) on 133 MSKA-normalised COCO-WholeBody keypoints
+# — a stronger keypoint encoder (the architecture behind MSKA's SOTA), gloss-free here. Setting "dsta"
+# auto-switches the data layer to the mska133 representation (poses.pose_repr_for_backbone) and feeds the
+# raw 133 keypoints with MSKA global frame-normalisation (frame size from manifest src_meta).
+backbone: cosign
+# DSTA-only: spatial positional-encoding buffers are sized to this many frames; must exceed the longest
+# window the backbone sees (streaming buffer_cap_s * fps). 256 ~ 20s at 12.5 fps (> the 18s buffer cap).
+dsta_num_frame: 256
+dsta_dropout: 0.1
+# Scale post-VLP pose features by sqrt(d_model) before mBART encoder, matching GFSLT-VLP's gloss_free_model.embed_scale
+# (models.py:307). HF MBartEncoder does NOT scale `inputs_embeds`, so with false the pretrained encoder receives pose
+# features at positional-embedding magnitude (positions then compete with content). This is the SINGLE source of truth
+# — the baseline / stage-2 / eval all inherit it, so toggling it requires re-running stage-1 VLP and every downstream
+# stage. A/B candidate for the low-BLEU front-end (try true). Ref: arXiv 2307.14768.
 scale_embedding: false
-visual_padding: gfslt     # GFSLT-VLP repeats boundary frames with 8-frame halos.
-# GFSLT-VLP VLP = contrastive (SLRCLIP) + masked-text decoder reconstruction
-# (Text_Decoder / CMLM). The CMLM half pretrains the mBART decoder reused by both
-# the AR baseline (Analysis B) and our DLM; omitting it leaves the decoder at raw
-# mBART init and makes the GFSLT baseline unfaithful. Ref: GFSLT-VLP train_vlp_v2.py.
+visual_padding: none # GFSLT-VLP repeats boundary frames with 8-frame halos.
+# Pose augmentation — TRAIN ONLY (dev/eval never augmented), applied to RAW pixel keypoints before normalization.
+# SPATIAL + length-preserving, so per-frame timestamps/BIO stay aligned (temporal augmentation is the separate fps_aug).
+# Frame-referenced ops (flip/affine/spatial_mask) use the per-dataset frame size (PoseIndex.width/height, e.g. PHOENIX 210x260,
+# CSL-Daily 512x512); rotation is centroid-based and size-free. `rotation` = MSKA `random_move` (datasets.py); `flip`+`affine`
+# = the pose-space analogue of GFSLT-VLP's RandomHorizontalFlip + RandomResizedCrop. enabled: false to disable.
+augment:
+    enabled: true
+    rotation: { deg: 15.0, prob: 0.5 } # MSKA default ±15°
+    flip: { prob: 0.0 } # set 0.5 for GFSLT-VLP-style horizontal flip (mirrors the signer)
+    affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null } # GFSLT RandomResizedCrop analogue
+    spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
+# GFSLT-VLP VLP = contrastive (SLRCLIP) + masked-text decoder reconstruction (Text_Decoder / CMLM). The CMLM half pretrains the
+# mBART decoder reused by both the AR baseline (Analysis B) and our DLM; omitting it leaves the decoder at raw mBART init and
+# makes the GFSLT baseline unfaithful. Ref: GFSLT-VLP train_vlp_v2.py.
 cmlm:
-  enabled: true
-  lambda: 1.0           # args.loss_lambda in train_vlp_v2.py
-  noise_rate: 0.15      # utils.NoiseInjecting default
-  noise_type: omit_last # {omit_last, omit}; GFSLT default omit_last
-  random_shuffle: false
-  label_smoothing: 0.2  # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
-mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 16
-learning_rate: 2.0e-4
+    enabled: true
+    lambda: 1.0 # args.loss_lambda in train_vlp_v2.py
+    noise_rate: 0.15 # utils.NoiseInjecting default
+    noise_type: omit_last # {omit_last, omit}; GFSLT default omit_last
+    random_shuffle: false
+    label_smoothing: 0.2 # CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.2)
+mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+batch_size: 4
+learning_rate: 5.0e-5
 weight_decay: 1.0e-4
-epochs: 80
+epochs: 100
 eval_every_epochs: 1
 early_stopping:
-  # Stage-1's deliverable is the aligned pose<->text space; in-batch retrieval accuracy measures it
-  # directly. val_loss mixes in the CMLM term, which overfits fastest on ~18k sentences and drags
-  # the combined loss up while the contrastive alignment is still improving — early-stopping on
-  # val_loss therefore stops too early. (val_loss rising after a few epochs is expected small-data
-  # overfitting, not a bug; the monitor just has to watch the right signal.)
-  monitor: val_image_retrieval_acc
-  mode: max
-  patience: 20
-  min_delta: 0.0
-  restore_best: true
+    # Stage-1's deliverable is the aligned pose<->text space; in-batch retrieval accuracy measures it directly. val_loss mixes in
+    # the CMLM term, which overfits fastest on ~18k sentences and drags the combined loss up while the contrastive alignment is
+    # still improving — early-stopping on val_loss therefore stops too early. (val_loss rising after a few epochs is expected
+    # small-data overfitting, not a bug; the monitor just has to watch the right signal.)
+    monitor: val_image_retrieval_acc
+    mode: max
+    patience: 20
+    min_delta: 0.0
+    restore_best: true
 scheduler:
-  type: cosine
-  eta_min: 1.0e-6
+    type: cosine
+    eta_min: 1.0e-6
 max_grad_norm: 1.0
 freeze_backbone: false

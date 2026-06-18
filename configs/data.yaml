@@ -1,82 +1,83 @@
 seed: 42
 active_languages: [phoenix]
 
-# pose_fps is a FALLBACK only. Real pose fps is resolved per video as
-# total_pose_frames / video_duration from <root>/video_meta.csv — generate once with
-# `python -m poses <root> [--format SEL]` (yt-dlp metadata fetch, no video download:
-# whole-second durations ~0.3% drift; width/height resolved through the --format
-# selector — pass the one the language's videos were downloaded with). Poses are
-# extracted at native/2 fps and the NATIVE rate varies per YouTube video (measured on
-# Auslan: 62% eff 12.5, 30% at 15.0, 10% at 12.0, 8% at 25). A constant 25 misplaced
-# every timestamp ~2x (label-motion correlation 0.10 vs 0.26 corrected; ~44% of
-# captions dropped by the duration filter); even a hand-set 12.5 leaves 37.7% of
-# videos with >5% timestamp error (median 26s end-of-video drift).
+# pose_fps is a FALLBACK only. Real pose fps is resolved per video as total_pose_frames / video_duration from
+# <root>/video_meta.csv — generate once with `python -m poses <root> [--format SEL]` (yt-dlp metadata fetch,
+# no video download: whole-second durations ~0.3% drift; width/height resolved through the --format selector —
+# pass the one the language's videos were downloaded with). Poses are extracted at native/2 fps and NATIVE rate
+# varies per YouTube video (measured on Auslan: 62% eff 12.5, 30% at 15.0, 10% at 12.0, 8% at 25). A constant 25
+# misplaced every timestamp ~2x (label-motion correlation 0.10 vs 0.26 corrected; ~44% of captions dropped by the
+# duration filter); even a hand-set 12.5 leaves 37.7% of videos with >5% timestamp error (median 26s end-of-video drift).
 languages:
-  # Synthetic streaming corpora (built by e2e-slt-streaming/data_synth). All data_synth datasets share
-  # ONE schema, so each is just another entry with `source: streams` + its own `root` + `target_lang`
-  # (the only per-dataset knob — it drives the mBART vocab trim). Clean GT cue boundaries + exact-fps
-  # poses → the proven-working alternative to the noisy YouTube data. To add CSL-Daily / How2Sign later,
-  # drop another entry below (e.g. csl_daily: source streams, target_lang zh_CN, root data/csl_daily;
-  # how2sign: source streams, target_lang en_XX, root data/how2sign) and re-run trim-mbart + Analysis A.
-  # PHOENIX is GERMAN: target_lang MUST be de_DE (mbart-large-cc25 covers it) so the trim keeps German
-  # subwords; en_XX would tokenize German as near-<unk> and the whole pipeline would learn nothing.
-  phoenix:
-    name: PHOENIX-2014T (synthetic streams)
-    source: streams          # routes load_language_records -> data.synth_streams.load_stream_records
-    target_lang: de_DE
-    root: data/phoenix
-    pose_fps: 12.5           # authoritative (== manifest.target_fps); streams are exactly this rate
-    normalize_by_resolution: false
-  asf:
-    name: Auslan
-    target_lang: en_XX
-    root: data/youtube-sl-25/asf
-    pose_fps: 25.0
-    # Per-video width/height from video_meta.csv are available, but dividing by them is OFF:
-    # (1) CoSign group normalization is already resolution-independent (coords divided by
-    # body reference lengths); (2) the stored width/height is the mp4 CONTAINER resolution,
-    # which may NOT match DWPose coordinate frame, so the division would not even map to [0,1].
-    normalize_by_resolution: false
-  bfi:
-    name: BSL
-    target_lang: en_XX
-    root: data/youtube-sl-25/bfi
-    pose_fps: 25.0
-  ase:
-    name: ASL
-    target_lang: en_XX
-    root: data/youtube-sl-25/ase
-    pose_fps: 25.0
+    # Synthetic streaming corpora (built by e2e-slt-streaming/data_synth). All data_synth datasets share
+    # ONE schema, so each is just another entry with `source: streams` + its own `root` + `target_lang`
+    # (the only per-dataset knob — it drives the mBART vocab trim). Clean GT cue boundaries + exact-fps
+    # poses → the proven-working alternative to the noisy YouTube data. To add CSL-Daily / How2Sign later,
+    # drop another entry below (e.g. csl_daily: source streams, target_lang zh_CN, root data/csl_daily;
+    # how2sign: source streams, target_lang en_XX, root data/how2sign) and re-run trim-mbart + Analysis A.
+    # PHOENIX is GERMAN: target_lang MUST be de_DE (mbart-large-cc25 covers it) so the trim keeps German
+    # subwords; en_XX would tokenize German as near-<unk> and the whole pipeline would learn nothing.
+    phoenix:
+        name: PHOENIX-2014T (synthetic streams)
+        source: streams # routes load_language_records -> data.synth_streams.load_stream_records
+        target_lang: de_DE
+        root: data/phoenix
+        pose_fps: 12.5 # authoritative (== manifest.target_fps); streams are exactly this rate
+        normalize_by_resolution: false
+        # CoSign-path keypoint confidence gate: points with conf < this are zeroed before group normalization
+        # (poses.normalize_keypoints). Inert for dsta backbone (MSKA norm feeds conf as a channel & doesn't threshold).
+        confidence_threshold: 0.0
+        # Pixel frame the raw 133-keypoint coords live in — used ONLY by dsta (MSKA) backbone's global normalization
+        # (x/w, (h-y)/h). Auto-read from manifest.json src_meta (PHOENIX: 210x260); set pose_width/pose_height here to override.
+        # Cosign ignores these (group-norm is resolution-independent), so this is inert unless stage1_vlp.yaml backbone: dsta.
+        # pose_width: 210
+        # pose_height: 260
+    asf:
+        name: Auslan
+        target_lang: en_XX
+        root: data/youtube-sl-25/asf
+        pose_fps: 25.0
+        # Per-video width/height from video_meta.csv are available, but dividing by them is OFF:
+        # (1) CoSign group normalization is already resolution-independent (coords divided by body reference lengths);
+        # (2) the stored width/height is the mp4 CONTAINER resolution, which may NOT match DWPose coordinate frame,
+        # so the division would not even map to [0,1].
+        normalize_by_resolution: false
+    bfi:
+        name: BSL
+        target_lang: en_XX
+        root: data/youtube-sl-25/bfi
+        pose_fps: 25.0
+    ase:
+        name: ASL
+        target_lang: en_XX
+        root: data/youtube-sl-25/ase
+        pose_fps: 25.0
 
 splits:
-  signverse_csv: data/SignVerse-2M-metadata_split.csv
-  fallback_seed: 42
-  fallback_train: 0.8
-  fallback_dev: 0.1
-  fallback_test: 0.1
+    signverse_csv: data/SignVerse-2M-metadata_split.csv
+    fallback_seed: 42
+    fallback_train: 0.8
+    fallback_dev: 0.1
+    # test split is the remainder (1 - train - dev), computed by build_splits.
 
 subtitles:
-  preferred_suffixes:
-    - .en-GB.vtt
-    - .en-en-GB.vtt
-    - .en-en.vtt
-    - .en.vtt
-  reject_suffixes:
-    - .en-orig.vtt
-    - .orig.vtt
-  min_caption_chars: 2
-  # Reject VTT variants that flatten the whole transcript into one short cue
-  # (common in *.en-en-GB.vtt sidecars) before selecting the subtitle file.
-  reject_flattened_transcripts: true
-  flattened_max_cues: 2
-  flattened_min_chars: 500
-  flattened_max_chars_per_second: 120.0
-  # Drop only whole-cue stage directions such as "AUDIENCE: (APPLAUSE)" or
-  # "(gentle piano music)"; keep real sentences that merely mention music/social URLs.
-  drop_noise_captions: true
-  min_duration_s: 0.20
-  max_duration_s: 60.0
-
-pose:
-  confidence_threshold: 0.5
-  selected_keypoints: cosign_77
+    preferred_suffixes:
+        - .en-GB.vtt
+        - .en-en-GB.vtt
+        - .en-en.vtt
+        - .en.vtt
+    reject_suffixes:
+        - .en-orig.vtt
+        - .orig.vtt
+    min_caption_chars: 2
+    # Reject VTT variants that flatten the whole transcript into one short cue
+    # (common in *.en-en-GB.vtt sidecars) before selecting the subtitle file.
+    reject_flattened_transcripts: true
+    flattened_max_cues: 2
+    flattened_min_chars: 500
+    flattened_max_chars_per_second: 120.0
+    # Drop only whole-cue stage directions such as "AUDIENCE: (APPLAUSE)" or
+    # "(gentle piano music)"; keep real sentences that merely mention music/social URLs.
+    drop_noise_captions: true
+    min_duration_s: 0.20
+    max_duration_s: 60.0

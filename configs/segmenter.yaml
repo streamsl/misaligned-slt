@@ -1,24 +1,25 @@
 seed: 42
 language: phoenix
 checkpoint:
-  dir: checkpoints/segmenter/phoenix   # best model.pt + best.json saved here
-  save_best: true                  # write on every new best monitored value (val_phrase_tiou_f1)
+    dir: checkpoints/segmenter/phoenix # best model.pt + best.json saved here
+    save_best: true # write on every new best monitored value (val_phrase_tiou_f1)
 wandb:
-  enabled: true
-  project: misaligned-slt
-  name: segmenter_phoenix
-  mode: online
-mixed_precision: auto   # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+    enabled: true
+    project: misaligned-slt
+    name: segmenter_phoenix
+    mode: online
+mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 128
 num_frames: 1024
-velocity: true          # Moryossef 2026 repo default: append fps-normalized velocity.
+velocity: true # Moryossef 2026 repo default: append fps-normalized velocity.
 hidden_dim: 384
 encoder_depth: 4
 attn_nhead: 8
 attn_ff_mult: 2
 attn_dropout: 0.1
-dice_loss_weight: 1.5  # Moryossef 2026 README: Dice weight 1.5 helped (NB: in the repo, Dice is on the
-                       # SIGN head; the phrase head trains on plain unweighted NLL — model.py:277-287).
+dice_loss_weight:
+    1.5 # Moryossef 2026 README: Dice weight 1.5 helped (NB: in the repo, Dice is on the
+    # SIGN head; the phrase head trains on plain unweighted NLL — model.py:277-287).
 # This model IS the Moryossef UNet-CNN arch (moryossef26/model.py), and Moryossef's own ablations show
 # the CNN does NOT want class weighting: the UNet skip connections detect B natively (EXPERIMENTS.md
 # finding 8), and weighting it over-segments and collapses tIoU-F1 — the metric we monitor (findings
@@ -37,48 +38,45 @@ bio_class_weights: null
 # steps — the model never trained. Raise for more optimization per epoch.
 steps_per_epoch: null
 fps_aug:
-  enabled: true
-  # Moryossef trains at random 25–50 fps because HIS data is 25–60 fps. Our poses are effectively
-  # 12.0–15.0 fps (extracted at native/2; per-video fps from video_meta.json) and
-  # apply_fps_aug only DOWNSAMPLES, so the range must dip BELOW the source rate to do anything:
-  # [6.25, 25] draws real 0.5–1.0x density variation for ~12.5 fps sources (RoPE keeps true
-  # seconds, so boundaries stay put) — the robustness the original ablation calls essential.
-  # max_fps stays ABOVE the sources on purpose: a draw >= source fps is a no-op = training at
-  # native density, which eval always runs at. Capping at 12.5 would deny the ~30% of videos at
-  # 15 fps (30fps native) and the full-rate 25s their native density in training.
-  min_fps: 6.25
-  max_fps: 25.0
-frame_dropout: 0.15    # Public repo default: drop 0-15% middle frames during train.
+    enabled: true
+    # Moryossef trains at random 25–50 fps because HIS data is 25–60 fps. Our poses are effectively 12.0–15.0
+    # fps (extracted at native/2; per-video fps from video_meta.json) and apply_fps_aug only DOWNSAMPLES, so
+    # the range must dip BELOW the source rate to do anything: [6.25, 25] draws real 0.5–1.0x density variation
+    # for ~12.5 fps sources (RoPE keeps true seconds, so boundaries stay put) — the robustness the original
+    # ablation calls essential. max_fps stays ABOVE the sources on purpose: a draw >= source fps is a no-op =
+    # training at native density, which eval always runs at. Capping at 12.5 would deny the ~30% of videos at
+    # 15 fps (30fps native) and the full-rate 25s their native density in training.
+    min_fps: 6.25
+    max_fps: 25.0
+frame_dropout: 0.15 # Public repo default: drop 0-15% middle frames during train.
 body_part_dropout: 0.1 # Public repo default: zero each hand independently during train.
-speed_aug:
-  enabled: false        # Moryossef 2026 README: speed augmentation hurts.
-attention_padding_mask:
-  enabled: false        # Moryossef 2026 README: padding attention mask hurt.
+# speed augmentation and the padding attention mask are intentionally NOT implemented
+# (Moryossef 2026 README reports both hurt); there is no toggle to enable them.
 optimizer:
-  lr: 1.0e-3
-  weight_decay: 1.0e-4
-  epochs: 500
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    epochs: 500
 eval_every_epochs: 1
 early_stopping:
-  # One-to-one tIoU-matched segment F1 (metrics._segment_tiou_f1): count-sensitive, so neither the
-  # all-I collapse (1 giant run → high frame-IoU) nor over-segmentation can game it. Moryossef's
-  # frame-IoU (val_phrase_seg_iou) is still logged for comparison with his published numbers.
-  # CEILING on this data (measured at the corrected per-video-fps timeline): a PERFECT ≥0.3s-pause
-  # detector scores tiou_f1@0.5 ≈ 0.31 (gold 33.3 segs/video, 68% of caption boundaries are
-  # back-to-back → under-segmentation is unavoidable; those merges are exactly the Mode-3 events
-  # the thesis studies). Plateauing around 0.20–0.31 is SUCCESS, with frame seg_iou expected at
-  # 0.7–0.9 — not Moryossef's 0.91 (his DGS phrase annotations are visual; ours are caption timings).
-  monitor: val_phrase_tiou_f1
-  mode: max
-  patience: 100
-  min_delta: 0.0
-  restore_best: true
+    # One-to-one tIoU-matched segment F1 (metrics.segmentation_prf — the SAME metric RQ2 uses):
+    # count-sensitive, so neither the all-I collapse (1 giant run) nor over-segmentation can game it.
+    # val_phrase_frame_f1 (per-frame O/B/I) and val_phrase_seg_precision/recall are logged alongside.
+    # CEILING on this data (measured at the corrected per-video-fps timeline): a PERFECT ≥0.3s-pause
+    # detector scores tiou_f1@0.5 ≈ 0.31 (gold 33.3 segs/video, 68% of caption boundaries are
+    # back-to-back → under-segmentation is unavoidable; those merges are exactly the Mode-3 events
+    # the thesis studies). Plateauing around 0.20–0.31 is SUCCESS, with per-frame frame_f1 high — not
+    # Moryossef's 0.91 segment number (his DGS phrase annotations are visual; ours are caption timings).
+    monitor: val_phrase_tiou_f1
+    mode: max
+    patience: 100
+    min_delta: 0.0
+    restore_best: true
 scheduler:
-  type: onecycle        # Moryossef 2026 repo default optimizer is adamw-onecycle.
-  max_lr: 1.0e-3
-  pct_start: 0.1
-  div_factor: 25.0
-  final_div_factor: 10000.0
+    type: onecycle # Moryossef 2026 repo default optimizer is adamw-onecycle.
+    max_lr: 1.0e-3
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 10000.0
 # Analysis A pred->GT matching bar (spec §8.1 Step 3): deliberately LOW so near-misses count as
 # matched pairs (their boundary error feeds the (Δ_head, Δ_tail) CDF) instead of inflating
 # skipped/phantom rates. A high bar (e.g. 0.9) would bias the jitter CDF toward near-zero offsets

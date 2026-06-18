@@ -1,29 +1,22 @@
 seed: 42
 languages: [phoenix]
 rq1:
-  # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration 
-  # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes 
-  # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative 
-  # tail = right-trunc (early-trigger) stress test; range must exceed Analysis A's measured tails so the curve is informative.
-  severity_mode: relative
-  severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3]   # fractions of sentence duration
-  smoke_grid_rel: [-0.2, 0.0, 0.2]
-  severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0]                              # used only when severity_mode: absolute
-  smoke_grid_s: [-1.0, 0.0, 1.0]
-  smoke_num_sentences: 10
-  batch_size: 16   # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
+    # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
+    # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
+    # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative
+    # tail = right-trunc (early-trigger) stress test; range must exceed Analysis A's measured tails so the curve is informative.
+    severity_mode: relative
+    severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3] # fractions of sentence duration
+    smoke_grid_rel: [-0.2, 0.0, 0.2]
+    severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0] # used only when severity_mode: absolute
+    smoke_grid_s: [-1.0, 0.0, 1.0]
+    smoke_num_sentences: 10
+    batch_size: 16 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
 rq2:
-  tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
-  smoke_num_videos: 3
+    tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
 # Clean-trained translator, head fixed at GT start, trailing context swept; the elbow is
 # where marginal BLEU per extra second drops below the explicit latency/quality coefficient.
 # buffer_cap_s persisted = p99 sentence duration + elbow (the buffer holds sentence + tail).
 tail_benefit:
-  tail_grid_s: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-  latency_quality_coeff_bleu_per_s: 0.5   # BLEU-4 points per extra second of trailing context
-metrics:
-  bleu4: true
-  rouge_l: true
-  meteor: true
-  cider: true
-  bleurt: true
+    tail_grid_s: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    latency_quality_coeff_bleu_per_s: 0.5 # BLEU-4 points per extra second of trailing context

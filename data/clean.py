@@ -41,8 +41,10 @@ class CleanSentenceItem:
     span: SentenceSpan
 
 class CleanSentenceDataset(Dataset): # GT-trimmed sentence clips for Stage 1 VLP and the clean AR baseline.
-    def __init__(self, records: list[VideoRecord], max_items: int | None = None):
+    def __init__(self, records: list[VideoRecord], max_items: int | None = None, pose_repr: str = "cosign77", augment=None):
         self.records_by_id = {record.video_id: record for record in records}
+        self.pose_repr = str(pose_repr)  # cosign77 / mska133 — must match the model's backbone
+        self.augment = augment           # PoseAugmentor (train) or None (dev/eval); applied pre-normalize
         items = [
             CleanSentenceItem(video_id=record.video_id, span=span)
             for record in records for span in record.sentences
@@ -56,7 +58,9 @@ class CleanSentenceDataset(Dataset): # GT-trimmed sentence clips for Stage 1 VLP
     def __getitem__(self, index: int) -> dict:
         item = self.items[int(index)]
         record = self.records_by_id[item.video_id]
-        poses, abs_timestamps = load_pose_window(record.pose, item.span.start_s, item.span.end_s, normalize=True)
+        poses, abs_timestamps = load_pose_window(
+            record.pose, item.span.start_s, item.span.end_s,
+            normalize=True, pose_repr=self.pose_repr, augment=self.augment)
         return {
             "poses": poses, "timestamps_s": abs_timestamps - item.span.start_s,
             "frame_mask": np.ones((poses.shape[0],), dtype=bool), "text": item.span.text,

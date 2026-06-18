@@ -13,7 +13,7 @@ from data.windowing import (
     BIO, TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
 )
-from poses import load_pose_window
+from poses import load_pose_window, build_pose_augmentor
 
 
 class WindowSampler:
@@ -39,11 +39,16 @@ class WindowSampler:
         mode_ratios: dict[str, float], buffer_cap_s: float,
         seed: int = 42, mode2_subcase_weights: dict[str, float] | None = None,
         fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
+        pose_repr: str = "cosign77", pose_augment_cfg: dict | None = None,
     ):
         self.records = records
         self.jitter = jitter
         self.mode_ratios = normalized_mode_ratios(mode_ratios)
         self.buffer_cap_s = float(buffer_cap_s)
+        self.pose_repr = str(pose_repr)  # cosign77 / mska133 — must match the model's backbone
+        # Spatial pose augmentation (train only), with its own rng so it does not perturb the window-sampling
+        # rng stream. None on dev (deterministic monitor) and never applied to the Mode-2a full-evidence view.
+        self.pose_augmentor = build_pose_augmentor(pose_augment_cfg, np.random.default_rng(int(seed) + 997))
 
         # fps_aug is a Hard Rule (§1.4.4, Moryossef 2026: essential, 0.58→0.49 without). Applied to sampled training windows only — 
         # the Mode-2a full-evidence view stays at native fps so the no-grad self-target decode sees the same frame rate inference will.
@@ -68,7 +73,10 @@ class WindowSampler:
 
 
     @classmethod
-    def from_stage2_config(cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict) -> "WindowSampler":
+    def from_stage2_config(
+        cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict, pose_repr: str = "cosign77",
+        pose_augment_cfg: dict | None = None,
+    ) -> "WindowSampler":
         ratios_cfg = stage2_cfg.get("mode_ratios", {})
         fallback_ratios = ratios_cfg.get("fallback", {})
         source = ratios_cfg.get("source")
@@ -106,6 +114,7 @@ class WindowSampler:
             fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
             fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
             fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
+            pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg,
         )
 
     def _choose_mode(self) -> str:
@@ -259,15 +268,19 @@ class WindowSampler:
         elif mode == "mode3": spec = self._mode3_spec(rec, anchor_idx)
         elif mode == "mode4": spec = self._mode4_spec(rec)
         else: raise ValueError(f"Unknown mode {mode}")
-        return self.materialize(rec, spec, fps_aug=self.fps_aug_enabled)
+        # Augment the sampled training window; the Mode-2a full-evidence view (materialized separately
+        # with defaults) stays un-augmented so the no-grad self-target matches inference conditions.
+        return self.materialize(rec, spec, fps_aug=self.fps_aug_enabled, augment=self.pose_augmentor is not None)
 
 
-    def materialize(self, rec: VideoRecord, spec: WindowSpec, fps_aug: bool = False) -> WindowSample:
+    def materialize(self, rec: VideoRecord, spec: WindowSpec, fps_aug: bool = False, augment: bool = False) -> WindowSample:
         """Realize a `WindowSpec` into tensors: load+normalize the pose window, build per-frame BIO labels from GT boundaries,
         pick the translation target (Mode 1/3 first-complete-span), and for Mode-2a attach the Mode-1-equivalent
         `full_evidence_spec` the confidence-bound term decodes under no_grad. `fps_aug=True` resamples the window to a
         random fps (Moryossef 2026 fps_aug; Hard Rule §1.4.4) and rebuilds the BIO labels from the resampled timestamps."""
-        poses, timestamps = load_pose_window(rec.pose, spec.start_s, spec.end_s, normalize=True)
+        poses, timestamps = load_pose_window(
+            rec.pose, spec.start_s, spec.end_s, normalize=True, pose_repr=self.pose_repr,
+            augment=self.pose_augmentor if augment else None)
         if fps_aug and poses.shape[0] > 1:
             from moryossef26.dataset import apply_fps_aug
             poses, timestamps, _ = apply_fps_aug(

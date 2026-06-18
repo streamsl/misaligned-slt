@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -10,6 +11,7 @@ from data.clean import CleanSentenceCollator, CleanSentenceDataset
 from data.loader import load_language_records
 from models.gfslt import GFSLTConfig
 from models.vlp import PoseTextCLIP
+from poses import pose_repr_for_backbone, build_pose_augmentor
 from models.checkpointing import save_visual_backbone
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from utils import load_yaml, mbart_trimmed_dir
@@ -31,11 +33,16 @@ def build_stage1_components(
     cfg = load_yaml(stage1_config)
     language = str(cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
+    
     tokenizer_dir = mbart_trimmed_dir(cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
+    backbone = str(cfg.get("backbone", "cosign"))
+    pose_repr = pose_repr_for_backbone(backbone)
 
+    # Train-only pose augmentation (spatial, pre-normalize); dev gets None (clean monitor).
+    augmentor = build_pose_augmentor(cfg.get("augment"), np.random.default_rng(int(cfg.get("seed", 42)) + 991))
     records, _ = load_language_records(data_cfg, language, split="train")
-    dataset = CleanSentenceDataset(records, max_items=max_items)
+    dataset = CleanSentenceDataset(records, max_items=max_items, pose_repr=pose_repr, augment=augmentor)
     cmlm_cfg = cfg.get("cmlm", {})
     cmlm_enabled = bool(cmlm_cfg.get("enabled", True))
 
@@ -56,7 +63,7 @@ def build_stage1_components(
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
-        dev_dataset = CleanSentenceDataset(dev_records, max_items=max_items)
+        dev_dataset = CleanSentenceDataset(dev_records, max_items=max_items, pose_repr=pose_repr)
         dev_collator = CleanSentenceCollator(
             tokenizer=tokenizer,
             max_text_tokens=int(cfg.get("max_text_tokens", 128)),
@@ -78,6 +85,10 @@ def build_stage1_components(
         mbart_name=mbart_trimmed_dir(cfg),  # one trimmed mBART for text encoder + visual side
         use_temporal_conv=bool(cfg.get("use_temporal_conv", False)),
         scale_embedding=bool(cfg.get("scale_embedding", False)),  # stage-1 is the source of truth; stage-2 inherits it
+        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
+        num_keypoints=133 if backbone == "dsta" else int(cfg.get("num_keypoints", 77)),
+        dsta_num_frame=int(cfg.get("dsta_num_frame", 256)),
+        dsta_dropout=float(cfg.get("dsta_dropout", 0.1)),
     )
     model = PoseTextCLIP(
         gfslt_cfg, projection_dim=int(cfg.get("embed_dim", 1024)),

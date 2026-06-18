@@ -13,6 +13,7 @@ from data.loader import StreamingWindowDataset, load_language_records
 from models.gfslt import GFSLTConfig
 from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
 from models.checkpointing import save_model_checkpoint
+from poses import pose_repr_for_backbone
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from train.losses import bio_class_weight_tensor
@@ -40,14 +41,20 @@ def _optional_float(value) -> float | None:
     return None if value is None else float(value)
 
 def build_gfslt_config(stage1_cfg: dict, stage2_cfg: dict) -> GFSLTConfig:
+    # backbone + scale_embedding are inherited from the stage-1 VLP config (its checkpoint carries the
+    # backbone weights and was trained at a specific input scale); a mismatch would load wrong weights.
+    backbone = str(stage1_cfg.get("backbone", "cosign"))
     return GFSLTConfig(
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
         use_temporal_conv=bool(stage2_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
-        # Inherit from the stage-1 VLP config: the visual input scale must match what the VLP encoder was trained with.
         scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
+        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
+        num_keypoints=133 if backbone == "dsta" else int(stage1_cfg.get("num_keypoints", 77)),
+        dsta_num_frame=int(stage1_cfg.get("dsta_num_frame", 256)),
+        dsta_dropout=float(stage1_cfg.get("dsta_dropout", 0.1)),
     )
 
 def build_stage2_components(
@@ -68,8 +75,13 @@ def build_stage2_components(
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
 
+    # Pose representation must match the backbone (stage-1 source of truth) end to end.
+    pose_repr = pose_repr_for_backbone(stage1_cfg.get("backbone", "cosign"))
+    pose_augment_cfg = stage2_cfg.get("augment")  # train-only; dev dataset below passes None
     train_records, _ = load_language_records(data_cfg, language, split="train")
-    train_dataset = StreamingWindowDataset(train_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg)
+    train_dataset = StreamingWindowDataset(
+        train_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
+        pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg)
     collator = WindowCollator(
         tokenizer, max_text_tokens=int(stage2_cfg.get("max_text_tokens", 128)),
         visual_padding=str(stage2_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "gfslt"))),
@@ -88,6 +100,7 @@ def build_stage2_components(
         dev_dataset = StreamingWindowDataset(
             dev_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
             steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
+            pose_repr=pose_repr,
         )
         dev_loader = DataLoader(dev_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), collate_fn=collator)
 

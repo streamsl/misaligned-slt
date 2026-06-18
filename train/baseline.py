@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -11,6 +12,7 @@ from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
 from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel, resolve_decoder_start_id
 from models.checkpointing import load_visual_backbone_checked, save_model_checkpoint
+from poses import pose_repr_for_backbone, build_pose_augmentor
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
@@ -34,17 +36,21 @@ def build_baseline_components(
     data_cfg = load_yaml(data_config)
     stage1_cfg = load_yaml(stage1_config)
     base_cfg = load_yaml(baseline_config)
-
     language = str(base_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
+
     tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
+    backbone = str(stage1_cfg.get("backbone", "cosign"))
+    pose_repr = pose_repr_for_backbone(backbone)
 
+    # Train-only pose augmentation (the baseline config's `augment:` block; falls back to stage-1's).
+    aug_cfg = base_cfg.get("augment", stage1_cfg.get("augment"))
+    augmentor = build_pose_augmentor(aug_cfg, np.random.default_rng(int(base_cfg.get("seed", 42)) + 991))
     records, _ = load_language_records(data_cfg, language, split="train")
-    dataset = CleanSentenceDataset(records, max_items=max_items)
+    dataset = CleanSentenceDataset(records, max_items=max_items, pose_repr=pose_repr, augment=augmentor)
     collator = CleanSentenceCollator(
-        tokenizer,
-        max_text_tokens=int(base_cfg.get("max_text_tokens", 128)),
+        tokenizer, max_text_tokens=int(base_cfg.get("max_text_tokens", 128)),
         visual_padding=str(base_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "gfslt"))),
     )
     loader = DataLoader(
@@ -54,7 +60,7 @@ def build_baseline_components(
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
-        dev_dataset = CleanSentenceDataset(dev_records, max_items=max_items)
+        dev_dataset = CleanSentenceDataset(dev_records, max_items=max_items, pose_repr=pose_repr)
         dev_loader = DataLoader(
             dev_dataset, batch_size=int(base_cfg.get("eval_batch_size", base_cfg.get("batch_size", 8))),
             shuffle=False, num_workers=0, collate_fn=collator,
@@ -67,6 +73,10 @@ def build_baseline_components(
         use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
         # Inherit from the stage-1 VLP config so the baseline encoder sees the same input scale VLP trained.
         scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
+        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
+        num_keypoints=133 if backbone == "dsta" else int(stage1_cfg.get("num_keypoints", 77)),
+        dsta_num_frame=int(stage1_cfg.get("dsta_num_frame", 256)),
+        dsta_dropout=float(stage1_cfg.get("dsta_dropout", 0.1)),
     )
     model = CleanARSLTModel(
         gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer),

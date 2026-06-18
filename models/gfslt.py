@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import MBartConfig, MBartForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
-from backbones.cosign import CoSign1s
+from backbones.cosign import CoSign1s, DSTANet
 
 try: from safetensors.torch import load_file as load_safetensors
 except Exception: load_safetensors = None # pragma: no cover - optional dependency path
@@ -23,9 +23,18 @@ class GFSLTConfig:
     # encoder, the bidirectional visual encoder, and the decoder that becomes the AR/DLM translation
     # decoder. trim_mbart depth-trims it (default 3 enc / 3 dec) so this is a small, fast model.
     mbart_name: str = "facebook/mbart-large-cc25"
-    num_keypoints: int = 77 # Selected keypoints from CoSign
+    num_keypoints: int = 77 # Selected keypoints fed to the backbone (CoSign: 77; DSTA/MSKA-native: 133)
     input_channels: int = 3 # x, y, confidence
     use_temporal_conv: bool = False
+    # Pose backbone: "cosign" = CoSign1s ST-GCN on 77 CoSign-normalised keypoints (default, prior behaviour); "dsta" = MSKA's 4-stream 
+    # decoupled spatial-temporal attention (backbones/dsta.py) on 133 MSKA-normalised COCO-WholeBody keypoints. The choice binds the 
+    # pose representation the data layer must produce (see poses.pose_io.pose_repr_for_backbone) and MUST be identical across the 
+    # stage-1 VLP and stage-2 (the VLP checkpoint carries backbone weights of one specific architecture).
+    backbone: str = "cosign"
+    # DSTA spatial PE buffers are sized to this many frames; it must exceed the longest window the
+    # backbone ever sees (streaming buffer_cap_s * fps). 256 ~ 20s at 12.5 fps (> the 18s buffer cap).
+    dsta_num_frame: int = 256
+    dsta_dropout: float = 0.1
     # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's gloss_free_model does for its visual 
     # sign embeddings (models.py:307, gated by config ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to 
     # `inputs_embeds` (only to the embed_tokens path), so the pretrained encoder expects pose features at token- embedding magnitude 
@@ -105,8 +114,20 @@ class PoseFeatureExtractor(nn.Module):
     def __init__(self, config: GFSLTConfig, level: str = 'spatial', adaptive: bool = True):
         super().__init__()
         self.config = config
+        self.backbone_type = str(getattr(config, "backbone", "cosign")).lower()
+        if self.backbone_type == "dsta":
+            # MSKA decoupled spatial-temporal attention on MSKA-native 133 keypoints. It keeps T frame-aligned internally 
+            # (force_stride1), so the legacy temporal_conv downsampler is incompatible (it would desync BIO/timestamps).
+            if bool(config.use_temporal_conv): raise ValueError("backbone='dsta' is frame-aligned; set use_temporal_conv=false.")
+            self.dsta = DSTANet(
+                hidden_size=config.hidden_size, num_frame=int(config.dsta_num_frame),
+                dropout=float(config.dsta_dropout),
+            )
+            self.use_temporal_conv = False
+            self.output_dim = config.hidden_size
+            return
         self.cosign = CoSign1s( # CoSign1s ST-GCN backbone for pose feature extraction
-            temporal_kernel=config.temporal_kernel, hidden_size=config.hidden_size, 
+            temporal_kernel=config.temporal_kernel, hidden_size=config.hidden_size,
             level=level, adaptive=adaptive
         )
         self.use_temporal_conv = bool(config.use_temporal_conv)
@@ -118,7 +139,8 @@ class PoseFeatureExtractor(nn.Module):
         frame_mask: torch.Tensor | None = None,
         timestamps_s: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        features = self.cosign(poses) # CoSign expects (B, T, K, 3) and outputs (B, T, hidden_size)
+        # Both backbones share CoSign1s's contract: (B, T, K, 3) -> (B, T, hidden_size), T preserved.
+        features = self.dsta(poses) if self.backbone_type == "dsta" else self.cosign(poses)
         if frame_mask is None: frame_mask = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
         if not self.use_temporal_conv: return features, frame_mask, timestamps_s
 

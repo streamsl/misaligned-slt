@@ -21,7 +21,7 @@ pd.set_option("display.float_format", "{:.4f}".format)
 from data.loader import VideoRecord, load_language_records
 from data.windowing import SentenceSpan
 from data.gfslt_padding import pad_visual_sequence_gfslt
-from poses import load_pose_window
+from poses import load_pose_window, pose_repr_for_backbone
 
 from models.gfslt import GFSLTConfig, CleanARSLTModel, resolve_decoder_start_id
 from models.streaming_slt import MisalignedSLTModel
@@ -272,14 +272,19 @@ def _load_tokenizer(stage1_cfg: dict, data_cfg: dict, language: str):
 
 
 def _gfslt_config(stage1_cfg: dict, method_cfg: dict) -> GFSLTConfig:
+    # backbone + scale_embedding must match the trained checkpoint: sourced from the stage-1 VLP config.
+    backbone = str(stage1_cfg.get("backbone", "cosign"))
     return GFSLTConfig(
         embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
         hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
         temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
         mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART training used
         use_temporal_conv=bool(method_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
-        # Must match the trained checkpoint: sourced from the stage-1 VLP config like the trainers.
         scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
+        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
+        num_keypoints=133 if backbone == "dsta" else int(stage1_cfg.get("num_keypoints", 77)),
+        dsta_num_frame=int(stage1_cfg.get("dsta_num_frame", 256)),
+        dsta_dropout=float(stage1_cfg.get("dsta_dropout", 0.1)),
     )
 
 
@@ -457,13 +462,16 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     inference_cfg = load_yaml(args.inference_config)
     model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
 
-    # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch
-    # near-uniform length so padding — and wasted compute — is minimal). Padding is masked, so batching does
-    # not change any per-window result, only throughput.
+    # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch near-uniform length 
+    # so padding — and wasted compute — is minimal). Padding is masked, so batching not change any per-window result, only throughput.
+    pose_repr = pose_repr_for_backbone(stage1_cfg.get("backbone"))
     materialized: list[tuple[ControlledWindow, np.ndarray, np.ndarray]] = []
     for window in windows:
         record = records_by_id[window.video_id]
-        poses, timestamps = load_pose_window(record.pose, window.window_start_s, window.window_end_s, normalize=True)
+        poses, timestamps = load_pose_window(
+            record.pose, window.window_start_s, window.window_end_s, 
+            normalize=True, pose_repr=pose_repr
+        )
         if poses.shape[0] == 0: continue
         materialized.append((window, poses, timestamps))
 
@@ -558,10 +566,11 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    pose_repr = pose_repr_for_backbone(stage1_cfg.get("backbone"))
 
     predicted: dict[str, list[PredictionEvent]] = {}
     for record in tqdm(records, desc="Processing records"):
-        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True, pose_repr=pose_repr)
         if poses.shape[0] == 0:
             predicted[record.video_id] = []
             continue
@@ -603,6 +612,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
     segments = load_prediction_file(args.segments)
+    pose_repr = pose_repr_for_backbone(stage1_cfg.get("backbone"))
 
     # The split comes from --split, NOT the JSON filename. Mismatched video_ids silently translate nothing and
     # score all-zero, so fail loud instead (the classic "gold_*_test.json but forgot --split test" footgun).
@@ -621,7 +631,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
         if record is None: continue
         events: list[PredictionEvent] = []
         for span in spans:
-            poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
+            poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True, pose_repr=pose_repr)
             if poses.shape[0] == 0: continue
             text, _ = _translate_window(
                 model=model, tokenizer=tokenizer, method=args.method,

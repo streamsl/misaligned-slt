@@ -35,10 +35,10 @@ from poses.pose_io import PoseIndex
 def _stream_frame_size(root: Path, lang_cfg: dict) -> tuple[int | None, int | None]:
     # Pixel frame the raw pose coordinates live in, needed by the MSKA (dsta) pose representation's
     # global normalization (x/w, (h-y)/h). Authoritative source is the builder's manifest src_meta
-    # (PHOENIX: src_w=210, src_h=260); config keys pose_width/pose_height override. The CoSign
+    # (PHOENIX: src_w=210, src_h=260); config keys width/height override. The CoSign
     # representation ignores these (its group normalization is resolution-independent).
-    width = lang_cfg.get("pose_width")
-    height = lang_cfg.get("pose_height")
+    width = lang_cfg.get("width")
+    height = lang_cfg.get("height")
     if width and height: return int(width), int(height)
     manifest = root / "manifest.json"
     if manifest.exists():

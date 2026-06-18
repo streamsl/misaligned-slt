@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import MBartConfig, MBartForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
-from backbones.cosign import CoSign1s, DSTANet
+from backbones import CoSign1s, DSTANet
 
 try: from safetensors.torch import load_file as load_safetensors
 except Exception: load_safetensors = None # pragma: no cover - optional dependency path

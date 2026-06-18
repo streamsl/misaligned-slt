@@ -250,7 +250,7 @@ def load_pose_window(
     start_frame = int(np.floor(start_s * pose_index.fps))
     end_frame = int(np.ceil(end_s * pose_index.fps))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
-    if augment is not None and poses.shape[1:] == (133, 3):s poses = augment(poses, pose_index.width, pose_index.height)
+    if augment is not None and poses.shape[1:] == (133, 3): poses = augment(poses, pose_index.width, pose_index.height)
     if normalize and poses.shape[1:] == (133, 3):
         if str(pose_repr).lower() == MSKA_REPR: 
             poses = normalize_keypoints_mska(poses, width=pose_index.width, height=pose_index.height)

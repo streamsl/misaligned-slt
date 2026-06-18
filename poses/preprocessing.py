@@ -2,9 +2,9 @@ import numpy as np
 from . import *
 
 
-def normalize_keypoints(
+def normalize_keypoints_cosign(
     keypoints: np.ndarray, width: int | None = None, height: int | None = None,
-    min_scale_px: float = 2.0, clip: float = 10.0,
+    min_scale_px: float = 2.0, clip: float = 10.0, conf_threshold: float | None = None,
 ) -> np.ndarray:
     '''
     CoSign group normalization (subtract root, divide by group reference length), made
@@ -19,7 +19,7 @@ def normalize_keypoints(
     by 1e6+ (measured: hand features up to 2.6e7, velocities 6.6e8 — enough to stop any model
     from learning past the label prior). Three guards, applied in the right order:
 
-    1. Confidence thresholding FIRST (raw points with conf < CONF_THRESHOLD are invalid and must
+    1. Confidence thresholding FIRST (raw points with conf < conf_threshold are invalid and must
        not define roots/scales — the old code normalized with raw coords and thresholded after).
     2. A frame's group is valid only if its root+reference points are valid AND the reference
        length >= `min_scale_px` (pixels). Invalid group-frames are zeroed entirely — same
@@ -32,15 +32,14 @@ def normalize_keypoints(
     Returns:
         (frames, 77, 3) normalized keypoints; invalid points/groups zeroed.
     '''
-    if keypoints.shape[1] != 133:
-        raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')
-
+    if keypoints.shape[1] != 133: raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')
     # Ensure float and finite to avoid overflow/underflow in linalg ops
     keypoints = np.asarray(keypoints, dtype=np.float32, order='C').copy()
     np.nan_to_num(keypoints, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Guard 1: invalidate low-confidence points BEFORE anything reads their coordinates.
-    invalid_pt = keypoints[:, :, 2] < CONF_THRESHOLD  # (T, 133)
+    # Guard 1: invalidate low-confidence points BEFORE anything reads their coordinates. 
+    # The threshold is per-dataset (PoseIndex.conf_threshold from data.yaml).
+    invalid_pt = keypoints[:, :, 2] < conf_threshold  # (T, 133)
     keypoints[invalid_pt] = 0.0                       # Zero out x,y,conf
 
     # Split into groups
@@ -107,21 +106,50 @@ def normalize_keypoints(
     return norm_kpts
 
 
-def subsample_frames(keypoints: np.ndarray, target_fps: float) -> np.ndarray:
+def normalize_keypoints_mska(keypoints: np.ndarray, width: int | None, height: int | None, clip: float = 1.5) -> np.ndarray:
     '''
-    Subsample to lower FPS if needed (e.g., from 12.5 to 5 fps)
-    Input: keypoints (frames, kpts, 3), target_fps (float)
-    Output: subsampled keypoints
+    MSKA global frame-normalization (github.com/sutwangyan/MSKA, datasets.py:
+    S2T_Dataset.augment_preprocess_inputs), the input representation MSKA's DSTA backbone expects.
+
+    Unlike CoSign's per-group root-relative normalization (which is offset-invariant but DESTROYS the
+    inter-part spatial layout — where the hands sit relative to face/body), this keeps ALL 133
+    COCO-WholeBody keypoints in a single shared frame so DSTA's 79-node body stream can learn that
+    layout (a phonological location cue in sign). MSKA pipeline, applied per (x, y, conf):
+
+        x' = x / width ;  y' = (height - y) / height ;  (x', y') -> (·-0.5)/0.5   # -> [-1, 1]
+        conf channel: untouched (DSTA feeds it as a 3rd input channel, letting the net down-weight
+                      unreliable points — so we do NOT confidence-threshold-zero like CoSign).
+
+    One deviation from MSKA, for our noisier synthetic poses: a hard clip of the normalized x,y to
+    ±`clip`. MSKA's studio HRNet keypoints are clean; ours carry occasional detection-failure outliers
+    (measured x down to -719 px in a 210-wide frame). Confident points map well inside [-1, 1] (measured
+    p1..p99 ~ [-0.7, 0.7]); `clip`=1.5 leaves a margin for legit frame-edge points and neutralises only
+    garbage. (Mirrors the Guard-3 clip rationale in `normalize_keypoints_cosign`.)
+
+    Args:
+        keypoints: (frames, 133, 3) x, y, confidence — RAW pixel coordinates.
+        width, height: the pixel frame the coordinates live in (PHOENIX synth: manifest src_meta
+                       src_w=210, src_h=260, carried on PoseIndex.width/height).
+    Returns:
+        (frames, 133, 3) MSKA-normalized keypoints (x, y in [-clip, clip]; conf unchanged).
     '''
-    if target_fps >= FPS: return keypoints
-    step = int(FPS / target_fps)
-    subsampled = keypoints[::step, :, :]
-    print(f'Subsampled from {keypoints.shape[0]} to {subsampled.shape[0]} frames (target FPS: {target_fps})')
-    return subsampled
+    if keypoints.shape[1:] != (133, 3): raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')
+    if not width or not height: raise ValueError(
+        'normalize_keypoints_mska needs the pixel frame width/height (PoseIndex.width/height). '
+        'For synth corpora these come from manifest.json src_meta; set them on the language entry or rebuild the manifest.'
+    )
+    kp = np.asarray(keypoints, dtype=np.float32, order='C').copy()
+    np.nan_to_num(kp, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    x = kp[:, :, 0] / float(width)
+    y = (float(height) - kp[:, :, 1]) / float(height)
+    kp[:, :, 0] = (x - 0.5) / 0.5
+    kp[:, :, 1] = (y - 0.5) / 0.5
+    np.clip(kp[:, :, :2], -float(clip), float(clip), out=kp[:, :, :2])
+    return kp
 
 
 if __name__ == '__main__':
     dummy_keypoints = np.random.rand(100, 133, 3)  # frames, kpts, (x,y,conf)
     dummy_keypoints[:, :, 2] = np.random.uniform(0.4, 1.0, (100, 133))  # Random conf
-    normalized = normalize_keypoints(dummy_keypoints)
-    subsampled = subsample_frames(normalized, target_fps=6.0)
+    print('cosign 77:', normalize_keypoints_cosign(dummy_keypoints).shape)
+    print('mska 133:', normalize_keypoints_mska(dummy_keypoints * 200, width=210, height=260).shape)

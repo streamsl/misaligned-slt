@@ -26,10 +26,10 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
-
+from poses import MSKA_STREAMS_133
 
 # --- MSKA Phoenix-2014T defaults (configs/phoenix-2014t_s2t.yaml: model.RecognitionNetwork.DSTA-Net) ---
-# net rows: (in_channels, out_channels, inter_channels, t_kernel, stride). The two stride-2 rows give
+# net rows: (in_channels, out_channels, inter_channels, t_kernel, stride). The 2 stride-2 rows give
 # MSKA's T/4 downsampling; `force_stride1` neutralises the stride (see module docstring) while keeping
 # channels/kernels identical. num_subset is DSTA's default (recognition.py:179).
 MSKA_NET: tuple[tuple[int, int, int, int, int], ...] = (
@@ -39,25 +39,7 @@ MSKA_NET: tuple[tuple[int, int, int, int, int], ...] = (
     (256, 256, 64, 3, 1), (256, 256, 64, 3, 1),
 )
 MSKA_NUM_SUBSET = 6
-
-# MSKA's 4 anatomical streams as indices into the FULL 133-keypoint COCO-WholeBody array
-# (configs/phoenix-2014t_s2t.yaml). Overlapping by design: hands carry the adjacent arm joints; the
-# body stream spans body+both hands+face so its LEARNED attention sees inter-part spatial layout
-# (the signal CoSign's per-group root-normalisation destroys — the reason we feed MSKA-native 133).
-MSKA_STREAMS_133: dict[str, tuple[int, ...]] = {
-    "left": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
-             107, 108, 109, 110, 111),                                                   # 27 nodes
-    "right": (0, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
-              126, 127, 128, 129, 130, 131, 132),                                        # 27 nodes
-    "face": (23, 26, 29, 33, 36, 39, 41, 43, 46, 48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76,
-             77, 79, 80, 81),                                                            # 26 nodes
-    "body": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
-             107, 108, 109, 110, 111, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
-             122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 23, 26, 29, 33, 36, 39, 41, 43, 46,
-             48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76, 77, 79, 80, 81),        # 79 nodes
-}
-# fuse = concat over channels of these streams, in MSKA's order (recognition.py:283).
-FUSE_ORDER = ("left", "face", "right", "body")
+FUSE_ORDER = ("left", "face", "right", "body") # Concat over channels of these streams, in MSKA's order (recognition.py:283).
 
 
 class PositionalEncoding(nn.Module):

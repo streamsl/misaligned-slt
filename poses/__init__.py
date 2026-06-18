@@ -1,3 +1,19 @@
+# MSKA's 4 anatomical streams as indices into the FULL 133-keypoint COCO-WholeBody array
+# (configs/phoenix-2014t_s2t.yaml). Overlapping by design: hands carry the adjacent arm joints; the
+# body stream spans body+both hands+face so its LEARNED attention sees inter-part spatial layout
+# (the signal CoSign's per-group root-normalisation destroys — the reason we feed MSKA-native 133).
+MSKA_STREAMS_133: dict[str, tuple[int, ...]] = {
+    "left": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
+             107, 108, 109, 110, 111),                                                   # 27 nodes
+    "right": (0, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+              126, 127, 128, 129, 130, 131, 132),                                        # 27 nodes
+    "face": (23, 26, 29, 33, 36, 39, 41, 43, 46, 48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76,
+             77, 79, 80, 81),                                                            # 26 nodes
+    "body": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
+             107, 108, 109, 110, 111, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+             122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 23, 26, 29, 33, 36, 39, 41, 43, 46,
+             48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76, 77, 79, 80, 81),        # 79 nodes
+}
 # -- Pose Preprocessing (CoSign Inspired) -----------------------------------
 # Define keypoint groups based on COCO-WholeBody (133 points: body 0-16, left foot 17-19, right foot 20-22, face 23-90, left hand 91-111, right hand 112-132)
 # Upper body (9): nose(0), left eye(1), right eye(2), left shoulder(5), right shoulder(6), left elbow(7), right elbow(8), left wrist(9), right wrist(10)
@@ -17,10 +33,6 @@ KPS_MODULES = {
     'mouth': {'kps_ids': MOUTH_IDS, 'kps_rel_range': (51, 59)},
     'face': {'kps_ids': FACE_IDS, 'kps_rel_range': (59, 77)},
 }
-CONF_THRESHOLD = 0.5  # From supp: Keypoints with conf > 0.5 considered valid
-WIDTH, HEIGHT = 1920, 1080
-FPS = 25.0
-
 from .preprocessing import *
 from .augmentation import *
 from .pose_io import *

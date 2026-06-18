@@ -32,6 +32,23 @@ from data.windowing import SentenceSpan
 from poses.pose_io import PoseIndex
 
 
+def _stream_frame_size(root: Path, lang_cfg: dict) -> tuple[int | None, int | None]:
+    # Pixel frame the raw pose coordinates live in, needed by the MSKA (dsta) pose representation's
+    # global normalization (x/w, (h-y)/h). Authoritative source is the builder's manifest src_meta
+    # (PHOENIX: src_w=210, src_h=260); config keys pose_width/pose_height override. The CoSign
+    # representation ignores these (its group normalization is resolution-independent).
+    width = lang_cfg.get("pose_width")
+    height = lang_cfg.get("pose_height")
+    if width and height: return int(width), int(height)
+    manifest = root / "manifest.json"
+    if manifest.exists():
+        try:
+            src = json.loads(manifest.read_text(encoding="utf-8")).get("src_meta", {})
+            if src.get("src_w") and src.get("src_h"): return int(src["src_w"]), int(src["src_h"])
+        except (OSError, ValueError, json.JSONDecodeError): pass
+    return (int(width) if width else None, int(height) if height else None)
+
+
 def _stream_target_fps(root: Path, lang_cfg: dict) -> float:
     # Prefer the builder's recorded target_fps (authoritative: poses were resampled to it); fall back to config.
     manifest = root / "manifest.json"
@@ -66,6 +83,7 @@ def load_stream_records(data_cfg: dict, language: str, split: str | None = None)
     lang_cfg = data_cfg["languages"][language]
     root = Path(lang_cfg["root"])
     fps = _stream_target_fps(root, lang_cfg)
+    width, height = _stream_frame_size(root, lang_cfg)
     splits = _stream_splits(root)
     selected_ids = splits.get(split, []) if split else sorted(sid for ids in splits.values() for sid in ids)
 
@@ -83,7 +101,11 @@ def load_stream_records(data_cfg: dict, language: str, split: str | None = None)
         if not pose_path.exists() or not vtt_path.exists(): continue
 
         n_frames = int(np.load(pose_path, mmap_mode="r").shape[0])
-        pose = PoseIndex(video_id=stream_id, paths=(pose_path,), frame_counts=(n_frames,), fps=float(fps))
+        pose = PoseIndex(
+            video_id=stream_id, paths=(pose_path,), frame_counts=(n_frames,),
+            fps=float(fps), width=width, height=height,
+            conf_threshold=float(lang_cfg.get("confidence_threshold", 0.5)),
+        )
         captions = merge_rolling_captions(parse_vtt(vtt_path, drop_noise=drop_noise))
         spans = tuple(
             SentenceSpan(video_id=stream_id, start_s=s, end_s=e, text=t) for s, e, t in captions

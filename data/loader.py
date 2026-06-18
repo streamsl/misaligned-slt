@@ -235,6 +235,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         width=int(lang_cfg["width"]) if lang_cfg.get("width") is not None else None,
         height=int(lang_cfg["height"]) if lang_cfg.get("height") is not None else None,
         video_meta=video_meta, resolution_from_meta=bool(lang_cfg.get("normalize_by_resolution", False)),
+        conf_threshold=float(lang_cfg.get("confidence_threshold", 0.5)),
     )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
     if missing_meta: print(
@@ -282,14 +283,16 @@ class StreamingWindowDataset(Dataset):
     def __init__(
         self, records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
         steps_per_epoch: int | None = None, include_full_evidence: bool = True, deterministic: bool = False,
+        pose_repr: str = "cosign77", pose_augment_cfg: dict | None = None,
     ):
         # `WindowSampler` is imported lazily inside StreamingWindowDataset.__init__ to break the
         # data.loader <-> train.sampler import cycle (train.sampler needs VideoRecord, defined below, for type hints).
         from train.sampler import WindowSampler
-
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
-        self.sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)
+        self.sampler = WindowSampler.from_stage2_config(
+            records, stage2_cfg, inference_cfg, pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg
+        )
         self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
         self.include_full_evidence = bool(include_full_evidence)
         # Eval loaders set deterministic=True: window `index` then always yields the SAME anchor
@@ -327,14 +330,10 @@ class StreamingWindowDataset(Dataset):
 
 
 def build_streaming_window_dataset(
-    records: list[VideoRecord],
-    stage2_cfg: dict[str, Any],
-    inference_cfg: dict[str, Any],
-    steps_per_epoch: int | None = None,
+    records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
+    steps_per_epoch: int | None = None, pose_repr: str = "cosign77", pose_augment_cfg: dict | None = None,
 ) -> StreamingWindowDataset:
     return StreamingWindowDataset(
-        records=records,
-        stage2_cfg=stage2_cfg,
-        inference_cfg=inference_cfg,
-        steps_per_epoch=steps_per_epoch,
+        records=records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
+        steps_per_epoch=steps_per_epoch, pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg,
     )

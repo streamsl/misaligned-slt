@@ -1,8 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
-import yaml
-import re
+import yaml, re
 
+_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
 def cfg_get(cfg: dict, *path: str, default=None):
     cur = cfg
@@ -39,17 +39,58 @@ def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `overri
     return out
 
 
-def load_yaml(path: str | Path) -> dict:
-    """Load a YAML config, resolving an optional `extends:` key.
+def resolve_placeholders(cfg: dict) -> dict:
+    """Substitute `${key}` in string values using the config's own TOP-LEVEL scalar keys.
 
-    `extends` may be a path (or list of paths), relative to the child file, to a parent config that is loaded first and deep-merged under the child. 
-    This lets e.g. `stage2_ar.yaml` inherit the entire `stage2_dlm.yaml` recipe (sampler, Analysis-A ratios/jitter, confidence-bound, optimization) 
-    and override only the decoder + output dir — so the AR-vs-DLM comparison isolates the decoder alone.
+    Makes configs dataset-agnostic: with `language: phoenix`, every `checkpoints/vlp/${language}`, `stage1_vlp_${language}`, 
+    `outputs/a_mode_ratios_${language}.json` etc. resolves to the phoenix path, and switching to another corpus is a one-line `language:` 
+    change (no other dataset to template here — roots/target_lang live per-entry in data.yaml). Unknown placeholders are left untouched 
+    (no key, no substitution), so this is a no-op for any config that uses none.
+    """
+    scalars = {k: v for k, v in cfg.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+    if not scalars: return cfg
+
+    def sub(s: str) -> str:
+        return _PLACEHOLDER_RE.sub(lambda m: str(scalars[m.group(1)]) if m.group(1) in scalars else m.group(0), s)
+
+    def walk(obj):
+        if isinstance(obj, dict): return {k: walk(v) for k, v in obj.items()}
+        if isinstance(obj, list): return [walk(v) for v in obj]
+        return sub(obj) if isinstance(obj, str) else obj
+
+    return walk(cfg)
+
+
+def load_yaml(path: str | Path) -> dict:
+    """Load a YAML config, resolving an optional `extends:` key and `${key}` placeholders.
+
+    `extends` may be a path (or list of paths), relative to the child file, to a parent config that is loaded first and deep-merged 
+    under the child. This lets e.g. `stage2_ar.yaml` inherit the entire `stage2_dlm.yaml` recipe (sampler, Analysis-A ratios/jitter, 
+    confidence-bound, optimization) and override only the decoder + output dir — so the AR-vs-DLM comparison isolates the decoder alone.
+    `${key}` placeholders are then resolved from the merged config's own top-level scalars (see resolve_placeholders) — chiefly `${language}`.
     """
     path = Path(path)
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
+    extends = cfg.pop("extends", None)
+    if not extends: return resolve_placeholders(cfg)
+    if isinstance(extends, str): extends = [extends]
+    merged: dict = {}
+    for parent in extends:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute(): parent_path = path.parent / parent_path
+        # Parents are loaded raw (placeholder resolution deferred to the merged child, so the child's
+        # `language` governs inherited templated paths — e.g. stage2_ar inherits stage2_dlm's templates).
+        merged = _deep_merge(merged, _load_yaml_raw(parent_path))
+    return resolve_placeholders(_deep_merge(merged, cfg))
+
+
+def _load_yaml_raw(path: str | Path) -> dict:
+    # load_yaml without placeholder resolution (used for `extends` parents; the child resolves the merge).
+    path = Path(path)
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
     extends = cfg.pop("extends", None)
     if not extends: return cfg
     if isinstance(extends, str): extends = [extends]
@@ -57,7 +98,7 @@ def load_yaml(path: str | Path) -> dict:
     for parent in extends:
         parent_path = Path(parent)
         if not parent_path.is_absolute(): parent_path = path.parent / parent_path
-        merged = _deep_merge(merged, load_yaml(parent_path))
+        merged = _deep_merge(merged, _load_yaml_raw(parent_path))
     return _deep_merge(merged, cfg)
 
 

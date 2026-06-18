@@ -3,7 +3,7 @@ import re, csv, json
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
-from .preprocessing import normalize_keypoints
+from .preprocessing import normalize_keypoints_cosign, normalize_keypoints_mska
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
@@ -13,6 +13,8 @@ META_FIELDS = ("video_id", "duration_s", "width", "height")
 # `python -m poses <lang_root> --format SEL` when a language was downloaded at a different (e.g. higher) 
 # resolution. Duration — the only fps-calibration input — is the same at every resolution.
 YTDLP_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+COSIGN_REPR = "cosign77"
+MSKA_REPR = "mska133"
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,9 @@ class PoseIndex:
     fps: float
     width: int | None = None
     height: int | None = None
+    # CoSign-path keypoint confidence gate (data.yaml languages.<lang>.confidence_threshold). Per-dataset:
+    # 0.0 keeps every detection (clean studio poses), ~0.5 drops unreliable ones (noisy in-the-wild poses).
+    conf_threshold: float = 0.5
 
     @property
     def total_frames(self) -> int:
@@ -83,7 +88,7 @@ def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
 
 def build_pose_index(
     pose_root: str | Path, fps: float, width: int | None = None, height: int | None = None,
-    video_meta: dict[str, dict] | None = None, resolution_from_meta: bool = False,
+    video_meta: dict[str, dict] | None = None, resolution_from_meta: bool = False, conf_threshold: float = 0.5,
 ) -> dict[str, PoseIndex]:
     """Index pose .npy files; fps is resolved PER VIDEO when `video_meta` covers it.
 
@@ -96,7 +101,7 @@ def build_pose_index(
     error (median 26s end-of-video misalignment vs ~3s sentences).
 
     `resolution_from_meta` additionally fills PoseIndex.width/height from the per-video metadata, which 
-    makes `normalize_keypoints` divide by them (GFSLT-style global scaling). Default OFF for 2 independent 
+    makes `normalize_keypoints_cosign` divide by them (GFSLT-style global scaling). Default OFF for 2 independent 
     reasons: (1) CoSign group normalization is already resolution-independent (coords divided by body 
     reference lengths), so the division would REINTRODUCE per-video resolution dependence; (2) the meta 
     width/height is the mp4 CONTAINER resolution, which on this dataset != the DWPose coordinate frame — 
@@ -124,16 +129,14 @@ def build_pose_index(
         if resolution_from_meta and meta.get("width") and meta.get("height"):
             vid_width, vid_height = int(meta["width"]), int(meta["height"])
         index[video_id] = PoseIndex(
-            video_id=video_id, paths=ordered,
-            frame_counts=counts, fps=float(video_fps),
-            width=vid_width, height=vid_height,
+            video_id=video_id, paths=ordered, frame_counts=counts, fps=float(video_fps),
+            width=vid_width, height=vid_height, conf_threshold=float(conf_threshold),
         )
     return index
 
 
 def fetch_youtube_meta(
-    video_ids: list[str], ytdlp_format: str = YTDLP_FORMAT,
-    workers: int = 4, chunk: int = 25,
+    video_ids: list[str], ytdlp_format: str = YTDLP_FORMAT, workers: int = 4, chunk: int = 25,
 ) -> dict[str, dict]:
     """yt-dlp METADATA-ONLY fetch -> {video_id: {duration_s, width, height}}. No video download.
 
@@ -224,15 +227,37 @@ def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) ->
     return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 133, 3), dtype=np.float32)
 
 
-def load_pose_window(pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    # Load a real-timeline pose window and relative timestamps
+def pose_repr_for_backbone(backbone: str | None) -> str:
+    """Map a model's pose backbone to the keypoint representation its data layer must produce.
+
+    `cosign` -> 77 CoSign group-normalized keypoints; `dsta` -> 133 MSKA-normalized COCO-WholeBody.
+    The two must match end to end (a VLP checkpoint carries one architecture's weights), so every
+    model-facing `load_pose_window` call derives its `pose_repr` through this single mapping.
+    """
+    return MSKA_REPR if str(backbone or "cosign").lower() == "dsta" else COSIGN_REPR
+
+
+def load_pose_window(
+    pose_index: PoseIndex, start_s: float, end_s: float,
+    normalize: bool = True, pose_repr: str = COSIGN_REPR, augment=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Load a real-timeline pose window and relative timestamps. `pose_repr` selects the normalization
+    # (cosign77 = CoSign group-normalized 77 kp; mska133 = MSKA global-normalized 133 kp). `augment`, when
+    # given (train only), is a callable (raw_poses, width, height) -> raw_poses applied to the RAW pixel
+    # keypoints BEFORE normalization — spatial, length-preserving, so timestamps/BIO stay aligned.
     start_s = max(0.0, float(start_s))
     end_s = min(float(end_s), pose_index.duration_s)
     start_frame = int(np.floor(start_s * pose_index.fps))
     end_frame = int(np.ceil(end_s * pose_index.fps))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
+    if augment is not None and poses.shape[1:] == (133, 3):s poses = augment(poses, pose_index.width, pose_index.height)
     if normalize and poses.shape[1:] == (133, 3):
-        poses = normalize_keypoints(poses, width=pose_index.width, height=pose_index.height)
+        if str(pose_repr).lower() == MSKA_REPR: 
+            poses = normalize_keypoints_mska(poses, width=pose_index.width, height=pose_index.height)
+        else: poses = normalize_keypoints_cosign(
+            poses, width=pose_index.width, height=pose_index.height, 
+            conf_threshold=pose_index.conf_threshold
+        )
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)
     return poses.astype(np.float32, copy=False), timestamps
     

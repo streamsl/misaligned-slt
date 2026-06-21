@@ -1,16 +1,19 @@
 seed: 42
 language: phoenix
 checkpoint:
-    dir: checkpoints/stage2_baseline/phoenix # best model.pt + best.json saved here
-    from_vlp: checkpoints/vlp/phoenix # stage-1 visual backbone to initialise from
+    dir: checkpoints/stage2_baseline/${language} # best model.pt + best.json saved here
+    from_vlp: checkpoints/vlp/${language} # stage-1 visual backbone to initialise from
     save_best: true
+    # Best-checkpoint SELECTION (separate from early stopping). GFSLT-VLP selects on dev BLEU (train_slt.py).
+    monitor: val_translation_bleu4
+    mode: max
+    restore_best: true
 decoder: ar
 wandb:
     enabled: true
     project: misaligned-slt
-    name: stage2_baseline_phoenix
+    name: stage2_baseline_${language}
     mode: online
-use_temporal_conv: false
 visual_padding: none
 # Freeze the from-scratch CoSign pose backbone in stage 2. The largest overfitting route on a small corpus is
 # end-to-end fine-tuning of the from-scratch GCN; freezing it after VLP is the spec-default regularizer.
@@ -23,7 +26,8 @@ label_smoothing: 0.2
 # Pose augmentation for the GFSLT-VLP literature-floor baseline (TRAIN only). GFSLT-VLP augments video
 # with RandomHorizontalFlip + RandomResizedCrop, so the pose analogue enables flip + affine; rotation
 # (MSKA) is left off by default here to stay faithful to the GFSLT recipe. Same schema as stage1_vlp.yaml.
-augment:
+# (No `fps` sub-block: the baseline trains on whole sentences, not streaming windows.)
+augmentation:
     enabled: true
     rotation: { deg: 15.0, prob: 0.0 }
     flip: { prob: 0.5 }
@@ -35,12 +39,10 @@ learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100
 eval_every_epochs: 1
-early_stopping:
-    monitor: val_translation_bleu4
-    mode: max
+early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`).
+    enabled: true # Remove or set enabled: false to disable.
     patience: 20
     min_delta: 0.0
-    restore_best: true
 scheduler:
     type: cosine
     eta_min: 1.0e-6

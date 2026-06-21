@@ -1,16 +1,22 @@
 seed: 42
 language: phoenix
 checkpoint:
-    dir: checkpoints/stage2_dlm/phoenix # best model.pt + best.json saved here
-    from_vlp: checkpoints/vlp/phoenix # stage-1 visual backbone to initialise from
+    dir: checkpoints/stage2_dlm/${language} # best model.pt + best.json saved here
+    from_vlp: checkpoints/vlp/${language} # stage-1 visual backbone to initialise from
     save_best: true # write on every new best dev value (not just end of training)
+    # Best-checkpoint SELECTION (separate from early stopping). Select on dev BLEU, not val_loss: the composite
+    # val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the small corpus while BLEU is still
+    # climbing, so a min-val_loss monitor would restore an early, low-BLEU checkpoint (GFSLT-VLP also selects on
+    # dev BLEU). Generation runs every eval anyway (validation.max_translation_samples: 0).
+    monitor: val_translation_bleu4
+    mode: max
+    restore_best: true
 decoder: dlm
 wandb:
     enabled: true
     project: misaligned-slt
-    name: stage2_dlm_phoenix
+    name: stage2_dlm_${language}
     mode: online # offline / disabled if no network or key
-use_temporal_conv: false
 visual_padding: none # If stage-2 training uses gfslt halos but streaming won't → a train/inference mismatch
 freeze_backbone: false # Freeze the from-scratch CoSign pose backbone in stage 2 as an overfitting regularizer.
 freeze_projection: false
@@ -44,7 +50,7 @@ confidence_bound:
     lambda: 0.3 # λ_cb; prior de-risk found ~0.3 stable
     warmup_epochs: 3 # hold CB off until the full-evidence self-target is trustworthy
 mode_ratios:
-    source: outputs/a_mode_ratios_phoenix.json
+    source: outputs/a_mode_ratios_${language}.json
     # Designed misalignment distribution used directly when no measured file exists AND auto-substituted when the measured
     # Analysis-A ratios are DEGENERATE (mode1 >= degenerate_mode1_threshold) — i.e. the segmenter is too clean (PHOENIX) to
     # produce real misalignment. Without this the sampler would train ~98% Mode-1 (no robustness). Robustness is still
@@ -62,23 +68,19 @@ mode2_subcase_weights:
     right: 0.45
     left: 0.45
     both: 0.10
-# Moryossef 2026: fps_aug essential (0.58→0.49 without), speed_aug forbidden. Applied to sampled training windows (BIO labels
-# rebuilt from resampled timestamps); the Mode-2a full-evidence view stays native-fps. The synthetic streams run at an exact
-# 12.5 fps (manifest.target_fps; the legacy YouTube path is per-video ~12–15 fps from video_meta.csv) and apply_fps_aug only
-# downsamples — the range must dip below source rate: [6.25, 25] gives real 0.5–1.0x density variation (RoPE keeps true seconds).
-# max_fps stays above the source on purpose: draws >= source fps are no-ops = native-density training, which eval always runs at.
-fps_aug:
-    enabled: true
-    min_fps: 6.25
-    max_fps: 25.0
-# Spatial pose augmentation (TRAIN windows only; the Mode-2a full-evidence view and dev are never
-# augmented). Same schema/semantics as stage1_vlp.yaml `augment`. rotation = MSKA; flip/affine = GFSLT-VLP.
-augment:
+# Pose augmentation — TRAIN windows only (the Mode-2a full-evidence view and dev are never augmented).
+# SPATIAL ops match stage1_vlp.yaml (rotation = MSKA; flip/affine = GFSLT-VLP). The `fps` sub-block is the
+# TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden): BIO labels are
+# rebuilt from the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the
+# source rate — synthetic streams run at exactly 12.5 fps, so [6.25, 25] gives real 0.5–1.0x density variation
+# (RoPE keeps true seconds); max_fps above source is intentional (draws >= source are native-density no-ops).
+augmentation:
     enabled: true
     rotation: { deg: 15.0, prob: 0.5 }
     flip: { prob: 0.0 }
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
+    fps: { enabled: true, min_fps: 6.25, max_fps: 25.0 }
 # Rare-class CE weighting for the in-model BIO head, which faces a heavy I-dominant imbalance (PHOENIX streams: B≈1.4%
 # of frames, signing density ~0.71; binary Dice has no B-vs-I gradient) and would otherwise collapse toward all-I. Unlike
 # the standalone UNet segmenter (bio_class_weights: null — its skip connections detect B natively and weighting makes that
@@ -93,7 +95,7 @@ bio_class_weights:
 # commit gate's δ_enc stability and RQ2 tIoU depend on. 0 = ablation (pure transformer, spec §4.4).
 bio_conv_stem_layers: 2
 jitter:
-    source: outputs/a_jitter_phoenix.json
+    source: outputs/a_jitter_${language}.json
     fallback_laplace:
         head_loc_s: 0.0
         head_scale_s: 0.6
@@ -105,15 +107,10 @@ learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100
 eval_every_epochs: 1
-early_stopping:
-    # Select on dev BLEU, not val_loss. The composite val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the
-    # small corpus while BLEU is still climbing, so a min-val_loss monitor restores an early, low-BLEU checkpoint (GFSLT-VLP
-    # likewise selects on dev BLEU, train_slt.py). Generation runs every eval anyway (max_translation_samples: 0).
-    monitor: val_translation_bleu4
-    mode: max
+early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
+    enabled: true # enabled: false to train the full `epochs`.
     patience: 20
     min_delta: 0.0
-    restore_best: true
 scheduler:
     type: cosine
     eta_min: 1.0e-6

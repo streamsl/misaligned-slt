@@ -39,16 +39,11 @@ class GFSLTConfig:
     # False = faithful MSKA path (BN over all frames incl. padding). Only effective for backbone='dsta'.
     dsta_mask_aware: bool = True
     # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's gloss_free_model does for its visual 
-    # sign embeddings (models.py:307, gated by config ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to 
+    # sign embeddings (models.py:463, gated by config ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to
     # `inputs_embeds` (only to the embed_tokens path), so the pretrained encoder expects pose features at token- embedding magnitude 
     # (~sqrt(d)), not positional-embedding magnitude. MUST be identical across stage-1 VLP and stage-2 (sourced from stage-1 config)
     # or the VLP-trained encoder sees out-of-distribution input magnitude in stage 2.
     scale_embedding: bool = False
-    # Skip mBART TEXT encoder in the pose path: Decoder cross-attends to per-frame VLP features DIRECTLY (BaseModelOutput(post_vlp)), 
-    # instead of post_vlp -> mBART encoder -> decoder. This mirrors the decoder-only-captioner design that reached stronger pose BLEU 
-    # in the prior project (mBART decoder cross-attending to a from-scratch visual encoder, never routing pose via a text-pretrained 
-    # encoder). NB this is NOT encoder_layers=0 (which still adds absolute positions + 2 LayerNorms).
-    bypass_mbart_encoder: bool = False
 
 
 def make_gfslt_config(cfg: dict) -> "GFSLTConfig":
@@ -79,7 +74,6 @@ def make_gfslt_config(cfg: dict) -> "GFSLTConfig":
         dsta_num_frame=int(dsta.get("num_frame", 256)),
         dsta_dropout=float(dsta.get("dropout", 0.1)),
         dsta_mask_aware=bool(dsta.get("mask_aware", True)),
-        bypass_mbart_encoder=bool(bb.get("bypass_mbart_encoder", False)),
     )
 
 
@@ -256,8 +250,6 @@ class GFSLTVisualBackbone(nn.Module): # Reusable visual front end: CoSign -> VLP
         timestamps_s: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         post_vlp, mask, timestamps = self.extract_post_vlp(poses, frame_mask, timestamps_s)
-        if self.config.bypass_mbart_encoder: # Decoder cross-attends to per-frame VLP features directly (no text-encoder in pose path).
-            return post_vlp, post_vlp, mask.long(), timestamps
         encoder = self.mbart.model.encoder(inputs_embeds=post_vlp, attention_mask=mask.long(), return_dict=True)
         return post_vlp, encoder.last_hidden_state, mask.long(), timestamps
 
@@ -321,33 +313,45 @@ class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
         )
 
     @torch.no_grad()
+    def generate_with_token_confidence(
+        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None,
+        max_new_tokens: int = 128, decoder_start_token_id: int | None = None, **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate, then score the model's REAL per-token confidence via one teacher-forced pass.
+
+        Returns (sequences, token_conf[B, L]) where token_conf[i, t] is the softmax prob the model assigns to
+        sequences[i, t]; the start slot (t=0) is 1.0 by definition. Decode-strategy-agnostic (greedy & beam).
+        """
+        _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
+        start_id = decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id
+        sequences = self.mbart.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+            max_new_tokens=max_new_tokens, decoder_start_token_id=start_id, **kwargs,
+        )
+        start = torch.ones((sequences.shape[0], 1), dtype=torch.float32, device=sequences.device)
+        if sequences.shape[1] < 2: return sequences, start
+        # HF generate() EXPANDS the encoder_outputs it receives to batch*num_beams in place (16 -> 16*4=64), so it
+        # cannot be reused; build a fresh BaseModelOutput from the un-expanded enc_hidden. Teacher-force the GENERATED
+        # sequence (decoder_input_ids = sequences[:, :-1]) to read the prob assigned to each produced token.
+        out = self.mbart(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+            decoder_input_ids=sequences[:, :-1], use_cache=False, return_dict=True,
+        )
+        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, sequences[:, 1:].unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
+        return sequences, torch.cat([start.to(tok_prob.dtype), tok_prob], dim=1)  # (B, L) aligned with sequences
+
+    @torch.no_grad()
     def generate_with_confidence(
         self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None,
         max_new_tokens: int = 128, decoder_start_token_id: int | None = None, per_token_conf: bool = False, **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate, then score the model's REAL confidence in its own output.
-
-        Returns (sequences, mean_confidence[B]) where mean_confidence[i] is the mean per-token softmax prob over the non-pad tokens 
-        row i produced. Token_confidence[i, t] is the softmax prob the model assigns to sequences[i, t] (the start slot is 1.0), 
-        via 1 teacher-forced pass (decode-strategy-agnostic: identical for greedy & beam).
-        """
-        _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
-        sequences = self.mbart.generate(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_new_tokens,
-            decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
-            **kwargs,
+        """Generate + the model's REAL output confidence. Returns (sequences, confidence): per-token [B, L] when
+        per_token_conf, else the per-row mean prob over the non-pad produced tokens [B]."""
+        sequences, token_conf = self.generate_with_token_confidence(
+            poses, frame_mask, timestamps_s=timestamps_s, max_new_tokens=max_new_tokens,
+            decoder_start_token_id=decoder_start_token_id, **kwargs,
         )
-        if sequences.shape[1] < 2: return sequences, torch.ones(sequences.shape[0], dtype=torch.float32, device=sequences.device)
-        # HF generate() EXPANDS the encoder_outputs it receives to batch*num_beams in place (16 -> 16*4=64),
-        # so it cannot be reused. Build a fresh BaseModelOutput from the un-expanded enc_hidden for this pass.
-        out = self.mbart(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_new_tokens,
-            decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
-            **kwargs,
-        )
-        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, sequences[:, 1:].unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
-        start = torch.ones((sequences.shape[0], 1), dtype=tok_prob.dtype, device=tok_prob.device)
-        token_conf = torch.cat([start, tok_prob], dim=1)  # (B, L) aligned with sequences
-        valid = (sequences[:, 1:] != int(self.mbart.config.pad_token_id))
         if per_token_conf: return sequences, token_conf
+        if sequences.shape[1] < 2: return sequences, torch.ones(sequences.shape[0], dtype=torch.float32, device=sequences.device)
+        valid = (sequences[:, 1:] != int(self.mbart.config.pad_token_id))
         return sequences, (token_conf[:, 1:] * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)

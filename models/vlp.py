@@ -57,13 +57,6 @@ class PoseTextCLIP(nn.Module):
 
 
     def _image_features_from_post_vlp(self, post_vlp: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        if self.visual.config.bypass_mbart_encoder:
-            # No mBART text encoder in the pose path: contrastively align the per-frame VLP features directly
-            # (masked mean-pool -> projection), so stage-1 pretrains the projection, not a pose-digesting encoder.
-            m = mask.unsqueeze(-1).to(post_vlp.dtype)
-            pooled = (post_vlp * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-            return F.normalize(self.image_proj(pooled), dim=-1)
-
         batch = post_vlp.shape[0]
         cls_token = self.visual_cls.expand(batch, -1, -1)
         inputs = torch.cat([cls_token, post_vlp], dim=1)

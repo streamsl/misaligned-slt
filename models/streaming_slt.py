@@ -119,7 +119,6 @@ class MisalignedSLTModel(nn.Module):
 
     def _encode_post_vlp_for_mbart(self, post_vlp: torch.Tensor, frame_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         enc_mask = frame_mask.long()
-        if self.visual.config.bypass_mbart_encoder: return post_vlp, enc_mask # cross-attend to the per-frame VLP features directly
         enc_out = self.mbart.model.encoder(inputs_embeds=post_vlp, attention_mask=enc_mask, return_dict=True)
         return enc_out.last_hidden_state, enc_mask
 

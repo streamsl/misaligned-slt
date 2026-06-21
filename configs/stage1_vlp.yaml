@@ -28,15 +28,10 @@ backbone:
     embed_dim: 1024 # VLP sign-projection / contrastive dim
     hidden_size: 1024 # pose-backbone hidden width (mBART d_model)
     # Scale post-VLP pose features by sqrt(d_model) before the mBART encoder, matching GFSLT-VLP's
-    # gloss_free_model.embed_scale (models.py:307). HF MBartEncoder does NOT scale `inputs_embeds`, so with
+    # gloss_free_model.embed_scale (models.py:463). HF MBartEncoder does NOT scale `inputs_embeds`, so with
     # false the pretrained encoder receives pose features at positional-embedding magnitude. A/B candidate.
     scale_embedding: false
     use_temporal_conv: false # legacy GFSLT temporal downsampler; keep false for the frame-aligned BIO contract.
-    # EXPERIMENT: skip the mBART TEXT encoder in the pose path. true = the decoder cross-attends to the per-frame
-    # VLP features directly (decoder-only-captioner style, like the prior project's stronger-pose-BLEU design);
-    # VLP stage-1 then aligns the projection (masked mean-pool), not a pose-digesting encoder. Inherited by
-    # baseline/stage-2/eval, so a fair A/B needs a fresh VLP run with the same value. (NOT encoder_layers=0.)
-    bypass_mbart_encoder: false
     cosign: # CoSign1s ST-GCN on 77 group-normalised keypoints (the default). Resolution-independent group norm.
         num_keypoints: 77
         temporal_kernel: 3
@@ -63,13 +58,12 @@ checkpoint:
 # Pose augmentation — TRAIN ONLY (dev/eval never augmented), applied to RAW pixel keypoints before
 # normalization. The `fps` sub-block is temporal (streaming windows only; ignored by stage 1 / the baseline).
 # Spatial ops are length-preserving so per-frame timestamps/BIO stay aligned. Frame-referenced ops
-# (flip/affine/spatial_mask) use the per-dataset frame size (data.yaml pose.width/height); rotation is
-# centroid-based and size-free. rotation = MSKA random_move; flip+affine = GFSLT-VLP flip + RandomResizedCrop.
+# (affine/spatial_mask) use the per-dataset frame size (data.yaml pose.width/height); rotation is
+# centroid-based and size-free.
 augmentation:
     enabled: true
-    rotation: { deg: 15.0, prob: 0.5 } # MSKA default ±15°
-    flip: { prob: 0.0 } # set 0.5 for GFSLT-VLP-style horizontal flip (mirrors the signer)
-    affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null } # GFSLT RandomResizedCrop analogue
+    rotation: { deg: 15.0, prob: 0.5 } # centroid rotation (GFSLT-VLP RandomRotate / MSKA random_move)
+    affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null } # scale~RandomResize, shift~RandomTranslate
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
 # GFSLT-VLP VLP = contrastive (SLRCLIP) + masked-text decoder reconstruction (Text_Decoder / CMLM). The CMLM half pretrains the
 # mBART decoder reused by both the AR baseline (Analysis B) and our DLM; omitting it leaves the decoder at raw mBART init and

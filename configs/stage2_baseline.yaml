@@ -23,14 +23,13 @@ freeze_projection: false # Freezes the VLP sign projection
 # GFSLT-VLP translation CE uses label_smoothing=0.2 (train_slt.py); HF mBART's internal loss has none.
 # Applied to the clean AR baseline so its loss matches the GFSLT recipe it is benchmarked against.
 label_smoothing: 0.2
-# Pose augmentation for the GFSLT-VLP literature-floor baseline (TRAIN only). GFSLT-VLP augments video
-# with RandomHorizontalFlip + RandomResizedCrop, so the pose analogue enables flip + affine; rotation
-# (MSKA) is left off by default here to stay faithful to the GFSLT recipe. Same schema as stage1_vlp.yaml.
-# (No `fps` sub-block: the baseline trains on whole sentences, not streaming windows.)
+# Pose augmentation for the baseline (TRAIN only). Same schema as stage1_vlp.yaml. GFSLT-VLP's image
+# recipe rotates + resizes + translates (RandomRotate(30)/RandomResize(0.2)/RandomTranslate), so the
+# pose floor enables rotation + affine. (No `fps` sub-block: the baseline trains on whole sentences,
+# not streaming windows.)
 augmentation:
     enabled: true
-    rotation: { deg: 15.0, prob: 0.0 }
-    flip: { prob: 0.5 }
+    rotation: { deg: 15.0, prob: 0.5 }
     affine: { prob: 0.5, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU

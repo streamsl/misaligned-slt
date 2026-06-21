@@ -9,12 +9,13 @@ from transformers import AutoTokenizer
 
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
 from data.loader import load_language_records
-from models.gfslt import GFSLTConfig
-from models.vlp import PoseTextCLIP
 from poses import pose_repr_for_backbone, build_pose_augmentor
+
+from models.gfslt import make_gfslt_config
+from models.vlp import PoseTextCLIP
 from models.checkpointing import save_visual_backbone
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
-from utils import load_yaml, mbart_trimmed_dir
+from utils import load_yaml, mbart_trimmed_dir, backbone_name
 
 
 @dataclass
@@ -36,11 +37,10 @@ def build_stage1_components(
     
     tokenizer_dir = mbart_trimmed_dir(cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
-    backbone = str(cfg.get("backbone", "cosign"))
-    pose_repr = pose_repr_for_backbone(backbone)
+    pose_repr = pose_repr_for_backbone(backbone_name(cfg))
 
     # Train-only pose augmentation (spatial, pre-normalize); dev gets None (clean monitor).
-    augmentor = build_pose_augmentor(cfg.get("augment"), np.random.default_rng(int(cfg.get("seed", 42)) + 991))
+    augmentor = build_pose_augmentor(cfg.get("augmentation"), np.random.default_rng(int(cfg.get("seed", 42)) + 991))
     records, _ = load_language_records(data_cfg, language, split="train")
     dataset = CleanSentenceDataset(records, max_items=max_items, pose_repr=pose_repr, augment=augmentor)
     cmlm_cfg = cfg.get("cmlm", {})
@@ -78,20 +78,9 @@ def build_stage1_components(
             dev_dataset, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 16))),
             shuffle=False, num_workers=0, collate_fn=dev_collator,
         )
-    gfslt_cfg = GFSLTConfig(
-        embed_dim=int(cfg.get("embed_dim", 1024)),
-        hidden_size=int(cfg.get("hidden_size", 1024)),
-        temporal_kernel=int(cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(cfg),  # one trimmed mBART for text encoder + visual side
-        use_temporal_conv=bool(cfg.get("use_temporal_conv", False)),
-        scale_embedding=bool(cfg.get("scale_embedding", False)),  # stage-1 is the source of truth; stage-2 inherits it
-        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
-        num_keypoints=133 if backbone == "dsta" else int(cfg.get("num_keypoints", 77)),
-        dsta_num_frame=int(cfg.get("dsta_num_frame", 256)),
-        dsta_dropout=float(cfg.get("dsta_dropout", 0.1)),
-    )
+    gfslt_cfg = make_gfslt_config(cfg)  # stage-1 owns the backbone; stage-2/baseline/eval reuse this block
     model = PoseTextCLIP(
-        gfslt_cfg, projection_dim=int(cfg.get("embed_dim", 1024)),
+        gfslt_cfg, projection_dim=gfslt_cfg.embed_dim,
         cmlm_lambda=float(cmlm_cfg.get("lambda", 1.0)) if cmlm_enabled else 0.0,
         cmlm_label_smoothing=float(cmlm_cfg.get("label_smoothing", 0.2)),
     )

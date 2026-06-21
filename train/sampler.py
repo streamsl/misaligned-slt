@@ -106,7 +106,7 @@ class WindowSampler:
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
-        fps_cfg = stage2_cfg.get("fps_aug", {})
+        fps_cfg = (stage2_cfg.get("augmentation", {}) or {}).get("fps", {})
         return cls(
             records=records, jitter=JitterSampler.from_config(jitter_cfg),
             mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),

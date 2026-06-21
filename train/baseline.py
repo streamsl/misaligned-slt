@@ -10,13 +10,13 @@ from transformers import AutoTokenizer
 
 from data.loader import load_language_records
 from data.clean import CleanSentenceCollator, CleanSentenceDataset
-from models.gfslt import load_gfslt_mbart, GFSLTConfig, GFSLTVisualBackbone, CleanARSLTModel, resolve_decoder_start_id
+from models.gfslt import make_gfslt_config, CleanARSLTModel, resolve_decoder_start_id
 from models.checkpointing import load_visual_backbone_checked, save_model_checkpoint
 from poses import pose_repr_for_backbone, build_pose_augmentor
 
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import compute_text_metrics, token_accuracy
-from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
+from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint, backbone_name
 
 
 @dataclass
@@ -41,11 +41,10 @@ def build_baseline_components(
 
     tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
-    backbone = str(stage1_cfg.get("backbone", "cosign"))
-    pose_repr = pose_repr_for_backbone(backbone)
+    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
 
-    # Train-only pose augmentation (the baseline config's `augment:` block; falls back to stage-1's).
-    aug_cfg = base_cfg.get("augment", stage1_cfg.get("augment"))
+    # Train-only pose augmentation (the baseline config's `augmentation:` block; falls back to stage-1's).
+    aug_cfg = base_cfg.get("augmentation", stage1_cfg.get("augmentation"))
     augmentor = build_pose_augmentor(aug_cfg, np.random.default_rng(int(base_cfg.get("seed", 42)) + 991))
     records, _ = load_language_records(data_cfg, language, split="train")
     dataset = CleanSentenceDataset(records, max_items=max_items, pose_repr=pose_repr, augment=augmentor)
@@ -65,26 +64,15 @@ def build_baseline_components(
             dev_dataset, batch_size=int(base_cfg.get("eval_batch_size", base_cfg.get("batch_size", 8))),
             shuffle=False, num_workers=0, collate_fn=collator,
         )
-    gfslt_cfg = GFSLTConfig(
-        embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
-        hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
-        temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
-        use_temporal_conv=bool(base_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
-        # Inherit from the stage-1 VLP config so the baseline encoder sees the same input scale VLP trained.
-        scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
-        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
-        num_keypoints=133 if backbone == "dsta" else int(stage1_cfg.get("num_keypoints", 77)),
-        dsta_num_frame=int(stage1_cfg.get("dsta_num_frame", 256)),
-        dsta_dropout=float(stage1_cfg.get("dsta_dropout", 0.1)),
-    )
     model = CleanARSLTModel(
-        gfslt_cfg, decoder_start_token_id=resolve_decoder_start_id(tokenizer),
+        make_gfslt_config(stage1_cfg),  # backbone inherited from the stage-1 VLP config
+        decoder_start_token_id=resolve_decoder_start_id(tokenizer),
         label_smoothing=float(base_cfg.get("label_smoothing", 0.0)),
     )
     checkpoint = vlp_checkpoint(base_cfg)
     if checkpoint: load_visual_backbone_checked(model.visual, str(checkpoint), name="baseline", preserve_decoder_io=True)
     else: print("baseline | WARNING: no checkpoint.from_vlp set; visual backbone trains from scratch.", flush=True)
+
     if bool(base_cfg.get("freeze_backbone", False)):
         n = model.visual.freeze_pose_backbone(freeze_projection=bool(base_cfg.get("freeze_projection", False)))
         print(f"baseline | froze pose backbone ({n / 1e6:.2f}M params; spec §4.1)", flush=True)

@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records
-from models.gfslt import GFSLTConfig
+from models.gfslt import make_gfslt_config
 from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
 from models.checkpointing import save_model_checkpoint
 from poses import pose_repr_for_backbone
@@ -18,7 +18,7 @@ from poses import pose_repr_for_backbone
 from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from train.losses import bio_class_weight_tensor
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint
+from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint, backbone_name
 
 
 @dataclass
@@ -40,23 +40,6 @@ def _optional_int(value) -> int | None:
 def _optional_float(value) -> float | None:
     return None if value is None else float(value)
 
-def build_gfslt_config(stage1_cfg: dict, stage2_cfg: dict) -> GFSLTConfig:
-    # backbone + scale_embedding are inherited from the stage-1 VLP config (its checkpoint carries the
-    # backbone weights and was trained at a specific input scale); a mismatch would load wrong weights.
-    backbone = str(stage1_cfg.get("backbone", "cosign"))
-    return GFSLTConfig(
-        embed_dim=int(stage1_cfg.get("embed_dim", 1024)),
-        hidden_size=int(stage1_cfg.get("hidden_size", 1024)),
-        temporal_kernel=int(stage1_cfg.get("temporal_kernel", 3)),
-        mbart_name=mbart_trimmed_dir(stage1_cfg),  # same trimmed mBART the VLP stage trained
-        use_temporal_conv=bool(stage2_cfg.get("use_temporal_conv", stage1_cfg.get("use_temporal_conv", False))),
-        scale_embedding=bool(stage1_cfg.get("scale_embedding", False)),
-        backbone=backbone,  # cosign | dsta — stage-1 source of truth; stage-2 + eval must match
-        num_keypoints=133 if backbone == "dsta" else int(stage1_cfg.get("num_keypoints", 77)),
-        dsta_num_frame=int(stage1_cfg.get("dsta_num_frame", 256)),
-        dsta_dropout=float(stage1_cfg.get("dsta_dropout", 0.1)),
-    )
-
 def build_stage2_components(
     data_config: str = "configs/data.yaml",
     stage1_config: str = "configs/stage1_vlp.yaml",
@@ -76,8 +59,8 @@ def build_stage2_components(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
 
     # Pose representation must match the backbone (stage-1 source of truth) end to end.
-    pose_repr = pose_repr_for_backbone(stage1_cfg.get("backbone", "cosign"))
-    pose_augment_cfg = stage2_cfg.get("augment")  # train-only; dev dataset below passes None
+    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
+    pose_augment_cfg = stage2_cfg.get("augmentation")  # train-only spatial aug; dev dataset below passes None
     train_records, _ = load_language_records(data_cfg, language, split="train")
     train_dataset = StreamingWindowDataset(
         train_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
@@ -108,7 +91,7 @@ def build_stage2_components(
     # extension (see MisalignedSLTModel.__init__: avoids the 1731-vs-1732 size mismatch and lets the DLM decoder
     # inherit the CMLM-pretrained mBART weights). For the AR arm this is equivalent to the old post-build load.
     model = MisalignedSLTModel(
-        gfslt_config=build_gfslt_config(stage1_cfg, stage2_cfg), tokenizer=tokenizer,
+        gfslt_config=make_gfslt_config(stage1_cfg), tokenizer=tokenizer,
         decoder=decoder or str(stage2_cfg.get("decoder", "dlm")),
         bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         block_size=int(stage2_cfg.get("block_size", 8)),
@@ -249,7 +232,7 @@ def train_stage2_epochs(
     cb_warmup_epochs = int(confidence_cfg.get("warmup_epochs", 1))
     cb_lambda = float(confidence_cfg.get("lambda", 0.3))
     logger = TrainLogger(f"stage2-{decoder_name}", stage2_cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
-    
+
     for epoch in range(1, int(epochs) + 1):
         cb_active = epoch > cb_warmup_epochs
         epoch_logs: list[dict[str, float]] = []

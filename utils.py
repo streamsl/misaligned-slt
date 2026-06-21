@@ -31,6 +31,10 @@ def mbart_trimmed_dir(cfg: dict) -> str:
     fallback = cfg.get("trimmed_mbart_dir", cfg.get("trimmed_tokenizer_dir", mbart_name(cfg)))
     return str(cfg_get(cfg, "mbart", "trimmed_dir", default=fallback))
 
+def backbone_name(cfg: dict) -> str:
+    # Pose backbone selector from the stage config's `backbone:` block (the architecture source of truth).
+    return str(cfg_get(cfg, "backbone", "name", default="cosign"))
+
 def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
     out = dict(base)
     for key, value in override.items():

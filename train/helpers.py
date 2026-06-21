@@ -204,7 +204,7 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         mean_epoch_s = sum(elapsed_epochs) / max(1, len(elapsed_epochs))
         remaining_s = max(0, int(self.epochs) - int(epoch)) * mean_epoch_s
 
-        row: dict = {"epoch": f"{epoch}/{self.epochs}", **self._public_metrics({**train_num, **val_num})}
+        row: dict = {"epoch": epoch, **self._public_metrics({**train_num, **val_num})}
         if took is not None: row["took"] = took
         row["eta"] = remaining_s
         row["ckpt"] = "saved" if saved_path else ""
@@ -226,8 +226,10 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         train = sorted(k for k in keys if k.startswith("train_"))
         val = sorted(k for k in keys if k.startswith("val_"))
 
-        train.remove("train_loss"); train.insert(0, "train_loss")
-        val.remove("val_loss"); val.insert(0, "val_loss")
+        # Pin *_loss first within each group, but only when present: train-only epochs (no dev_loader, or a
+        # non-eval epoch) emit no val_* columns, so an unconditional remove() would crash _save_history_files.
+        if "train_loss" in train: train.remove("train_loss"); train.insert(0, "train_loss")
+        if "val_loss" in val: val.remove("val_loss"); val.insert(0, "val_loss")
         tail = [k for k in ("took", "eta", "ckpt") if k in keys]
         other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
         return ["epoch", *train, *val, *other, *tail]
@@ -311,15 +313,20 @@ class TrainControl:
 
     @classmethod
     def from_config(cls, cfg: dict, default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min") -> "TrainControl":
+        # Two separated concerns:
+        #   checkpoint: monitor / mode / restore_best  -> best-model SELECTION (always active when a dev set exists)
+        #   early_stopping: enabled / patience / min_delta -> TERMINATION only (opt-in; removing the block disables it)
         validation = cfg.get("validation", {})
+        ckpt = cfg.get("checkpoint", {})
         early = cfg.get("early_stopping", {})
+        early_enabled = bool(early.get("enabled", False))
         return cls(
             eval_every_epochs=int(cfg.get("eval_every_epochs", validation.get("eval_every_epochs", 0)) or 0),
-            early_stopping_patience=int(early.get("patience", cfg.get("patience", 0)) or 0),
+            early_stopping_patience=int(early.get("patience", 0) or 0) if early_enabled else 0,
             early_stopping_min_delta=float(early.get("min_delta", 0.0)),
-            monitor=str(early.get("monitor", default_monitor)),
-            monitor_mode=str(early.get("mode", default_mode)),  # type: ignore[arg-type]
-            restore_best=bool(early.get("restore_best", True)),
+            monitor=str(ckpt.get("monitor", default_monitor)),
+            monitor_mode=str(ckpt.get("mode", default_mode)),  # type: ignore[arg-type]
+            restore_best=bool(ckpt.get("restore_best", True)),
         )
 
     def should_eval(self, epoch: int, epochs: int) -> bool:

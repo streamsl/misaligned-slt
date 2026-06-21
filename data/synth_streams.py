@@ -57,7 +57,7 @@ def _stream_target_fps(root: Path, lang_cfg: dict) -> float:
             fps = json.loads(manifest.read_text(encoding="utf-8")).get("target_fps")
             if fps: return float(fps)
         except (OSError, ValueError, json.JSONDecodeError): pass
-    return float(lang_cfg.get("pose_fps", 12.5))
+    return float((lang_cfg.get("pose", {}) or {}).get("fps", 12.5))
 
 
 def _stream_splits(root: Path) -> dict[str, list[str]]:
@@ -104,7 +104,7 @@ def load_stream_records(data_cfg: dict, language: str, split: str | None = None)
         pose = PoseIndex(
             video_id=stream_id, paths=(pose_path,), frame_counts=(n_frames,),
             fps=float(fps), width=width, height=height,
-            conf_threshold=float(lang_cfg.get("confidence_threshold", 0.5)),
+            conf_threshold=float((lang_cfg.get("pose", {}) or {}).get("confidence_threshold", 0.0)),
         )
         captions = merge_rolling_captions(parse_vtt(vtt_path, drop_noise=drop_noise))
         spans = tuple(

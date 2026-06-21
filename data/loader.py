@@ -229,18 +229,19 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     # VARIES per YouTube video: 12.0-15.0 measured). config pose_fps is fallback-only; with no
     # sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
     video_meta = load_video_meta(root / META_FILENAME)
+    pose_cfg = lang_cfg.get("pose", {}) or {}
+    fps_fallback = float(pose_cfg.get("fps", 25.0))
     pose_index = build_pose_index(
-        root / "poses",
-        fps=float(lang_cfg.get("pose_fps", 25.0)),
-        width=int(lang_cfg["width"]) if lang_cfg.get("width") is not None else None,
-        height=int(lang_cfg["height"]) if lang_cfg.get("height") is not None else None,
-        video_meta=video_meta, resolution_from_meta=bool(lang_cfg.get("normalize_by_resolution", False)),
-        conf_threshold=float(lang_cfg.get("confidence_threshold", 0.5)),
+        root / "poses", fps=fps_fallback,
+        width=int(pose_cfg["width"]) if pose_cfg.get("width") is not None else None,
+        height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
+        video_meta=video_meta, resolution_from_meta=bool(pose_cfg.get("normalize_by_resolution", False)),
+        conf_threshold=float(pose_cfg.get("confidence_threshold", 0.5)),
     )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
     if missing_meta: print(
         f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from "
-        f"{root / META_FILENAME}; falling back to pose_fps={lang_cfg.get('pose_fps', 25.0)} "
+        f"{root / META_FILENAME}; falling back to pose.fps={fps_fallback} "
         f"for them — run `python -m poses {root}` (yt-dlp metadata fetch, no video download)."
     )
     subtitle_cfg = data_cfg.get("subtitles", {})

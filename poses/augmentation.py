@@ -5,27 +5,28 @@ SPATIAL and LENGTH-PRESERVING, so per-frame timestamps and BIO labels stay align
 segmentation contract). TEMPORAL augmentation is handled separately by `moryossef26.apply_fps_aug`,
 which rebuilds the timestamps it resamples.
 
-Two augmentation families are exposed through `PoseAugmentor` / `build_pose_augmentor`:
-  - **MSKA** rotation: `rotate` reproduces MSKA's `random_move` (github.com/sutwangyan/MSKA
-    datasets.py:224 — rotate ±deg around the keypoint centroid; translation/scale were commented out
-    there). This is the augmentation MSKA actually trains its DSTA backbone with.
-  - **GFSLT-VLP** spatial: `flip_lr` + `affine` are the pose-space analogue of GFSLT-VLP's video
-    augmentation (RandomHorizontalFlip + RandomResizedCrop; arXiv 2307.14768). ColorJitter has no pose
-    analogue and is dropped.
+Spatial primitives exposed through `PoseAugmentor` / `build_pose_augmentor`. These are the pose-space
+analogue of GFSLT-VLP's image augmentation (`va.RandomRotate(30)` + `va.RandomResize(0.2)` +
+`va.RandomTranslate`, see its datasets.py) and MSKA's centroid `random_move`:
+  - `rotate` — random rotation by U(-deg, deg) around the keypoint centroid. Needs no frame size; the
+    only op enabled by default.
+  - `affine` — random scale / shift / shear around the frame centre (scale ~ RandomResize, shift ~
+    RandomTranslate).
+  - `spatial_mask` — cutout of a random spatial box.
+GFSLT-VLP's fixed-size random crop and colour jitter have no pose analogue; it does NOT flip.
 
 Width/height come from `PoseIndex.width/height` (per dataset — PHOENIX 210x260, CSL-Daily 512x512,
-etc.). When they are unknown, frame-referenced ops (flip / affine / spatial_mask) are skipped and only
-the centroid-based rotation runs.
+etc.). When they are unknown, frame-referenced ops (affine / spatial_mask) are skipped and only the
+centroid-based rotation runs.
 """
 import numpy as np
 from scipy.ndimage import zoom
-from . import LEFT_HAND_IDS, RIGHT_HAND_IDS, FACE_IDS, MOUTH_IDS
 
 
 # ── Spatial primitives (parametrised by frame size; operate on x,y only, conf left intact) ─────────────
 def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Generator | None = None) -> np.ndarray:
-    """MSKA `random_move`: rotate (x, y) by U(-max_angle_deg, max_angle_deg) around the centroid of the
-    non-zero keypoints (github.com/sutwangyan/MSKA/blob/main/datasets.py#L224). Needs no frame size."""
+    """Rotate (x, y) by U(-max_angle_deg, max_angle_deg) around the centroid of the non-zero keypoints
+    (in the spirit of MSKA's `random_move`). Needs no frame size."""
     keypoints = np.asarray(keypoints, dtype=np.float32).copy()
     if keypoints.ndim != 3 or keypoints.shape[-1] < 2: return keypoints
     rng = rng or np.random.default_rng()
@@ -40,27 +41,6 @@ def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Ge
     return keypoints
 
 
-def flip_lr(keypoints: np.ndarray, width: float) -> np.ndarray:
-    """Horizontal mirror (x -> width - x) with left/right keypoint-group swap, for COCO-WholeBody 133.
-    Produces a valid mirrored signer (left-handed <-> right-handed); the text label is unchanged."""
-    if keypoints.ndim != 3 or keypoints.shape[-1] != 3: raise ValueError(f'Expected (T, K, 3), got {keypoints.shape}')
-    keypoints = np.asarray(keypoints, dtype=np.float32).copy()
-    valid = keypoints[..., 2] > 0
-    keypoints[..., 0] = np.where(valid, float(width) - keypoints[..., 0], keypoints[..., 0])
-
-    left_hand = keypoints[:, LEFT_HAND_IDS, :].copy()
-    keypoints[:, LEFT_HAND_IDS, :] = keypoints[:, RIGHT_HAND_IDS, :]
-    keypoints[:, RIGHT_HAND_IDS, :] = left_hand
-    for li, ri in [(1, 2), (5, 6), (7, 8), (9, 10)]:  # eyes / shoulders / elbows / wrists
-        tmp = keypoints[:, li, :].copy()
-        keypoints[:, li, :] = keypoints[:, ri, :]
-        keypoints[:, ri, :] = tmp
-
-    keypoints[:, FACE_IDS] = keypoints[:, FACE_IDS][:, ::-1].copy()   # face contour reverses under mirror
-    keypoints[:, MOUTH_IDS] = keypoints[:, MOUTH_IDS][:, ::-1].copy()
-    return keypoints
-
-
 def affine(
     keypoints: np.ndarray, width: float, height: float,
     scale: tuple[float, float] | None = (0.9, 1.1),
@@ -71,8 +51,8 @@ def affine(
 ) -> np.ndarray:
     """Random affine (scale/shift/rotate/shear) around the frame centre, on conf>0 points only.
 
-    GFSLT-VLP RandomResizedCrop analogue: `scale` ~ zoom, `shift` ~ crop offset (fraction of frame).
-    Leave `degree` None when a separate `rotate` is used, to avoid double-rotating.
+    `scale` ~ zoom, `shift` ~ translation as a fraction of frame size. Leave `degree` None when a
+    separate `rotate` is used, to avoid double-rotating.
     """
     if keypoints.ndim != 3 or keypoints.shape[-1] != 3: raise ValueError(f'Expected (T, K, 3), got {keypoints.shape}')
     rng = rng or np.random.default_rng()
@@ -137,8 +117,7 @@ def interp1d_(keypoints: np.ndarray, target_len: int, rng: np.random.Generator |
 
 # ── Orchestration ─────────────────────────────────────────────────────────────────────────────────────
 _DEFAULTS = {
-    "rotation": {"deg": 15.0, "prob": 0.5},          # MSKA random_move
-    "flip": {"prob": 0.0},                           # Horizontal flip
+    "rotation": {"deg": 15.0, "prob": 0.5},          # centroid rotation (MSKA-style)
     "affine": {"prob": 0.0, "scale": [0.9, 1.1], "shift": [-0.05, 0.05], "degree": None, "shear": None},
     "spatial_mask": {"prob": 0.0, "size": [0.1, 0.2]},
 }
@@ -153,7 +132,6 @@ class PoseAugmentor:
         self.rng = rng
         c = {**_DEFAULTS, **(cfg or {})}
         self.rot = {**_DEFAULTS["rotation"], **(c.get("rotation") or {})}
-        self.flip = {**_DEFAULTS["flip"], **(c.get("flip") or {})}
         self.aff = {**_DEFAULTS["affine"], **(c.get("affine") or {})}
         self.smask = {**_DEFAULTS["spatial_mask"], **(c.get("spatial_mask") or {})}
 
@@ -161,8 +139,6 @@ class PoseAugmentor:
         poses = np.asarray(poses, dtype=np.float32)
         if poses.ndim != 3 or poses.shape[0] == 0: return poses
         has_frame = bool(width) and bool(height)
-        if has_frame and float(self.flip.get("prob", 0.0)) > 0 and self.rng.random() < float(self.flip["prob"]):
-            poses = flip_lr(poses, width)
         if has_frame and float(self.aff.get("prob", 0.0)) > 0 and self.rng.random() < float(self.aff["prob"]):
             poses = affine(poses, width, height, scale=_pair(self.aff.get("scale")), shift=_pair(self.aff.get("shift")),
                            degree=_pair(self.aff.get("degree")), shear=_pair(self.aff.get("shear")), rng=self.rng)

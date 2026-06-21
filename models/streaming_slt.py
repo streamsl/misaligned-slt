@@ -6,12 +6,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutput
+from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 
 from models.bio_head import RoPEBIOHead
 from models.checkpointing import load_visual_backbone_checked
 from models.dlm_decoder import OPUTBlockDiffusionDecoder
 from models.gfslt import GFSLTConfig, GFSLTVisualBackbone, load_gfslt_mbart, resolve_decoder_start_id
-from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 
 
 @dataclass
@@ -94,8 +94,7 @@ class MisalignedSLTModel(nn.Module):
         #   2. OPUTBlockDiffusionDecoder.__init__ copies the current mBART decoder into its vocab+1 substrate. We load the
         #      VLP-trained decoder layers first, while preserving the base token embeddings/lm_head just as GFSLT-VLP
         #      train_slt.py restores decoder.embed_tokens/embed_positions from the transformer checkpoint.
-        if vlp_checkpoint:
-            load_visual_backbone_checked(self.visual, vlp_checkpoint, name=f"stage2-{decoder}", preserve_decoder_io=True)
+        if vlp_checkpoint: load_visual_backbone_checked(self.visual, vlp_checkpoint, name=f"stage2-{decoder}", preserve_decoder_io=True)
         if decoder == "dlm":
             adapter = _PostVLPTranslationNetwork(self.mbart, tokenizer)
             self.dlm_decoder = OPUTBlockDiffusionDecoder(adapter, block_size=block_size)
@@ -120,6 +119,7 @@ class MisalignedSLTModel(nn.Module):
 
     def _encode_post_vlp_for_mbart(self, post_vlp: torch.Tensor, frame_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         enc_mask = frame_mask.long()
+        if self.visual.config.bypass_mbart_encoder: return post_vlp, enc_mask # cross-attend to the per-frame VLP features directly
         enc_out = self.mbart.model.encoder(inputs_embeds=post_vlp, attention_mask=enc_mask, return_dict=True)
         return enc_out.last_hidden_state, enc_mask
 
@@ -151,8 +151,17 @@ class MisalignedSLTModel(nn.Module):
             encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_text_tokens,
             decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self._decoder_start_id(),
         )
-        conf = torch.ones(generated.shape, dtype=torch.float32, device=generated.device)
-        return generated, conf
+        # REAL per-token confidence (was a 1.0 placeholder): the softmax prob the AR decoder assigns to each
+        # token it produced, via one teacher-forced pass. (B, L) aligned with `generated`; the start slot is 1.
+        # Greedy decode (num_beams=1) does not expand encoder_outputs, but build a fresh BaseModelOutput anyway.
+        if generated.shape[1] < 2: return generated, torch.ones(generated.shape, dtype=torch.float32, device=generated.device)
+        out = self.mbart(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+            decoder_input_ids=generated[:, :-1], use_cache=False, return_dict=True,
+        )
+        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, generated[:, 1:].unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
+        start = torch.ones((generated.shape[0], 1), dtype=tok_prob.dtype, device=tok_prob.device)
+        return generated, torch.cat([start, tok_prob], dim=1)
 
 
     def _ar_confidence_bound_logits(
@@ -201,8 +210,8 @@ class MisalignedSLTModel(nn.Module):
 
 
     def forward_loss(
-        self, batch: dict, lambda_trans: float = 1.0, dice_weight: float = 1.5,
-        bio_class_weights: torch.Tensor | None = None,
+        self, batch: dict, lambda_trans: float = 1.0, 
+        dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
         oput_rollout_eval_mode: bool = True, oput_eos_supervision: int = 32,
         confidence_bound_enabled: bool = True, confidence_bound_active: bool = True, confidence_bound_tau: float = 0.75,

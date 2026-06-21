@@ -6,10 +6,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import MBartConfig, MBartForConditionalGeneration
-from transformers.modeling_outputs import BaseModelOutput
 from backbones import CoSign1s, DSTANet
 
+from transformers import MBartConfig, MBartForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 try: from safetensors.torch import load_file as load_safetensors
 except Exception: load_safetensors = None # pragma: no cover - optional dependency path
 
@@ -35,12 +35,52 @@ class GFSLTConfig:
     # backbone ever sees (streaming buffer_cap_s * fps). 256 ~ 20s at 12.5 fps (> the 18s buffer cap).
     dsta_num_frame: int = 256
     dsta_dropout: float = 0.1
+    # Exclude batch-padded frames from DSTA's BatchNorm statistics (mask-aware BN);
+    # False = faithful MSKA path (BN over all frames incl. padding). Only effective for backbone='dsta'.
+    dsta_mask_aware: bool = True
     # Scale the post-VLP pose features fed to the mBART encoder by sqrt(d_model), as GFSLT-VLP's gloss_free_model does for its visual 
     # sign embeddings (models.py:307, gated by config ['training']['scale_embedding']). HF MBartEncoder does NOT apply embed_scale to 
     # `inputs_embeds` (only to the embed_tokens path), so the pretrained encoder expects pose features at token- embedding magnitude 
     # (~sqrt(d)), not positional-embedding magnitude. MUST be identical across stage-1 VLP and stage-2 (sourced from stage-1 config)
     # or the VLP-trained encoder sees out-of-distribution input magnitude in stage 2.
     scale_embedding: bool = False
+    # Skip mBART TEXT encoder in the pose path: Decoder cross-attends to per-frame VLP features DIRECTLY (BaseModelOutput(post_vlp)), 
+    # instead of post_vlp -> mBART encoder -> decoder. This mirrors the decoder-only-captioner design that reached stronger pose BLEU 
+    # in the prior project (mBART decoder cross-attending to a from-scratch visual encoder, never routing pose via a text-pretrained 
+    # encoder). NB this is NOT encoder_layers=0 (which still adds absolute positions + 2 LayerNorms).
+    bypass_mbart_encoder: bool = False
+
+
+def make_gfslt_config(cfg: dict) -> "GFSLTConfig":
+    """Build a GFSLTConfig from a stage config's `backbone:` block — the single architecture source of truth.
+
+    The stage-1 VLP config owns the backbone; stage-2, the baseline, and eval all build their config from the SAME `backbone:` 
+    block (passed the stage-1 config) so the architecture cannot drift from the VLP checkpoint. Schema:
+      backbone:
+        name: cosign | dsta
+        embed_dim / hidden_size / scale_embedding / use_temporal_conv
+        cosign: { num_keypoints, temporal_kernel }
+        dsta:   { num_frame, dropout, mask_aware }
+    """
+    from utils import mbart_trimmed_dir
+    bb = dict(cfg.get("backbone", {}) or {})
+    name = str(bb.get("name", "cosign")).lower()
+    cosign = dict(bb.get("cosign", {}) or {})
+    dsta = dict(bb.get("dsta", {}) or {})
+    return GFSLTConfig(
+        embed_dim=int(bb.get("embed_dim", 1024)),
+        hidden_size=int(bb.get("hidden_size", 1024)),
+        temporal_kernel=int(cosign.get("temporal_kernel", 3)),
+        mbart_name=mbart_trimmed_dir(cfg),
+        use_temporal_conv=bool(bb.get("use_temporal_conv", False)),
+        scale_embedding=bool(bb.get("scale_embedding", False)),
+        backbone=name,
+        num_keypoints=133 if name == "dsta" else int(cosign.get("num_keypoints", 77)),
+        dsta_num_frame=int(dsta.get("num_frame", 256)),
+        dsta_dropout=float(dsta.get("dropout", 0.1)),
+        dsta_mask_aware=bool(dsta.get("mask_aware", True)),
+        bypass_mbart_encoder=bool(bb.get("bypass_mbart_encoder", False)),
+    )
 
 
 def _sanitize_generation_config(model: MBartForConditionalGeneration) -> MBartForConditionalGeneration:
@@ -123,6 +163,9 @@ class PoseFeatureExtractor(nn.Module):
                 hidden_size=config.hidden_size, num_frame=int(config.dsta_num_frame),
                 dropout=float(config.dsta_dropout),
             )
+            # Exclude padded frames from DSTA's BatchNorms (variable-length windows are batch-zero-padded;
+            # the constant features padding produces would otherwise skew BN). False = faithful MSKA path.
+            self.dsta_mask_aware = bool(getattr(config, "dsta_mask_aware", True))
             self.use_temporal_conv = False
             self.output_dim = config.hidden_size
             return
@@ -140,7 +183,10 @@ class PoseFeatureExtractor(nn.Module):
         timestamps_s: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # Both backbones share CoSign1s's contract: (B, T, K, 3) -> (B, T, hidden_size), T preserved.
-        features = self.dsta(poses) if self.backbone_type == "dsta" else self.cosign(poses)
+        if self.backbone_type == "dsta":
+            dsta_mask = frame_mask if (frame_mask is not None and self.dsta_mask_aware) else None
+            features = self.dsta(poses, frame_mask=dsta_mask)
+        else: features = self.cosign(poses)
         if frame_mask is None: frame_mask = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
         if not self.use_temporal_conv: return features, frame_mask, timestamps_s
 
@@ -210,6 +256,8 @@ class GFSLTVisualBackbone(nn.Module): # Reusable visual front end: CoSign -> VLP
         timestamps_s: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         post_vlp, mask, timestamps = self.extract_post_vlp(poses, frame_mask, timestamps_s)
+        if self.config.bypass_mbart_encoder: # Decoder cross-attends to per-frame VLP features directly (no text-encoder in pose path).
+            return post_vlp, post_vlp, mask.long(), timestamps
         encoder = self.mbart.model.encoder(inputs_embeds=post_vlp, attention_mask=mask.long(), return_dict=True)
         return post_vlp, encoder.last_hidden_state, mask.long(), timestamps
 
@@ -274,13 +322,14 @@ class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
 
     @torch.no_grad()
     def generate_with_confidence(
-        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
-        max_new_tokens: int = 128, decoder_start_token_id: int | None = None, **kwargs,
+        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None,
+        max_new_tokens: int = 128, decoder_start_token_id: int | None = None, per_token_conf: bool = False, **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate, then score the model's REAL confidence in its own output.
 
-        Returns (sequences, mean_confidence[B]) where mean_confidence[i] is mean softmax prob the model assigns to tokens it produced 
-        for row i, via 1 teacher-forced pass over generated sequence (decode-strategy-agnostic: identical definition for greedy & beam).
+        Returns (sequences, mean_confidence[B]) where mean_confidence[i] is the mean per-token softmax prob over the non-pad tokens 
+        row i produced. Token_confidence[i, t] is the softmax prob the model assigns to sequences[i, t] (the start slot is 1.0), 
+        via 1 teacher-forced pass (decode-strategy-agnostic: identical for greedy & beam).
         """
         _, enc_hidden, enc_mask, _ = self.visual.encode(poses, frame_mask, timestamps_s=timestamps_s)
         sequences = self.mbart.generate(
@@ -292,11 +341,13 @@ class CleanARSLTModel(nn.Module): # Clean pre-trimmed GFSLT-style AR baseline.
         # HF generate() EXPANDS the encoder_outputs it receives to batch*num_beams in place (16 -> 16*4=64),
         # so it cannot be reused. Build a fresh BaseModelOutput from the un-expanded enc_hidden for this pass.
         out = self.mbart(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
-            decoder_input_ids=sequences[:, :-1], use_cache=False, return_dict=True,
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, max_new_tokens=max_new_tokens,
+            decoder_start_token_id=decoder_start_token_id if decoder_start_token_id is not None else self.decoder_start_token_id,
+            **kwargs,
         )
-        gen = sequences[:, 1:]
-        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, gen.unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
-        valid = (gen != int(self.mbart.config.pad_token_id))
-        mean_conf = (tok_prob * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-        return sequences, mean_conf
+        tok_prob = out.logits.log_softmax(dim=-1).gather(-1, sequences[:, 1:].unsqueeze(-1)).squeeze(-1).exp()  # (B, L-1)
+        start = torch.ones((sequences.shape[0], 1), dtype=tok_prob.dtype, device=tok_prob.device)
+        token_conf = torch.cat([start, tok_prob], dim=1)  # (B, L) aligned with sequences
+        valid = (sequences[:, 1:] != int(self.mbart.config.pad_token_id))
+        if per_token_conf: return sequences, token_conf
+        return sequences, (token_conf[:, 1:] * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)

@@ -29,7 +29,8 @@ def build_segmenter_loader(
     seg_cfg = load_yaml(segmenter_config)
     language = str(seg_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
     records, _ = load_language_records(data_cfg, language, split=split)
-    fps_cfg = seg_cfg.get("fps_aug", {})
+    aug_cfg = seg_cfg.get("augmentation", {}) or {}
+    fps_cfg = aug_cfg.get("fps", {})
     trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)
     dataset = SegmenterChunkDataset(
         records=records,
@@ -40,8 +41,8 @@ def build_segmenter_loader(
         fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
         velocity=bool(seg_cfg.get("velocity", True)),
         training=split == "train",
-        frame_dropout=float(seg_cfg.get("frame_dropout", 0.15)),
-        body_part_dropout=float(seg_cfg.get("body_part_dropout", 0.1)),
+        frame_dropout=float(aug_cfg.get("frame_dropout", 0.15)),
+        body_part_dropout=float(aug_cfg.get("body_part_dropout", 0.1)),
         seed=int(seg_cfg.get("seed", 42)),
         trusted_gap_s=None if trusted_gap is None else float(trusted_gap),
     )

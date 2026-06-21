@@ -33,13 +33,14 @@ class PoseTextCLIP(nn.Module):
     with the saved visual backbone into both downstream arms.
     """
     def __init__(
-        self, config: GFSLTConfig, projection_dim: int = 1024, logit_scale_init: float = 0.07,
+        self, config: GFSLTConfig, projection_dim: int = 1024, logit_scale_init: float = 0.07, 
         cmlm_lambda: float = 1.0, cmlm_label_smoothing: float = 0.2, label_temp: float = 10.0,
     ):
         super().__init__()
         # GFSLT-VLP SLRCLIP target temperature: utils.KLLoss does softmax(label * 10) on the eye target.
         self.label_temp = float(label_temp)
         self.visual = GFSLTVisualBackbone(config)
+
         # Text encoder is a second instance of the same trimmed mBART (separate weights). GFSLT-VLP
         # used the full trimmed model here; we use the depth-trimmed one everywhere for speed.
         self.text_mbart = load_gfslt_mbart(config.mbart_name)
@@ -55,11 +56,14 @@ class PoseTextCLIP(nn.Module):
         self.cmlm_lambda = float(cmlm_lambda)
 
 
-    def encode_image(
-        self, poses: torch.Tensor, frame_mask: torch.Tensor,
-        timestamps_s: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        post_vlp, mask, _ = self.visual.extract_post_vlp(poses, frame_mask, timestamps_s)
+    def _image_features_from_post_vlp(self, post_vlp: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self.visual.config.bypass_mbart_encoder:
+            # No mBART text encoder in the pose path: contrastively align the per-frame VLP features directly
+            # (masked mean-pool -> projection), so stage-1 pretrains the projection, not a pose-digesting encoder.
+            m = mask.unsqueeze(-1).to(post_vlp.dtype)
+            pooled = (post_vlp * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+            return F.normalize(self.image_proj(pooled), dim=-1)
+
         batch = post_vlp.shape[0]
         cls_token = self.visual_cls.expand(batch, -1, -1)
         inputs = torch.cat([cls_token, post_vlp], dim=1)
@@ -68,10 +72,14 @@ class PoseTextCLIP(nn.Module):
         return F.normalize(self.image_proj(out.last_hidden_state[:, 0]), dim=-1)
 
 
+    def encode_image(self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
+        post_vlp, mask, _ = self.visual.extract_post_vlp(poses, frame_mask, timestamps_s)
+        return self._image_features_from_post_vlp(post_vlp, mask)
+
+
     def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.text_mbart.model.encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        # GFSLT-VLP pools at input_ids.argmax(dim=-1), which selects the
-        # high-id mBART language-code token in standard mBART-formatted text.
+        # GFSLT-VLP pools at input_ids.argmax(dim=-1), which selects high-id mBART language-code token in standard mBART-formatted text.
         pooled_indices = input_ids.argmax(dim=-1) # Find EOS token position
         invalid = attention_mask.gather(1, pooled_indices.unsqueeze(1)).squeeze(1) == 0
         if invalid.any():
@@ -108,22 +116,22 @@ class PoseTextCLIP(nn.Module):
         text_input_ids: torch.Tensor, text_attention_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None,
         masked_text_input_ids: torch.Tensor | None = None, masked_text_attention_mask: torch.Tensor | None = None,
     ) -> VLPOutput:
-        image_features = self.encode_image(poses, frame_mask, timestamps_s=timestamps_s)
+        post_vlp, vmask, _ = self.visual.extract_post_vlp(poses, frame_mask, timestamps_s)
+        image_features = self._image_features_from_post_vlp(post_vlp, vmask)
         text_features = self.encode_text(text_input_ids, text_attention_mask)
         scale = self.logit_scale.exp().clamp(max=100.0)
         logits_i = scale * image_features @ text_features.t()
         logits_t = logits_i.t()
 
-        # GFSLT-VLP SLRCLIP loss (utils.KLLoss): KL( softmax(logits) || softmax(eye * label_temp) ),
-        # symmetric over image/text directions. reduction="batchmean" reproduces GFSLT's
-        # KLDivLoss(size_average=True) * batch_size (= sum/N). The softmax(eye*10) target is near-one-hot
-        # (~0.003 smoothing); with one-hot this equals cross-entropy, so this is the faithful GFSLT form.
+        # GFSLT-VLP SLRCLIP loss (utils.KLLoss): KL( softmax(logits) || softmax(eye * label_temp) ), symmetric over image/text directions. 
+        # reduction="batchmean" reproduces GFSLT's KLDivLoss(size_average=True) * batch_size (= sum/N). The softmax(eye*10) target is 
+        # near-one-hot (~0.003 smoothing); with one-hot this equals cross-entropy, so this is the faithful GFSLT form.
         n = logits_i.shape[0]
         eye = torch.eye(n, dtype=logits_i.dtype, device=logits_i.device)
-        # Duplicate captions are FALSE negatives (measured 7.5% exact duplicates on Auslan; PHOENIX
-        # weather text is also highly repetitive). Fold them in as ADDITIONAL positives (multi-positive
-        # target) rather than pushing them apart — and unlike masking logits to -inf this keeps the KL
-        # target all-positive/finite (no 0*-inf NaN). No duplicates ⇒ exactly softmax(eye*label_temp).
+        
+        # Duplicate captions are FALSE negatives (measured 7.5% exact duplicates on Auslan; PHOENIX weather text is also highly repetitive). 
+        # Fold them in as ADDITIONAL positives (multi-positive target) rather than pushing them apart — and unlike masking logits to -inf 
+        # this keeps the KL target all-positive/finite (no 0*-inf NaN). No duplicates ⇒ exactly softmax(eye*label_temp).
         same_text = (text_input_ids.unsqueeze(0) == text_input_ids.unsqueeze(1)).all(dim=-1)
         positives = (eye + same_text.to(logits_i.dtype)).clamp(max=1.0)  # 1 on diagonal OR identical-text pairs
         target = F.softmax(positives * self.label_temp, dim=1)
@@ -139,6 +147,7 @@ class PoseTextCLIP(nn.Module):
                 masked_input_ids=masked_text_input_ids, masked_attention_mask=masked_text_attention_mask,
             )
             loss = contrastive + self.cmlm_lambda * cmlm
+
         return VLPOutput(
             loss=loss, image_features=image_features, text_features=text_features,
             logits_per_image=logits_i, logits_per_text=logits_t,

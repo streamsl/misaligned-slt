@@ -232,12 +232,31 @@ def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tok
     return "".join(out).strip()
 
 
+# Full-width CJK punctuation -> ASCII. mT5 decodes Chinese text but emits ASCII '?'/',' for some marks while the
+# references carry full-width '？'/'，' (and '。' etc.), so an un-normalized char-BLEU penalizes a 1-char punctuation
+# mismatch on nearly every sentence. Uni-Sign's eval (fine_tuning.py:285) does exactly this for '，'/'？' on the refs;
+# we normalize BOTH sides over the common marks so the score reflects content, not punctuation encoding.
+_CJK_PUNCT_MAP = {
+    '￥': '$', '％': '%', '＃': '#', '＠': '@', '，': ',', '。': '.', '？': '?', '！': '!', '、': ',', '；': ';', '：': ':',
+    '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
+    '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
+}
+_CJK_PUNCT_TABLE = {ord(k): v for k, v in _CJK_PUNCT_MAP.items()}
+
+
 def compute_text_metrics(
-    predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a", 
+    predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a",
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation"
 ) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
     scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
     if not predictions: return {f"{prefix}_{key}": value for key, value in scores.items()}
+    # CJK detection from the (gold) references; if present, normalize full-width punctuation on BOTH sides so
+    # the ASCII-punct model output matches the full-width refs (else char-BLEU loses ~1 n-gram/sentence).
+    is_cjk = any(_char_split_cjk(ref) != ref for ref in references)
+    if is_cjk:
+        predictions = [pred.translate(_CJK_PUNCT_TABLE) for pred in predictions]
+        references = [ref.translate(_CJK_PUNCT_TABLE) for ref in references]
+        
     refs_nested = [[ref] for ref in references]
     cjk_predictions = [_char_split_cjk(pred) for pred in predictions]
     cjk_references = [_char_split_cjk(ref) for ref in references]
@@ -245,8 +264,14 @@ def compute_text_metrics(
 
     bleu = _load_evaluate_metric("sacrebleu")
     if bleu is not None:
-        try: 
-            scores["bleu4"] = float(bleu.compute(predictions=predictions, references=refs_nested, tokenize=sacrebleu_tokenize)["score"])
+        # Chinese/CJK has no word spaces, so sacrebleu's default '13a' (European) tokenizer collapses BLEU to
+        # ~0 even on correct translations (n-grams never match). Switch to sacrebleu's CJK char tokenizer 'zh'
+        # whenever the references are CJK — this is the CSL-Daily / Uni-Sign convention, so BLEU is comparable
+        # to their reported 25.x. cjk_references != references is the same CJK signal used for ROUGE/CIDEr below.
+        try: scores["bleu4"] = float(bleu.compute(
+                predictions=predictions, references=refs_nested, 
+                tokenize="zh" if is_cjk else sacrebleu_tokenize
+            )["score"])
         except Exception: pass
 
     rouge = _load_evaluate_metric("rouge")

@@ -9,9 +9,9 @@ from data.batch import collate_windows
 from data.loader import load_language_records
 from data.windowing import BIO
 
-from models.checkpointing import save_model_checkpoint, save_visual_backbone
+from models.checkpointing import save_model_checkpoint
 from train.sampler import WindowSampler
-from utils import checkpoint_dir, load_yaml, mbart_name, mbart_trimmed_dir
+from utils import checkpoint_dir, load_yaml
 
 
 def smoke_data(args: argparse.Namespace) -> dict:
@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT training utilities")
     parser.add_argument(
         "--stage", default="smoke-data",
-        choices=["trim-mbart", "smoke-data", "train-stage1", "train-baseline", "train-stage2", "train-segmenter"],
+        choices=["smoke-data", "train-stage2", "train-segmenter"],
     )
     parser.add_argument(
         "--language", default=None, 
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
+    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
@@ -65,67 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    if args.stage == "trim-mbart":
-        from trim_mbart import trim_MBartForConditionalGeneration
-        data_cfg = load_yaml(args.data_config)
-        stage1_cfg = load_yaml(args.stage1_config)
-        language = str(args.language or stage1_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
-        target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-        trimmed_dir = mbart_trimmed_dir(stage1_cfg)
-        # mbart.layers: {encoder, decoder, attention_heads} depth-trims the model in the same step
-        # (omit the block to keep full mBART depth). One model dir serves every stage.
-        layers_cfg = stage1_cfg.get("mbart", {}).get("layers", {})
-        result = trim_MBartForConditionalGeneration(
-            data_config=args.data_config, language=language,
-            mbart_name=mbart_name(stage1_cfg), target_lang=target_lang,
-            tokenizer_out=trimmed_dir, model_out=trimmed_dir,
-            encoder_layers=layers_cfg.get("encoder"), decoder_layers=layers_cfg.get("decoder"),
-            attention_heads=layers_cfg.get("attention_heads"),
-        )
-    elif args.stage == "smoke-data": result = smoke_data(args)
-
-    elif args.stage == "train-stage1":
-        from train.stage1 import build_stage1_components, train_stage1_epochs
-        stage1_cfg = load_yaml(args.stage1_config)
-        epochs = int(args.epochs or stage1_cfg.get("epochs", 1))
-        components = build_stage1_components(
-            data_config=args.data_config, stage1_config=args.stage1_config,
-            max_items=args.num_samples if args.num_samples > 0 else None, include_dev=True,
-        )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        optimizer = torch.optim.AdamW(
-            components.model.parameters(), lr=float(stage1_cfg.get("learning_rate", 5e-4)),
-            weight_decay=float(stage1_cfg.get("weight_decay", 1e-4)),
-        )
-        logs = train_stage1_epochs(
-            components.model, components.train_loader, optimizer, device=device, 
-            epochs=epochs, cfg=stage1_cfg, dev_loader=components.dev_loader,
-        )
-        output_dir = Path(checkpoint_dir(stage1_cfg, default=f"checkpoints/vlp/{stage1_cfg.get('language', args.language)}"))
-        path = save_visual_backbone(components.model.visual, output_dir)
-        result = {"stage": args.stage, "device": str(device), "visual_backbone": str(path), "epochs": epochs, "log_rows": len(logs)}
-
-    elif args.stage == "train-baseline":
-        from train.baseline import build_baseline_components, train_baseline_epochs
-        base_cfg = load_yaml(args.baseline_config)
-        epochs = int(args.epochs or base_cfg.get("epochs", 1))
-        components = build_baseline_components(
-            data_config=args.data_config, stage1_config=args.stage1_config, baseline_config=args.baseline_config,
-            max_items=args.num_samples if args.num_samples > 0 else None, include_dev=True,
-        )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        optimizer = torch.optim.AdamW(
-            [p for p in components.model.parameters() if p.requires_grad],  # skip a frozen backbone
-            lr=float(base_cfg.get("learning_rate", 5e-4)),
-            weight_decay=float(base_cfg.get("weight_decay", 1e-4)),
-        )
-        logs = train_baseline_epochs(
-            components.model, components.train_loader, optimizer, device=device, epochs=epochs, 
-            cfg=base_cfg, dev_loader=components.dev_loader, tokenizer=components.tokenizer,
-        )
-        path = save_model_checkpoint(components.model, checkpoint_dir(base_cfg, default="checkpoints/stage2_baseline"))
-        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
-
+    if args.stage == "smoke-data": result = smoke_data(args)
     elif args.stage == "train-stage2":
         from train.stage2 import build_stage2_components, train_stage2_epochs
         stage2_cfg = load_yaml(args.stage2_config)

@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,15 +9,14 @@ from transformers import AutoTokenizer
 
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records
-from models.gfslt import make_gfslt_config
+from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel, Stage2LossOutput
 from models.checkpointing import save_model_checkpoint
-from poses import pose_repr_for_backbone
 
-from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from train.losses import bio_class_weight_tensor
+from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import load_yaml, mbart_trimmed_dir, vlp_checkpoint, backbone_name
+from utils import load_yaml, language_model_name, pretrained_checkpoint
 
 
 @dataclass
@@ -42,7 +40,7 @@ def _optional_float(value) -> float | None:
 
 def build_stage2_components(
     data_config: str = "configs/data.yaml",
-    stage1_config: str = "configs/stage1_vlp.yaml",
+    stage1_config: str = "configs/stage1_pretraining.yaml",
     stage2_config: str = "configs/stage2_dlm.yaml",
     inference_config: str = "configs/inference.yaml",
     decoder: str | None = None,
@@ -54,20 +52,29 @@ def build_stage2_components(
     inference_cfg = load_yaml(inference_config)
     language = str(stage2_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
 
-    tokenizer_dir = mbart_trimmed_dir(stage1_cfg)
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, src_lang=target_lang, tgt_lang=target_lang)
+    # Uni-Sign front end; the LANGUAGE MODEL (and its tokenizer) is selected by language_model.name: mT5 (Path A
+    # default) or mBART (the mT5-vs-mBART ablation). Same pose encoder + prompt either way — only the LM differs.
+    lm_name = language_model_name(stage1_cfg)
+    prompt_lang = prompt_lang_for_target(target_lang)
+    if "mbart" in lm_name.lower():
+        tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
+        front_end = UniSignMBartFrontEnd(
+            mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(lm_name, legacy=False)
+        front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
 
-    # Pose representation must match the backbone (stage-1 source of truth) end to end.
-    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
     pose_augment_cfg = stage2_cfg.get("augmentation")  # train-only spatial aug; dev dataset below passes None
     train_records, _ = load_language_records(data_cfg, language, split="train")
     train_dataset = StreamingWindowDataset(
-        train_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
-        pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg)
+        train_records, stage2_cfg=stage2_cfg, 
+        inference_cfg=inference_cfg, pose_augment_cfg=pose_augment_cfg
+    )
     collator = WindowCollator(
         tokenizer, max_text_tokens=int(stage2_cfg.get("max_text_tokens", 128)),
-        visual_padding=str(stage2_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "gfslt"))),
+        visual_padding=str(stage2_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "none"))),
     )
     train_loader = DataLoader(
         train_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)),
@@ -76,31 +83,30 @@ def build_stage2_components(
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
-        # Dev scoring should cover the same experimental unit as PHOENIX/GFSLT training: one
-        # sentence anchor, not one video. With len(dev_records), validation sampled only one fixed
-        # window per video and could miss most sentences.
+        # Dev scoring should cover the same experimental unit as standard SLT training: 1 sentence anchor, not 1 video. 
+        # With len(dev_records), validation sampled only 1 fixed window per video and could miss most sentences.
         dev_steps = sum(len(record.sentences) for record in dev_records)
         dev_dataset = StreamingWindowDataset(
             dev_records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
             steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
-            pose_repr=pose_repr,
         )
         dev_loader = DataLoader(dev_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), collate_fn=collator)
 
-    # Pass the VLP checkpoint INTO the constructor so the visual backbone is loaded before the DLM MASK-token
-    # extension (see MisalignedSLTModel.__init__: avoids the 1731-vs-1732 size mismatch and lets the DLM decoder
-    # inherit the CMLM-pretrained mBART weights). For the AR arm this is equivalent to the old post-build load.
+    # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
+    # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).
     model = MisalignedSLTModel(
-        gfslt_config=make_gfslt_config(stage1_cfg), tokenizer=tokenizer,
+        front_end=front_end, tokenizer=tokenizer, 
         decoder=decoder or str(stage2_cfg.get("decoder", "dlm")),
-        bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         block_size=int(stage2_cfg.get("block_size", 8)),
+        bio_hidden_dim=int(stage2_cfg.get("bio_hidden_dim", 384)),
         bio_conv_stem_layers=int(stage2_cfg.get("bio_conv_stem_layers", 2)),
-        vlp_checkpoint=vlp_checkpoint(stage2_cfg),
+        pretrained_path=pretrained_checkpoint(stage2_cfg),
     )
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'Model initialized with {total_params / 1e6:.2f}M parameters')
     if bool(stage2_cfg.get("freeze_backbone", False)):
-        n = model.visual.freeze_pose_backbone(freeze_projection=bool(stage2_cfg.get("freeze_projection", False)))
-        print(f"stage2 | froze pose backbone ({n / 1e6:.2f}M params; spec §4.1)", flush=True)
+        n = model.front_end.freeze_pose_backbone(freeze_projection=bool(stage2_cfg.get("freeze_projection", False)))
+        print(f"stage2 | froze pose backbone ({n / 1e6:.2f}M parameters)", flush=True)
     return Stage2Components(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader)
 
 
@@ -155,8 +161,8 @@ def evaluate_stage2(
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
         # row["loss"] = float(output.loss.detach().cpu().item())
-        post_vlp, mask, timestamps = model.visual.extract_post_vlp(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
-        bio_logits = model.bio_head(post_vlp, timestamps_s=timestamps).logits
+        bio_tap, mask, timestamps = model.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
+        bio_logits = model.bio_head(bio_tap, timestamps_s=timestamps).logits
         row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
         # Moryossef-style segmentation metrics on the in-model BIO head (frame macro-F1, frame-IoU, overlap
         # segment-F1, one-to-one tIoU-matched segment-F1) under the inference decode (runs split at interior Bs),

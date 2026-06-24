@@ -1,2 +1,1 @@
-from .cosign import CoSign1s
-from .dsta import DSTANet
+from .unisign import UniSignPoseEncoder

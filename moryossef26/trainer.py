@@ -56,7 +56,7 @@ def build_segmenter(segmenter_config: str = "configs/segmenter.yaml") -> Moryoss
     cfg = load_yaml(segmenter_config)
     pose_dim = 6 if bool(cfg.get("velocity", True)) else 3
     return MoryossefSegmenter(
-        pose_dims=(77, pose_dim),
+        pose_dims=(69, pose_dim),  # Uni-Sign 69-kp layout (poses.load_pose_window normalizes to it)
         hidden_dim=int(cfg.get("hidden_dim", 384)),
         encoder_depth=int(cfg.get("encoder_depth", 4)),
         attn_nhead=int(cfg.get("attn_nhead", 8)),

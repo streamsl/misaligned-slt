@@ -156,7 +156,7 @@ def collate_segmenter_chunks(batch: list[dict]) -> dict:
 def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray, clip: float = 50.0) -> np.ndarray:
     """Append units/second velocity (Moryossef 2026 utils/pose.compute_velocity: diff / dt).
 
-    Two guards theirs does not need (their normalize_mean_std input is bounded; our CoSign-normalized
+    Two guards theirs does not need (their normalize_mean_std input is bounded; our Uni-Sign-normalized
     keypoints are zeroed when detection drops): a velocity spanning a missing detection — either
     endpoint keypoint zeroed — is detection flicker, not motion (a 0↔value flip at 25 fps reads as
     |Δ|×25), so it is masked to 0; and velocities are clipped to ±clip (real signing peaks at ~20

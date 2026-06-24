@@ -86,7 +86,7 @@ class MoryossefSegmenter(nn.Module):
     Analysis A and the RQ2 pipeline-floor baseline consume the phrase head only.
     """
     def __init__(
-        self, pose_dims: tuple[int, int] = (77, 3), hidden_dim: int = 384, encoder_depth: int = 4, num_classes: int = 4,
+        self, pose_dims: tuple[int, int] = (69, 3), hidden_dim: int = 384, encoder_depth: int = 4, num_classes: int = 4,
         attn_nhead: int = 8, attn_ff_mult: int = 2, attn_dropout: float = 0.1, num_frames: int = 1024,
     ):
         super().__init__()

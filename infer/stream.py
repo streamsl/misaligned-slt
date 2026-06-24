@@ -89,11 +89,10 @@ class StreamingSLTRunner:
     def _bump(self, key: str, n: int = 1) -> None:
         self.gate_stats[key] = self.gate_stats.get(key, 0) + int(n)
 
-    def _decode_span(self, post_vlp: torch.Tensor, mask: torch.Tensor, span_slice: slice):
-        if self.decode_conditioning == "span": post_vlp, mask = post_vlp[:, span_slice], mask[:, span_slice]
-        return self.model.generate_from_post_vlp(
-            post_vlp, mask,
-            max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
+    def _decode_span(self, bio_tap: torch.Tensor, mask: torch.Tensor, span_slice: slice):
+        if self.decode_conditioning == "span": bio_tap, mask = bio_tap[:, span_slice], mask[:, span_slice]
+        return self.model.generate_from_bio_tap(
+            bio_tap, mask, max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,
             dcd_decode_algo=self.dcd_decode_algo, dcd_decode_param=self.dcd_decode_param, dcd_sample_top_k=self.dcd_sample_top_k,
@@ -115,8 +114,8 @@ class StreamingSLTRunner:
         ts_b = (timestamps_s[in_buffer] - start_s).unsqueeze(0)
         mask_b = torch.ones(poses_b.shape[:2], dtype=torch.bool, device=poses.device)
 
-        post_vlp, mask, ts = self.model.visual.extract_post_vlp(poses_b, mask_b, ts_b)
-        bio_logits = self.model.bio_head(post_vlp, timestamps_s=ts).logits
+        bio_tap, mask, ts = self.model.front_end.extract_bio_tap(poses_b, mask_b, ts_b)
+        bio_logits = self.model.bio_head(bio_tap, timestamps_s=ts).logits
         bio_tags = bio_logits.argmax(dim=-1)[0]
         buffer_full = (end_s - start_s) >= self.buffer_cap_s
         span = first_complete_bio_span(bio_tags)
@@ -133,7 +132,7 @@ class StreamingSLTRunner:
             self._bump("committed"); self._bump("forced_commit")
 
             s_idx, last_idx = b_idx, int(bio_tags.numel()) - 1
-            tokens, confidence = self._decode_span(post_vlp, mask, slice(s_idx, last_idx + 1))
+            tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, last_idx + 1))
             return StreamingEvent(
                 start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, last_idx].item()),
                 token_ids=tokens[0].detach().cpu(), token_confidence=confidence[0].detach().cpu(),
@@ -141,7 +140,7 @@ class StreamingSLTRunner:
             )
 
         s_idx, closing_o_idx = span
-        tokens, confidence = self._decode_span(post_vlp, mask, slice(s_idx, max(s_idx + 1, closing_o_idx)))
+        tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, max(s_idx + 1, closing_o_idx)))
         decision = self.commit_gate.update(bio_tags, token_confidence=confidence[0])
         self._bump("spans_seen")
         if decision.boundary_stable: self._bump("boundary_ok")

@@ -1,38 +1,18 @@
-# MSKA's 4 anatomical streams as indices into the FULL 133-keypoint COCO-WholeBody array
-# (configs/phoenix-2014t_s2t.yaml). Overlapping by design: hands carry the adjacent arm joints; the
-# body stream spans body+both hands+face so its LEARNED attention sees inter-part spatial layout
-# (the signal CoSign's per-group root-normalisation destroys — the reason we feed MSKA-native 133).
-MSKA_STREAMS_133: dict[str, tuple[int, ...]] = {
-    "left": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
-             107, 108, 109, 110, 111),                                                   # 27 nodes
-    "right": (0, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
-              126, 127, 128, 129, 130, 131, 132),                                        # 27 nodes
-    "face": (23, 26, 29, 33, 36, 39, 41, 43, 46, 48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76,
-             77, 79, 80, 81),                                                            # 26 nodes
-    "body": (0, 1, 3, 5, 7, 9, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
-             107, 108, 109, 110, 111, 2, 4, 6, 8, 10, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
-             122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 23, 26, 29, 33, 36, 39, 41, 43, 46,
-             48, 53, 56, 59, 62, 65, 68, 71, 72, 73, 74, 75, 76, 77, 79, 80, 81),        # 79 nodes
-}
-# -- Pose Preprocessing (CoSign Inspired) -----------------------------------
-# Define keypoint groups based on COCO-WholeBody (133 points: body 0-16, left foot 17-19, right foot 20-22, face 23-90, left hand 91-111, right hand 112-132)
-# Upper body (9): nose(0), left eye(1), right eye(2), left shoulder(5), right shoulder(6), left elbow(7), right elbow(8), left wrist(9), right wrist(10)
-# Mouth (8): inner lips approx 60-67 in face (face starts at 23, so 23+60-67 = 83-90, but adjust to 8)
-# Face lower/cheek (18): contour approx 23+0 to 23+16 (17 points), plus nose
-BODY_IDS = [0, 1, 2, 5, 6, 7, 8, 9, 10]  # 9 points
-LEFT_HAND_IDS = list(range(91, 112))  # 21 points
-RIGHT_HAND_IDS = list(range(112, 133))  # 21 points
-MOUTH_IDS = list(range(83, 91))  # Inner mouth 8 points
-FACE_IDS = list(range(23, 40)) + [53]  # First 18 as cheek/lower approx
-ALL_SELECTED_IDS = BODY_IDS + LEFT_HAND_IDS + RIGHT_HAND_IDS + MOUTH_IDS + FACE_IDS  # Total 9+21+21+8+18=77
-NUM_KEYPOINTS = len(ALL_SELECTED_IDS)
-KPS_MODULES = {
-    'body': {'kps_ids': BODY_IDS, 'kps_rel_range': (0, 9)},
-    'left_hand': {'kps_ids': LEFT_HAND_IDS, 'kps_rel_range': (9, 30)},
-    'right_hand': {'kps_ids': RIGHT_HAND_IDS, 'kps_rel_range': (30, 51)},
-    'mouth': {'kps_ids': MOUTH_IDS, 'kps_rel_range': (51, 59)},
-    'face': {'kps_ids': FACE_IDS, 'kps_rel_range': (59, 77)},
-}
+# -- Uni-Sign 69-keypoint selection ------------------------------------------
+# COCO-WholeBody-133 -> Uni-Sign 69 selection (ZechengLi19/Uni-Sign datasets.py load_part_kp), in the
+# fixed part order [body 9 | left 21 | right 21 | face_all 18] that backbones.unisign.UniSignPoseEncoder
+# splits back out. These indices + the crop_scale in preprocessing.normalize_keypoints_unisign MUST stay
+# byte-faithful or the released pose-only checkpoints (csl_daily/how2sign/openasl) see out-of-distribution
+# input and the pretraining is wasted. (133-kp layout: body 0-16, feet 17-22, face 23-90, L hand 91-111,
+# R hand 112-132.)
+UNISIGN_BODY_IDX = [0] + list(range(3, 11))                                  # 9  (nose + shoulders..wrists)
+UNISIGN_LEFT_IDX = list(range(91, 112))                                      # 21 (left hand)
+UNISIGN_RIGHT_IDX = list(range(112, 133))                                    # 21 (right hand)
+UNISIGN_FACE_IDX = list(range(23, 40))[::2] + list(range(83, 91)) + [53]     # 18 (9 contour + 8 mouth + nose)
+# The 69 raw-133 indices in part order — for selecting the raw subset (e.g. visualize.py skeleton overlay).
+UNISIGN_SELECTED_IDS = UNISIGN_BODY_IDX + UNISIGN_LEFT_IDX + UNISIGN_RIGHT_IDX + UNISIGN_FACE_IDX
+UNISIGN_NUM_KP = len(UNISIGN_SELECTED_IDS)
+
 from .preprocessing import *
 from .augmentation import *
 from .pose_io import *

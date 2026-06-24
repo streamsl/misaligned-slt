@@ -31,7 +31,7 @@ class Graph:
 
 
     def get_edge(self, layout):
-        if layout in ['left_hand', 'right_hand']:
+        if layout in ['left', 'right']:  # Uni-Sign hand layout (21-joint graph, shared L/R)
             self.num_node = 21
             self_link = [(i, i) for i in range(self.num_node)]
             neighbor_link = [
@@ -54,22 +54,16 @@ class Graph:
             self.edge = self_link + neighbor_link
             self.center = 0
             
-        elif layout == 'mouth':
-            self.num_node = 8
+        elif layout == 'face_all':  # Uni-Sign face graph (9 contour + 8 mouth + 1 nose), ZechengLi19/Uni-Sign gcn_utils.py
+            self.num_node = 9 + 8 + 1
             self_link = [(i, i) for i in range(self.num_node)]
-            neighbor_link = [[i, i + 1] for i in range(self.num_node - 1)] + \
-                            [[self.num_node - 1, 0]]
-            self.edge = self_link + neighbor_link
-            self.center = 4
-            
-        elif layout == 'face':
-            self.num_node = 18
-            self_link = [(i, i) for i in range(self.num_node)]
-            neighbor_link = [[i, i + 1] for i in range(16)] + \
+            neighbor_link = [[i, i + 1] for i in range(9 - 1)] + \
+                            [[i, i + 1] for i in range(9, 9 + 8 - 1)] + \
+                            [[9 + 8 - 1, 9]] + \
                             [[17, i] for i in range(17)]
             self.edge = self_link + neighbor_link
             self.center = self.num_node - 1
-            
+
 
     def get_adjacency(self, strategy):
         valid_hop = range(0, self.max_hop + 1, self.dilation)

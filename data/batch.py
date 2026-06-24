@@ -1,21 +1,17 @@
 from __future__ import annotations
-from data.gfslt_padding import pad_visual_sequence_gfslt
 from data.windowing import BIO
 import torch
 
 
-def collate_windows(batch: list[dict], visual_padding: str = "gfslt") -> dict[str, torch.Tensor | list]:
+def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str, torch.Tensor | list]:
     prepared = []
     for item in batch:
         poses_i = torch.as_tensor(item["poses"]).float()
         ts_i = torch.as_tensor(item["timestamps_s"]).float()
         labels_i = torch.as_tensor(item["bio_labels"]).long()
-        if visual_padding == "gfslt":
-            poses_i, ts_i, mask_i, labels_i = pad_visual_sequence_gfslt(
-                poses_i, ts_i, bio_labels=labels_i, pad_label=BIO["UNK"]
-            )
-        elif visual_padding in {"none", "zero"}: mask_i = torch.ones(poses_i.shape[0], dtype=torch.bool)
-        else: raise ValueError(f"Unsupported visual_padding={visual_padding}")
+        # Uni-Sign uses raw windows; padding is handled at batch level + masked via frame_mask (no boundary halos).
+        if visual_padding in {"none", "zero"}: mask_i = torch.ones(poses_i.shape[0], dtype=torch.bool)
+        else: raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
         prepared.append((item, poses_i, ts_i, mask_i, labels_i))
 
     max_len = max(poses_i.shape[0] for _, poses_i, _, _, _ in prepared)
@@ -45,7 +41,7 @@ def collate_windows(batch: list[dict], visual_padding: str = "gfslt") -> dict[st
 class WindowCollator:# Collate windows and optionally tokenize complete-anchor references.
     def __init__(
         self, tokenizer=None, max_text_tokens: int = 128,
-        pad_to_max_length: bool = True, visual_padding: str = "gfslt",
+        pad_to_max_length: bool = True, visual_padding: str = "none",
     ):
         self.tokenizer = tokenizer
         self.max_text_tokens = int(max_text_tokens)

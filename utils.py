@@ -11,29 +11,25 @@ def cfg_get(cfg: dict, *path: str, default=None):
         cur = cur[key]
     return cur
 
-# Single source of truth for the consolidated `checkpoint:` / `mbart:` config blocks (§12).
-# Each reader falls back to the pre-consolidation flat keys so older configs keep working.
+# Single source of truth for the consolidated `checkpoint:` / `language_model:` config blocks (§12).
+# Readers fall back to the pre-rename keys (`mbart:`, `checkpoint.from_vlp`) so older configs keep working.
 def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
     return cfg_get(cfg, "checkpoint", "dir", default=cfg.get("output_dir", default))
 
-def vlp_checkpoint(cfg: dict, default: str | None = None) -> str | None:
-    return cfg_get(cfg, "checkpoint", "from_vlp", default=cfg.get("checkpoint_vlp", default))
+def pretrained_checkpoint(cfg: dict, default: str | None = None) -> str | None:
+    # Weights to start from: the released Uni-Sign pose-only checkpoint (the mBART ablation loads the pose
+    # encoder from it; the mBART LM starts from base).
+    return cfg_get(cfg, "checkpoint", "from_pretrained", default=default)
 
 def save_best_enabled(cfg: dict, default: bool = True) -> bool:
     return bool(cfg_get(cfg, "checkpoint", "save_best", default=default))
 
-def mbart_name(cfg: dict) -> str:
-    return str(cfg_get(cfg, "mbart", "name", default=cfg.get("mbart_name", "facebook/mbart-large-cc25")))
-
-def mbart_trimmed_dir(cfg: dict) -> str:
-    # trim_mbart writes one directory holding the trimmed tokenizer and the (depth-trimmed)
-    # model used by every stage — text encoder, visual encoder, and AR/DLM decoder all load it.
-    fallback = cfg.get("trimmed_mbart_dir", cfg.get("trimmed_tokenizer_dir", mbart_name(cfg)))
-    return str(cfg_get(cfg, "mbart", "trimmed_dir", default=fallback))
-
-def backbone_name(cfg: dict) -> str:
-    # Pose backbone selector from the stage config's `backbone:` block (the architecture source of truth).
-    return str(cfg_get(cfg, "backbone", "name", default="cosign"))
+def language_model_name(cfg: dict) -> str:
+    # ONE key for the text model regardless of family: facebook/mbart-large-cc25 OR google/mt5-base.
+    return str(cfg_get(
+        cfg, "language_model", "name", 
+        default=cfg_get(cfg, "mbart", "name", default=cfg.get("mbart_name", "facebook/mbart-large-cc25"))
+    ))
 
 def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
     out = dict(base)

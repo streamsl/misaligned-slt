@@ -39,13 +39,12 @@ class WindowSampler:
         mode_ratios: dict[str, float], buffer_cap_s: float,
         seed: int = 42, mode2_subcase_weights: dict[str, float] | None = None,
         fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
-        pose_repr: str = "cosign77", pose_augment_cfg: dict | None = None,
+        pose_augment_cfg: dict | None = None,
     ):
         self.records = records
         self.jitter = jitter
         self.mode_ratios = normalized_mode_ratios(mode_ratios)
         self.buffer_cap_s = float(buffer_cap_s)
-        self.pose_repr = str(pose_repr)  # cosign77 / mska133 — must match the model's backbone
         # Spatial pose augmentation (train only), with its own rng so it does not perturb the window-sampling
         # rng stream. None on dev (deterministic monitor) and never applied to the Mode-2a full-evidence view.
         self.pose_augmentor = build_pose_augmentor(pose_augment_cfg, np.random.default_rng(int(seed) + 997))
@@ -74,7 +73,7 @@ class WindowSampler:
 
     @classmethod
     def from_stage2_config(
-        cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict, pose_repr: str = "cosign77",
+        cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict,
         pose_augment_cfg: dict | None = None,
     ) -> "WindowSampler":
         ratios_cfg = stage2_cfg.get("mode_ratios", {})
@@ -114,7 +113,7 @@ class WindowSampler:
             fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
             fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
             fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
-            pose_repr=pose_repr, pose_augment_cfg=pose_augment_cfg,
+            pose_augment_cfg=pose_augment_cfg,
         )
 
     def _choose_mode(self) -> str:
@@ -279,8 +278,9 @@ class WindowSampler:
         `full_evidence_spec` the confidence-bound term decodes under no_grad. `fps_aug=True` resamples the window to a
         random fps (Moryossef 2026 fps_aug; Hard Rule §1.4.4) and rebuilds the BIO labels from the resampled timestamps."""
         poses, timestamps = load_pose_window(
-            rec.pose, spec.start_s, spec.end_s, normalize=True, pose_repr=self.pose_repr,
-            augment=self.pose_augmentor if augment else None)
+            rec.pose, spec.start_s, spec.end_s, normalize=True,
+            augment=self.pose_augmentor if augment else None
+        )
         if fps_aug and poses.shape[0] > 1:
             from moryossef26.dataset import apply_fps_aug
             poses, timestamps, _ = apply_fps_aug(

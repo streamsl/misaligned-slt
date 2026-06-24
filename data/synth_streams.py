@@ -3,7 +3,7 @@
 Loads any corpus built by the author's e2e-slt-streaming `data_synth` pipeline — pre-trimmed SLT
 benchmark cues concatenated into continuous streams with gaps/phantoms — onto the same
 `VideoRecord`/`SentenceSpan`/`PoseIndex` abstraction the YouTube path uses, so every downstream stage
-(VLP, segmenter, stage-2, analysis, eval) runs unchanged via `load_language_records` dispatch.
+(segmenter, stage-2, analysis, eval) runs unchanged via `load_language_records` dispatch.
 
 All `data_synth` corpora share ONE schema, so this single module serves every dataset; a corpus is
 selected by its `data.yaml` language entry (key + `root` + `target_lang`), not by code here:
@@ -33,10 +33,10 @@ from poses.pose_io import PoseIndex
 
 
 def _stream_frame_size(root: Path, lang_cfg: dict) -> tuple[int | None, int | None]:
-    # Pixel frame the raw pose coordinates live in, needed by the MSKA (dsta) pose representation's
-    # global normalization (x/w, (h-y)/h). Authoritative source is the builder's manifest src_meta
-    # (PHOENIX: src_w=210, src_h=260); config keys width/height override. The CoSign
-    # representation ignores these (its group normalization is resolution-independent).
+    # Pixel frame the raw pose coordinates live in — used only by the train-time spatial augmentations
+    # (affine / spatial_mask). Authoritative source is the builder's manifest src_meta (PHOENIX:
+    # src_w=210, src_h=260); config keys width/height override. Uni-Sign normalization is bbox-relative
+    # and resolution-independent, so it ignores these.
     width = lang_cfg.get("width")
     height = lang_cfg.get("height")
     if width and height: return int(width), int(height)
@@ -104,7 +104,6 @@ def load_stream_records(data_cfg: dict, language: str, split: str | None = None)
         pose = PoseIndex(
             video_id=stream_id, paths=(pose_path,), frame_counts=(n_frames,),
             fps=float(fps), width=width, height=height,
-            conf_threshold=float((lang_cfg.get("pose", {}) or {}).get("confidence_threshold", 0.0)),
         )
         captions = merge_rolling_captions(parse_vtt(vtt_path, drop_noise=drop_noise))
         spans = tuple(

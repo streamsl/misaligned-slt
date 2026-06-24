@@ -6,14 +6,13 @@ segmentation contract). TEMPORAL augmentation is handled separately by `moryosse
 which rebuilds the timestamps it resamples.
 
 Spatial primitives exposed through `PoseAugmentor` / `build_pose_augmentor`. These are the pose-space
-analogue of GFSLT-VLP's image augmentation (`va.RandomRotate(30)` + `va.RandomResize(0.2)` +
-`va.RandomTranslate`, see its datasets.py) and MSKA's centroid `random_move`:
+analogue of standard image-space augmentation (random rotate / resize / translate):
   - `rotate` — random rotation by U(-deg, deg) around the keypoint centroid. Needs no frame size; the
     only op enabled by default.
   - `affine` — random scale / shift / shear around the frame centre (scale ~ RandomResize, shift ~
     RandomTranslate).
   - `spatial_mask` — cutout of a random spatial box.
-GFSLT-VLP's fixed-size random crop and colour jitter have no pose analogue; it does NOT flip.
+Fixed-size random crop and colour jitter have no pose analogue; this augmentor does NOT flip.
 
 Width/height come from `PoseIndex.width/height` (per dataset — PHOENIX 210x260, CSL-Daily 512x512,
 etc.). When they are unknown, frame-referenced ops (affine / spatial_mask) are skipped and only the
@@ -25,8 +24,7 @@ from scipy.ndimage import zoom
 
 # ── Spatial primitives (parametrised by frame size; operate on x,y only, conf left intact) ─────────────
 def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Generator | None = None) -> np.ndarray:
-    """Rotate (x, y) by U(-max_angle_deg, max_angle_deg) around the centroid of the non-zero keypoints
-    (in the spirit of MSKA's `random_move`). Needs no frame size."""
+    # Rotate (x, y) by U(-max_angle_deg, max_angle_deg) around the centroid of non-zero keypoints. Needs no frame size.
     keypoints = np.asarray(keypoints, dtype=np.float32).copy()
     if keypoints.ndim != 3 or keypoints.shape[-1] < 2: return keypoints
     rng = rng or np.random.default_rng()
@@ -117,7 +115,7 @@ def interp1d_(keypoints: np.ndarray, target_len: int, rng: np.random.Generator |
 
 # ── Orchestration ─────────────────────────────────────────────────────────────────────────────────────
 _DEFAULTS = {
-    "rotation": {"deg": 15.0, "prob": 0.5},          # centroid rotation (MSKA-style)
+    "rotation": {"deg": 15.0, "prob": 0.5},  # centroid rotation
     "affine": {"prob": 0.0, "scale": [0.9, 1.1], "shift": [-0.05, 0.05], "degree": None, "shear": None},
     "spatial_mask": {"prob": 0.0, "size": [0.1, 0.2]},
 }

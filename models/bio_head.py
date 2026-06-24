@@ -126,7 +126,7 @@ class TemporalConvStem(nn.Module):
     The standalone segmenter (moryossef26/model.py) keeps the full UNet CNN before its RoPE layers, and Moryossef's ablations 
     attribute precise boundary placement to exactly those skip-connection convolutions (EXPERIMENTS.md finding 23 "UNet skip 
     connections are critical for sign boundary precision"; finding 8 "CNN naturally detects B"). This in-model BIO head reads 
-    post-VLP features DIRECTLY with no UNet, so without a conv stem it is structurally a transformer/BiLSTM-style tagger, which 
+    pose-token features DIRECTLY with no UNet, so without a conv stem it is structurally a transformer/BiLSTM-style tagger, which 
     Moryossef shows is weak on B / boundary localization — and that directly feeds the commit gate's I→O δ_enc stability and 
     RQ2 tIoU. This stem is the cheap middle ground (spec §4.4 wants the head small, so this is 2 conv layers, not the full UNet).
 
@@ -153,7 +153,7 @@ class TemporalConvStem(nn.Module):
 
 
 class RoPEBIOHead(nn.Module):
-    """Phrase-level Moryossef-style BIO head over post-VLP visual features.
+    """Phrase-level Moryossef-style BIO head over per-frame pose-token features.
 
     `.logits` aliases the phrase BIO logits, which the FSM consumes. Moryossef 2026 additionally carries a *sign* (sub-sentence) BIO head,
     but that head is supervised by sign-level temporal segment annotations. YouTube-SL-25 only provides sentence/caption timestamps, so 

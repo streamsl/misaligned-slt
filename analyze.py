@@ -15,7 +15,7 @@ from moryossef26.trainer import build_segmenter
 from infer.commit_gate import first_closing_o_index
 from eval import _build_eval_model, _translate_window
 from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
-from utils import load_yaml, update_yaml_scalar
+from utils import load_yaml, update_yaml_scalar, checkpoint_dir
 
 
 @dataclass(frozen=True)
@@ -254,7 +254,7 @@ def _eval_model_for(method: str, args: argparse.Namespace, stage1_cfg: dict, met
 def tail_benefit(args: argparse.Namespace) -> dict:
     """Spec §8.3 — tail-benefit curve sets BUFFER_CAP_S.
 
-    Protocol: clean-trained translator (the Analysis-B GFSLT baseline), dev split, head fixed at the
+    Protocol: clean-trained translator (the Analysis-B clean baseline), dev split, head fixed at the
     true sentence start (Δ_head = 0), trailing context Δ_tail swept upward; BLEU-4 per Δ_tail. The
     elbow is the first grid point whose marginal BLEU per extra second drops below the explicit
     latency/quality coefficient (eval.yaml tail_benefit.latency_quality_coeff_bleu_per_s) — not a
@@ -353,8 +353,8 @@ def delta_enc(args: argparse.Namespace) -> dict:
         poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
         ts = torch.as_tensor(timestamps_np - start_s, dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
-        post_vlp, _, ts_out = model.visual.extract_post_vlp(poses, mask, ts)
-        tags = model.bio_head(post_vlp, timestamps_s=ts_out).logits.argmax(dim=-1)[0]
+        bio_tap, _, ts_out = model.front_end.extract_bio_tap(poses, mask, ts)
+        tags = model.bio_head(bio_tap, timestamps_s=ts_out).logits.argmax(dim=-1)[0]
         return first_closing_o_index(tags)
 
     shifts: dict[str, list[int]] = {"drop_first_frame": [], "keypoint_noise": []}
@@ -400,7 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--segmenter-config", default="configs/segmenter.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
+    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
@@ -426,7 +426,6 @@ if __name__ == "__main__":
     if args.checkpoint is None and args.stage == "segmenter-infer":
         # Derive from the segmenter config's checkpoint dir (e.g. checkpoints/segmenter/phoenix) instead of
         # a hardcoded language, so it follows the active dataset and `--language` overrides.
-        from utils import checkpoint_dir
         seg_cfg = load_yaml(args.segmenter_config)
         args.checkpoint = str(Path(checkpoint_dir(seg_cfg, default=f"checkpoints/segmenter/{args.language}")) / "model.pt")
     if args.stage == "dataset-summary": result = dataset_summary(args)

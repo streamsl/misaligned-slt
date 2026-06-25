@@ -10,8 +10,8 @@ Layering (so each concept has one home):
   models/unisign.py                   mT5 binding:  `MT5BlockDiffusionDecoder` (concrete `_decode`).
 
 A decoder is built per language-model family by subclassing `dmax.OPUTBlockDiffusionDecoder` and implementing
-ONLY `_decode` / `_decode_from_embeds` / `__init__`. Conditioning is uniform: every decoder consumes a
-precomputed encoder memory (`enc_hidden`/`enc_mask`); encoding is the front end's job (models/front_end.py).
+ONLY `_decode` / `__init__`. Conditioning is uniform: every decoder consumes a precomputed encoder memory 
+(`enc_hidden`/`enc_mask`); encoding is the front end's job (models/front_end.py).
 
 Implements BD3LM (block diffusion) adapted to mBART via A2D recipe from dLLM, with full bd3lms fidelity:
   - Architecture: pretrained mBART decoder with block-causal self-attention.
@@ -150,10 +150,10 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
       - Trains with MDLM masked diffusion loss (loglinear noise schedule).
       - Generates via iterative denoising block-by-block at inference time.
 
-    Subclasses provide ONLY the architecture-specific decode (`_decode`, `_decode_from_embeds`) and call
-    `_init_block_diffusion(...)` from their `__init__` to build the shared vocab+1 `[MASK]` embedding / LM head
-    and store the hyper-parameters. Everything else (target prep, noise schedule, BD3LM `[xt|x0]` forward, the
-    MDLM loss, and the block-by-block sampler) is shared here. DMax (OPUT + SPD/DCD) lives in `models.dmax`.
+    Subclasses provide ONLY the architecture-specific decode (`_decode`) and call `_init_block_diffusion(...)` from 
+    their `__init__` to build the shared vocab+1 `[MASK]` embedding / LM head and store the hyper-parameters. 
+    Everything else (target prep, noise schedule, BD3LM `[xt|x0]` forward, MDLM loss, and block-by-block sampler) is 
+    shared here. DMax (OPUT + SPD/DCD) lives in `models.dmax`.
     '''
     def _init_block_diffusion(
         self, *, d_model: int, vocab_size: int, embed_source_weight: torch.Tensor, lm_source_weight: torch.Tensor,
@@ -200,32 +200,22 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     # ── Architecture-specific decode (subclass responsibility) ────────────────
     def _decode(
         self, decoder_input_ids: torch.Tensor, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
-        self_attn_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None, 
-        sigma: torch.Tensor | None = None
+        self_attn_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        '''Run AR decoder layers with custom self-attention mask.
+        '''Run the AR decoder backbone with a custom (block-causal / BD3LM) self-attention mask.
 
-        Bypasses ARDecoder.forward() to replace its internal causal mask. Everything else
-        (positional embeddings, layer norms, cross-attention, FFN) is identical to the AR path.
+        Bypasses the HF decoder.forward causal mask; everything else (positions, norms, cross-attention, FFN)
+        is identical to the AR path. Each backbone implements this ONE method (no separate embeds variant).
 
         Args:
-            decoder_input_ids: (B, T) token IDs.
-            enc_hidden: encoder hidden states for cross-attention.
-            enc_mask: encoder padding mask.
-            self_attn_mask: optional (1, 1, T, T) or (B, 1, T, T) float mask.
-                If None, builds block-causal mask from block_size.
-            position_ids: optional (B, T) position IDs for embed_positions.
-                If None, uses default sequential positions from embed_positions.
-            sigma: optional (B,) or (B, 1) noise level for time conditioning.
+            decoder_input_ids: (B, T) token IDs — always supplied (used for shape and the learned positions).
+            enc_hidden / enc_mask: encoder memory + padding mask for cross-attention.
+            self_attn_mask: optional (1/B, 1, T, T) float mask; None -> block-causal mask from block_size.
+            position_ids: optional (B, T) positions for the BD3LM [xt|x0] repeated geometry; None -> sequential.
+            inputs_embeds: optional (B, T, d) decoder-input embeddings that REPLACE embedding decoder_input_ids
+                (the SPD soft-embedding mixture). None -> the decoder embeds decoder_input_ids itself.
         '''
-        raise NotImplementedError
-
-
-    def _decode_from_embeds(
-        self, token_ids: torch.Tensor, raw_inputs_embeds: torch.Tensor,
-        enc_hidden: torch.Tensor, enc_mask: torch.Tensor, self_attn_mask: torch.Tensor | None = None,
-        sigma: torch.Tensor | None = None
-    ) -> torch.Tensor:
         raise NotImplementedError
 
     
@@ -240,21 +230,20 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         x0 = torch.cat([bos, x0], dim=1)             # (B, L+1)
 
         # Text attention mask: 1 for real tokens, 0 for padding
-        text_mask = (x0 != self.pad_index)           # (B, L+1) bool
-        if self.ignore_bos: text_mask[:, 0] = False  # BOS never masked
+        valid = (x0 != self.pad_index)           # (B, L+1) bool
+        if self.ignore_bos: valid[:, 0] = False  # BOS never masked
 
         # Align length to a multiple of block_size
-        L = x0.shape[1]
-        num_blocks = max(1, math.ceil(L / self.block_size))
-        L_aligned = num_blocks * self.block_size
-        if L < L_aligned:
-            x0 = F.pad(x0, (0, L_aligned - L), value=self.pad_index)
-            text_mask = F.pad(text_mask, (0, L_aligned - L), value=False)
+        aligned_len = max(1, math.ceil(x0.shape[1] / self.block_size)) * self.block_size
+        if x0.shape[1] < aligned_len:
+            x0 = F.pad(x0, (0, aligned_len - x0.shape[1]), value=self.pad_index)
+            valid = F.pad(valid, (0, aligned_len - valid.shape[1]), value=False)
 
-        # Supervise the canvas tail after [.., eos, lang] with EOS targets (dLLM AppendEOSBlockWrapper /
-        # DMax 32-trailing-eos recipe) so post-sentence slots are maskable and never confident garbage.
+        # Supervised EOS tail after [.., eos, lang] (dLLM AppendEOSBlockWrapper / DMax 32-trailing-eos): without it, 
+        # slots past the sentence end are never trained and decode to confident garbage before EOS commits, which the 
+        # commit gate then reads as hardened. See block_diffusion.supervise_trailing_eos.
         return supervise_trailing_eos(
-            x0, text_mask, pad_index=self.pad_index, eos_index=self.eos_index,
+            x0, valid, pad_index=self.pad_index, eos_index=self.eos_index,
             max_tokens=self.eos_supervision_tokens if eos_supervision is None else int(eos_supervision),
         )
 

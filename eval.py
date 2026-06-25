@@ -17,17 +17,14 @@ pd.set_option("display.width", None)               # auto-detect terminal width
 pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
 pd.set_option("display.float_format", "{:.4f}".format)
 
-
-from data.loader import VideoRecord, load_language_records
+from poses import load_pose_window
 from data.windowing import SentenceSpan
-from data.gfslt_padding import pad_visual_sequence_gfslt
-from poses import load_pose_window, pose_repr_for_backbone
-
-from models.gfslt import make_gfslt_config, CleanARSLTModel, resolve_decoder_start_id
+from data.loader import VideoRecord, load_language_records
+from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
-from utils import checkpoint_dir, load_yaml, mbart_trimmed_dir, backbone_name
+from utils import checkpoint_dir, load_yaml, language_model_name, pretrained_checkpoint
 
 
 @dataclass(frozen=True)
@@ -265,45 +262,143 @@ def _method_config_path(args: argparse.Namespace) -> str:
     return defaults[args.method]
 
 
-def _load_tokenizer(stage1_cfg: dict, data_cfg: dict, language: str):
-    from transformers import AutoTokenizer
-    target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    return AutoTokenizer.from_pretrained(mbart_trimmed_dir(stage1_cfg), src_lang=target_lang, tgt_lang=target_lang)
-
-
 def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict, method_cfg: dict, device: torch.device):
-    tokenizer = _load_tokenizer(stage1_cfg, data_cfg, args.language)
+    """Uni-Sign pose-only model. The language model is selected by `language_model.name`: mT5 (Path A default) or
+    mBART (the mT5-vs-mBART ablation). The `stage2_baseline` method is the released Uni-Sign mT5 model (eval-only)."""
+    from transformers import T5Tokenizer, AutoTokenizer
+    target_lang = data_cfg["languages"][args.language].get("target_lang")
+    prompt_lang = prompt_lang_for_target(target_lang)
+    lm_name = language_model_name(stage1_cfg)
+
     if args.method == "stage2_baseline":
-        model = CleanARSLTModel(make_gfslt_config(stage1_cfg), decoder_start_token_id=resolve_decoder_start_id(tokenizer))
+        # The baseline is the RELEASED Uni-Sign mT5 pose-only model (there is no released mBART SLT), evaluated
+        # AR-only with beam search — the literature-comparison floor / clean point. It is the SAME
+        # `MisalignedSLTModel(decoder="ar")` as stage2_ar, just with the released weights instead of trained ones
+        # (its BIO head is unused for translation). `load_unisign_pretrained` strict-loads the front end (pose+mT5).
+        mt5_name = lm_name if "mt5" in lm_name.lower() else "google/mt5-base"
+        tokenizer = T5Tokenizer.from_pretrained(mt5_name, legacy=False)
+        front_end = UniSignMT5FrontEnd(mt5_name=mt5_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+        model = MisalignedSLTModel(front_end=front_end, tokenizer=tokenizer, decoder="ar",
+                                   bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)))
+        ckpt = Path(args.checkpoint or pretrained_checkpoint(stage1_cfg, default="")
+                    or checkpoint_dir(method_cfg, default="") or "")
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Missing Uni-Sign checkpoint: {ckpt}. Set checkpoint.from_pretrained or pass --checkpoint.")
+        rep = load_unisign_pretrained(model, ckpt, strict=True)
+        print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
+              f"{rep['pose_missing'] + rep['mt5_missing']}, unexpected {rep['pose_unexpected'] + rep['mt5_unexpected']})", flush=True)
+        model.to(device); model.eval()
+        return model, tokenizer
+
+    # Trained stage2_ar / stage2_dlm: the unified MisalignedSLTModel on the Uni-Sign front end (mT5 or mBART) + the
+    # trained checkpoint. Same pose encoder + prompt either way — only the LM differs (clean mT5-vs-mBART ablation).
+    if "mbart" in lm_name.lower():
+        tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
+        front_end = UniSignMBartFrontEnd(mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer)
     else:
-        model = MisalignedSLTModel(
-            gfslt_config=make_gfslt_config(stage1_cfg), tokenizer=tokenizer, 
-            decoder="ar" if args.method == "stage2_ar" else "dlm",
-            bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
-            block_size=int(method_cfg.get("block_size", 8)),
-        )
+        tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
+        front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+    model = MisalignedSLTModel(
+        front_end=front_end, tokenizer=tokenizer,
+        decoder="ar" if args.method == "stage2_ar" else "dlm",
+        bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
+        block_size=int(method_cfg.get("block_size", 8)),
+    )
     checkpoint = Path(args.checkpoint or checkpoint_dir(method_cfg, default="") or "")
     if not checkpoint.exists():
         raise FileNotFoundError(f"Missing checkpoint for {args.method}: {checkpoint}. Train the method first or pass --checkpoint.")
     load_model_checkpoint(model, checkpoint, strict=False)
-    model.to(device)
-    model.eval()
+    model.to(device); model.eval()
     return model, tokenizer
 
 
 def _prep_window(
     poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float, visual_padding: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Window pose tensor + window-relative timestamps + frame mask, applying the SAME visual padding the
-    model was trained with. The trainers feed `visual_padding: gfslt` (pad_visual_sequence_gfslt: 8 repeated
-    boundary frames each side, marked valid); evaluating on raw windows is a train/inference mismatch that
-    silently drops several BLEU. None/zero = raw window (use for streaming-consistent stage-2)."""
+    """Window pose tensor + window-relative timestamps + frame mask. Uni-Sign uses raw windows
+    (`visual_padding: none`) — the mT5/mBART encoder masks padding via the attention mask; no boundary halos."""
     poses = torch.as_tensor(poses_np, dtype=torch.float32)
     ts = torch.as_tensor(np.asarray(timestamps_np, dtype=np.float32) - float(start_s), dtype=torch.float32)
-    if visual_padding == "gfslt": poses, ts, mask, _ = pad_visual_sequence_gfslt(poses, ts)
-    elif visual_padding in {"none", "zero"}: mask = torch.ones(poses.shape[0], dtype=torch.bool)
-    else: raise ValueError(f"Unsupported visual_padding={visual_padding}")
+    if visual_padding in {"none", "zero"}: mask = torch.ones(poses.shape[0], dtype=torch.bool)
+    else: raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
     return poses, ts, mask
+
+
+def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int) -> dict:
+    """Build the `MisalignedSLTModel.generate_from_poses` kwargs for a method. Baseline = AR **beam search** (the
+    literature-comparison floor); stage2_ar / stage2_dlm stay **greedy** (num_beams=1) so §9.3 is a clean
+    AR-vs-DLM contrast — the DLM arm additionally uses the SPD/DCD params (the AR arms ignore them)."""
+    if method == "stage2_baseline":
+        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+        return {"max_text_tokens": max_tokens, "num_beams": num_beams}
+
+    trans_cfg = inference_cfg.get("translation", {})
+    dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
+    spd_cfg = method_cfg.get("spd", {})
+    return {
+        "max_text_tokens": max_tokens, "num_beams": 1,
+        "diffusion_steps": int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
+        "tau_dec": float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
+        "spd_top_k": int(spd_cfg.get("top_k", 1)),
+        "spd_renormalize": bool(spd_cfg.get("renormalize", True)),
+        "spd_revision": bool(spd_cfg.get("revision", True)),
+        "temperature": float(dcd_cfg.get("temperature", 0.0)),
+        "dcd_window_length": int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
+        "dcd_max_window_length": int(dcd_cfg.get("max_window_length", 64)),
+        "dcd_window_type": str(dcd_cfg.get("window_type", "sliding")),
+        "dcd_decode_algo": str(dcd_cfg.get("decode_algo", "threshold")),
+        "dcd_decode_param": dcd_cfg.get("decode_param", trans_cfg.get("commit_confidence_tau", 0.75)),
+        "dcd_sample_top_k": None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
+        "dcd_top_p": None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
+        "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
+        "dcd_refresh_count": int(dcd_cfg.get("refresh_count", 16)),
+    }
+
+
+@torch.no_grad()
+def _translate_windows(
+    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
+    device: torch.device, inference_cfg: dict, method_cfg: dict,
+) -> list[tuple[str, float]]:
+    """Translate a batch of pre-trimmed pose windows -> [(text, mean_token_confidence)].
+
+    ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the
+    released model; stage2_ar = AR greedy; stage2_dlm = SPD/DCD). It returns the REAL per-token confidence (the
+    softmax prob the model assigns its own tokens), so the §9.1 "confidently wrong" claim is measured, not a
+    placeholder. Variable-length windows are right-padded and masked via `frame_mask` (the LM encoder attends only
+    to real frames; SPD/DCD reads per-row lengths), so each row's result is identical to translating it alone."""
+    if not items: return []
+    visual_padding = str(method_cfg.get("visual_padding", "none"))
+    prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
+    max_t = max(int(p.shape[0]) for p, _, _ in prepped)
+    pose_shape = tuple(prepped[0][0].shape[1:])
+    batch = len(items)
+    
+    poses = torch.zeros((batch, max_t, *pose_shape), dtype=torch.float32)
+    timestamps = torch.zeros((batch, max_t), dtype=torch.float32)
+    frame_mask = torch.zeros((batch, max_t), dtype=torch.bool)
+    for i, (p_t, ts_t, m_t) in enumerate(prepped):
+        n = int(p_t.shape[0])
+        poses[i, :n] = p_t
+        timestamps[i, :n] = ts_t
+        frame_mask[i, :n] = m_t
+    poses, timestamps, frame_mask = poses.to(device), timestamps.to(device), frame_mask.to(device)
+
+    max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
+    gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
+    _, tokens, confidence = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
+    tok = tokens.detach().cpu()
+    conf = confidence.detach().float().cpu()
+    texts = [t.strip() for t in tokenizer.batch_decode(tok, skip_special_tokens=True)]
+
+    # Per-row confidence = mean prob over the REAL produced tokens only — drop the decoder-start slot (its conf is
+    # the placeholder 1.0) and any padding after EOS, so the §9.1 "confidently wrong" signal is not diluted by pads.
+    n = min(tok.shape[1], conf.shape[1])
+    tok, conf = tok[:, :n], conf[:, :n]
+    valid = tok != int(tokenizer.pad_token_id)
+    if n: valid[:, 0] = False
+    confs = ((conf * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)).tolist()
+    return list(zip(texts, [float(c) for c in confs]))
 
 
 @torch.no_grad()
@@ -312,112 +407,8 @@ def _translate_window(
     poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float,
     device: torch.device, inference_cfg: dict, method_cfg: dict,
 ) -> tuple[str, float]:
-    visual_padding = str(method_cfg.get("visual_padding", "gfslt"))
-    poses_t, ts_t, mask_t = _prep_window(poses_np, timestamps_np, start_s, visual_padding)
-    poses = poses_t.unsqueeze(0).to(device)
-    timestamps = ts_t.unsqueeze(0).to(device)
-    frame_mask = mask_t.unsqueeze(0).to(device)
-    max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
-    if method == "stage2_baseline":
-        # Literature-comparison floor decodes with beam search like GFSLT-VLP (num_beams=4, train_slt.py);
-        # The FSM methods below stay greedy to keep the AR-vs-DLM contrast clean.
-        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
-        # REAL output confidence (mean prob the model assigns to its own tokens), not a 1.0 placeholder —
-        # the "confidently wrong" claim must be measured. confidence is per-row mean (shape [B]).
-        tokens, confidence = model.generate_with_confidence(
-            poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
-            max_new_tokens=max_tokens, num_beams=num_beams,
-        )
-    else:
-        trans_cfg = inference_cfg.get("translation", {})
-        dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
-        spd_cfg = method_cfg.get("spd", {})
-        _, tokens, confidence = model.generate_from_poses(
-            poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, max_text_tokens=max_tokens,
-            diffusion_steps=int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-            tau_dec=float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
-            spd_top_k=int(spd_cfg.get("top_k", 1)),
-            spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-            spd_revision=bool(spd_cfg.get("revision", True)),
-            temperature=float(dcd_cfg.get("temperature", 0.0)),
-            dcd_window_length=int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
-            dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-            dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
-            dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
-            dcd_decode_param=dcd_cfg.get("decode_param", trans_cfg.get("commit_confidence_tau", 0.75)),
-            dcd_sample_top_k=None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
-            dcd_top_p=None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
-            dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
-            dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
-        )
-    text = tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)[0].strip()
-    mean_conf = float(confidence.detach().float().mean().cpu().item()) if confidence.numel() else 0.0
-    return text, mean_conf
-
-
-@torch.no_grad()
-def _translate_windows_batched(
-    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
-    device: torch.device, inference_cfg: dict, method_cfg: dict,
-) -> list[tuple[str, float]]:
-    """Translate many windows in one forward. Variable-length windows are right-padded and the padding is
-    masked via `frame_mask` (the mBART encoder attends only to real frames; SPD/DCD reads per-row lengths),
-    so each row's result is identical to the unbatched `_translate_window` — this only removes the
-    one-window-at-a-time Python/GPU-launch overhead of the RQ1 sweep."""
-    if not items: return []
-    visual_padding = str(method_cfg.get("visual_padding", "gfslt"))
-    # Apply the model's training visual padding per row FIRST, then batch-pad to the max padded length
-    # (batch padding stays masked). Without this, batched eval mismatches training exactly like the unbatched path.
-    prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
-    max_t = max(int(p.shape[0]) for p, _, _ in prepped)
-    pose_shape = tuple(prepped[0][0].shape[1:])
-    batch = len(items)
-    poses = torch.zeros((batch, max_t, *pose_shape), dtype=torch.float32)
-    timestamps = torch.zeros((batch, max_t), dtype=torch.float32)
-    frame_mask = torch.zeros((batch, max_t), dtype=torch.bool)
-
-    for i, (p_t, ts_t, m_t) in enumerate(prepped):
-        n = int(p_t.shape[0])
-        poses[i, :n] = p_t
-        timestamps[i, :n] = ts_t
-        frame_mask[i, :n] = m_t
-
-    poses, timestamps, frame_mask = poses.to(device), timestamps.to(device), frame_mask.to(device)
-    max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
-    if method == "stage2_baseline":
-        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
-        tokens, mean_conf = model.generate_with_confidence(
-            poses=poses, frame_mask=frame_mask, timestamps_s=timestamps,
-            max_new_tokens=max_tokens, num_beams=num_beams,
-        )
-        texts = [t.strip() for t in tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)]
-        return list(zip(texts, [float(c) for c in mean_conf.detach().cpu().tolist()]))
-
-    trans_cfg = inference_cfg.get("translation", {})
-    dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
-    spd_cfg = method_cfg.get("spd", {})
-    _, tokens, confidence = model.generate_from_poses(
-        poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, max_text_tokens=max_tokens,
-        diffusion_steps=int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-        tau_dec=float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
-        spd_top_k=int(spd_cfg.get("top_k", 1)),
-        spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-        spd_revision=bool(spd_cfg.get("revision", True)),
-        temperature=float(dcd_cfg.get("temperature", 0.0)),
-        dcd_window_length=int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
-        dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-        dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
-        dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
-        dcd_decode_param=dcd_cfg.get("decode_param", trans_cfg.get("commit_confidence_tau", 0.75)),
-        dcd_sample_top_k=None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
-        dcd_top_p=None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
-        dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
-        dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
-    )
-    texts = [t.strip() for t in tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)]
-    conf = confidence.detach().float().cpu()
-    confs = [float(conf[i].mean().item()) if conf[i].numel() else 0.0 for i in range(batch)]
-    return list(zip(texts, confs))
+    # Single-window convenience wrapper over `_translate_windows` (used by the RQ2 pipeline floor + analyze.py).
+    return _translate_windows(model, tokenizer, method, [(poses_np, timestamps_np, start_s)], device, inference_cfg, method_cfg)[0]
 
 
 def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
@@ -445,14 +436,10 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
 
     # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch near-uniform length 
     # so padding — and wasted compute — is minimal). Padding is masked, so batching not change any per-window result, only throughput.
-    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
     materialized: list[tuple[ControlledWindow, np.ndarray, np.ndarray]] = []
     for window in windows:
         record = records_by_id[window.video_id]
-        poses, timestamps = load_pose_window(
-            record.pose, window.window_start_s, window.window_end_s, 
-            normalize=True, pose_repr=pose_repr
-        )
+        poses, timestamps = load_pose_window(record.pose, window.window_start_s, window.window_end_s, normalize=True)
         if poses.shape[0] == 0: continue
         materialized.append((window, poses, timestamps))
 
@@ -462,7 +449,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     rows = []
     for start in tqdm(range(0, len(materialized), batch_size), desc="Translating windows"):
         chunk = materialized[start : start + batch_size]
-        results = _translate_windows_batched(
+        results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk],
             device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
@@ -547,11 +534,10 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
-    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
 
     predicted: dict[str, list[PredictionEvent]] = {}
     for record in tqdm(records, desc="Processing records"):
-        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True, pose_repr=pose_repr)
+        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
             predicted[record.video_id] = []
             continue
@@ -579,7 +565,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 @torch.no_grad()
 def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     """Segment-then-translate pipeline floor: The retrained Moryossef segmenter's predicted spans (analyze.py --stage segmenter-infer JSON,
-    via --segments) are cut from the pose stream and translated by clean-trained GFSLT baseline — the natural pipeline with no robustness 
+    via --segments) are cut from the pose stream and translated by clean-trained Uni-Sign baseline — natural pipeline with no robustness 
     training anywhere. Scored by the same tIoU/translation harness as the streaming FSM, so floor and method are directly comparable.
     """
     from moryossef26.infer import load_prediction_file
@@ -593,7 +579,6 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
     segments = load_prediction_file(args.segments)
-    pose_repr = pose_repr_for_backbone(backbone_name(stage1_cfg))
 
     # The split comes from --split, NOT the JSON filename. Mismatched video_ids silently translate nothing and
     # score all-zero, so fail loud instead (the classic "gold_*_test.json but forgot --split test" footgun).
@@ -612,7 +597,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
         if record is None: continue
         events: list[PredictionEvent] = []
         for span in spans:
-            poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True, pose_repr=pose_repr)
+            poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
             if poses.shape[0] == 0: continue
             text, _ = _translate_window(
                 model=model, tokenizer=tokenizer, method=args.method,
@@ -675,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_vlp.yaml")
+    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--method-config", default=None)
     parser.add_argument("--language", default="phoenix")
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])

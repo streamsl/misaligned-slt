@@ -220,6 +220,17 @@ def _load_evaluate_metric(name: str):
     except Exception: return None
 
 
+# Full-width CJK punctuation -> ASCII. mT5 decodes Chinese text but emits ASCII '?'/',' for some marks while the
+# references carry full-width '？'/'，' (and '。' etc.), so an un-normalized char-BLEU penalizes a 1-char punctuation
+# mismatch on nearly every sentence. Uni-Sign's eval (fine_tuning.py:285) does exactly this for '，'/'？' on the refs;
+# we normalize BOTH sides over the common marks so the score reflects content, not punctuation encoding.
+_CJK_PUNCT_MAP = {
+    '￥': '$', '％': '%', '＃': '#', '＠': '@', '，': ',', '。': '.', '？': '?', '！': '!', '、': ',', '；': ';', '：': ':',
+    '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
+    '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
+}
+_CJK_PUNCT_TABLE = {ord(k): v for k, v in _CJK_PUNCT_MAP.items()}
+
 def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tokenizing metrics such as CIDEr.
     out: list[str] = []
     for ch in text:
@@ -232,16 +243,26 @@ def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tok
     return "".join(out).strip()
 
 
-# Full-width CJK punctuation -> ASCII. mT5 decodes Chinese text but emits ASCII '?'/',' for some marks while the
-# references carry full-width '？'/'，' (and '。' etc.), so an un-normalized char-BLEU penalizes a 1-char punctuation
-# mismatch on nearly every sentence. Uni-Sign's eval (fine_tuning.py:285) does exactly this for '，'/'？' on the refs;
-# we normalize BOTH sides over the common marks so the score reflects content, not punctuation encoding.
-_CJK_PUNCT_MAP = {
-    '￥': '$', '％': '%', '＃': '#', '＠': '@', '，': ',', '。': '.', '？': '?', '！': '!', '、': ',', '；': ';', '：': ':',
-    '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
-    '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
-}
-_CJK_PUNCT_TABLE = {ord(k): v for k, v in _CJK_PUNCT_MAP.items()}
+def _rouge_l(hyps: list[str], refs: list[str]) -> float:
+    """ROUGE-L f-score (mean over sentences), via the SAME package Uni-Sign reports with — pltrdy `rouge`
+    (`from rouge import Rouge`, `get_scores(...)['rouge-l']['f']`), whitespace-tokenized over the (already
+    char-split for CJK) strings, matching Uni-Sign SLRT_metrics.translation_performance. HF `evaluate`'s
+    "rouge" is Google's rouge_score, whose ROUGE-L F-measure differs (~1 point on CJK) so it is NOT comparable
+    to their 0.55. Empty hyp/ref scores 0 (pltrdy raises on empty — counting them as misses is the honest
+    accounting); rouge_score is the fallback only if pltrdy is not installed."""
+    try:
+        from rouge import Rouge as _PltRouge
+        scorer = _PltRouge()
+        fs = []
+        for h, r in zip(hyps, refs):
+            if not h.strip() or not r.strip(): fs.append(0.0)
+            else: fs.append(float(scorer.get_scores(h, r)[0]["rouge-l"]["f"]))
+        return float(sum(fs) / len(fs)) if fs else 0.0
+    except Exception:
+        rouge = _load_evaluate_metric("rouge")
+        if rouge is None: return 0.0
+        try: return float(rouge.compute(predictions=hyps, references=refs, tokenizer=lambda t: t.split())["rougeL"])
+        except Exception: return 0.0
 
 
 def compute_text_metrics(
@@ -250,45 +271,42 @@ def compute_text_metrics(
 ) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
     scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
     if not predictions: return {f"{prefix}_{key}": value for key, value in scores.items()}
-    # CJK detection from the (gold) references; if present, normalize full-width punctuation on BOTH sides so
-    # the ASCII-punct model output matches the full-width refs (else char-BLEU loses ~1 n-gram/sentence).
+    # Preprocess EXACTLY like Uni-Sign's eval so the numbers are comparable to the paper (fine_tuning.py:284-288 + 
+    # SLRT_metrics.translation_performance): for CJK refs, char-split EVERY character and normalize ONLY the reference's 
+    # full-width comma/question-mark (`，`/`？` -> `,`/`?`), leaving the prediction's punctuation untouched. A full 
+    # punctuation map on BOTH sides is NOT what Uni-Sign does and measurably DEPRESSES ROUGE-L by ~0.03 (LCS sees a 
+    # different sequence). Non-CJK stays word-level. BLEU = sacrebleu '13a' on these strings (their `sableu`); 
+    # ROUGE-L = pltrdy `rouge` (their package, ~1 pt different from HF's rouge_score). BLEURT scores the RAW text.
     is_cjk = any(_char_split_cjk(ref) != ref for ref in references)
-    if is_cjk:
-        predictions = [pred.translate(_CJK_PUNCT_TABLE) for pred in predictions]
-        references = [ref.translate(_CJK_PUNCT_TABLE) for ref in references]
-        
-    refs_nested = [[ref] for ref in references]
-    cjk_predictions = [_char_split_cjk(pred) for pred in predictions]
-    cjk_references = [_char_split_cjk(ref) for ref in references]
-    cjk_refs_nested = [[ref] for ref in cjk_references]
+
+    def _proc(s: str, is_ref: bool) -> str:
+        if not is_cjk: return s                                  # word-level for non-CJK (Uni-Sign level='word')
+        s = s.replace(" ", "").replace("\n", "")
+        if is_ref: s = s.replace("，", ",").replace("？", "?")    # Uni-Sign's asymmetric ref-only normalization
+        return " ".join(list(s))                                 # char-split every character (level='char')
+
+    pred_proc = [_proc(p, False) for p in predictions]
+    ref_proc = [_proc(r, True) for r in references]
+    ref_proc_nested = [[r] for r in ref_proc]
 
     bleu = _load_evaluate_metric("sacrebleu")
     if bleu is not None:
-        # Chinese/CJK has no word spaces, so sacrebleu's default '13a' (European) tokenizer collapses BLEU to
-        # ~0 even on correct translations (n-grams never match). Switch to sacrebleu's CJK char tokenizer 'zh'
-        # whenever the references are CJK — this is the CSL-Daily / Uni-Sign convention, so BLEU is comparable
-        # to their reported 25.x. cjk_references != references is the same CJK signal used for ROUGE/CIDEr below.
+        # sacrebleu '13a' over the char-split strings = Uni-Sign's `sableu(tokenizer='13a')` 
+        # (char-level BLEU for CJK, standard word BLEU for non-CJK).
         try: scores["bleu4"] = float(bleu.compute(
-                predictions=predictions, references=refs_nested, 
-                tokenize="zh" if is_cjk else sacrebleu_tokenize
+                predictions=pred_proc, references=ref_proc_nested, tokenize=sacrebleu_tokenize
             )["score"])
         except Exception: pass
-
-    rouge = _load_evaluate_metric("rouge")
-    if rouge is not None:
-        try:
-            rouge_kwargs = {"tokenizer": lambda text: text.split()} if cjk_predictions != predictions else {}
-            scores["rougeL"] = float(rouge.compute(predictions=cjk_predictions, references=cjk_references, **rouge_kwargs)["rougeL"])
-        except Exception: pass
+    scores["rougeL"] = _rouge_l(pred_proc, ref_proc)
 
     cider = _load_evaluate_metric("sunhill/cider")
     if cider is not None:
-        try: scores["cider"] = float(cider.compute(predictions=cjk_predictions, references=cjk_refs_nested)["cider_score"])
+        try: scores["cider"] = float(cider.compute(predictions=pred_proc, references=ref_proc_nested)["cider_score"])
         except Exception: pass
 
     meteor = _load_evaluate_metric("meteor")
     if meteor is not None:
-        try: scores["meteor"] = float(meteor.compute(predictions=cjk_predictions, references=cjk_references)["meteor"])
+        try: scores["meteor"] = float(meteor.compute(predictions=pred_proc, references=ref_proc)["meteor"])
         except Exception: pass
 
     if bleurt_checkpoint:

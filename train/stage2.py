@@ -40,22 +40,20 @@ def _optional_float(value) -> float | None:
 
 def build_stage2_components(
     data_config: str = "configs/data.yaml",
-    stage1_config: str = "configs/stage1_pretraining.yaml",
     stage2_config: str = "configs/stage2_dlm.yaml",
     inference_config: str = "configs/inference.yaml",
     decoder: str | None = None,
     include_dev: bool = False,
 ) -> Stage2Components:
     data_cfg = load_yaml(data_config)
-    stage1_cfg = load_yaml(stage1_config)
     stage2_cfg = load_yaml(stage2_config)
     inference_cfg = load_yaml(inference_config)
     language = str(stage2_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    # Uni-Sign front end; the LANGUAGE MODEL (and its tokenizer) is selected by language_model.name: mT5 (Path A
-    # default) or mBART (the mT5-vs-mBART ablation). Same pose encoder + prompt either way — only the LM differs.
-    lm_name = language_model_name(stage1_cfg)
+    # Uni-Sign front end; the LANGUAGE MODEL (and its tokenizer) is selected by this config's language_model.name:
+    # mT5 (Path A default) or mBART (the mT5-vs-mBART ablation). Same pose encoder + prompt either way — only the LM differs.
+    lm_name = language_model_name(stage2_cfg)
     prompt_lang = prompt_lang_for_target(target_lang)
     if "mbart" in lm_name.lower():
         tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
@@ -74,11 +72,14 @@ def build_stage2_components(
     )
     collator = WindowCollator(
         tokenizer, max_text_tokens=int(stage2_cfg.get("max_text_tokens", 128)),
-        visual_padding=str(stage2_cfg.get("visual_padding", stage1_cfg.get("visual_padding", "none"))),
+        visual_padding=str(stage2_cfg.get("visual_padding", "none")),
     )
+    # num_workers>0 parallelizes pose load + window sampling + tokenization (the CPU bottleneck that otherwise
+    # stalls the GPU). 0 is safest on Windows; set num_workers in the config for Colab/Linux.
+    num_workers = int(stage2_cfg.get("num_workers", 0))
     train_loader = DataLoader(
-        train_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)),
-        shuffle=False, num_workers=0, collate_fn=collator,
+        train_dataset, batch_size=int(stage2_cfg.get("batch_size", 4)), shuffle=False, 
+        num_workers=num_workers, persistent_workers=num_workers > 0, collate_fn=collator,
     )
     dev_loader = None
     if include_dev:
@@ -144,15 +145,15 @@ def evaluate_stage2(
             confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),
             cb_lambda=float(confidence_cfg.get("lambda", 0.3)),
             verified_full_evidence_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
-            cb_decode_steps=int(stage2_cfg.get("diffusion_steps", 64)),
+            cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
             cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", stage2_cfg.get("block_size", 8))),
             cb_dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-            cb_dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
+            cb_dcd_window_type=str(confidence_cfg.get("window_type", dcd_cfg.get("window_type", "sliding"))),
             cb_dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
             cb_dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
             cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
             cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
-            cb_dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
+            cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
             cb_dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
             cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
@@ -258,15 +259,15 @@ def train_stage2_epochs(
                 confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),
                 cb_lambda=cb_lambda,
                 verified_full_evidence_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
-                cb_decode_steps=int(stage2_cfg.get("diffusion_steps", 64)),
+                cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
                 cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", stage2_cfg.get("block_size", 8))),
                 cb_dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-                cb_dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
+                cb_dcd_window_type=str(confidence_cfg.get("window_type", dcd_cfg.get("window_type", "sliding"))),
                 cb_dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
                 cb_dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
                 cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
                 cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
-                cb_dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
+                cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
                 cb_dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
                 cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
                 cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),

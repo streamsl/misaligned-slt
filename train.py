@@ -54,7 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
@@ -73,7 +72,6 @@ if __name__ == "__main__":
         epochs = int(args.epochs or stage2_cfg.get("epochs", 1))
         components = build_stage2_components(
             data_config=args.data_config,
-            stage1_config=args.stage1_config,
             stage2_config=args.stage2_config,
             inference_config=args.inference_config,
             decoder=args.decoder,

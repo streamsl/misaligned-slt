@@ -224,13 +224,11 @@ def _load_evaluate_metric(name: str):
 # references carry full-width '？'/'，' (and '。' etc.), so an un-normalized char-BLEU penalizes a 1-char punctuation
 # mismatch on nearly every sentence. Uni-Sign's eval (fine_tuning.py:285) does exactly this for '，'/'？' on the refs;
 # we normalize BOTH sides over the common marks so the score reflects content, not punctuation encoding.
-_CJK_PUNCT_MAP = {
+_CJK_PUNCT_TABLE = str.maketrans({
     '￥': '$', '％': '%', '＃': '#', '＠': '@', '，': ',', '。': '.', '？': '?', '！': '!', '、': ',', '；': ';', '：': ':',
     '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
     '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
-}
-_CJK_PUNCT_TABLE = {ord(k): v for k, v in _CJK_PUNCT_MAP.items()}
-
+})
 def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tokenizing metrics such as CIDEr.
     out: list[str] = []
     for ch in text:

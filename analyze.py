@@ -244,11 +244,11 @@ def analysis_a(args: argparse.Namespace) -> dict:
     }
 
 
-def _eval_model_for(method: str, args: argparse.Namespace, stage1_cfg: dict, method_cfg: dict, device: torch.device):
+def _eval_model_for(method: str, args: argparse.Namespace, method_cfg: dict, device: torch.device):
     # Reuse eval.py's checkpoint-loading model builder via a minimal namespace.
     data_cfg = load_yaml(args.data_config)
     ns = SimpleNamespace(method=method, checkpoint=args.checkpoint, language=args.language)
-    return _build_eval_model(ns, data_cfg, stage1_cfg, method_cfg, device)
+    return _build_eval_model(ns, data_cfg, method_cfg, device)
 
 
 def tail_benefit(args: argparse.Namespace) -> dict:
@@ -268,7 +268,6 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
-    stage1_cfg = load_yaml(args.stage1_config)
     base_cfg = load_yaml(args.baseline_config)
     inference_cfg = load_yaml(args.inference_config)
     tb_cfg = eval_cfg.get("tail_benefit", {})
@@ -277,7 +276,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
 
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _eval_model_for("stage2_baseline", args, stage1_cfg, base_cfg, device)
+    model, tokenizer = _eval_model_for("stage2_baseline", args, base_cfg, device)
 
     durations = [span.duration_s for rec in records for span in rec.sentences]
     p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
@@ -337,11 +336,10 @@ def delta_enc(args: argparse.Namespace) -> dict:
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
-    stage1_cfg = load_yaml(args.stage1_config)
     method_cfg = load_yaml(args.stage2_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, _ = _eval_model_for("stage2_dlm", args, stage1_cfg, method_cfg, device)
+    model, _ = _eval_model_for("stage2_dlm", args, method_cfg, device)
     sigma = float(args.noise_sigma)
 
     sentences = [(rec, span) for rec in records for span in rec.sentences]
@@ -400,7 +398,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--segmenter-config", default="configs/segmenter.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")

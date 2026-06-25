@@ -1,10 +1,14 @@
 seed: 42
 language: csl # active dataset = Uni-Sign CSL-Daily (override --language per dataset)
+# The baseline is the released Uni-Sign model, so the LM is fixed to mT5 (there is no released mBART SLT).
+language_model:
+    name: google/mt5-base
 checkpoint:
-    dir: checkpoints/stage2_baseline/${language} # best model.pt + best.json saved here
-    # The baseline is EVAL-ONLY: the released Uni-Sign mT5 model (read from stage1_pretraining.yaml
-    # checkpoint.from_pretrained). The training block below is retained only for an optional from-scratch retrain.
-    from_pretrained: checkpoints/pretraining/${language}
+    dir: checkpoints/stage2_baseline/${language} # output dir (best.json / any optional retrain)
+    # The baseline is EVAL-ONLY and loads ONLY this from_pretrained — the released Uni-Sign pose-only SLT
+    # checkpoint — with NO fallback to a trained checkpoint dir, so a `train-stage2` run can never make the
+    # baseline eval silently load trained/empty weights (that was the BLEU 21 -> 0.01 footgun).
+    from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
     save_best: true
     # Best-checkpoint SELECTION (separate from early stopping). SLT models select on dev BLEU.
     monitor: val_translation_bleu4
@@ -12,7 +16,7 @@ checkpoint:
     restore_best: true
 decoder: ar
 wandb:
-    enabled: true
+    enabled: false
     project: misaligned-slt
     name: stage2_baseline_${language}
     mode: online
@@ -26,25 +30,25 @@ freeze_projection: false # Freezes the pose -> LM-dim projection
 label_smoothing: 0.2
 # Pose augmentation for an optional retrain (TRAIN only). Same schema as stage1_pretraining.yaml: spatial
 # rotation + affine on raw keypoints. (No `fps` sub-block: the baseline scores whole sentences, not streaming windows.)
-augmentation:
-    enabled: true
-    rotation: { deg: 15.0, prob: 0.5 }
-    affine: { prob: 0.5, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
-    spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
-mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 8
-learning_rate: 2.0e-4
-weight_decay: 1.0e-4
-epochs: 100
-eval_every_epochs: 1
-early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`).
-    enabled: true # Remove or set enabled: false to disable.
-    patience: 20
-    min_delta: 0.0
-scheduler:
-    type: cosine
-    eta_min: 1.0e-6
-max_grad_norm: 1.0
+# augmentation:
+#     enabled: true
+#     rotation: { deg: 15.0, prob: 0.5 }
+#     affine: { prob: 0.5, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
+#     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
+# mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
+# batch_size: 16
+# learning_rate: 2.0e-4
+# weight_decay: 1.0e-4
+# epochs: 100
+# eval_every_epochs: 1
+# early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`).
+#     enabled: true # Remove or set enabled: false to disable.
+#     patience: 20
+#     min_delta: 0.0
+# scheduler:
+#     type: cosine
+#     eta_min: 1.0e-6
+# max_grad_norm: 1.0
 max_text_tokens: 128
 validation:
     max_translation_samples: 0 # 0 = score translation on ALL dev sentences

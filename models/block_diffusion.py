@@ -53,7 +53,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # Attention-mask builders + canvas-tail supervision
 # ════════════════════════════════════════════════════════════════════════════
@@ -135,7 +134,6 @@ def build_block_causal_mask(batch_size, tgt_len, block_size, dtype, device):
     mask = torch.zeros(tgt_len, tgt_len, dtype=dtype, device=device)
     mask = mask.masked_fill(~can_attend, torch.finfo(dtype).min)
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, tgt_len, tgt_len)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # Abstract base: BD3LM core (training + block-diffusion generation)

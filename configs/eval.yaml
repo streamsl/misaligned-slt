@@ -11,7 +11,7 @@ rq1:
     severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0] # used only when severity_mode: absolute
     smoke_grid_s: [-1.0, 0.0, 1.0]
     smoke_num_sentences: 10
-    batch_size: 16 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
+    batch_size: 128 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
 rq2:
     tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
 # Clean-trained translator, head fixed at GT start, trailing context swept; the elbow is

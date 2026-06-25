@@ -262,13 +262,14 @@ def _method_config_path(args: argparse.Namespace) -> str:
     return defaults[args.method]
 
 
-def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict, method_cfg: dict, device: torch.device):
-    """Uni-Sign pose-only model. The language model is selected by `language_model.name`: mT5 (Path A default) or
-    mBART (the mT5-vs-mBART ablation). The `stage2_baseline` method is the released Uni-Sign mT5 model (eval-only)."""
+def _build_eval_model(args: argparse.Namespace, data_cfg: dict, method_cfg: dict, device: torch.device):
+    """Uni-Sign pose-only model. Everything (the language model via `language_model.name`, and the checkpoint via
+    `checkpoint.from_pretrained` / `checkpoint.dir`) is read from the METHOD config — no separate stage-1 config.
+    The `stage2_baseline` method is the released Uni-Sign mT5 model (eval-only)."""
     from transformers import T5Tokenizer, AutoTokenizer
     target_lang = data_cfg["languages"][args.language].get("target_lang")
     prompt_lang = prompt_lang_for_target(target_lang)
-    lm_name = language_model_name(stage1_cfg)
+    lm_name = language_model_name(method_cfg)
 
     if args.method == "stage2_baseline":
         # The baseline is the RELEASED Uni-Sign mT5 pose-only model (there is no released mBART SLT), evaluated
@@ -280,10 +281,13 @@ def _build_eval_model(args: argparse.Namespace, data_cfg: dict, stage1_cfg: dict
         front_end = UniSignMT5FrontEnd(mt5_name=mt5_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
         model = MisalignedSLTModel(front_end=front_end, tokenizer=tokenizer, decoder="ar",
                                    bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)))
-        ckpt = Path(args.checkpoint or pretrained_checkpoint(stage1_cfg, default="")
-                    or checkpoint_dir(method_cfg, default="") or "")
+        # Load ONLY from from_pretrained (the released ckpt) — NO fallback to a trained `checkpoint.dir`, so a
+        # concurrent / prior `train-stage2` run can never make the baseline silently pick up trained weights.
+        ckpt = Path(args.checkpoint or pretrained_checkpoint(method_cfg, default="") or "")
         if not ckpt.exists():
-            raise FileNotFoundError(f"Missing Uni-Sign checkpoint: {ckpt}. Set checkpoint.from_pretrained or pass --checkpoint.")
+            raise FileNotFoundError(
+                f"Missing released Uni-Sign checkpoint for stage2_baseline: {ckpt!s}. Set checkpoint.from_pretrained "
+                f"in configs/stage2_baseline.yaml to checkpoints/csl_daily_pose_only_slt.pth, or pass --checkpoint.")
         rep = load_unisign_pretrained(model, ckpt, strict=True)
         print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
               f"{rep['pose_missing'] + rep['mt5_missing']}, unexpected {rep['pose_unexpected'] + rep['mt5_unexpected']})", flush=True)
@@ -415,7 +419,6 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ1 on test without --allow-test")
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
-    stage1_cfg = load_yaml(args.stage1_config)
     method_cfg = load_yaml(_method_config_path(args))
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
@@ -432,7 +435,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     records_by_id = {record.video_id: record for record in records}
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     inference_cfg = load_yaml(args.inference_config)
-    model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
+    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
 
     # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch near-uniform length 
     # so padding — and wasted compute — is minimal). Padding is masked, so batching not change any per-window result, only throughput.
@@ -527,11 +530,10 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     if args.method == "stage2_baseline":
         raise SystemExit("Streaming RQ2 uses the FSM (stage2_dlm/stage2_ar). For the baseline pipeline-floor, pass --predictions.")
     data_cfg = load_yaml(args.data_config)
-    stage1_cfg = load_yaml(args.stage1_config)
     method_cfg = load_yaml(_method_config_path(args))
     inference_cfg = load_yaml(args.inference_config)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
+    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
@@ -570,11 +572,10 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     """
     from moryossef26.infer import load_prediction_file
     data_cfg = load_yaml(args.data_config)
-    stage1_cfg = load_yaml(args.stage1_config)
     method_cfg = load_yaml(_method_config_path(args))
     inference_cfg = load_yaml(args.inference_config)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _build_eval_model(args, data_cfg, stage1_cfg, method_cfg, device)
+    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
 
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
@@ -660,7 +661,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
-    parser.add_argument("--stage1-config", default="configs/stage1_pretraining.yaml")
     parser.add_argument("--method-config", default=None)
     parser.add_argument("--language", default="phoenix")
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])

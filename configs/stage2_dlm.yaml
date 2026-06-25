@@ -1,5 +1,9 @@
 seed: 42
-language: csl # active dataset = CSL-Daily (override --language per dataset). Backbone/LM inherited from stage1_pretraining.yaml.
+language: csl # active dataset = CSL-Daily (override --language per dataset).
+# The pose encoder is always Uni-Sign; the LANGUAGE MODEL is selected here: google/mt5-base (Path A default, the
+# released Uni-Sign weights load on top) | facebook/mbart-large-cc25 (the mT5-vs-mBART ablation; mBART starts from base).
+language_model:
+    name: google/mt5-base
 checkpoint:
     dir: checkpoints/stage2_dlm/${language} # best model.pt + best.json saved here
     # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint (the mBART ablation loads the
@@ -15,7 +19,7 @@ checkpoint:
     restore_best: true
 decoder: dlm
 wandb:
-    enabled: true
+    enabled: false
     project: misaligned-slt
     name: stage2_dlm_${language}
     mode: online # offline / disabled if no network or key
@@ -51,6 +55,14 @@ confidence_bound:
     tau_cb: 0.75
     lambda: 0.3 # λ_cb; prior de-risk found ~0.3 stable
     warmup_epochs: 3 # hold CB off until the full-evidence self-target is trustworthy
+    # SPEED: the Mode-2a self-target runs TWO full SPD/DCD decodes per batch (full-evidence + truncated) — the
+    # dominant DLM training cost. It is internal (it only picks 'confidently wrong' slots), so it decodes FAST and
+    # need NOT match the inference decode: few settle steps + the (verified-exact) static-window prefix KV-cache.
+    # decode_steps bounds only the settle phase (commit always runs to completion). Set cache_type: none + window_type:
+    # sliding to make CB decode exactly like inference at the cost of speed.
+    decode_steps: 16
+    cache_type: prefix
+    window_type: static
 mode_ratios:
     source: outputs/a_mode_ratios_${language}.json
     # Designed misalignment distribution used directly when no measured file exists AND auto-substituted when the measured
@@ -104,6 +116,7 @@ jitter:
         tail_scale_s: 0.8
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
+num_workers: 4 # DataLoader workers for parallel pose-load + window-sample + tokenize.
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100

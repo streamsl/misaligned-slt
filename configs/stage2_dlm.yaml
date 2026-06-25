@@ -1,12 +1,14 @@
 seed: 42
-language: phoenix
+language: csl # active dataset = CSL-Daily (override --language per dataset). Backbone/LM inherited from stage1_pretraining.yaml.
 checkpoint:
     dir: checkpoints/stage2_dlm/${language} # best model.pt + best.json saved here
-    from_vlp: checkpoints/vlp/${language} # stage-1 visual backbone to initialise from
+    # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint (the mBART ablation loads the
+    # pose encoder from it; the mBART LM starts from base).
+    from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
     save_best: true # write on every new best dev value (not just end of training)
     # Best-checkpoint SELECTION (separate from early stopping). Select on dev BLEU, not val_loss: the composite
     # val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the small corpus while BLEU is still
-    # climbing, so a min-val_loss monitor would restore an early, low-BLEU checkpoint (GFSLT-VLP also selects on
+    # climbing, so a min-val_loss monitor would restore an early, low-BLEU checkpoint (standard SLT also selects on
     # dev BLEU). Generation runs every eval anyway (validation.max_translation_samples: 0).
     monitor: val_translation_bleu4
     mode: max
@@ -17,8 +19,8 @@ wandb:
     project: misaligned-slt
     name: stage2_dlm_${language}
     mode: online # offline / disabled if no network or key
-visual_padding: none # If stage-2 training uses gfslt halos but streaming won't → a train/inference mismatch
-freeze_backbone: false # Freeze the from-scratch CoSign pose backbone in stage 2 as an overfitting regularizer.
+visual_padding: none # raw windows; the LM encoder masks padding via attention_mask (no boundary halos)
+freeze_backbone: false # Freeze the Uni-Sign pose encoder in stage 2 as an overfitting regularizer.
 freeze_projection: false
 lambda_trans: 1.0
 oput:
@@ -69,17 +71,17 @@ mode2_subcase_weights:
     left: 0.45
     both: 0.10
 # Pose augmentation — TRAIN windows only (the Mode-2a full-evidence view and dev are never augmented).
-# SPATIAL ops match stage1_vlp.yaml (centroid rotation + affine/spatial_mask jitter). The `fps` sub-block is the
-# TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden): BIO labels are
-# rebuilt from the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the
-# source rate — synthetic streams run at exactly 12.5 fps, so [6.25, 25] gives real 0.5–1.0x density variation
-# (RoPE keeps true seconds); max_fps above source is intentional (draws >= source are native-density no-ops).
+# SPATIAL ops match stage1_pretraining.yaml (centroid rotation + affine/spatial_mask jitter). The `fps` sub-block is the
+# TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden): BIO labels are rebuilt from
+# the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the source rate — the synthetic
+# CSL streams run at 30 fps (data.yaml csl pose.fps), so [15, 30] gives real 0.5–1.0x density variation (RoPE keeps true
+# seconds); max_fps == source draws are native-density no-ops. For 12.5 fps PHOENIX streams use [6.25, 12.5].
 augmentation:
     enabled: true
     rotation: { deg: 15.0, prob: 0.5 }
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
-    fps: { enabled: true, min_fps: 6.25, max_fps: 25.0 }
+    fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
 # Rare-class CE weighting for the in-model BIO head, which faces a heavy I-dominant imbalance (PHOENIX streams: B≈1.4%
 # of frames, signing density ~0.71; binary Dice has no B-vs-I gradient) and would otherwise collapse toward all-I. Unlike
 # the standalone UNet segmenter (bio_class_weights: null — its skip connections detect B natively and weighting makes that
@@ -89,7 +91,7 @@ bio_class_weights:
     B: 2.0
     I: 1.0
 # In-model BIO head temporal Conv1d stem depth (models/bio_head.py TemporalConvStem). The standalone
-# segmenter keeps the full Moryossef UNet; this head reads post-VLP features directly with no UNet, so
+# segmenter keeps the full Moryossef UNet; this head reads pose-token features directly with no UNet, so
 # a small conv stem restores the local boundary inductive bias (EXPERIMENTS.md findings 8/23) that the
 # commit gate's δ_enc stability and RQ2 tIoU depend on. 0 = ablation (pure transformer, spec §4.4).
 bio_conv_stem_layers: 2

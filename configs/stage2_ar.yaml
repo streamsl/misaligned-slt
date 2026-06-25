@@ -1,16 +1,15 @@
 # AR-vs-DLM de-risk baseline (§9.3) — a go/no-go gate on the diffusion choice.
 #
-# Per spec §4.8/§9.3 the AR variant must share EVERYTHING with our DLM except the
-# decoder family: identical CoSign->VLP->encoder->BIO front end, identical window
-# sampler (Analysis-A `mode_ratios` + `jitter` + `mode2_subcase_weights`), identical
-# confidence-bound term (AR-adapted), identical optimization. Otherwise the result
-# conflates "diffusion vs AR" with "robust-window vs clean-window training", which
-# Analysis B already isolates. So this file only overrides the decoder + outputs and
-# inherits the rest from stage2_dlm.yaml (the OPUT/SPD/DCD blocks it inherits are
-# simply unused by the AR path).
+# Per spec §4.8/§9.3 the AR variant must share EVERYTHING with our DLM except the decoder family:
+# identical Uni-Sign pose -> prompt -> LM-encoder -> BIO front end, identical window sampler
+# (Analysis-A `mode_ratios` + `jitter` + `mode2_subcase_weights`), identical confidence-bound
+# term (AR-adapted), identical optimization. Otherwise the result conflates "diffusion vs AR"
+# with "robust-window vs clean-window training", which Analysis B already isolates. So this file
+# only overrides the decoder + outputs and inherits the rest from stage2_dlm.yaml (OPUT/SPD/DCD
+# blocks it inherits are simply unused by the AR path).
 extends: stage2_dlm.yaml
 decoder: ar
 checkpoint:
-    dir: checkpoints/stage2_ar/${language} # override only the save dir; from_vlp + save_best inherited from stage2_dlm
+    dir: checkpoints/stage2_ar/${language} # override only the save dir; from_pretrained + save_best inherited from stage2_dlm
 wandb:
     name: stage2_ar_${language}

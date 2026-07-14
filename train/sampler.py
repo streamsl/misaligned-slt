@@ -2,7 +2,7 @@
 real-timeline training windows across four modes whose mix is calibrated by
 Analysis A's measured segmenter-error rates."""
 from __future__ import annotations
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import json
@@ -13,18 +13,18 @@ from data.windowing import (
     BIO, TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
 )
-from poses import load_pose_window, build_pose_augmentor
+from poses import load_pose_window, build_pose_augmentor, apply_fps_aug
 
 
 class WindowSampler:
-    """Emit one real-timeline training window per step (spec §5).
+    """Emit one real-timeline training window per step.
 
     Each step picks a GT sentence anchor and a mode (probabilities from Analysis A's measured segmenter-error rates), 
     then cuts a window on the *real* video timeline — neighbour content and gaps inside the jittered range are the actual 
     adjacent frames, never concatenated clips (avoids seam artifacts). The 4 modes mirror the inference-time buffer states:
 
     - **Mode 1** — anchor fully inside (jittered head/tail). OPUT target = anchor.
-    - **Mode 2** — anchor truncated: `right` (no closing O, → confidence-bound),
+    - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge, → confidence-bound),
       `left` (no B, → no translation loss, trains silence), `both` (interior, rare).
     - **Mode 3** — ≥2 complete sentences; target = earliest complete span (first-complete-span rule, identical at train and inference).
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
@@ -49,7 +49,7 @@ class WindowSampler:
         # rng stream. None on dev (deterministic monitor) and never applied to the Mode-2a full-evidence view.
         self.pose_augmentor = build_pose_augmentor(pose_augment_cfg, np.random.default_rng(int(seed) + 997))
 
-        # fps_aug is a Hard Rule (§1.4.4, Moryossef 2026: essential, 0.58→0.49 without). Applied to sampled training windows only — 
+        # fps_aug is a Hard Rule (Moryossef 2026: essential, 0.58→0.49 without). Applied to sampled training windows only — 
         # the Mode-2a full-evidence view stays at native fps so the no-grad self-target decode sees the same frame rate inference will.
         self.fps_aug_enabled = bool(fps_aug_enabled)
         self.fps_aug_min = float(fps_aug_min)
@@ -63,20 +63,18 @@ class WindowSampler:
         self.anchors = [(ri, si) for ri, rec in enumerate(records) for si, _ in enumerate(rec.sentences)]
         if not self.anchors: raise ValueError("WindowSampler requires at least one sentence anchor.")
 
-        # Anchor windowing (spec §5.0): every GT sentence is drawn once per pass through the permutation,
-        # so with steps_per_epoch == len(anchors) each sentence anchors a window each epoch — random
-        # sampling with replacement undersamples short sentences and wastes data. The mode is still drawn
-        # independently per step. (Requires num_workers=0; each worker would otherwise hold its own cursor.)
+        # Anchor windowing: every GT sentence is drawn once per pass through the permutation, so with steps_per_epoch == len(anchors) 
+        # each sentence anchors a window each epoch — random sampling with replacement undersamples short sentences and wastes data. 
+        # The mode is still drawn independently per step. (Requires num_workers=0; each worker would otherwise hold its own cursor.)
         self._anchor_order = self.rng.permutation(len(self.anchors))
         self._anchor_cursor = 0
 
 
     @classmethod
-    def from_stage2_config(
-        cls, records: list[VideoRecord], stage2_cfg: dict, inference_cfg: dict,
-        pose_augment_cfg: dict | None = None,
+    def from_slt_config(
+        cls, records: list[VideoRecord], slt_cfg: dict, inference_cfg: dict, pose_augment_cfg: dict | None = None,
     ) -> "WindowSampler":
-        ratios_cfg = stage2_cfg.get("mode_ratios", {})
+        ratios_cfg = slt_cfg.get("mode_ratios", {})
         fallback_ratios = ratios_cfg.get("fallback", {})
         source = ratios_cfg.get("source")
         measured = None
@@ -84,32 +82,30 @@ class WindowSampler:
             loaded = json.loads(Path(source).read_text(encoding="utf-8"))
             measured = loaded.get("mode_ratios", loaded)
 
-        jitter_cfg = dict(stage2_cfg.get("jitter", {}))
+        jitter_cfg = dict(slt_cfg.get("jitter", {}))
         mode_ratios = measured if measured is not None else fallback_ratios
-        # Degenerate-measurement guard. On a clean corpus (e.g. PHOENIX) the retrained segmenter is
-        # near-perfect, so Analysis A measures almost all Mode 1 (mode1~0.98) and a ~0-offset jitter CDF.
-        # Training on that = no misalignment = the robustness method learns nothing — here faithfulness to
-        # the spec's "derive ratios from Analysis A" becomes a bug, because that rule assumed a NONTRIVIAL
-        # measured error distribution. When the measurement is degenerate we fall back to the DESIGNED
-        # distribution (fallback ratios + fallback_laplace jitter) and warn; robustness is then evaluated
-        # by the segmenter-agnostic RQ1 controlled sweep, which never depended on a noisy segmenter.
+        # Degenerate-measurement guard. On a clean corpus, the retrained segmenter is near-perfect, so Analysis A measures almost all 
+        # Mode 1 and a ~0-offset jitter CDF. Training on that = no misalignment = robustness method learns nothing — here faithfulness 
+        # to the "derive ratios from Analysis A" becomes a bug, because that rule assumed a NONTRIVIAL measured error distribution. 
+        # When the measurement is degenerate we fall back to the DESIGNED distribution (fallback ratios + fallback_laplace jitter) and 
+        # warn; robustness is then evaluated by the segmenter-agnostic RQ1 controlled sweep, which never depended on a noisy segmenter.
         threshold = float(ratios_cfg.get("degenerate_mode1_threshold", 0.9))
         if measured is not None and normalized_mode_ratios(measured).get("mode1", 0.0) >= threshold:
             print(
                 f"[sampler] WARNING: measured Analysis-A mode ratios are degenerate "
                 f"(mode1={normalized_mode_ratios(measured).get('mode1', 0.0):.3f} >= {threshold}); the "
                 f"segmenter is too clean to yield a useful misalignment distribution. Using the DESIGNED "
-                f"fallback ratios + jitter (configs/stage2_dlm.yaml: mode_ratios.fallback, jitter."
+                f"fallback ratios + jitter (configs/dlm.yaml: mode_ratios.fallback, jitter."
                 f"fallback_laplace). Robustness is evaluated via the controlled RQ1 sweep.", flush=True,
             )
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
-        fps_cfg = (stage2_cfg.get("augmentation", {}) or {}).get("fps", {})
+        fps_cfg = (slt_cfg.get("augmentation", {}) or {}).get("fps", {})
         return cls(
             records=records, jitter=JitterSampler.from_config(jitter_cfg),
             mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
-            seed=int(stage2_cfg.get("seed", 42)), mode2_subcase_weights=stage2_cfg.get("mode2_subcase_weights"),
+            seed=int(slt_cfg.get("seed", 42)), mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"),
             fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
             fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
             fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
@@ -145,14 +141,14 @@ class WindowSampler:
 
 
     def _mode1_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Complete-anchor window
-        # Jitter both edges, retry until anchor's B and closing O are both inside; fall back to a clean clip if jitter never fits.
+        # Jitter both edges, retry until anchor's B and terminator frame are both inside; fall back to a clean clip if jitter never fits.
         anchor = rec.sentences[anchor_idx]
         eps = 1.0 / rec.pose.fps
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
             # Analysis A stores signed offsets as pred_boundary - gt_boundary.
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
-            # The end check mirrors first_complete_span(min_o_after_s=1/fps) in materialize(); a looser check here
+            # The end check mirrors first_complete_span(min_tail_s=1/fps) in materialize(); a looser check here
             # would classify the window complete yet yield no translation target (silently unsupervised Mode 1).
             if classify_anchor_visibility(anchor, start_s, end_s) == "complete" and anchor.end_s + eps <= end_s:
                 return WindowSpec(rec.video_id, start_s, end_s, "mode1", anchor_idx)
@@ -180,8 +176,8 @@ class WindowSampler:
 
 
     def _mode2_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Truncated-anchor window
-        """`right` keeps the start, cuts before the end (B, no closing O); `left` cuts after the start, keeps
-        the end (no B); `both` is a strictly-interior slice (all I).
+        """`right` keeps the start, cuts before the end (B, no terminator); `left` cuts after the start, keeps
+        the end + its terminator frame (no B); `both` is a strictly-interior slice (all I).
 
         The truncation depth — where the window cuts *inside* the anchor — is drawn from Analysis A's measured
         over-segmentation cut positions (`JitterSampler.sample_cut`), the empirical answer to "where does the
@@ -201,16 +197,24 @@ class WindowSampler:
             subcase = "right"  # degenerate interior slice → fall through to right-trunc
 
         if subcase == "left":
-            # Keep the true end, discard the head: window starts at the spurious cut. Tail jitter may only
-            # push the end OUTWARD (max(dt,0)) so the closing O stays inside — otherwise the GT end leaves
+            # Keep true end, discard the head: window starts at the spurious cut. Tail jitter may only push the end OUTWARD 
+            # (max(dt,eps)) so the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves 
             # the window and the labels no longer describe a left-truncation (P2: labels follow the window).
             cut = min(self._cut_time(anchor), anchor.end_s - eps)
             # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end),
-            # so the closing O is inside; tail jitter only extends it further out.
+            # so the terminator is inside; tail jitter only extends it further out.
             start_s, end_s = self._clip_window(rec, cut, min(rec.pose.duration_s, anchor.end_s + max(dt, eps)))
         else:  # "right": keep the true start, cut before the end. Head jitter only pulls the start outward.
             cut = max(self._cut_time(anchor), anchor.start_s + eps)
-            start_s, end_s = self._clip_window(rec, max(0.0, anchor.start_s + min(dh, 0.0)), cut)
+            start_lo = max(0.0, anchor.start_s + min(dh, 0.0))
+            # A COMPLETE earlier sentence inside the right-truncated view is poison for the confidence-bound term: the decoder 
+            # — correctly, per the shared first-complete-span rule — would translate the NEIGHBOUR, while y_full is anchored on 
+            # the anchor (_full_evidence_spec enforces anchor-first), so the gate would penalize correct behaviour. Clamp the 
+            # start past the predecessor's B: the neighbour can then only appear left-truncated (tail I-frames — never a selectable 
+            # target), which is also exactly the post-commit leftover geometry streaming produces.
+            prev_starts = [s.start_s for s in rec.sentences if s.start_s < anchor.start_s]
+            if prev_starts: start_lo = max(start_lo, max(prev_starts) + eps)
+            start_s, end_s = self._clip_window(rec, start_lo, cut)
         return WindowSpec(rec.video_id, start_s, end_s, "mode2", anchor_idx, subcase)  # type: ignore[arg-type]
 
 
@@ -281,13 +285,11 @@ class WindowSampler:
             rec.pose, spec.start_s, spec.end_s, normalize=True,
             augment=self.pose_augmentor if augment else None
         )
-        if fps_aug and poses.shape[0] > 1:
-            from moryossef26.dataset import apply_fps_aug
-            poses, timestamps, _ = apply_fps_aug(
-                poses, source_fps=rec.pose.fps,
-                min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=self.rng,
-                source_timestamps_s=timestamps,
-            )
+        if fps_aug and poses.shape[0] > 1: poses, timestamps, _ = apply_fps_aug(
+            poses, source_fps=rec.pose.fps,
+            min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=self.rng,
+            source_timestamps_s=timestamps,
+        )
 
         frame_mask = np.ones((poses.shape[0],), dtype=bool)
         labels = make_bio_labels(
@@ -297,21 +299,40 @@ class WindowSampler:
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
         target, full_evidence_spec = None, None
 
+        # Realized-mode relabel: a Mode-1 draw whose jitter also captured a complete neighbour IS a Mode-3 window (≥2 complete spans; 
+        # the target below is the first complete span either way — supervision is identical, per the shared rule). Relabelling keeps 
+        # the logged per-mode losses / mode-proportion drift check honest; forcing the anchor to be first instead (rejection) would 
+        # distort the measured jitter CDF conditional on corpus sentence spacing, a distribution the segmenter does not have.
+        if spec.mode == "mode1" and count_complete_spans(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps) >= 2:
+            spec = replace(spec, mode="mode3")
+
         if spec.mode in {"mode1", "mode3"}: target = first_complete_span(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps)
         elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
             target = None
             full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
+
+        # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. 
+        # In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content 
+        # the FSM already emitted — the gate floors it unconditionally (no cross-seam duplication). The ANCHOR itself straddling 
+        # the edge (Mode 2b) is the MISSED-HEAD case, NOT a commit: the FSM's commit log would show nothing there (χ=0 at inference), 
+        # so training mirrors it with χ=0 and leaves those frames to the trust-scaled wall/ramp — which is what lets translation vote
+        # to relocate a start (§2.6). Inference-parity of χ is the invariant; the anchor test enforces it.
+        commit_mask = np.zeros((poses.shape[0],), dtype=bool)
+        for span in rec.sentences:
+            straddles = span.start_s < spec.start_s < span.end_s
+            is_predecessor = anchor_span is None or span.start_s < anchor_span.start_s
+            if straddles and is_predecessor: commit_mask |= (timestamps >= span.start_s) & (timestamps < span.end_s)
         return WindowSample(
-            spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s,
-            bio_labels=labels, frame_mask=frame_mask, spans=rec.sentences,
-            translation_target=target, anchor_span=anchor_span, full_evidence_spec=full_evidence_spec,
+            spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, 
+            frame_mask=frame_mask, spans=rec.sentences, translation_target=target, anchor_span=anchor_span, 
+            full_evidence_spec=full_evidence_spec, commit_mask=commit_mask,
         )
 
     @staticmethod
     def to_dict(sample: WindowSample) -> dict:
         return {
             "spec": asdict(sample.spec), "poses": sample.poses, "timestamps_s": sample.timestamps_s,
-            "bio_labels": sample.bio_labels, "frame_mask": sample.frame_mask,
+            "bio_labels": sample.bio_labels, "frame_mask": sample.frame_mask, "commit_mask": sample.commit_mask,
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
             "anchor_span": asdict(sample.anchor_span) if sample.anchor_span else None,
             "full_evidence_spec": asdict(sample.full_evidence_spec) if sample.full_evidence_spec else None,

@@ -1,0 +1,73 @@
+# Faithful Moryossef 2026 analysis segmenter (spec §4.6) — the INDEPENDENT instrument for Analysis A (§8.1),
+# Analysis B's realistic operating point (§8.2), and the RQ2 cascaded baseline (§9.2). It is NOT the in-system FSM
+# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads RAW pose keypoints (+velocity)
+# through a UNet CNN, a DIFFERENT input space from the in-system head's Uni-Sign features (docs/membership_gate.md
+# §1.4 "weights do not transfer"). That input-space independence is what makes Analysis A's calibration non-circular.
+#
+# NOTE on the corpus: on clean synthetic CSL streams (concatenated pre-trimmed clips, clean GT boundaries) ANY
+# segmenter is near-perfect, so Analysis A is degenerate and the sampler falls back to the designed mix regardless
+# — this segmenter's measured-calibration value is realized only on genuinely noisy corpora (PHOENIX / YouTube-SL-25).
+seed: 42
+language: csl # active dataset; --language overrides
+checkpoint:
+    dir: checkpoints/segmenter/${language}
+    save_best: true
+    # 1-to-1 tIoU-matched segment F1 (metrics.segmentation_prf — the metric RQ2 uses): collapse-resistant
+    # (neither all-I nor over-segmentation games it). On clean gap-separated streams a good detector is near-ceiling.
+    monitor: val_phrase_tiou_f1
+    mode: max
+    restore_best: true
+wandb:
+    enabled: false
+    project: misaligned-slt
+    name: segmenter_${language}
+    mode: online
+
+# MoryossefSegmenter arch (moryossef26/model.py) — the faithful 2026 release: UNet CNN → RoPE Transformer → phrase
+# BIO head, ~5.5M params. Trained END-TO-END on raw keypoints (no frozen backbone).
+pose_joints: 69 # Uni-Sign 69-kp layout (poses.load_pose_window normalizes to it)
+velocity: true # Moryossef 2026 default: append fps-normalized per-keypoint velocity (pose_dim 3 -> 6)
+hidden_dim: 384
+encoder_depth: 4
+attn_nhead: 8
+attn_ff_mult: 2
+attn_dropout: 0.1
+
+# BIO loss = Dice(1.5) + PLAIN cross-entropy. bio_class_weights null (UNWEIGHTED) is deliberate for THIS UNet-CNN:
+# Moryossef's own ablations show the CNN detects B natively via its skip connections (EXPERIMENTS.md finding 8) and
+# class-weighting it over-segments and collapses tIoU-F1 (findings 7/17/25; E11 unweighted Phrase IoU 0.90 vs E5
+# light-B=2 IoU 0.64). The ~35x B-weight recipe is the ORIGINAL paper's BiLSTM recipe, not the CNN one.
+#   FALLBACK: if THIS UNet-CNN actually collapses to all-I on dev (val_bio_recall=1.0, zero predicted segments),
+#   try {O:1, B:2, I:1} and compare val_phrase_tiou_f1 — an EXPLICIT ablation, not the default.
+dice_loss_weight: 1.5
+bio_class_weights: null
+
+# Whole-video chunk training (Moryossef-style; distinct from the SLT window sampler).
+num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked inference
+steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames / num_frames)
+batch_size: 8
+augmentation:
+    # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip below the
+    # source rate to do anything: CSL streams are 30 fps (data.yaml) → [15, 30]. For 25.5 fps PHOENIX use [12.75, 25.5].
+    fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
+    frame_dropout: 0.15 # Moryossef repo default: drop 0-15% middle frames during train.
+    body_part_dropout: 0.1 # Moryossef repo default: zero each hand independently during train.
+
+learning_rate: 1.0e-3
+weight_decay: 1.0e-4
+epochs: 500
+eval_every_epochs: 1
+early_stopping:
+    enabled: true
+    patience: 100
+    min_delta: 0.0
+scheduler:
+    type: onecycle # Moryossef 2026 repo default optimizer is adamw-onecycle
+    max_lr: 1.0e-3
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 10000.0
+mixed_precision: auto
+max_grad_norm: 1.0
+# NB: the Analysis-A pred→GT match bar is NOT here — it is an analysis knob (analyze.ANALYSIS_A_MATCH_TIOU = 0.1,
+# override with `analyze.py --tiou-threshold`), not a segmenter-training param.

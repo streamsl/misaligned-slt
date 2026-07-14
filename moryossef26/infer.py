@@ -1,29 +1,29 @@
+"""Whole-stream inference + standalone evaluation for the segmenters (shared by both models).
+
+ONE inference wrapper for both the faithful Moryossef segmenter (raw keypoints + velocity) and the in-system BIO
+head run as the `s1` ablation (Uni-Sign features). The wrapper just calls `model.forward` and decodes — chunking
+lives INSIDE the model (`chunked_rope_encode` at the head's train-time chunk size), which is the correct,
+train-consistent Moryossef inference. The only per-model differences are the `velocity` flag (append raw-keypoint
+velocity for the UNet segmenter; the frozen-encoder S1 head reads raw poses) and the logits container.
+"""
 from __future__ import annotations
-from pathlib import Path
-import json
-
-import torch
 import numpy as np
-from data.loader import VideoRecord
-from data.windowing import BIO, make_bio_labels
-from poses import load_pose_window
+import torch
 
-from models.checkpointing import load_model_checkpoint
+from data.loader import VideoRecord
+from data.windowing import TRUSTED_GAP_S, make_bio_labels
+from poses import load_pose_window
 from moryossef26.dataset import append_velocity
-from moryossef26.model import MoryossefSegmenter
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
-def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Tensor | list[float]) -> list[Segment]:
-    """Time-domain wrapper over `metrics.signing_runs_with_b_splits` (one splitting rule).
+def bio_tags_to_segments(tags, timestamps_s) -> list[Segment]:
+    """Decode BIO argmax tags → time-domain phrase Segments (the shared span-decode rule).
 
-    Prediction decode = contiguous signing runs (Moryossef's `likeliest_probs_to_segments` — his
-    decode never requires a predicted `B`), additionally split at interior `B`s so adjacent predicted
-    sentences stay separate when the model does emit a boundary — Analysis A's over/under-segmentation
-    counts read those splits. A B-required decode yields zero segments whenever the model detects
-    signing but never wins argmax with `B` (one B frame per sentence; 68% of caption boundaries have
-    no visual pause). End time = onset of the frame after the last in-span frame, extrapolating one
-    frame step past the sequence end for still-open spans.
+    Prediction decode = contiguous signing runs (Moryossef's `likeliest_probs_to_segments`; his decode never
+    requires a predicted `B`), additionally split at interior `B`s so adjacent predicted sentences stay separate.
+    End time = onset of the frame after the last in-span frame, extrapolating one frame step past the sequence end
+    for still-open spans.
     """
     if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
     times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
@@ -37,95 +37,71 @@ def bio_tags_to_segments(tags: torch.Tensor | list[int], timestamps_s: torch.Ten
         segments.append(Segment(times[int(seg["start"])], end_t))
     return segments
 
-    
-def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {"video_id": video_id, "segments": [{"start_s": float(segment.start_s), "end_s": float(segment.end_s)} for segment in segments]}
-        for video_id, segments in sorted(predictions.items())
-    ]
-    path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path
 
-
-def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(raw, dict):
-        items = raw.items()
-        return {str(video_id): [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows] for video_id, rows in items}
-
-    predictions: dict[str, list[Segment]] = {}
-    for row in raw:
-        if "video_id" in row and "segments" in row:
-            predictions[str(row["video_id"])] = [Segment(float(item["start_s"]), float(item["end_s"])) for item in row["segments"]]
-        elif "video_id" in row and "start_s" in row and "end_s" in row:
-            predictions.setdefault(str(row["video_id"]), []).append(Segment(float(row["start_s"]), float(row["end_s"])))
-        else: raise ValueError(f"Unsupported prediction row format: {row}")
-    return predictions
-
-
-def load_segmenter_for_inference(checkpoint: str | Path, model: MoryossefSegmenter, device: torch.device,) -> MoryossefSegmenter:
-    load_model_checkpoint(model, checkpoint, strict=False)
-    model.to(device)
-    model.eval()
-    return model
+def _phrase_logits(
+    model, poses_np: np.ndarray, timestamps_np: np.ndarray, 
+    device: torch.device, velocity: bool
+) -> torch.Tensor:
+    # Run one whole stream through `model.forward` → per-frame phrase logits (chunking is internal to the model).
+    if velocity: poses_np = append_velocity(poses_np, timestamps_np)
+    poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
+    timestamps = torch.as_tensor(timestamps_np, dtype=torch.float32, device=device).unsqueeze(0)
+    mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
+    out = model(poses, frame_mask=mask, timestamps_s=timestamps)
+    return out["phrase"] if isinstance(out, dict) else out.logits  # MoryossefSegmenter dict vs BIOHeadOutput
 
 
 @torch.no_grad()
 def predict_phrase_segments(
-    model: MoryossefSegmenter, records: list[VideoRecord], 
-    device: torch.device, velocity: bool = True,
+    model, records: list[VideoRecord], device: torch.device,
+    velocity: bool = True, rope_chunk: int | None = None,
 ) -> dict[str, list[Segment]]:
+    # Predicted phrase segments per video (Analysis A / Analysis B / RQ2 cascade upstream).
+    model.eval().to(device)
+    if rope_chunk is not None and hasattr(model, "bio_head"):  # S1 head: chunk RoPE like training
+        model.bio_head.chunk_size = int(rope_chunk)
     predictions: dict[str, list[Segment]] = {}
+    
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
             predictions[record.video_id] = []
             continue
-
-        if velocity: poses = append_velocity(poses, timestamps)
-        poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)
-        timestamps_t = torch.as_tensor(timestamps, dtype=torch.float32, device=device).unsqueeze(0)
-        logits = model(poses_t, timestamps_s=timestamps_t)["phrase"]
-        tags = logits.argmax(dim=-1)[0].detach().cpu()
-        segments = bio_tags_to_segments(tags, timestamps)
-        predictions[record.video_id] = segments
+        tags = _phrase_logits(model, poses, timestamps, device, velocity).argmax(dim=-1)[0].detach().cpu()
+        predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
     return predictions
 
 
 @torch.no_grad()
 def evaluate_segmenter_whole_video(
-    model: MoryossefSegmenter, records: list[VideoRecord],
-    device: torch.device, velocity: bool = True,
+    model, records: list[VideoRecord], device: torch.device,
+    velocity: bool = True, rope_chunk: int | None = None, trusted_gap_s: float | None = TRUSTED_GAP_S,
 ) -> dict[str, float]:
-    """Moryossef evaluate.py-style metrics on the held-out split: process each video whole (the encoder chunks internally), 
-    build GT phrase BIO from caption spans, and average frame-F1 / segment-IoU / segment-F1 + frame P/R/F1 over videos.
+    """Moryossef evaluate.py-style STANDALONE eval: process each video whole (encoder chunks internally), build GT
+    phrase BIO from caption spans, and average frame-F1 / 1-to-1 tIoU segment P/R/F1 over videos.
 
-    This is the faithful test-set protocol — phrase level only (no sign head) — as
-    opposed to the random-chunk dev loss used inside the training loop.
+    This is the faithful whole-video test protocol (phrase level only, no sign head), and — for `--segmenter-arch
+    s1` — the way to score the pretrained in-system BIO head on its own, without waiting for joint fine-tuning.
+    `trusted_gap_s` defaults to TRUSTED_GAP_S so GT labeling matches training: long uncaptioned stretches become
+    UNK (excluded from the metric), not O — else the segmenter is penalized for firing on possibly-uncaptioned signing.
     """
-    was_training = model.training
-    model.eval()
+    model.eval().to(device)
+    if rope_chunk is not None and hasattr(model, "bio_head"): 
+        model.bio_head.chunk_size = int(rope_chunk)
     rows: list[dict[str, float]] = []
+
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0: continue
         gold = make_bio_labels(
             timestamps, record.sentences, 0.0, float(record.pose.duration_s),
-            video_duration_s=record.pose.duration_s,  # long uncaptioned stretches -> UNK (excluded from eval)
+            trusted_gap_s=trusted_gap_s, video_duration_s=record.pose.duration_s,
         )
-        if velocity: poses = append_velocity(poses, timestamps)
-        
-        poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)
-        timestamps_t = torch.as_tensor(timestamps, dtype=torch.float32, device=device).unsqueeze(0)
-        logits = model(poses_t, timestamps_s=timestamps_t)["phrase"].detach().cpu()
+        logits = _phrase_logits(model, poses, timestamps, device, velocity).detach().cpu()
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
         rows.append({
             **bio_frame_metrics(logits, labels, prefix="phrase"),
             **moryossef_segment_metrics(logits, labels, prefix="phrase"),
         })
-    if was_training: model.train()
     if not rows: return {}
-    keys = rows[0].keys()
-    return {k: float(sum(r[k] for r in rows) / len(rows)) for k in keys}
+    return {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}

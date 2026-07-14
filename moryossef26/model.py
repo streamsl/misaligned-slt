@@ -81,9 +81,14 @@ class PoseEncoderUNetBlock(nn.Module): # Two-sided temporal UNet block copied fr
 class MoryossefSegmenter(nn.Module):
     """CNN-medium-attn segmenter with a phrase BIO head.
 
-    Moryossef 2026 jointly trains sign (sub-sentence) and phrase (sentence) BIO heads, but the sign head needs sign-level segment annotations. 
-    We retrain on YouTube-SL-25, which only has sentence/caption boundaries, so the sign head has no supervision and is omitted. 
-    Analysis A and the RQ2 pipeline-floor baseline consume the phrase head only.
+    This is the INDEPENDENT analysis instrument (Analysis A/B + RQ2 cascaded baseline), deliberately NOT the
+    in-system BIO head: it reads RAW pose keypoints (+ velocity) through a UNet CNN, a *different input space* from
+    the in-system head's Uni-Sign encoder features (docs/membership_gate.md §1.4: "weights do not transfer... the
+    analysis segmenter keeps its own job"). That input-space independence is what makes Analysis A non-circular.
+
+    Moryossef 2026 jointly trains sign (sub-sentence) and phrase (sentence) BIO heads, but the sign head needs
+    sign-level segment annotations. We retrain on YouTube-SL-25 / concatenated corpora, which only carry
+    sentence/caption boundaries, so the sign head has no supervision and is omitted — only the phrase head is used.
     """
     def __init__(
         self, pose_dims: tuple[int, int] = (69, 3), hidden_dim: int = 384, encoder_depth: int = 4, num_classes: int = 4,
@@ -117,9 +122,16 @@ class MoryossefSegmenter(nn.Module):
         x = self.input_norm(feats.float()).to(feats.dtype)  # fp32 RMSNorm under autocast (see bio_head note)
         if timestamps_s is None: # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
             timestamps_s = torch.arange(x.shape[1], device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
-        # Process in training-size chunks so eval context matches the training distribution.
+        # Process in training-size chunks so eval context matches the training distribution (chunking lives INSIDE
+        # the model via chunked_rope_encode — the inference wrapper just calls forward; see moryossef26/infer.py).
         return chunked_rope_encode(self.encoder_attn, x, timestamps_s, self.num_frames)
 
-    def forward(self, pose_data: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def forward(
+        self, pose_data: torch.Tensor, frame_mask: torch.Tensor | None = None, 
+        timestamps_s: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        # frame_mask is accepted (and ignored) so the inference wrapper can call MoryossefSegmenter and BioS1Model
+        # with 1 uniform signature; at inference chunks are dense (no padding), and training uses no attn pad mask
+        # (Moryossef 2026's largest negative ablation).
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)
         return {"phrase": self.phrase_bio_head(encoded)}

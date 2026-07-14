@@ -1,150 +1,93 @@
+"""Faithful Moryossef 2026 analysis segmenter (spec §4.6): the INDEPENDENT instrument for Analysis A (§8.1),
+Analysis B's realistic operating point (§8.2), and the RQ2 cascaded baseline (§9.2).
+
+It reads RAW pose keypoints (+ velocity) through a UNet CNN → RoPE Transformer → phrase BIO head — a DIFFERENT
+input space from the in-system head's Uni-Sign features (docs/membership_gate.md §1.4), which is what makes
+Analysis A's calibration non-circular. Trained standalone on whole-video chunks (SegmenterChunkDataset), never the
+FSM head's bio_head_init. Reuses the shared training infra (run_epoch_loop); the whole model trains end-to-end.
+"""
 from __future__ import annotations
-from dataclasses import dataclass
 import torch
 from torch.utils.data import DataLoader
 
-from data.windowing import BIO, TRUSTED_GAP_S
+from data.windowing import TRUSTED_GAP_S
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter
-from models.checkpointing import save_model_checkpoint
 
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
-from train.helpers import AmpHelper, TrainControl, TrainLogger, attach_save_best, build_scheduler, mean_logs
+from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
 
-@dataclass
-class SegmenterTrainOutput:
-    logs: list[dict[str, float]]
-
-
-def build_segmenter_loader(
-    data_config: str = "configs/data.yaml",
-    segmenter_config: str = "configs/segmenter.yaml",
-    split: str = "train",
-) -> DataLoader:
+def build_segmenter_loaders(data_config: str, segmenter_config: str) -> tuple[DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
-    seg_cfg = load_yaml(segmenter_config)
-    language = str(seg_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
-    records, _ = load_language_records(data_cfg, language, split=split)
-    aug_cfg = seg_cfg.get("augmentation", {}) or {}
+    cfg = load_yaml(segmenter_config)
+    language = str(cfg.get("language", data_cfg.get("active_languages", ["csl"])[0]))
+    aug_cfg = cfg.get("augmentation", {}) or {}
     fps_cfg = aug_cfg.get("fps", {})
     trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)
-    dataset = SegmenterChunkDataset(
-        records=records,
-        num_frames=int(seg_cfg.get("num_frames", 1024)),
-        steps_per_epoch=seg_cfg.get("steps_per_epoch") if split == "train" else None,
-        fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
-        fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
-        fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
-        velocity=bool(seg_cfg.get("velocity", True)),
-        training=split == "train",
-        frame_dropout=float(aug_cfg.get("frame_dropout", 0.15)),
-        body_part_dropout=float(aug_cfg.get("body_part_dropout", 0.1)),
-        seed=int(seg_cfg.get("seed", 42)),
-        trusted_gap_s=None if trusted_gap is None else float(trusted_gap),
-    )
-    return DataLoader(
-        dataset, batch_size=int(seg_cfg.get("batch_size", 8)),
-        shuffle=False, num_workers=0, collate_fn=collate_segmenter_chunks,
-    )
-
-
-def build_segmenter(segmenter_config: str = "configs/segmenter.yaml") -> MoryossefSegmenter:
-    cfg = load_yaml(segmenter_config)
-    pose_dim = 6 if bool(cfg.get("velocity", True)) else 3
-    return MoryossefSegmenter(
-        pose_dims=(69, pose_dim),  # Uni-Sign 69-kp layout (poses.load_pose_window normalizes to it)
-        hidden_dim=int(cfg.get("hidden_dim", 384)),
-        encoder_depth=int(cfg.get("encoder_depth", 4)),
-        attn_nhead=int(cfg.get("attn_nhead", 8)),
-        attn_ff_mult=int(cfg.get("attn_ff_mult", 2)),
-        attn_dropout=float(cfg.get("attn_dropout", 0.1)),
+    common = dict(
         num_frames=int(cfg.get("num_frames", 1024)),
+        fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
+        fps_aug_min=float(fps_cfg.get("min_fps", 15.0)), fps_aug_max=float(fps_cfg.get("max_fps", 30.0)),
+        velocity=bool(cfg.get("velocity", True)),
+        frame_dropout=float(aug_cfg.get("frame_dropout", 0.15)), body_part_dropout=float(aug_cfg.get("body_part_dropout", 0.1)),
+        seed=int(cfg.get("seed", 42)), trusted_gap_s=None if trusted_gap is None else float(trusted_gap),
+    )
+    train_records, _ = load_language_records(data_cfg, language, split="train")
+    dev_records, _ = load_language_records(data_cfg, language, split="dev")
+    dev_steps = sum(len(r.sentences) for r in dev_records)
+    train_ds = SegmenterChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, **common)
+    dev_ds = SegmenterChunkDataset(dev_records, steps_per_epoch=max(dev_steps, 1), training=False, **common)
+    bs = int(cfg.get("batch_size", 8))
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, collate_fn=collate_segmenter_chunks)
+    dev_loader = DataLoader(dev_ds, batch_size=bs, collate_fn=collate_segmenter_chunks)
+    return train_loader, dev_loader, cfg
+
+
+def build_segmenter(segmenter_config: str) -> MoryossefSegmenter:
+    cfg = load_yaml(segmenter_config)
+    pose_dim = 6 if bool(cfg.get("velocity", True)) else 3  # +velocity doubles the per-keypoint channel dim
+    return MoryossefSegmenter(
+        pose_dims=(int(cfg.get("pose_joints", 69)), pose_dim),
+        hidden_dim=int(cfg.get("hidden_dim", 384)), encoder_depth=int(cfg.get("encoder_depth", 4)),
+        attn_nhead=int(cfg.get("attn_nhead", 8)), attn_ff_mult=int(cfg.get("attn_ff_mult", 2)),
+        attn_dropout=float(cfg.get("attn_dropout", 0.1)), num_frames=int(cfg.get("num_frames", 1024)),
     )
 
 
 @torch.no_grad()
-def evaluate_segmenter(
-    model: MoryossefSegmenter, loader: DataLoader,
-    device: torch.device, dice_weight: float = 1.5, class_weights: torch.Tensor | None = None,
-) -> dict[str, float]:
-    was_training = model.training
-    model.eval()
-    rows: list[dict[str, float]] = []
-    for batch in loader:
-        poses = batch["poses"].to(device)
-        timestamps = batch["timestamps_s"].to(device)
-        labels = batch["phrase_bio"].to(device)
-        outputs = model(poses, timestamps_s=timestamps)
-        loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight, class_weights=class_weights)
-        row = {
-            "loss": float(loss.detach().cpu().item()),
-            **bio_frame_metrics(outputs["phrase"], labels),
-            # Match whole-video inference: Moryossef's prediction decode opens contiguous
-            # signing runs, and our port additionally splits those runs at interior B tags.
-            # The one-to-one tIoU F1 monitor below is still collapse-resistant.
-            **moryossef_segment_metrics(outputs["phrase"], labels, prefix="phrase", decode="runs_bsplit"),
-        }
-        rows.append(row)
-    if was_training: model.train()
-    return mean_logs(rows, prefix="val")
-
-
-def train_segmenter_epochs(
-    model: MoryossefSegmenter, loader: DataLoader, optimizer: torch.optim.Optimizer,
-    device: torch.device, epochs: int, dice_weight: float = 1.5,
-    cfg: dict | None = None, dev_loader: DataLoader | None = None,
-) -> SegmenterTrainOutput:
-    model.to(device)
-    model.train()
-    logs: list[dict[str, float]] = []
-    cfg = cfg or {}
-    class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
-
-    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
-    amp = AmpHelper.from_config(cfg, device)
-    control = TrainControl.from_config(cfg, default_monitor="val_phrase_tiou_f1", default_mode="max")
-    attach_save_best(control, cfg, "segmenter", save_model_checkpoint)
-    logger = TrainLogger("segmenter", cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
-    
-    for epoch in range(1, int(epochs) + 1):
-        epoch_logs: list[dict[str, float]] = []
-        for step, batch in enumerate(loader, start=1):
+def evaluate_segmenter(model, loader, device, dice_weight, class_weights) -> dict[str, float]:
+    rows = []
+    with eval_mode(model):
+        for batch in loader:
             poses = batch["poses"].to(device)
             timestamps = batch["timestamps_s"].to(device)
             labels = batch["phrase_bio"].to(device)
+            logits = model(poses, timestamps_s=timestamps)["phrase"]
+            row = {"bio_loss": float(bio_nll_dice_loss(logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
+            row.update(bio_frame_metrics(logits, labels, prefix="bio"))
+            row.update(moryossef_segment_metrics(logits, labels, prefix="phrase"))
+            rows.append(row)
+    return mean_logs(rows, prefix="val")
 
-            optimizer.zero_grad(set_to_none=True)
-            with amp.autocast():
-                outputs = model(poses, timestamps_s=timestamps)
-                loss = bio_nll_dice_loss(outputs["phrase"], labels, dice_weight=dice_weight, class_weights=class_weights)
 
-            amp.backward(loss)
-            amp.clip_and_step(optimizer, model.parameters(), float(cfg.get("max_grad_norm", 1.0)))
-            scheduler.step_batch()
-            row = {
-                "epoch": float(epoch), "step": float(step),
-                "phrase_bio_loss": float(loss.detach().cpu().item()), "lr": scheduler.lr(optimizer),
-            }
-            epoch_logs.append(row)
-            logs.append(row)
-            logger.log_step(epoch, step, row)
+def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg) -> list[dict]:
+    dice_weight = float(cfg.get("dice_loss_weight", 1.5))
+    class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
+    if class_weights is not None: class_weights = class_weights.to(device)
+    optimizer = build_optimizer(cfg, model.parameters())  # end-to-end: UNet + RoPE + head all train
 
-        scheduler.step_epoch()
-        train_means = mean_logs(epoch_logs)
-        if dev_loader is not None and control.should_eval(epoch, epochs):
-            metrics = evaluate_segmenter(model, dev_loader, device, dice_weight=dice_weight, class_weights=class_weights)
-            improved = control.update(model, metrics, epoch)
-            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
-            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
-            if control.stopped_early:
-                print(f"segmenter | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
-                break
-        else: logger.epoch_summary(epoch, train=train_means)
+    def step_fn(batch, epoch):
+        logits = model(batch["poses"], timestamps_s=batch["timestamps_s"])["phrase"]
+        loss = bio_nll_dice_loss(logits, batch["phrase_bio"], dice_weight=dice_weight, class_weights=class_weights)
+        return loss, {"bio_loss": float(loss.detach())}
 
-    control.restore(model)
-    logger.finish()
-    return SegmenterTrainOutput(logs=logs)
+    return run_epoch_loop(
+        name="segmenter", model=model, loader=train_loader, optimizer=optimizer, 
+        device=device, epochs=epochs, cfg=cfg, step_fn=step_fn,
+        evaluate_fn=lambda epoch: evaluate_segmenter(model, dev_loader, device, dice_weight, class_weights),
+        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader,
+    )

@@ -1,76 +1,37 @@
-from __future__ import annotations
-from dataclasses import dataclass
+"""Whole-video-chunk dataset for the faithful Moryossef analysis segmenter (Analysis A/B + RQ2 cascade floor).
 
+Random natural-timeline chunks of whole videos — the segmentation training regime (Moryossef 2026), distinct from
+the SLT window sampler that trains the in-system BIO head. This model reads RAW pose keypoints (+ velocity) through
+a UNet CNN, so the raw-keypoint augmentations Moryossef uses apply here: fps_aug (essential), frame_dropout,
+body_part_dropout, and appended per-keypoint velocity. (The in-system head, by contrast, reads FROZEN Uni-Sign
+features and drops these — see configs/bio_pretrain.yaml. That input-space split is the whole point of §4.6.)
+"""
+from __future__ import annotations
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from data.loader import VideoRecord
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
-from poses import load_pose_window
+from poses import load_pose_window, apply_fps_aug
 
 
-def apply_fps_aug(
-    poses: np.ndarray, source_fps: float,
-    min_fps: float = 25.0, max_fps: float = 50.0,
-    rng: np.random.Generator | None = None,
-    source_timestamps_s: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Sample a Moryossef-style fps augmentation without speed augmentation.
-
-    The returned indices select frames from the original sequence. When the caller provides the source timestamps, 
-    the selected timestamps are sliced from that timeline directly. This matters for arbitrary real-timeline windows:
-    `load_pose_window` floors the start frame, so reanchoring to the requested window start can shift BIO/RoPE timing 
-    by up to one frame. Moryossef 2026's fps_aug changes frame density, not the physical time attached to a frame.
-    """
-    if rng is None: rng = np.random.default_rng()
-    num_frames = int(poses.shape[0])
-    if num_frames <= 0: return poses, np.zeros((0,), dtype=np.float32), source_fps
-    if source_timestamps_s is not None:
-        source_timestamps_s = np.asarray(source_timestamps_s, dtype=np.float32)
-        if source_timestamps_s.shape[0] != num_frames:
-            raise ValueError("source_timestamps_s must have one timestamp per pose frame")
-
-    target_fps = float(rng.uniform(min_fps, max_fps))
-    if source_fps <= target_fps * 1.05:
-        indices = np.arange(num_frames, dtype=np.int64)
-        timestamps = source_timestamps_s if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
-        return poses, timestamps.astype(np.float32, copy=False), float(source_fps)
-
-    target_len = max(1, round(num_frames * target_fps / float(source_fps)))
-    indices = np.round(np.arange(target_len) * (num_frames - 1) / max(1, target_len - 1))
-    indices = indices.astype(np.int64).clip(0, num_frames - 1)
-    timestamps = source_timestamps_s[indices] if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
-    return poses[indices], timestamps, target_fps
-
-
-@dataclass
-class SegmenterChunk:
-    poses: np.ndarray
-    timestamps_s: np.ndarray
-    phrase_bio: np.ndarray
-    frame_mask: np.ndarray
-    video_id: str
-    start_s: float
-    end_s: float
-
-
-class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the external Moryossef-style segmenter.
+class SegmenterChunkDataset(Dataset):
+    # Random real-timeline chunks for the standalone Moryossef segmenter (raw keypoints + velocity).
     def __init__(
         self, records: list[VideoRecord],
         num_frames: int = 1024, steps_per_epoch: int | None = None,
-        fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
+        fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
         velocity: bool = True, training: bool = True,
-        frame_dropout: float = 0.0, body_part_dropout: float = 0.0, seed: int = 42,
-        trusted_gap_s: float | None = TRUSTED_GAP_S,
+        frame_dropout: float = 0.0, body_part_dropout: float = 0.0,
+        seed: int = 42, trusted_gap_s: float | None = TRUSTED_GAP_S,
     ):
         if not records: raise ValueError("SegmenterChunkDataset requires at least one record")
         self.records = records
         self.num_frames = int(num_frames)
         if steps_per_epoch is None and training:
-            # One epoch = enough random chunks to COVER the corpus once. The old default
-            # (len(records) = one chunk per video) made "epoch" meaningless: at batch 128 it was
-            # 7 optimizer steps, so epoch-based early stopping killed runs after ~150 steps total.
+            # One epoch = enough random chunks to COVER the corpus once (sum of video frames / num_frames), not
+            # one chunk per video — else epoch-based early stopping kills runs after a handful of steps.
             total_frames = sum(int(r.pose.total_frames) for r in records)
             steps_per_epoch = max(len(records), total_frames // max(1, self.num_frames))
         self.steps_per_epoch = int(steps_per_epoch or len(records))
@@ -96,24 +57,20 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
         rec = self.records[int(rng.integers(0, len(self.records)))]
         chunk_s = self.num_frames / rec.pose.fps
 
-        if rec.pose.duration_s <= chunk_s: start_s = 0.0
-        else: start_s = float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))
+        start_s = 0.0 if rec.pose.duration_s <= chunk_s else float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))
         end_s = min(rec.pose.duration_s, start_s + chunk_s)
         poses, abs_timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
         if poses.shape[0] > self.num_frames:
-            poses = poses[: self.num_frames]
-            abs_timestamps = abs_timestamps[: self.num_frames]
+            poses, abs_timestamps = poses[: self.num_frames], abs_timestamps[: self.num_frames]
 
-        # All augmentations are train-only (Moryossef load_and_augment gates fps_aug/dropouts on
-        # split==TRAIN; their eval runs at native fps). Eval previously got random fps_aug too —
-        # extra monitor noise on top of the random-chunk draw.
-        if self.training and self.fps_aug_enabled:
+        # All augmentations are train-only (Moryossef gates fps_aug/dropouts on split==TRAIN; eval runs native fps).
+        if self.training and self.fps_aug_enabled and poses.shape[0] > 1:
             poses, abs_timestamps, _ = apply_fps_aug(
                 poses, source_fps=rec.pose.fps,
                 min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=rng,
                 source_timestamps_s=abs_timestamps,
             )
-            
+
         if self.training and self.body_part_dropout > 0.0:
             poses = apply_body_part_dropout(poses, self.body_part_dropout, rng)
         if self.training and self.frame_dropout > 0.0:
@@ -132,6 +89,7 @@ class SegmenterChunkDataset(Dataset): # Random real-timeline chunks for the exte
 
 
 def collate_segmenter_chunks(batch: list[dict]) -> dict:
+    # Right-pad chunks (poses zero-pad, labels UNK, mask False). Padded frames are masked out of the loss.
     max_len = max(item["poses"].shape[0] for item in batch)
     pose_shape = batch[0]["poses"].shape[1:]
     poses, timestamps, labels, masks, meta = [], [], [], [], []
@@ -142,7 +100,7 @@ def collate_segmenter_chunks(batch: list[dict]) -> dict:
         timestamps.append(torch.nn.functional.pad(torch.as_tensor(item["timestamps_s"]).float(), (0, pad)))
         labels.append(torch.cat([
             torch.as_tensor(item["phrase_bio"]).long(),
-            torch.full((pad,), BIO["UNK"], dtype=torch.long),
+            torch.full((pad,), BIO["UNK"], dtype=torch.long)
         ]))
         masks.append(torch.cat([torch.ones(n, dtype=torch.bool), torch.zeros(pad, dtype=torch.bool)]))
         meta.append({k: item[k] for k in ("video_id", "start_s", "end_s")})
@@ -177,7 +135,7 @@ def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray, clip: float = 5
 
 
 def apply_body_part_dropout(poses: np.ndarray, probability: float, rng: np.random.Generator) -> np.ndarray:
-    # Zero left/right hand channels independently, as train-time segmenter aug.
+    # Zero left/right hand channels independently, as train-time segmenter aug (Moryossef repo default).
     out = poses.copy()
     if rng.random() < float(probability): out[:, 9:30, :] = 0.0
     if rng.random() < float(probability): out[:, 30:51, :] = 0.0
@@ -189,7 +147,7 @@ def apply_frame_dropout(
 ) -> tuple[np.ndarray, np.ndarray]: # Drop a random 0..max_rate fraction of middle frames, preserving edges.
     if poses.shape[0] <= 2: return poses, timestamps_s
     drop_rate = float(rng.uniform(0.0, max(0.0, float(max_rate))))
-    
+
     n_drop = int((poses.shape[0] - 2) * drop_rate)
     if n_drop <= 0: return poses, timestamps_s
     middle = np.arange(1, poses.shape[0] - 1)

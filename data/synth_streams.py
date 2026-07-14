@@ -3,7 +3,7 @@
 Loads any corpus built by the author's e2e-slt-streaming `data_synth` pipeline — pre-trimmed SLT
 benchmark cues concatenated into continuous streams with gaps/phantoms — onto the same
 `VideoRecord`/`SentenceSpan`/`PoseIndex` abstraction the YouTube path uses, so every downstream stage
-(segmenter, stage-2, analysis, eval) runs unchanged via `load_language_records` dispatch.
+(segmenter, SLT training, analysis, eval) runs unchanged via `load_language_records` dispatch.
 
 All `data_synth` corpora share ONE schema, so this single module serves every dataset; a corpus is
 selected by its `data.yaml` language entry (key + `root` + `target_lang`), not by code here:

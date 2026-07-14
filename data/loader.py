@@ -224,6 +224,12 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         from data.synth_streams import load_stream_records
         return load_stream_records(data_cfg, language, split=split)
 
+    # Official pre-trimmed benchmark releases: one single-sentence record per clip, real context frames included — 
+    # the clean literature-comparison corpus for RQ1 (--severity-grid-s 0.0 = the paper-comparable point).
+    if str(lang_cfg.get("source", "")).lower() == "pretrimmed":
+        from data.pretrimmed import load_pretrimmed_records
+        return load_pretrimmed_records(data_cfg, language, split=split)
+
     root = Path(lang_cfg["root"])
     # Per-video fps from the video_meta.json sidecar (poses were extracted at native/2 fps, which
     # VARIES per YouTube video: 12.0-15.0 measured). config pose_fps is fallback-only; with no
@@ -281,7 +287,7 @@ class StreamingWindowDataset(Dataset):
     stochastic window sampler while still satisfying PyTorch/HF Trainer's map-style dataset interface.
     """
     def __init__(
-        self, records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
+        self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any],
         steps_per_epoch: int | None = None, include_full_evidence: bool = True, 
         deterministic: bool = False, pose_augment_cfg: dict | None = None,
     ):
@@ -290,8 +296,8 @@ class StreamingWindowDataset(Dataset):
         from train.sampler import WindowSampler
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
-        self.sampler = WindowSampler.from_stage2_config(
-            records, stage2_cfg, inference_cfg, pose_augment_cfg=pose_augment_cfg
+        self.sampler = WindowSampler.from_slt_config(
+            records, slt_cfg, inference_cfg, pose_augment_cfg=pose_augment_cfg
         )
         self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
         self.include_full_evidence = bool(include_full_evidence)
@@ -299,7 +305,7 @@ class StreamingWindowDataset(Dataset):
         # under a per-index rng, so the early-stopping monitor scores a fixed dev set every epoch
         # instead of a fresh random draw (which makes "best epoch" partly a lottery).
         self.deterministic = bool(deterministic)
-        self.seed = int(stage2_cfg.get("seed", 42))
+        self.seed = int(slt_cfg.get("seed", 42))
 
     def __len__(self) -> int:
         return self.steps_per_epoch
@@ -330,10 +336,10 @@ class StreamingWindowDataset(Dataset):
 
 
 def build_streaming_window_dataset(
-    records: list[VideoRecord], stage2_cfg: dict[str, Any], inference_cfg: dict[str, Any],
+    records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any],
     steps_per_epoch: int | None = None, pose_augment_cfg: dict | None = None,
 ) -> StreamingWindowDataset:
     return StreamingWindowDataset(
-        records=records, stage2_cfg=stage2_cfg, inference_cfg=inference_cfg,
+        records=records, slt_cfg=slt_cfg, inference_cfg=inference_cfg,
         steps_per_epoch=steps_per_epoch, pose_augment_cfg=pose_augment_cfg,
     )

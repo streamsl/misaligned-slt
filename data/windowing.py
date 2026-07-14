@@ -49,6 +49,11 @@ class WindowSample:
     translation_target: SentenceSpan | None
     anchor_span: SentenceSpan | None = None
     full_evidence_spec: WindowSpec | None = None
+    # χ (membership gate, docs/membership_gate.md §2.7): frames of LEFT-TRUNCATED predecessor sentences —
+    # a sentence whose B lies before the window edge is, in the streaming interpretation, one the FSM already
+    # committed (the window's left edge mimics the post-commit cut). A FACT from sampler bookkeeping, not a
+    # model belief; at inference the FSM supplies the same mask from its commit log.
+    commit_mask: np.ndarray | None = None
 
 
 def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, trusted_gap_s: float) -> list[tuple[float, float]]:
@@ -104,12 +109,21 @@ def first_complete_span(
     spans: tuple[SentenceSpan, ...],
     window_start_s: float,
     window_end_s: float,
-    min_o_after_s: float = 1e-6,
-) -> SentenceSpan | None: # Earliest span whose B and closing O are inside the same window.
+    min_tail_s: float = 1e-6,
+) -> SentenceSpan | None:
+    """Earliest span whose B and TERMINATOR are inside the same window (first-complete-span, Hard Rule §1.4.8).
+
+    Timestamp form of the terminator rule: a span is complete when its end lies ≥ `min_tail_s` inside the window,
+    i.e. the window contains at least the frame AFTER the span's last frame. That frame carries the terminator
+    label — `O` when a gap follows, or the next sentence's `B` when sentences are back-to-back (adjacent sentences
+    have no closing `O`; requiring one would misclassify a completed anchor as right-truncated). The label-space
+    twin of this rule is `infer.commit_gate.bio_complete_spans` (terminate on O-or-B); both must stay in sync —
+    same selection at training (GT labels) and inference (predicted labels).
+    """
     for span in sorted(spans, key=lambda s: (s.start_s, s.end_s)):
         has_b = span.start_s >= window_start_s
-        has_closing_o = span.end_s + min_o_after_s <= window_end_s
-        if has_b and has_closing_o: return span
+        has_terminator = span.end_s + min_tail_s <= window_end_s
+        if has_b and has_terminator: return span
     return None
 
 def classify_anchor_visibility(span: SentenceSpan, start_s: float, end_s: float) -> str:
@@ -125,9 +139,10 @@ def count_complete_spans(
     spans: tuple[SentenceSpan, ...],
     window_start_s: float,
     window_end_s: float,
-    min_o_after_s: float = 1e-6,
+    min_tail_s: float = 1e-6,
 ) -> int:
+    # Same terminator semantics as first_complete_span: end ≥ min_tail_s inside the window (O-or-B terminator frame).
     return sum(
-        1 for span in spans 
-        if span.start_s >= window_start_s and span.end_s + min_o_after_s <= window_end_s
+        1 for span in spans
+        if span.start_s >= window_start_s and span.end_s + min_tail_s <= window_end_s
     )

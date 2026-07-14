@@ -3,26 +3,47 @@ from data.windowing import BIO
 import torch
 
 
+def frame_mask_for(n_frames: int, visual_padding: str = "none") -> torch.Tensor:
+    """All-True per-frame mask for an unpadded window. Uni-Sign uses raw windows ('none'); padding is added at
+    batch level and masked via this frame_mask (no boundary halos). The single source of the padding contract —
+    shared by collate_windows and eval._prep_window."""
+    if visual_padding in {"none", "zero"}: return torch.ones(int(n_frames), dtype=torch.bool)
+    raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
+
+
+def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
+    """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn),
+    not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero-pad frames would leak into the last
+    real frames' features before the LM attention mask drops the pads — making a row's features depend on its
+    batchmates' lengths. Repeating the last frame keeps the receptive-field edge benign and batch-invariant."""
+    if pad <= 0: return poses
+    if poses.shape[0]: return torch.cat([poses, poses[-1:].expand(pad, *poses.shape[1:])])
+    return torch.nn.functional.pad(poses, (0,) * (2 * (poses.ndim - 1)) + (0, pad))
+
+
 def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str, torch.Tensor | list]:
     prepared = []
     for item in batch:
         poses_i = torch.as_tensor(item["poses"]).float()
         ts_i = torch.as_tensor(item["timestamps_s"]).float()
         labels_i = torch.as_tensor(item["bio_labels"]).long()
-        # Uni-Sign uses raw windows; padding is handled at batch level + masked via frame_mask (no boundary halos).
-        if visual_padding in {"none", "zero"}: mask_i = torch.ones(poses_i.shape[0], dtype=torch.bool)
-        else: raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
+        mask_i = frame_mask_for(poses_i.shape[0], visual_padding)
         prepared.append((item, poses_i, ts_i, mask_i, labels_i))
 
     max_len = max(poses_i.shape[0] for _, poses_i, _, _, _ in prepared)
     pose_shape = prepared[0][1].shape[1:]
     poses, frame_masks, timestamps  = [], [], []
     bio_labels, specs, targets, anchor_spans = [], [], [], []
+    commit_masks = []
 
     for item, poses_i, ts_i, mask_i, labels_i in prepared:
         n = poses_i.shape[0]
         pad = max_len - n
-        poses.append(torch.nn.functional.pad(poses_i, (0, 0, 0, 0, 0, pad)))
+        chi_i = item.get("commit_mask")
+        chi_t = torch.zeros(n, dtype=torch.bool) if chi_i is None else torch.as_tensor(chi_i).bool()
+        commit_masks.append(torch.cat([chi_t, torch.zeros(pad, dtype=torch.bool)]))  # padding is never "committed"
+        # Padded frames stay masked (attention) and UNK (BIO loss); only the GCN receptive-field edge changes.
+        poses.append(repeat_last_frame(poses_i, pad))
         frame_masks.append(torch.cat([mask_i, torch.zeros(pad, dtype=torch.bool)]))
         timestamps.append(torch.nn.functional.pad(ts_i, (0, pad)))
         bio_labels.append(torch.cat([labels_i, torch.full((pad,), BIO["UNK"], dtype=torch.long)]))
@@ -34,6 +55,7 @@ def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str
         "poses": torch.stack(poses).reshape(len(batch), max_len, *pose_shape),
         "frame_mask": torch.stack(frame_masks), "timestamps_s": torch.stack(timestamps),
         "bio_labels": torch.stack(bio_labels), "specs": specs,
+        "commit_mask": torch.stack(commit_masks),
         "translation_targets": targets, "anchor_spans": anchor_spans,
     }
 

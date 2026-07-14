@@ -15,7 +15,7 @@ FRAME-DOMAIN entry points (consume BIO logits/labels; the BIO-head TRAINING moni
                              `*_seg_recall` from `segmentation_prf` on frame-unit segments (the collapse-proof
                              monitor; an all-`I`/all-`O` collapse cannot game one-to-one matching). The looser
                              overlap seg-F1 and frame-IoU flavors were removed (used for no decision).
-  Used by: train/stage2.py (in-model BIO head), moryossef26/{trainer,infer}.py (the standalone segmenter).
+  Used by: train/slt.py + train/bio_pretrain.py (the in-system BIO head) and moryossef26/ (the Moryossef segmenter).
   Segment decoders feeding it: `bio_labels_to_segments` (gold), `signing_runs_with_b_splits` (prediction),
   `likeliest_segments` (parity) — all three are one parameterized core, `_bio_runs`.
 
@@ -92,7 +92,7 @@ def likeliest_segments(logits: torch.Tensor) -> list[dict]:
     return _bio_runs(logits.detach().cpu().argmax(dim=-1), split_on_b=False, open_on_i=True, close_on_unk=True)
 
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """PREDICTION/inference decode: contiguous signing runs, split at interior `B` (== infer.bio_tags_to_segments).
+    """PREDICTION/inference decode: contiguous signing runs, split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
 
     Moryossef's prediction decode (`likeliest_probs_to_segments`) never requires a predicted `B` — a segment is
     any contiguous B/I run; requiring `B` to OPEN is fatal here (`B` is ~1% of frames, 68% of caption boundaries

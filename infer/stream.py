@@ -3,11 +3,11 @@ from dataclasses import dataclass
 
 import torch
 from data.windowing import BIO
-from infer.commit_gate import CommitGate, first_complete_bio_span, _span_opens
+from infer.commit_gate import CommitGate, select_target_span, _span_opens
 
 
 def active_span_start(bio_tags: torch.Tensor) -> int | None:
-    # Start index of the in-progress span (opened, never closed). Opening matches the shared decode
+    # Start index of the in-progress span (opened, never terminated). Opening matches the shared decode
     # (commit_gate._span_opens): B anywhere, or a mid-buffer O→I transition; buffer-start I without
     # B stays closed (left-truncated per Mode-2b training — never translate a headless fragment).
     start: int | None = None
@@ -17,6 +17,16 @@ def active_span_start(bio_tags: torch.Tensor) -> int | None:
         if _span_opens(tag, prev, start is not None): start = idx
         prev = tag
     return start
+
+
+def leading_i_run_end(bio_tags: torch.Tensor) -> int | None:
+    # Terminator index of a buffer-start I-run (the continuation of a force-cut sentence): the first O-or-B
+    # after the leading I frames. None if the buffer does not start with I, or the run reaches the buffer end.
+    tags = bio_tags.tolist()
+    if not tags or tags[0] != BIO["I"]: return None
+    for idx, tag in enumerate(tags):
+        if tag in (BIO["O"], BIO["B"]): return idx
+    return None
 
 
 @dataclass
@@ -34,17 +44,18 @@ class StreamingEvent:
 class StreamingSLTRunner:
     """Model-backed sawtooth inference runner.
 
-    Decoder state is not stored on the runner. Each stride recomputes visual features/BIO for the current buffer 
-    and cold-starts translation for the first complete predicted span.
+    Decoder state is not stored on the runner. Each stride recomputes visual features/BIO for the current buffer
+    and cold-starts translation for the selected target span (first complete span ≥ Λ_min).
     """
     def __init__(
-        self, model, stride_s: float = 1.0, buffer_cap_s: float = 18.0, delta_enc_frames: int = 3, hysteresis_strides: int = 2,
+        self, model, stride_s: float = 1.0, buffer_cap_s: float = 18.0, delta_enc_frames: int = 3, hysteresis_strides: int = 3,
         token_confidence_tau: float = 0.75, max_text_tokens: int = 128, diffusion_steps: int = 64, tau_dec: float = 0.75,
         spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
         dcd_top_p: float | None = None, dcd_cache_type: str = "none", dcd_refresh_count: int = 16,
-        decode_conditioning: str = "window",
+        decode_conditioning: str = "window", min_span_frames: int = 0, forced_tail_policy: str = "skip",
+        gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4,
     ):
         # decode_conditioning: "window" (default) decodes under the FULL buffer's features — exactly the
         # training conditioning, where Mode 1/3 windows feed the whole jittered window to the encoder and
@@ -52,14 +63,36 @@ class StreamingSLTRunner:
         # disregarded*, not cropped away). "span" crops conditioning to the predicted BIO span (the spec §7.1
         # pseudocode's `enc[span]`), which the trained conditional never sees except at the zero-jitter corner
         # of the CDF — kept as an ablation. The BIO span still defines the emitted boundaries either way.
-        if decode_conditioning not in {"window", "span"}: raise ValueError(f"Unknown decode_conditioning: {decode_conditioning}")
+        if decode_conditioning not in {"window", "span"}: 
+            raise ValueError(f"Unknown decode_conditioning: {decode_conditioning}")
+
+        # forced_tail_policy — what to do with the continuation of a sentence cut by a FORCED (cap) commit:
+        #   "skip" (default): never translate it. The continuation is a left-truncated fragment; 
+        #     Mode-2b training gives the decoder NO translation supervision on that conditioning, 
+        #     so its decode is undefined behaviour. The leftover I-run at buffer start is simply never selected.
+        #   "translate_partial": emit the fragment's decode flagged PARTIAL once its terminator appears —
+        #     best-effort recovery of the sentence ending, at the cost of decoding out-of-training-distribution
+        #     conditioning. Kept as an option/ablation, not the default.
+        if forced_tail_policy not in {"skip", "translate_partial"}: 
+            raise ValueError(f"Unknown forced_tail_policy: {forced_tail_policy}")
+
         self.decode_conditioning = str(decode_conditioning)
+        self.forced_tail_policy = str(forced_tail_policy)
         self.model = model
         self.stride_s = float(stride_s)
         self.buffer_cap_s = float(buffer_cap_s)
         self.max_text_tokens = int(max_text_tokens)
         self.diffusion_steps = int(diffusion_steps)
         self.tau_dec = float(tau_dec)
+
+        # Λ_min (min_span_frames): shortest selectable span, in encoder frames. Must exceed 2δ so the overlap-cut
+        # leftover can never be selected even if mislabelled B (see commit_gate.select_target_span). 0 disables.
+        self.min_span_frames = int(min_span_frames)
+        if self.min_span_frames and self.min_span_frames <= 2 * int(delta_enc_frames):
+            raise ValueError(
+                f"min_span_frames ({self.min_span_frames}) must exceed 2*delta_enc_frames ({2 * int(delta_enc_frames)}); "
+                "otherwise the post-commit overlap leftover is a selectable span."
+            )
 
         self.spd_top_k = int(spd_top_k)
         self.spd_renormalize = bool(spd_renormalize)
@@ -81,6 +114,18 @@ class StreamingSLTRunner:
             hysteresis_strides=hysteresis_strides,
             token_confidence_tau=token_confidence_tau,
         )
+        # Membership gate at streaming inference (docs/membership_gate.md): per stride, build Ω from the BIO posteriors (on-policy span, 
+        # no GT) + χ from the runner's own commit log — the same conditioning the decoder trained under. δ defaults to the commit gate's 
+        # delta_enc_frames (1 constant, 3 roles). Only under 'window' conditioning: 'span' crops the pose axis and would misalign Ω columns.
+        self.gate_enabled = bool(gate_enabled) and self.decode_conditioning == "window"
+        self.gate_delta = int(gate_delta if gate_delta is not None else delta_enc_frames)
+        self.gate_eps = float(gate_eps)
+        # Absolute end-time of the last committed span: buffer frames earlier than this are χ=1 (already emitted — 
+        # the ≤δ overlap leftovers the cut deliberately keeps).
+        self._committed_until_s = 0.0
+        # True between a forced (cap) commit that cut through an open span and the resolution of that
+        # sentence's continuation. Only consulted by forced_tail_policy="translate_partial".
+        self._after_forced = False
         # Why-did-it-(not)-commit counters, accumulated across all run() calls. A low streaming recall with
         # near-perfect frame BIO is almost always the gate suppressing emission; comparing spans_seen vs
         # boundary_ok vs translation_ok pinpoints which signal blocks (usually translation_ok on a weak model).
@@ -89,22 +134,33 @@ class StreamingSLTRunner:
     def _bump(self, key: str, n: int = 1) -> None:
         self.gate_stats[key] = self.gate_stats.get(key, 0) + int(n)
 
-    def _decode_span(self, bio_tap: torch.Tensor, mask: torch.Tensor, span_slice: slice):
+    def _decode_span(self, bio_tap: torch.Tensor, mask: torch.Tensor, span_slice: slice, omega_bias: torch.Tensor | None = None):
         if self.decode_conditioning == "span": bio_tap, mask = bio_tap[:, span_slice], mask[:, span_slice]
         return self.model.generate_from_bio_tap(
             bio_tap, mask, max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,
             dcd_decode_algo=self.dcd_decode_algo, dcd_decode_param=self.dcd_decode_param, dcd_sample_top_k=self.dcd_sample_top_k,
-            dcd_top_p=self.dcd_top_p, dcd_cache_type=self.dcd_cache_type, dcd_refresh_count=self.dcd_refresh_count,
+            dcd_top_p=self.dcd_top_p, dcd_cache_type=self.dcd_cache_type, dcd_refresh_count=self.dcd_refresh_count, omega_bias=omega_bias,
         )
+
+    def _stride_omega(self, bio_logits: torch.Tensor, mask: torch.Tensor, ts_b: torch.Tensor, start_s: float):
+        # Per-stride membership gate: on-policy span (no GT at inference), χ = frames already emitted per the runner's own commit log 
+        # (≤δ overlap leftovers the cut keeps). None when gate is off or the model has no gate builder (plain test fakes / AR-only models).
+        if not self.gate_enabled or not hasattr(self.model, "build_gate_omega"): return None
+        chi = (ts_b + float(start_s)) < self._committed_until_s  # (1, T') bool, absolute timeline
+        omega_bias, _ = self.model.build_gate_omega(
+            bio_logits, None, mask, memory_len=self.model.front_end.prompt_length() + int(bio_logits.shape[1]),
+            commit_mask=chi, delta=self.gate_delta, eps=self.gate_eps, min_span_frames=self.min_span_frames,
+        )
+        return omega_bias
 
     @torch.no_grad()
     def step(self, poses: torch.Tensor, timestamps_s: torch.Tensor, end_s: float, last_commit_t: float = 0.0) -> StreamingEvent | None:
         """One sawtooth stride over the buffer [last_commit_t, end_s).
 
-        The buffer grows from the last commit point (spec §7.1), not a fixed trailing window, so a committed sentence is cut out and 
-        never re-emitted. A buffer that reaches BUFFER_CAP_S forces a PARTIAL commit to bound latency.
+        The buffer grows from the last commit cut, not a fixed trailing window, so a committed sentence is cut out and never re-emitted. 
+        A buffer that reaches BUFFER_CAP_S forces a PARTIAL commit to bound latency.
         """
         start_s = float(last_commit_t)
         in_buffer = (timestamps_s >= start_s) & (timestamps_s < end_s)
@@ -118,10 +174,30 @@ class StreamingSLTRunner:
         bio_logits = self.model.bio_head(bio_tap, timestamps_s=ts).logits
         bio_tags = bio_logits.argmax(dim=-1)[0]
         buffer_full = (end_s - start_s) >= self.buffer_cap_s
-        span = first_complete_bio_span(bio_tags)
+        omega_bias = self._stride_omega(bio_logits, mask, ts_b, start_s)
 
+        # after_forced resolution (translate_partial only). Auto-reset when the buffer does not start with I —
+        # there is no continuation to wait for (e.g. the forced flush landed in a gap), so normal selection must
+        # proceed immediately; blocking on a lead that never appears would deadlock the FSM into cap-only commits.
+        if self._after_forced and self.forced_tail_policy == "translate_partial":
+            lead_term = leading_i_run_end(bio_tags)
+            if bio_tags.numel() and int(bio_tags[0].item()) != BIO["I"]: self._after_forced = False
+            elif lead_term is not None:
+                self._after_forced = False
+                if lead_term >= max(1, self.min_span_frames):
+                    self._bump("committed"); self._bump("forced_tail_commit")
+                    tokens, confidence = self._decode_span(bio_tap, mask, slice(0, lead_term), omega_bias=omega_bias)
+                    self.commit_gate.reset()
+                    return StreamingEvent(
+                        start_s=float(start_s + ts_b[0, 0].item()), end_s=float(start_s + ts_b[0, lead_term].item()),
+                        token_ids=tokens[0].detach().cpu(), token_confidence=confidence[0].detach().cpu(),
+                        bio_start_index=0, bio_end_index=lead_term, flagged_partial=True, commit_time_s=float(end_s),
+                    )
+        elif self._after_forced: self._after_forced = False  # "skip": leftover I-run is simply never selected
+
+        span = select_target_span(bio_tags, self.min_span_frames)
         if span is None:
-            self.commit_gate.update(bio_tags, token_confidence=None)
+            self.commit_gate.update(None, token_confidence=None)
             if not buffer_full: return None
 
             # Forced commit at the cap: decode the in-progress (right-truncated)
@@ -130,18 +206,19 @@ class StreamingSLTRunner:
             self.commit_gate.reset()
             if b_idx is None: return None
             self._bump("committed"); self._bump("forced_commit")
+            self._after_forced = True  # the cut lands mid-sentence; its continuation follows
 
             s_idx, last_idx = b_idx, int(bio_tags.numel()) - 1
-            tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, last_idx + 1))
+            tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, last_idx + 1), omega_bias=omega_bias)
             return StreamingEvent(
                 start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, last_idx].item()),
                 token_ids=tokens[0].detach().cpu(), token_confidence=confidence[0].detach().cpu(),
                 bio_start_index=s_idx, bio_end_index=last_idx, flagged_partial=True, commit_time_s=float(end_s),
             )
 
-        s_idx, closing_o_idx = span
-        tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, max(s_idx + 1, closing_o_idx)))
-        decision = self.commit_gate.update(bio_tags, token_confidence=confidence[0])
+        s_idx, term_idx = span
+        tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, max(s_idx + 1, term_idx)), omega_bias=omega_bias)
+        decision = self.commit_gate.update(span, token_confidence=confidence[0])
         self._bump("spans_seen")
         if decision.boundary_stable: self._bump("boundary_ok")
         if decision.translation_confident: self._bump("translation_ok")
@@ -152,9 +229,9 @@ class StreamingSLTRunner:
         if forced: self._bump("forced_commit")
         self.commit_gate.reset()
         return StreamingEvent(
-            start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, closing_o_idx].item()),
+            start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, term_idx].item()),
             token_ids=tokens[0].detach().cpu(), token_confidence=confidence[0].detach().cpu(),
-            bio_start_index=s_idx, bio_end_index=closing_o_idx, flagged_partial=forced, commit_time_s=float(end_s),
+            bio_start_index=s_idx, bio_end_index=term_idx, flagged_partial=forced, commit_time_s=float(end_s),
         )
 
     @torch.no_grad()
@@ -164,14 +241,27 @@ class StreamingSLTRunner:
         timestamps = torch.arange(poses.shape[0], device=device, dtype=torch.float32) / float(fps)
         events: list[StreamingEvent] = []
         duration = float(timestamps[-1].item()) if timestamps.numel() else 0.0
+        # Overlap cut: keep last δ frames when cutting at a committed terminator. A terminator estimate late by up to δ 
+        # then still leaves the next sentence's onset (its B) in the buffer — without the overlap, a late estimate eats 
+        # the next sentence's B; buffer-start I never opens a span (Mode-2b silence), and that sentence is silently dropped. 
+        # The ≤2δ leftover of the committed sentence is skipped by _span_opens / Λ_min, so it is never re-emitted.
+        overlap_s = float(self.commit_gate.history.delta_enc_frames) / float(fps)
+        frame_s = 1.0 / float(fps)
         last_commit_t = 0.0
         end_s = self.stride_s
+        self._after_forced = False
+        self._committed_until_s = 0.0  # χ commit log resets per stream
+
         while end_s <= duration + self.stride_s:
             event = self.step(poses, timestamps, end_s=end_s, last_commit_t=last_commit_t)
             if event is not None:
                 events.append(event)
-                last_commit_t = event.end_s  # cut the buffer at the commit point
+                # χ: everything up to this commit's end is now emitted content — the ≤δ overlap the next
+                # buffer keeps must be attention-floored by the membership gate (seam-duplication guard §2.7).
+                self._committed_until_s = max(self._committed_until_s, float(event.end_s))
+                # Advance by at least one frame so a degenerate (≤δ) span can never stall the stream.
+                last_commit_t = max(event.end_s - overlap_s, last_commit_t + frame_s)
             elif (end_s - last_commit_t) >= self.buffer_cap_s:
-                last_commit_t = end_s  # gap/fragment buffer hit the cap with nothing to emit
+                last_commit_t = max(end_s - overlap_s, last_commit_t + frame_s)  # gap/fragment buffer hit the cap with nothing to emit
             end_s += self.stride_s
         return events

@@ -19,7 +19,9 @@ def _unisign_crop_scale_body(body, thr):
     result[..., 0] = (body[..., 0] - xs) / scale
     result[..., 1] = (body[..., 1] - ys) / scale
     result[..., :2] = (result[..., :2] - 0.5) * 2.0
-    np.clip(result[..., :2], -1.0, 1.0, out=result[..., :2])
+    # Uni-Sign crop_scale clips the WHOLE array — including the confidence channel (RTMPose scores exceed
+    # 1.0 on easy joints; upstream the model only ever sees conf <= 1). Clipping xy-only leaves conf > 1.
+    np.clip(result, -1.0, 1.0, out=result)
     result[result[..., 2] <= thr] = 0.0
     return result, float(scale)
 
@@ -50,7 +52,7 @@ def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.n
         if scale == 0: return np.zeros_like(part)
 
         part[..., :2] = part[..., :2] / scale
-        np.clip(part[..., :2], -1.0, 1.0, out=part[..., :2])
+        np.clip(part, -1.0, 1.0, out=part)  # full-array clip incl. conf, matching load_part_kp
         part[part[..., 2] <= thr] = 0.0
         return part
 

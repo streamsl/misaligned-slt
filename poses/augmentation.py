@@ -1,9 +1,8 @@
 """Pose-sequence augmentation — dataset-driven (frame width/height passed in, never global).
 
-Applied to RAW pixel keypoints (T, 133, 3) BEFORE normalization, TRAIN ONLY. Everything here is
-SPATIAL and LENGTH-PRESERVING, so per-frame timestamps and BIO labels stay aligned (the streaming /
-segmentation contract). TEMPORAL augmentation is handled separately by `moryossef26.apply_fps_aug`,
-which rebuilds the timestamps it resamples.
+The SPATIAL primitives (`PoseAugmentor`) are LENGTH-PRESERVING, so per-frame timestamps and BIO labels
+stay aligned (the streaming / segmentation contract). `apply_fps_aug` below is the TEMPORAL augmentation
+(frame-density resampling; it rebuilds the timestamps it resamples) used by the window sampler.
 
 Spatial primitives exposed through `PoseAugmentor` / `build_pose_augmentor`. These are the pose-space
 analogue of standard image-space augmentation (random rotate / resize / translate):
@@ -19,7 +18,40 @@ etc.). When they are unknown, frame-referenced ops (affine / spatial_mask) are s
 centroid-based rotation runs.
 """
 import numpy as np
-from scipy.ndimage import zoom
+
+
+def apply_fps_aug(
+    poses: np.ndarray, source_fps: float,
+    min_fps: float = 25.0, max_fps: float = 50.0,
+    rng: np.random.Generator | None = None,
+    source_timestamps_s: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Moryossef-style fps augmentation (frame-density resampling, no speed change).
+
+    The returned indices select frames from the original sequence. When the caller provides the source timestamps,
+    the selected timestamps are sliced from that timeline directly. This matters for arbitrary real-timeline windows:
+    `load_pose_window` floors the start frame, so reanchoring to the requested window start can shift BIO/RoPE timing
+    by up to one frame. fps_aug changes frame density, not the physical time attached to a frame.
+    """
+    if rng is None: rng = np.random.default_rng()
+    num_frames = int(poses.shape[0])
+    if num_frames <= 0: return poses, np.zeros((0,), dtype=np.float32), source_fps
+    if source_timestamps_s is not None:
+        source_timestamps_s = np.asarray(source_timestamps_s, dtype=np.float32)
+        if source_timestamps_s.shape[0] != num_frames:
+            raise ValueError("source_timestamps_s must have one timestamp per pose frame")
+
+    target_fps = float(rng.uniform(min_fps, max_fps))
+    if source_fps <= target_fps * 1.05:
+        indices = np.arange(num_frames, dtype=np.int64)
+        timestamps = source_timestamps_s if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
+        return poses, timestamps.astype(np.float32, copy=False), float(source_fps)
+
+    target_len = max(1, round(num_frames * target_fps / float(source_fps)))
+    indices = np.round(np.arange(target_len) * (num_frames - 1) / max(1, target_len - 1))
+    indices = indices.astype(np.int64).clip(0, num_frames - 1)
+    timestamps = source_timestamps_s[indices] if source_timestamps_s is not None else indices.astype(np.float32) / float(source_fps)
+    return poses[indices], timestamps, target_fps
 
 
 # ── Spatial primitives (parametrised by frame size; operate on x,y only, conf left intact) ─────────────
@@ -94,23 +126,6 @@ def spatial_mask(
             & (oy < keypoints[..., 1]) & (keypoints[..., 1] < oy + box))
     keypoints[mask] = 0.0
     return keypoints
-
-
-# ── Temporal primitives (NOT used by the default augmentor — they change length / alignment) ───────────
-def interp1d_(keypoints: np.ndarray, target_len: int, rng: np.random.Generator | None = None) -> np.ndarray:
-    """Resize along time (axis 0) by spline interpolation. WARNING: changes T -> breaks timestamp/BIO
-    alignment; use `moryossef26.apply_fps_aug` (rebuilds timestamps) for temporal augmentation instead."""
-    keypoints = np.asarray(keypoints)
-    target_len = int(max(1, target_len))
-    src_len = int(keypoints.shape[0])
-    if src_len <= 1: return np.repeat(keypoints[:1], target_len, axis=0) if src_len else keypoints
-    if src_len == target_len: return keypoints
-    rng = rng or np.random.default_rng()
-    order = 1 if rng.random() < 0.33 else (3 if rng.random() < 0.5 else 0)
-    out = zoom(keypoints, zoom=(target_len / src_len, 1.0, 1.0), order=order, mode='nearest', prefilter=(order > 1))
-    if out.shape[0] > target_len: out = out[:target_len]
-    elif out.shape[0] < target_len: out = np.pad(out, ((0, target_len - out.shape[0]), (0, 0), (0, 0)))
-    return out
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────────────────────────────

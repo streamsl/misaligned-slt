@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutput
 from models.dmax import OPUTBlockDiffusionDecoder
+from models.membership_gate import CrossAttnOmegaInjector
 
 
 class SLTFrontEnd(nn.Module):
@@ -42,7 +43,7 @@ class SLTFrontEnd(nn.Module):
     def encode_memory(self, bio_tap, bio_mask):
         raise NotImplementedError
 
-    def ar_loss(self, enc_hidden, enc_mask, labels) -> torch.Tensor:
+    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None) -> torch.Tensor:
         raise NotImplementedError
 
     def make_dlm_decoder(self, block_size: int) -> OPUTBlockDiffusionDecoder:
@@ -53,6 +54,21 @@ class SLTFrontEnd(nn.Module):
 
     def freeze_pose_backbone(self, freeze_projection: bool = False) -> int:
         return 0
+
+    # ── membership gate on the AR path (shared) ───────────────────────────────
+    def _omega_injector(self) -> CrossAttnOmegaInjector:
+        # Lazily attach cross-attention Ω hooks to the AR language model (once). The DLM arm gates in its own
+        # manual decode loop; the AR arm reuses HF forward/generate, so the gate rides in on these hooks.
+        inj = getattr(self, "_xattn_omega", None)
+        if inj is None:
+            inj = CrossAttnOmegaInjector(self.lm_model)
+            object.__setattr__(self, "_xattn_omega", inj)  # not an nn.Module param; keep off the module tree
+        return inj
+
+    def ar_omega_context(self, omega_bias):
+        # Context manager: within it, every AR cross-attention adds Ω (None → identity). Wraps ar_loss /
+        # ar_generate / the AR confidence-bound forward so all AR decodes see the same conditioning.
+        return self._omega_injector().with_omega(omega_bias)
 
     # ── shared ────────────────────────────────────────────────────────────────
     def encode(self, poses, frame_mask, timestamps_s=None):
@@ -72,15 +88,18 @@ class SLTFrontEnd(nn.Module):
         return encode
 
     @torch.no_grad()
-    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens=128, num_beams=1, decoder_start_id=None):
-        # AR generation over a precomputed encoder memory. Returns (tokens, per-token confidence).
+    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens=128, num_beams=1, decoder_start_id=None, omega_bias=None):
+        # AR generation over a precomputed encoder memory. Returns (tokens, per-token confidence). Under
+        # `omega_bias`, every cross-attention step is membership-gated (same Ω the DLM decode uses).
         start = decoder_start_id if decoder_start_id is not None else self.decoder_start_id
         kwargs = {} if start is None else {"decoder_start_token_id": start}
-        generated = self.lm_model.generate(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
-            max_new_tokens=max_new_tokens, num_beams=num_beams, **kwargs,
-        )
-        return generated, self._teacher_forced_confidence(enc_hidden, enc_mask, generated)
+        with self.ar_omega_context(omega_bias):
+            generated = self.lm_model.generate(
+                encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+                max_new_tokens=max_new_tokens, num_beams=num_beams, **kwargs,
+            )
+            conf = self._teacher_forced_confidence(enc_hidden, enc_mask, generated)  # gated too (fair confidence)
+        return generated, conf
 
     def _teacher_forced_confidence(self, enc_hidden, enc_mask, generated):
         # REAL per-token confidence: the softmax prob the decoder assigns each token it produced 

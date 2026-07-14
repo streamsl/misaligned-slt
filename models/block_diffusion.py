@@ -199,7 +199,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     def _decode(
         self, decoder_input_ids: torch.Tensor, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
         self_attn_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None, omega_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         '''Run the AR decoder backbone with a custom (block-causal / BD3LM) self-attention mask.
 
@@ -213,6 +213,8 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
             position_ids: optional (B, T) positions for the BD3LM [xt|x0] repeated geometry; None -> sequential.
             inputs_embeds: optional (B, T, d) decoder-input embeddings that REPLACE embedding decoder_input_ids
                 (the SPD soft-embedding mixture). None -> the decoder embeds decoder_input_ids itself.
+            omega_bias: optional (B, 1, 1, M) membership-gate bias ADDED to the cross-attention logits, every
+                layer and head (models.membership_gate; docs/membership_gate.md §2.9). None -> no gate.
         '''
         raise NotImplementedError
 
@@ -259,20 +261,23 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
 
     def _bd3lm_logits( # BD3LM [xt|x0] forward with repeated effective positions; return xt-half logits (first L).
         self, noisy_ids: torch.Tensor, clean_ids: torch.Tensor, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
-    ) -> torch.Tensor: 
+        omega_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # BD3LM attention mask: (1, 1, 2L, 2L)
         batch, length = clean_ids.shape
         bd3lm_mask = build_bd3lm_mask(length, self.block_size, enc_hidden.dtype, clean_ids.device)
-        
+
         # Repeated position IDs: [0..L-1, 0..L-1] (no sigma/time conditioning — A2D is not time-aware; dLLM
         # BD3LMTrainer passes no sigma, and TimestepEmbedder/AdaLN is DDiT-specific, absent from mBART/mT5).
         base_pos = torch.arange(length, device=clean_ids.device).unsqueeze(0).expand(batch, -1)
         position_ids = torch.cat([base_pos, base_pos], dim=1)  # (B, 2L)
 
         # BD3LM forward: [xt | x0] with the 3-component mask + SHARED positional embeddings; xt-half logits only.
+        # omega_bias (over the M encoder frames) is query-independent, so the same (B,1,1,M) bias applies to all
+        # 2L target queries — the [xt|x0] concatenation on the TARGET axis does not touch the cross-attn key axis.
         logits = self._decode(
             torch.cat([noisy_ids, clean_ids], dim=1), enc_hidden, enc_mask,
-            self_attn_mask=bd3lm_mask, position_ids=position_ids,
+            self_attn_mask=bd3lm_mask, position_ids=position_ids, omega_bias=omega_bias,
         )  # (B, 2L, V+1)
         return logits[:, :length]  # (B, L, V+1), take only first L logits (xt half)
 

@@ -6,7 +6,7 @@ mBART / mT5 bindings (models/unisign.py) supply only the backbone decode.
 
   - `oput_forward`   — OPUT two-pass training (mask + on-policy argmax corruption), trains self-correction.
   - `decode_spd_dcd` / `generate_spd_dcd` — SPD (renormalized soft state) + DCD (sliding-window commits).
-  - `remasked_logits` / `truncated_marginal_logits` — grad-bearing surrogates for the confidence-bound term.
+  - `remasked_logits` — grad-bearing surrogate for the confidence-bound term.
 
 References: DMax OPUT + SPD/DCD (train_llada2_bd_oput.py); dLLM A2D (arXiv 2602.22661).
 '''
@@ -121,7 +121,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     - `decode_spd_dcd` / `generate_spd_dcd` — **SPD+DCD** inference: SPD carries a renormalized soft mask/token embedding 
       state across denoising steps; DCD's sliding window selects which masked slots to commit vs defer. Cold-start per
       call — no state crosses streaming strides.
-    - `truncated_marginal_logits`: Cheap grad-bearing forward used by confidence-bound term instead of backprop via full decode.
+    - `remasked_logits`: cheap grad-bearing forward used by the confidence-bound term instead of backprop via full decode.
 
     `[xt|x0]` BD3LM concatenation and block-diff mask match DMax's own block-diff training loop (`train_llada2_bd_oput.py`).
     '''
@@ -131,6 +131,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         loss_over_all_positions: bool = True, sample_rollout: bool = False,
         rollout_eval_mode: bool = True, eos_supervision: int | None = None,
         rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None,
+        omega_bias: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
@@ -138,6 +139,11 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         corruption is sampled with dropout OFF (DMax eval-mode rollout): if `rollout_encode_fn` is given the whole
         conditioning path is re-encoded in eval (full fidelity); otherwise only the decoder is toggled to eval over
         the same `enc_hidden` (decoder-side fidelity).
+
+        `omega_bias` (membership gate, models.membership_gate) is part of the FIXED conditioning: identical across
+        both OPUT passes AND the rollout (it depends only on the BIO posteriors / encoder features, not the target
+        tokens). OPUT corrupts the *target*; Ω conditions the *input* — so it belongs on every decode here, and its
+        gradient (into the BIO logits) flows through the two grad-bearing passes, not the no-grad rollout.
         '''
         x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids, eos_supervision=eos_supervision)
         rollout_decode_fn = None
@@ -149,21 +155,21 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
                 self.eval()
                 try:
                     r_enc, r_mask = rollout_encode_fn()
-                    return self._bd3lm_logits(noisy_ids, x0, r_enc, r_mask)
+                    return self._bd3lm_logits(noisy_ids, x0, r_enc, r_mask, omega_bias=omega_bias)
                 finally: self.train(was_training)
         elif rollout_eval_mode:
-            # DMax OPUT samples the on-policy corruption under model.eval() + no_grad. For this conditional AR port, 
-            # that means re-running the conditioning path as well as the decoder with dropout off; the gradient-bearing 
+            # DMax OPUT samples the on-policy corruption under model.eval() + no_grad. For this conditional AR port,
+            # that means re-running the conditioning path as well as the decoder with dropout off; the gradient-bearing
             # L_mask/L_pred passes below still share the same train-mode `enc_hidden`, so their conditioning remains fixed.
             def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
                 was_training = self.training
                 self.eval()
-                try: return self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask)
+                try: return self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias)
                 finally: self.train(was_training)
 
         out = oput_two_pass_loss(
             clean_ids=x0, valid_mask=valid,
-            decode_fn=lambda noisy_ids: self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask),
+            decode_fn=lambda noisy_ids: self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias),
             mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high,
             loss_over_all_positions=loss_over_all_positions, sample_rollout=sample_rollout,
             rollout_module=None if rollout_decode_fn is not None else (self if rollout_eval_mode else None),
@@ -175,23 +181,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         }
 
 
-    def truncated_marginal_logits(self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
-        '''One grad-bearing forward giving p(token_j | conditioning, all-masked target).
-
-        Legacy/ablation variant of the confidence-bound gradient surrogate. The all-`[MASK]` input corresponds 
-        to t = 1 corruption, which OPUT's t ∈ [t_low, t_high] training never visits, and its marginal is not 
-        the conditional the decode's gate read — prefer `remasked_logits`, which re-masks only the gated slots 
-        inside the committed decode (the DCD deferral counterfactual). Kept for the ablation comparison.
-        '''
-        batch = enc_hidden.shape[0]
-        token_ids = torch.full((batch, int(seq_len)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)
-        token_ids[:, 0] = int(self.bos_index)
-        return self._decode(token_ids, enc_hidden, enc_mask)
-
-
     def remasked_logits(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
-        decoded_tokens: torch.Tensor, remask_positions: torch.Tensor,
+        decoded_tokens: torch.Tensor, remask_positions: torch.Tensor, omega_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         '''Grad-bearing forward on a committed sequence with the gated slots re-masked (confidence-bound surrogate).
 
@@ -205,7 +197,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
         remask[:, 0] = False  # BOS fixed
         token_ids = torch.where(remask, torch.full_like(decoded_tokens, int(self.mask_token_id)), decoded_tokens)
-        return self._decode(token_ids, enc_hidden, enc_mask)
+        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)
 
 
     # ── DCD prefix KV-cache (backbone-agnostic; block-boundary exact) ─────────
@@ -296,11 +288,12 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
     def decode_spd_dcd(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
-        max_length: int = 128, diffusion_steps: int = 64, tau_dec: float = 0.75, top_k: int = 1, 
+        max_length: int = 128, diffusion_steps: int = 64, tau_dec: float = 0.75, top_k: int = 1,
         spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
-        decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None, 
-        top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16, window_block_clip: bool = True,
+        decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
+        top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16,
+        omega_bias: torch.Tensor | None = None,
     ) -> SPDDecodeResult:
         batch = enc_hidden.shape[0]
         token_ids = torch.full(
@@ -309,12 +302,20 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         )
         token_ids[:, 0] = int(self.bos_index)
 
-        if cache_type == "prefix" and window_type == "static": 
+        if cache_type == "prefix" and window_type == "static" and omega_bias is None:
             logits_fn = self._make_static_prefix_cache_logits_fn(enc_hidden, enc_mask)
+        elif cache_type == "prefix" and window_type == "static":
+            # The prefix KV-cache path does not carry the membership-gate bias (its cached forward bypasses the
+            # cross-attn-bias arg). When Ω is active — the Mode-2a CB decode under the gate — fall back to the
+            # exact no-cache path so the gated decode is CORRECT (slower, but CB is training-time machinery and
+            # decodes a short canvas). Cold-start streaming inference already uses cache_type='none'.
+            def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None) -> torch.Tensor:
+                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
         elif cache_type == "none":
             def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None) -> torch.Tensor:
                 # inputs_embeds=None -> _decode embeds `ids` itself; otherwise it uses the SPD soft-embedding mixture.
-                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds)
+                # omega_bias is fixed conditioning: identical across every denoising step of this single decode.
+                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
         else: raise NotImplementedError(
             "Only cache_type='none' or cache_type='prefix'+window_type='static' are implemented (both verified "
             "for the mT5 and mBART decoders); sliding/dual cache requires a separate verified port."
@@ -327,9 +328,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             window_length=window_length or self.block_size, max_window_length=max_window_length,
             window_type=window_type, decode_algo=decode_algo, decode_param=decode_param,
             sample_top_k=sample_top_k, top_p=top_p, cache_type=cache_type, refresh_count=refresh_count,
-            # This decoder is block-causal, so the DCD window must not span
-            # attention blocks (see spd_dcd_decode docstring). False = ablation.
-            block_size=self.block_size if window_block_clip else None,
+            # This decoder is block-causal, so the DCD window must not span attention blocks (see spd_dcd_decode docstring).
+            block_size=self.block_size,
         )
 
 

@@ -9,10 +9,12 @@ from transformers.modeling_outputs import BaseModelOutput
 from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 from models.bio_head import RoPEBIOHead
 from models.front_end import SLTFrontEnd
+from models.membership_gate import build_omega, omega_cross_bias
+from infer.commit_gate import open_span_start, select_target_span
 
 
 @dataclass
-class Stage2LossOutput:
+class SLTLossOutput:
     loss: torch.Tensor
     bio_loss: torch.Tensor
     translation_loss: torch.Tensor
@@ -67,6 +69,82 @@ class MisalignedSLTModel(nn.Module):
         )
         return bio_tap, bio_mask, enc_hidden, enc_mask, timestamps
 
+    @staticmethod
+    def _span_iou(a: tuple[int, int] | None, b: tuple[int, int] | None) -> float:
+        # tIoU of 2 [start, terminator) frame spans; 0 if either is missing.
+        if a is None or b is None: return 0.0
+        lo = max(a[0], b[0]); hi = min(a[1], b[1])
+        inter = max(0, hi - lo)
+        union = (a[1] - a[0]) + (b[1] - b[0]) - inter
+        return inter / union if union > 0 else 0.0
+
+    def build_gate_omega(
+        self, bio_logits: torch.Tensor, bio_labels: torch.Tensor | None, frame_mask: torch.Tensor,
+        memory_len: int, commit_mask: torch.Tensor | None = None,
+        delta: int = 3, eps: float = 1e-4, min_span_frames: int = 0,
+        iou_veto: float = 0.5, gt_anchored: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Build the membership-gate cross-attention bias (B,1,1,M) for a batch (docs/membership_gate.md).
+
+        The per-window selected span (s, τ) is ON-POLICY — from the BIO head's OWN argmax (`select_target_span`,
+        the SAME rule the streaming FSM uses) — so training and inference see the same imperfect gate (§1.3).
+        At training, `bio_labels` (the true B/I/O, already in window-relative frames) provides the GT span for
+        the IoU veto (§1.5) — the honest residue of teacher forcing: where the predicted target overlaps GT at
+        IoU < `iou_veto`, the span is rebuilt from the GT anchor for that window only (train-only rail, rate
+        logged). `gt_anchored=True` forces the GT span (the always-GT ablation). At INFERENCE `bio_labels=None`:
+        no GT, no veto — the predicted span is used verbatim, which is exactly the deployed behaviour.
+        """
+        B, T, _ = bio_logits.shape
+        device = bio_logits.device
+        lengths = frame_mask.to(device).long().sum(dim=1) if frame_mask is not None else torch.full((B,), T, device=device)
+        pred_tags = bio_logits.detach().argmax(dim=-1)  # selection carries no gradient (§0)
+
+        starts, terms, has_term = [], [], []
+        vetoed, n_gt = 0, 0  # veto rate is over windows that HAVE a GT target (§1.6 diagnostic)
+        for b in range(B):
+            n = int(lengths[b].item())
+            pred = select_target_span(pred_tags[b, :n], min_span_frames)
+            if bio_labels is None: span = pred  # inference: on-policy, no veto, no GT
+            else:
+                gt = select_target_span(bio_labels[b, :n], min_span_frames)
+                if gt is not None: n_gt += 1
+                if gt_anchored:                 # always-GT ablation row
+                    span = gt
+                    if gt is not None: vetoed += 1
+                elif gt is not None and (pred is None or self._span_iou(pred, gt) < float(iou_veto)):
+                    span = gt; vetoed += 1       # policy failed on a window that had a target → veto to GT
+                else: 
+                    span = pred
+                
+            if span is not None:
+                starts.append(int(span[0])); terms.append(int(span[1])); has_term.append(True)
+            else:
+                # No TERMINATED span. If an OPEN (terminator-less) span runs to the buffer edge — Mode-2a
+                # right-truncation or a buffer-cap forced commit — anchor Ω at ITS true start s (doc §2.8 forced
+                # path: γ≡γ_s, no right cliff → Ω≈0 for the all-I interior). Anchoring at frame 0 instead would
+                # sweep the opening B and floor the entire span the gate is meant to OPEN (attention ×0.01). Use
+                # the GT open start at training (honest teacher-forced anchor for cb_omega_trunc), else predicted.
+                src = bio_labels[b, :n] if bio_labels is not None else pred_tags[b, :n]
+                open_s = open_span_start(src)
+                if open_s is None and bio_labels is not None:
+                    open_s = open_span_start(pred_tags[b, :n])
+                if open_s is not None:
+                    starts.append(int(open_s)); terms.append(-1); has_term.append(False)
+                else:
+                    # Genuinely no span (all-gap / buffer-start-I leftover). Ω here is never decoded — the FSM
+                    # skips these (all-gap → no target; left-truncated → forced_tail_policy 'skip') — so the value
+                    # is inert; anchor past the end so logm stays ≈0 rather than suppressing from frame 0.
+                    starts.append(max(0, n - 1)); terms.append(-1); has_term.append(False)
+
+        out = build_omega(
+            bio_logits,
+            starts=torch.tensor(starts, device=device), terminators=torch.tensor(terms, device=device), commit_mask=commit_mask, 
+            lengths=lengths, delta=delta, eps=eps, has_terminator=torch.tensor(has_term, device=device),
+        )
+        omega_bias = omega_cross_bias(out.omega, memory_len=int(memory_len), dtype=bio_logits.dtype)
+        stats = {"veto_rate": vetoed / max(1, n_gt), "gamma_s_mean": float(out.gamma_s.mean())}
+        return omega_bias, stats
+
 
     @torch.no_grad()
     def generate_from_bio_tap(
@@ -74,8 +152,8 @@ class MisalignedSLTModel(nn.Module):
         tau_dec: float = 0.75, spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none",  dcd_refresh_count: int = 16, 
-        decoder_start_token_id: int | None = None, num_beams: int = 1,
+        dcd_top_p: float | None = None, dcd_cache_type: str = "none",  dcd_refresh_count: int = 16,
+        decoder_start_token_id: int | None = None, num_beams: int = 1, omega_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         enc_hidden, enc_mask = self.front_end.encode_memory(bio_tap, frame_mask)
         if self.decoder_type == "dlm":
@@ -84,61 +162,66 @@ class MisalignedSLTModel(nn.Module):
                 tau_dec=tau_dec, top_k=spd_top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision, temperature=temperature,
                 window_length=dcd_window_length, max_window_length=dcd_max_window_length, window_type=dcd_window_type,
                 decode_algo=dcd_decode_algo, decode_param=dcd_decode_param, sample_top_k=dcd_sample_top_k,
-                top_p=dcd_top_p, cache_type=dcd_cache_type, refresh_count=dcd_refresh_count,
+                top_p=dcd_top_p, cache_type=dcd_cache_type, refresh_count=dcd_refresh_count, omega_bias=omega_bias,
             )
             return result.sequences, result.confidence
 
         # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns the
         # REAL per-token confidence (softmax prob of each produced token), aligned with `generated`. `num_beams>1`
-        # is the clean-baseline beam search; the stage-2 AR arm stays greedy (num_beams=1) for the §9.3 contrast.
+        # is the clean-baseline beam search; the SLT AR arm stays greedy (num_beams=1) for the §9.3 contrast.
+        # Under `omega_bias`, cross-attention is membership-gated per step (same Ω the DLM decode uses).
         return self.front_end.ar_generate(
             enc_hidden, enc_mask, max_new_tokens=max_text_tokens, num_beams=num_beams,
-            decoder_start_id=decoder_start_token_id,
+            decoder_start_id=decoder_start_token_id, omega_bias=omega_bias,
         )
 
 
     def _ar_confidence_bound_logits(
-        self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, 
-        max_len: int, diffusion_steps: int, tau_dec: float,
+        self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, max_len: int, omega_bias=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return gradient-carrying AR logits on the truncated model path.
 
-        `generate_from_bio_tap` is intentionally called under no-grad to choose the AR prefix. The subsequent forward pass 
-        replays that prefix and keeps gradients in the logits used by the confidence-bound CE term.
+        `generate_from_bio_tap` is intentionally called under no-grad to choose the AR prefix. The subsequent forward pass
+        replays that prefix and keeps gradients in the logits used by the confidence-bound CE term. When the gate is on,
+        BOTH the prefix generation and the grad-bearing replay run under the same Ω conditioning (the replay's gradient
+        into the BIO logits through Ω is part of the coupling on Mode-2a as well). (AR is not a diffusion decoder, so
+        diffusion_steps/tau_dec don't apply here — the DLM arm's CB path uses them, this one doesn't.)
         """
-        del diffusion_steps, tau_dec
         with torch.no_grad():
-            trunc_tokens, _ = self.generate_from_bio_tap(bio_tap, frame_mask, max_text_tokens=max(1, max_len - 1))
+            trunc_tokens, _ = self.generate_from_bio_tap(
+                bio_tap, frame_mask, max_text_tokens=max(1, max_len - 1), omega_bias=omega_bias
+            )
             trunc_tokens = self._pad_or_trim_tokens(trunc_tokens, max_len)
 
         enc_hidden, enc_mask = self.front_end.encode_memory(bio_tap, frame_mask)
-        out = self.front_end.lm_model(
-            encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
-            decoder_input_ids=trunc_tokens[:, :-1].contiguous(), use_cache=False, return_dict=True,
-        )
+        with self.front_end.ar_omega_context(omega_bias):
+            out = self.front_end.lm_model(
+                encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,
+                decoder_input_ids=trunc_tokens[:, :-1].contiguous(), use_cache=False, return_dict=True,
+            )
         return out.logits, trunc_tokens
 
 
     @torch.no_grad()
     def generate_from_poses(
-        self, poses: torch.Tensor, frame_mask: torch.Tensor, 
-        timestamps_s: torch.Tensor | None = None, max_text_tokens: int = 128, diffusion_steps: int = 64, 
-        tau_dec: float = 0.75, spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
-        dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
-        dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none", dcd_refresh_count: int = 16, 
-        decoder_start_token_id: int | None = None, num_beams: int = 1,
+        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
+        gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
+        commit_mask: torch.Tensor | None = None, **decode_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Poses → (bio_logits, tokens, confidence). This method owns the BIO tap + the membership gate; every
+        decode knob (max_text_tokens / diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id)
+        passes straight through to `generate_from_bio_tap` — declared once, there, not re-listed here."""
         bio_tap, mask, ts = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
         bio_logits = self.bio_head(bio_tap, timestamps_s=ts).logits
-        tokens, confidence = self.generate_from_bio_tap(
-            bio_tap, mask, max_text_tokens=max_text_tokens, diffusion_steps=diffusion_steps, tau_dec=tau_dec,
-            spd_top_k=spd_top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision, temperature=temperature,
-            dcd_window_length=dcd_window_length, dcd_max_window_length=dcd_max_window_length, dcd_window_type=dcd_window_type,
-            dcd_decode_algo=dcd_decode_algo, dcd_decode_param=dcd_decode_param, dcd_sample_top_k=dcd_sample_top_k, 
-            dcd_top_p=dcd_top_p, dcd_cache_type=dcd_cache_type, dcd_refresh_count=dcd_refresh_count, 
-            decoder_start_token_id=decoder_start_token_id, num_beams=num_beams,
+        # Membership gate at inference: on-policy span from the head's own argmax (bio_labels=None → no veto),
+        # χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in training (§1.3/§2.8).
+        # Both arms: the DLM injects Ω in its decode; the AR arm via HF cross-attn hooks (front_end.ar_generate).
+        omega_bias = None
+        if gate_enabled: omega_bias, _ = self.build_gate_omega(
+            bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]),
+            commit_mask=commit_mask, delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
         )
+        tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
         return bio_logits, tokens, confidence
 
 
@@ -153,7 +236,9 @@ class MisalignedSLTModel(nn.Module):
         cb_dcd_decode_algo: str = "threshold", cb_dcd_decode_param: int | float | None = None, cb_dcd_sample_top_k: int | None = None,
         cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_dcd_refresh_count: int = 16,
         cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, cb_spd_revision: bool = True, cb_temperature: float = 0.0,
-    ) -> Stage2LossOutput:
+        gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
+        gate_iou_veto: float = 0.5, gate_gt_anchored: bool = False,
+    ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
         Computes ``L = L_BIO + lambda_trans * L_translation`` where the translation term is routed *per window mode* (the batch carries 
@@ -168,7 +253,7 @@ class MisalignedSLTModel(nn.Module):
           gradient uses 1 cheap re-masked forward rather than back-prop through the decode.
         - **Mode 2b / 2c / Mode 4** (left/both-truncated, all-gap): no translation loss (the model must stay silent / not hallucinate text).
 
-        Per-mode losses logged separately. Returns `Stage2LossOutput` with the total, the BIO and translation components, and a `logs` dict.
+        Per-mode losses logged separately. Returns `SLTLossOutput` with the total, the BIO and translation components, and a `logs` dict.
         """
         bio_tap, bio_mask, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
         bio_out = self.bio_head(bio_tap, timestamps_s=timestamps)
@@ -177,6 +262,21 @@ class MisalignedSLTModel(nn.Module):
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
+
+        # Membership gate (docs/membership_gate.md): build the (B,1,1,M) cross-attention bias Ω from the BIO
+        # posteriors + the on-policy selected span, so the decoder is CONDITIONED on the segmentation belief
+        # (the coupling — gradient from the translation loss reaches the BIO logits through Ω). BOTH arms: the
+        # DLM injects Ω in its manual decode; the AR arm injects the same Ω via HF cross-attn hooks
+        # (front_end.ar_omega_context) — so §9.3 is gated-vs-gated, isolating the decoder family. None → pre-gate.
+        omega_bias = None
+        if gate_enabled:
+            omega_bias, gate_stats = self.build_gate_omega(
+                bio_out.logits, batch["bio_labels"], batch.get("frame_mask"), memory_len=int(enc_hidden.shape[1]), 
+                commit_mask=batch.get("commit_mask"), delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
+                iou_veto=gate_iou_veto, gt_anchored=gate_gt_anchored,
+            )
+            logs["gate_veto_rate"] = bio_tap.new_tensor(gate_stats["veto_rate"])
+            logs["gate_gamma_s_mean"] = bio_tap.new_tensor(gate_stats["gamma_s_mean"])
 
         if target_tokens is not None and supervised is not None and supervised.any():
             idx = supervised.to(device=bio_tap.device).nonzero(as_tuple=False).flatten()
@@ -191,7 +291,6 @@ class MisalignedSLTModel(nn.Module):
                 )
                 for mode in ("mode1", "mode3"):
                     selected = [int(i) for i in idx_list if mode_names[int(i)] == mode]
-                    # logs[f"translation_{mode}_count"] = bio_tap.new_tensor(float(len(selected)))
                     if selected: mode_to_indices[mode] = torch.tensor(selected, dtype=torch.long, device=bio_tap.device)
 
             if self.decoder_type == "ar":
@@ -200,18 +299,21 @@ class MisalignedSLTModel(nn.Module):
                     weighted_losses: list[tuple[torch.Tensor, torch.Tensor]] = []
 
                     for mode, mode_idx in mode_to_indices.items():
-                        loss = self.front_end.ar_loss(enc_hidden[mode_idx], enc_mask[mode_idx], labels[mode_idx])
+                        loss = self.front_end.ar_loss(
+                            enc_hidden[mode_idx], enc_mask[mode_idx], labels[mode_idx],
+                            omega_bias=None if omega_bias is None else omega_bias[mode_idx]
+                        )
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=loss.dtype).clamp(min=1)
                         weighted_losses.append((loss, weight))
-                        # logs[f"ar_{mode}_ce_loss"] = loss.detach()
 
                     total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
                     translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
-                    # logs["ar_ce_loss"] = translation_loss.detach()
                 else:
-                    translation_loss = self.front_end.ar_loss(enc_hidden[idx], enc_mask[idx], labels[idx])
-                    # logs["ar_ce_loss"] = translation_loss.detach()
+                    translation_loss = self.front_end.ar_loss(
+                        enc_hidden[idx], enc_mask[idx], labels[idx],
+                        omega_bias=None if omega_bias is None else omega_bias[idx]
+                    )
             else:
                 labels = target_tokens["labels"].to(bio_tap.device)
                 if mode_to_indices:
@@ -223,35 +325,33 @@ class MisalignedSLTModel(nn.Module):
                             labels=labels[mode_idx], t_low=oput_t_low, t_high=oput_t_high,
                             loss_over_all_positions=True, sample_rollout=oput_sample_rollout,
                             rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=oput_eos_supervision,
-                            rollout_encode_fn=(self.front_end.eval_encode_memory_fn(bio_tap[mode_idx], bio_mask[mode_idx])
-                                               if oput_rollout_eval_mode else None),
+                            rollout_encode_fn=(
+                                self.front_end.eval_encode_memory_fn(bio_tap[mode_idx], bio_mask[mode_idx])
+                                if oput_rollout_eval_mode else None
+                            ),
+                            omega_bias=None if omega_bias is None else omega_bias[mode_idx],
                         )
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=dlm_out["translation_loss"].dtype).clamp(min=1)
                         weighted_losses.append((dlm_out["translation_loss"], weight))
                         masked_weights.append((dlm_out["oput_masked_fraction"], weight))
 
-                        # logs[f"oput_{mode}_loss"] = dlm_out["translation_loss"].detach()
-                        # logs[f"oput_{mode}_mask_loss"] = dlm_out["oput_mask_loss"]
-                        # logs[f"oput_{mode}_pred_loss"] = dlm_out["oput_pred_loss"]
-                        # logs[f"oput_{mode}_masked_fraction"] = dlm_out["oput_masked_fraction"]
 
                     total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
                     translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
-                    # logs["oput_loss"] = translation_loss.detach()
-                    # logs["oput_masked_fraction"] = (sum(value * weight for value, weight in masked_weights) / total_weight).detach()
                 else:
                     dlm_out = self.dlm_decoder.oput_forward(
                         enc_hidden=enc_hidden[idx], enc_mask=enc_mask[idx],
                         labels=labels[idx], t_low=oput_t_low, t_high=oput_t_high,
                         loss_over_all_positions=True, sample_rollout=oput_sample_rollout,
                         rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=oput_eos_supervision,
-                        rollout_encode_fn=(self.front_end.eval_encode_memory_fn(bio_tap[idx], bio_mask[idx]) 
-                                           if oput_rollout_eval_mode else None),
+                        rollout_encode_fn=(
+                            self.front_end.eval_encode_memory_fn(bio_tap[idx], bio_mask[idx])
+                            if oput_rollout_eval_mode else None
+                        ),
+                        omega_bias=None if omega_bias is None else omega_bias[idx],
                     )
                     translation_loss = dlm_out["translation_loss"]
-                    # logs["oput_loss"] = translation_loss.detach()
-                    # logs["oput_masked_fraction"] = dlm_out["oput_masked_fraction"]
 
         if (confidence_bound_enabled and confidence_bound_active and batch.get("full_evidence") is not None
             and batch.get("full_evidence_indices") is not None and batch["full_evidence_indices"].numel() > 0
@@ -265,6 +365,26 @@ class MisalignedSLTModel(nn.Module):
             ref_mask = batch["reference_tokens"]["attention_mask"].to(bio_tap.device)[cb_indices].bool()
             max_len = ref_ids.shape[1]
 
+            # Membership gate for the Mode-2a CB decodes (both arms, so §9.3 stays symmetric): the truncated
+            # decode is gated by Ω from its own posteriors (on-policy); the full-evidence self-target by Ω from
+            # the full view's posteriors. None when the gate is off. Both trunc decodes/forwards share cb_omega_trunc.
+            cb_omega_trunc = cb_omega_full = None
+            if gate_enabled:
+                prompt_len = self.front_end.prompt_length()
+                chi = batch.get("commit_mask")
+                cb_omega_trunc, _ = self.build_gate_omega(
+                    bio_out.logits[cb_indices],
+                    batch.get("bio_labels")[cb_indices] if batch.get("bio_labels") is not None else None,
+                    bio_mask[cb_indices], memory_len=prompt_len + int(bio_tap.shape[1]),
+                    commit_mask=chi[cb_indices] if chi is not None else None,
+                    delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, iou_veto=gate_iou_veto,
+                )
+                full_cb_bio_logits = self.bio_head(full_bio_tap).logits
+                cb_omega_full, _ = self.build_gate_omega(
+                    full_cb_bio_logits, None, full_mask, memory_len=prompt_len + int(full_bio_tap.shape[1]),
+                    delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
+                )
+
             if self.decoder_type == "dlm":
                 # Encode the truncated path ONCE, grad-bearing (the no-grad decode below won't track it; remasked_logits
                 # later does). Encoding belongs to the front end, not the decoder (unified enc_hidden interface).
@@ -272,24 +392,23 @@ class MisalignedSLTModel(nn.Module):
                 with torch.no_grad():
                     full_enc_hidden, full_enc_mask = self.front_end.encode_memory(full_bio_tap, full_mask)
                     full_decode = self.dlm_decoder.generate_spd_dcd(
-                        enc_hidden=full_enc_hidden, enc_mask=full_enc_mask, max_length=max_len, 
-                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k, 
+                        enc_hidden=full_enc_hidden, enc_mask=full_enc_mask, max_length=max_len,
+                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count,
+                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count, omega_bias=cb_omega_full,
                     )
                     full_tokens = full_decode.sequences
 
-                    # The gate reads the confidence/argmax the *real* decode produces
-                    # (what DCD sees at inference), so this stays under no_grad.
+                    # The gate reads the confidence/argmax the *real* decode produces (what DCD sees at inference), so this stays under no_grad.
                     trunc_decode = self.dlm_decoder.decode_spd_dcd(
-                        enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len, 
-                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k, 
+                        enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len,
+                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count,
+                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count, omega_bias=cb_omega_trunc,
                     )
                 trunc_tokens = trunc_decode.sequences
                 trunc_confidence = trunc_decode.confidence
@@ -309,25 +428,25 @@ class MisalignedSLTModel(nn.Module):
                     verified_full_evidence_gate=verified_full_evidence_gate, pad_token_id=self.tokenizer.pad_token_id,
                 )
                 if cb_active_mask.any(): trunc_logits = self.dlm_decoder.remasked_logits(
-                    enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask,
-                    decoded_tokens=trunc_tokens, remask_positions=cb_active_mask,
+                    enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, decoded_tokens=trunc_tokens, 
+                    remask_positions=cb_active_mask, omega_bias=cb_omega_trunc,
                 )
-                else:
-                    trunc_logits = None
-                    # logs["confidence_bound_loss"] = bio_tap.new_tensor(0.0)
-                    # logs["confidence_bound_active"] = bio_tap.new_tensor(0.0)
+                else: trunc_logits = None
             else:
+                # AR Mode-2a: reuse the shared cb_omega_full / cb_omega_trunc built above the arm split, so the
+                # DLM and AR CB paths are gated symmetrically (§9.3).
                 with torch.no_grad():
-                    full_tokens, _ = self.generate_from_bio_tap(full_bio_tap, full_mask, max_text_tokens=max(1, max_len - 1))
+                    full_tokens, _ = self.generate_from_bio_tap(
+                        full_bio_tap, full_mask, max_text_tokens=max(1, max_len - 1), omega_bias=cb_omega_full
+                    )
                     full_tokens = self._pad_or_trim_tokens(full_tokens, max_len)
 
                 trunc_logits, _ = self._ar_confidence_bound_logits(
-                    bio_tap[cb_indices], bio_mask[cb_indices], max_len=max_len,
-                    diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau,
+                    bio_tap[cb_indices], bio_mask[cb_indices], max_len=max_len, omega_bias=cb_omega_trunc,
                 )
-                # AR decode layout is [lang, tok1, ..., eos] (decoder start fixed to language code, matching mBART's training-time shift), so 
-                # after dropping the start token, slot j of full_tokens[:, 1:] lines up with reference slot j ([tok1, ..., eos, lang]); the loss's 
-                # min-length slicing trims the dangling lang code. Do NOT slice the reference too — that would shift the verified gate off by one.
+                # AR decode layout is [lang, tok1, ..., eos] (decoder start fixed to language code, matching mBART's training-time shift), 
+                # so after dropping the start token, slot j of full_tokens[:, 1:] lines up with reference slot j ([tok1, ..., eos, lang]); 
+                # Loss's min-length slicing trims the dangling lang code. DON'T slice reference too — that shifts verified gate off by 1.
                 full_tokens = full_tokens[:, 1:]
                 trunc_tokens, trunc_confidence = None, None
                 cb_ref_ids, cb_ref_mask, cb_active_mask = ref_ids, ref_mask, None
@@ -340,23 +459,8 @@ class MisalignedSLTModel(nn.Module):
                     enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
                 )
                 translation_loss = translation_loss + float(cb_lambda) * cb.loss
-                # logs["confidence_bound_loss"] = cb.loss.detach()
-                # logs["confidence_bound_active"] = cb.active_count.detach().float()
-
-        if confidence_bound_enabled and confidence_bound_active and "trunc_decode_logits" in batch and "full_decode_tokens" in batch:
-            cb = confidence_bound_loss(
-                trunc_logits=batch["trunc_decode_logits"].to(bio_tap.device),
-                full_tokens=batch["full_decode_tokens"].to(bio_tap.device),
-                reference_tokens=batch.get("reference_tokens", {}).get("input_ids", None).to(bio_tap.device)
-                if isinstance(batch.get("reference_tokens"), dict) else None,
-                tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
-                enabled=True, pad_token_id=self.tokenizer.pad_token_id,
-            )
-            translation_loss = translation_loss + float(cb_lambda) * cb.loss
-            # logs["confidence_bound_loss"] = cb.loss.detach()
-            # logs["confidence_bound_active"] = cb.active_count.detach().float()
 
         total = bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()
         logs["loss"] = total.detach()
-        return Stage2LossOutput(total, bio_loss, translation_loss, logs)
+        return SLTLossOutput(total, bio_loss, translation_loss, logs)

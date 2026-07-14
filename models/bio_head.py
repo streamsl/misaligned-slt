@@ -84,7 +84,8 @@ def chunked_rope_encode(
 ) -> torch.Tensor:
     """Run pre-norm RoPE layers over fixed-size chunks (Moryossef chunked inference).
 
-    Shared by `RoPEBIOHead` and `MoryossefSegmenter`. Each chunk attends only within itself; RoPE relative time in seconds keeps 
+    Shared by both segmenters' RoPE stacks: the in-system `RoPEBIOHead` (BioS1Model) and the analysis
+    `MoryossefSegmenter.encoder_attn`. Each chunk attends only within itself; RoPE relative time in seconds keeps
     positions consistent across chunk boundaries, which is what makes train-size chunked eval match the training distribution. 
     `chunk_size=None` (or T <= chunk_size) is a single full pass. Timestamps are dim-normalized up front so 1-D inputs are not 
     silently dropped on the chunked path (which would fall back to the 50fps index assumption and break fps-augmented inputs).
@@ -123,12 +124,12 @@ class ClassifierHead(nn.Module): # Two-layer MLP classifier: hidden_dim → hidd
 class TemporalConvStem(nn.Module):
     """Residual stride-1 temporal Conv1d stem restoring the local boundary inductive bias of Moryossef 2026's UNet front-end.
 
-    The standalone segmenter (moryossef26/model.py) keeps the full UNet CNN before its RoPE layers, and Moryossef's ablations 
-    attribute precise boundary placement to exactly those skip-connection convolutions (EXPERIMENTS.md finding 23 "UNet skip 
-    connections are critical for sign boundary precision"; finding 8 "CNN naturally detects B"). This in-model BIO head reads 
-    pose-token features DIRECTLY with no UNet, so without a conv stem it is structurally a transformer/BiLSTM-style tagger, which 
-    Moryossef shows is weak on B / boundary localization — and that directly feeds the commit gate's I→O δ_enc stability and 
-    RQ2 tIoU. This stem is the cheap middle ground (spec §4.4 wants the head small, so this is 2 conv layers, not the full UNet).
+    Moryossef 2026's segmenter keeps a full UNet CNN before its RoPE layers, and their ablations attribute precise boundary placement to 
+    exactly those skip-connection convolutions (EXPERIMENTS.md finding 23 "UNet skip connections are critical for sign boundary precision"; 
+    finding 8 "CNN naturally detects B"). This in-model BIO head reads pose-token features DIRECTLY with no UNet, so without a conv stem 
+    it is structurally a transformer/BiLSTM-style tagger, which Moryossef shows is weak on B / boundary localization — and that directly 
+    feeds the commit gate's I→O δ_enc stability and RQ2 tIoU. This stem is the cheap middle ground (We wants the head small, so this is 
+    2 conv layers, not the full UNet).
 
     Stride 1 + odd kernel + 'same' padding keeps the sequence length, so per-frame BIO labels stay aligned. Normalization is per-position 
     RMSNorm (over channels only): length- and batch-independent, so it introduces no train/inference mismatch over the growing streaming 

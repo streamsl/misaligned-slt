@@ -1,6 +1,5 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from types import SimpleNamespace
 from statistics import median
 from pathlib import Path
 import json, argparse, math
@@ -9,13 +8,17 @@ import torch
 import numpy as np
 from data.loader import load_language_records
 from poses import load_pose_window
-from moryossef26.infer import load_prediction_file, load_segmenter_for_inference, predict_phrase_segments, save_prediction_file
-from moryossef26.trainer import build_segmenter
 
-from infer.commit_gate import first_closing_o_index
-from eval import _build_eval_model, _translate_window
+from infer.commit_gate import first_terminator_index
+from eval import _build_eval_model, _translate_window, load_prediction_file, save_prediction_file
 from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
-from utils import load_yaml, update_yaml_scalar, checkpoint_dir
+from utils import load_yaml, update_yaml_scalar, pick_device, pretrained_checkpoint, checkpoint_dir
+
+# Analysis-A pred↔GT matching bar: deliberately LOW so near-misses count as matched pairs feeding the 
+# (Δ_head, Δ_tail) jitter CDF, not as phantom/skip events. A high bar biases the DF toward near-zero 
+# offsets and miscalibrates the mode ratios. A corpus-level analysis knob, not a segmenter setting, 
+# so it lives here; override per-run with --tiou-threshold.
+ANALYSIS_A_MATCH_TIOU = 0.1
 
 
 @dataclass(frozen=True)
@@ -202,31 +205,84 @@ def dataset_summary(args: argparse.Namespace) -> dict:
     }
 
 
+def _load_segmenter(args):
+    """Build + load a trained segmenter by --segmenter-arch (shared by segmenter-infer and segmenter-eval).
+
+    external (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
+    head — the non-circular Analysis-A/B / RQ2-cascade instrument, gate-doc §1.4). s1: the in-system BIO head, an
+    ablation that swaps the same Uni-Sign head in to isolate system design from segmentation competence.
+    Returns (model, device, velocity, rope_chunk, checkpoint).
+    """
+    device = pick_device(args.device)
+    if args.segmenter_arch == "s1":
+        from train.bio_pretrain import build_bio_s1_model
+        cfg = load_yaml(args.bio_config)
+        model = build_bio_s1_model(cfg)
+        ckpt_default = f"checkpoints/bio_s1/{args.language}"
+        # Uni-Sign features; whole-video chunked RoPE at ~the deployment buffer scale (rope_eval_chunk in
+        # bio_pretrain.yaml ≈ BUFFER_CAP_S×fps) — the S1 head runs in the FSM on a buffer capped at BUFFER_CAP_S.
+        velocity, rope_chunk = False, int(cfg.get("rope_eval_chunk", 1024))
+    else:
+        from moryossef26.trainer import build_segmenter
+        cfg = load_yaml(args.segmenter_config)
+        model = build_segmenter(args.segmenter_config)
+        ckpt_default = f"checkpoints/segmenter/{args.language}"
+        velocity, rope_chunk = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
+    checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=ckpt_default)) / "model.pt")
+    blob = torch.load(checkpoint, map_location="cpu")
+    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
+    return model, device, velocity, rope_chunk, checkpoint
+
+
 def segmenter_infer(args: argparse.Namespace) -> dict:
-    if args.split == "test" and not args.allow_test: 
+    """Predicted phrase segments on a split — the upstream segmenter for Analysis A / Analysis B / the RQ2 cascade."""
+    if args.split == "test" and not args.allow_test:
         raise SystemExit("Refusing to run segmenter inference on test without --allow-test")
-    cfg = load_yaml(args.data_config)
-    records, _ = load_language_records(cfg, args.language, split=args.split)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = build_segmenter(args.segmenter_config)
-    load_segmenter_for_inference(args.checkpoint, model, device)
-    seg_cfg = load_yaml(args.segmenter_config)
-    predictions = predict_phrase_segments(model, records, device=device, velocity=bool(seg_cfg.get("velocity", True)))
-    output = Path(args.output or f"outputs/segmenter_predictions_{args.language}_{args.split}.json")
+    from moryossef26.infer import predict_phrase_segments
+    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
+    print(f"[segmenter-infer] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
+
+    predictions = predict_phrase_segments(model, records, device=device, velocity=velocity, rope_chunk=rope_chunk)
+    output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
     save_prediction_file(predictions, output)
     return {
         "language": args.language, "split": args.split, "videos": len(records),
+        "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "predicted_segments": sum(len(v) for v in predictions.values()), "output": str(output),
     }
+
+
+def segmenter_eval(args: argparse.Namespace) -> dict:
+    """Standalone whole-video segmentation eval (Moryossef evaluate.py protocol): frame-F1 + one-to-one tIoU segment
+    P/R/F1 on a split. Works for either --segmenter-arch — including `s1`, so the in-system BIO head can be scored on
+    its own after train-bio, without waiting for joint fine-tuning.
+    """
+    if args.split == "test" and not args.allow_test:
+        raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
+    from moryossef26.infer import evaluate_segmenter_whole_video
+    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
+    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
+
+    metrics = evaluate_segmenter_whole_video(model, records, device=device, velocity=velocity, rope_chunk=rope_chunk)
+    payload = {
+        "language": args.language, "split": args.split, "videos": len(records),
+        "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint, "metrics": metrics,
+    }
+    output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload["output"] = str(output)
+    return payload
 
 
 def analysis_a(args: argparse.Namespace) -> dict:
     if args.split == "test" and not args.allow_test:
         raise SystemExit("Analysis A must run on dev; use --allow-test only for smoke debugging")
     cfg = load_yaml(args.data_config)
-    seg_cfg = load_yaml(args.segmenter_config)
     records, _ = load_language_records(cfg, args.language, split=args.split)
-    predictions = load_prediction_file(args.predictions)
+    predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
     gold_segments = {
         record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences]
         for record in records
@@ -234,7 +290,7 @@ def analysis_a(args: argparse.Namespace) -> dict:
     durations = {record.video_id: float(record.pose.duration_s) for record in records}
     analysis = analyze_segmenter_errors(
         predicted=predictions, gold=gold_segments, durations=durations,
-        tiou_threshold=float(args.tiou_threshold or seg_cfg.get("match_tiou_threshold", 0.1)),
+        tiou_threshold=float(args.tiou_threshold if args.tiou_threshold is not None else ANALYSIS_A_MATCH_TIOU),
     )
     paths = write_analysis_a_outputs(analysis, args.output_dir, args.language)
     return {
@@ -245,25 +301,88 @@ def analysis_a(args: argparse.Namespace) -> dict:
 
 
 def _eval_model_for(method: str, args: argparse.Namespace, method_cfg: dict, device: torch.device):
-    # Reuse eval.py's checkpoint-loading model builder via a minimal namespace.
+    # Reuse eval.py's checkpoint-loading model builder (plain scalars — no fake namespace).
     data_cfg = load_yaml(args.data_config)
-    ns = SimpleNamespace(method=method, checkpoint=args.checkpoint, language=args.language)
-    return _build_eval_model(ns, data_cfg, method_cfg, device)
+    return _build_eval_model(method, args.checkpoint, args.language, data_cfg, method_cfg, device)
+
+
+def analysis_b(args: argparse.Namespace) -> dict:
+    """Analysis B (§8.2) — the paper's MOTIVATING experiment: a CLEAN SLT model degrades under a REALISTIC
+    upstream segmenter's boundary errors. Runs on dev, before SLT training, and is method-INDEPENDENT (the clean
+    baseline is not our method). Produces the clean-vs-realistic headline table.
+
+    Realistic point: translate the windows the EXTERNAL segmenter actually cut (`--predictions`, the segmenter-infer
+    output), with each window's reference = the GT sentence it most overlaps. Clean point: translate the GT-trimmed
+    windows. The controlled severity CURVE (§8.2 Step 2b / §9.1 no-robustness floor) is the SAME machinery as
+    `eval.py --rq 1 --method baseline --split dev` — run that for the curve; this stage assembles the realistic gap.
+    """
+    if args.split == "test" and not args.allow_test:
+        raise SystemExit("Analysis B runs on dev; --allow-test only for smoke debugging")
+    if not args.predictions:
+        raise SystemExit("--predictions required: the external segmenter's spans (analyze.py --stage segmenter-infer)")
+    data_cfg = load_yaml(args.data_config)
+    base_cfg = load_yaml(args.baseline_config)
+    inference_cfg = load_yaml(args.inference_config)
+    device = pick_device(args.device)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    model, tokenizer = _eval_model_for("baseline", args, base_cfg, device)
+
+    def _translate(start_s, end_s, rec):
+        poses, ts = load_pose_window(rec.pose, start_s, end_s, normalize=True)
+        if poses.shape[0] == 0: return None
+        text, _ = _translate_window(model=model, tokenizer=tokenizer, method="baseline",
+                                    poses_np=poses, timestamps_np=ts, start_s=start_s,
+                                    device=device, inference_cfg=inference_cfg, method_cfg=base_cfg)
+        return text
+
+    # Clean point: GT-trimmed windows.
+    clean_pred, clean_ref = [], []
+    for rec in records:
+        for s in rec.sentences:
+            t = _translate(float(s.start_s), float(s.end_s), rec)
+            if t is not None: clean_pred.append(t); clean_ref.append(s.text)
+
+    # Realistic point: the external segmenter's predicted spans; reference = the max-overlap GT sentence.
+    predicted = load_prediction_file(args.predictions)
+    real_pred, real_ref = [], []
+    by_id = {r.video_id: r for r in records}
+    for vid, spans in predicted.items():
+        rec = by_id.get(vid)
+        if rec is None: continue
+        for span in spans:
+            best, best_ov = None, 0.0
+            for gt in rec.sentences:
+                ov = max(0.0, min(span.end_s, gt.end_s) - max(span.start_s, gt.start_s))
+                if ov > best_ov: best_ov, best = ov, gt
+            if best is None: continue  # phantom span in a gap → no GT reference; excluded from the corpus score
+            t = _translate(float(span.start_s), float(span.end_s), rec)
+            if t is not None: real_pred.append(t); real_ref.append(best.text)
+
+    clean = compute_text_metrics(clean_pred, clean_ref, prefix="clean") if clean_pred else {}
+    realistic = compute_text_metrics(real_pred, real_ref, prefix="realistic") if real_pred else {}
+    payload = {
+        "language": args.language, "split": args.split, "clean": clean, "realistic": realistic,
+        "clean_windows": len(clean_pred), "realistic_windows": len(real_pred),
+        "delta_bleu4": float(clean.get("clean_bleu4", 0.0) - realistic.get("realistic_bleu4", 0.0)),
+        "note": "Controlled severity curve = eval.py --rq 1 --method baseline --split dev (the §9.1 no-robustness floor).",
+    }
+    output = Path(args.output or f"outputs/analysis_b_{args.language}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload["output"] = str(output)
+    return payload
 
 
 def tail_benefit(args: argparse.Namespace) -> dict:
-    """Spec §8.3 — tail-benefit curve sets BUFFER_CAP_S.
+    """Tail-benefit curve sets BUFFER_CAP_S.
 
-    Protocol: clean-trained translator (the Analysis-B clean baseline), dev split, head fixed at the
-    true sentence start (Δ_head = 0), trailing context Δ_tail swept upward; BLEU-4 per Δ_tail. The
-    elbow is the first grid point whose marginal BLEU per extra second drops below the explicit
-    latency/quality coefficient (eval.yaml tail_benefit.latency_quality_coeff_bleu_per_s) — not a
-    hand-picked number and not a %-of-clean threshold.
+    Protocol: clean-trained translator (Analysis-B clean baseline), dev split, head fixed at true sentence start (Δ_head = 0), trailing 
+    context Δ_tail swept upward; BLEU-4 per Δ_tail. The elbow is 1st grid point whose marginal BLEU per extra second drops below explicit 
+    latency/quality coefficient (eval.yaml tail_benefit.latency_quality_coeff_bleu_per_s) — not hand-picked number or %-of-clean threshold.
 
-    Buffer-cap semantics (spec ambiguity resolved, documented): the spec says "this elbow is the
-    buffer cap", but the FSM buffer must hold the WHOLE sentence plus the trailing context, so a
-    1–3 s tail elbow alone cannot be the cap. We persist buffer_cap_s = p99 sentence duration +
-    elbow (both raw values are in the JSON artifact for the paper).
+    Buffer-cap semantics (spec ambiguity resolved, documented): the spec says "this elbow is the buffer cap", but the FSM buffer must hold 
+    the WHOLE sentence plus the trailing context, so a 1–3 s tail elbow alone cannot be the cap. We persist buffer_cap_s = p99 sentence 
+    duration + elbow (both raw values are in the JSON artifact for the paper).
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
@@ -275,8 +394,8 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     coeff = float(tb_cfg.get("latency_quality_coeff_bleu_per_s", 0.5))
 
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _eval_model_for("stage2_baseline", args, base_cfg, device)
+    device = pick_device(args.device)
+    model, tokenizer = _eval_model_for("baseline", args, base_cfg, device)
 
     durations = [span.duration_s for rec in records for span in rec.sentences]
     p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
@@ -290,7 +409,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
             poses, timestamps = load_pose_window(rec.pose, span.start_s, end_s, normalize=True)
             if poses.shape[0] == 0: continue
             text, _ = _translate_window(
-                model=model, tokenizer=tokenizer, method="stage2_baseline",
+                model=model, tokenizer=tokenizer, method="baseline",
                 poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
                 device=device, inference_cfg=inference_cfg, method_cfg=base_cfg,
             )
@@ -326,20 +445,35 @@ def tail_benefit(args: argparse.Namespace) -> dict:
 
 
 def delta_enc(args: argparse.Namespace) -> dict:
-    """Spec §8.4 — BIO temporal noise floor sets the commit gate's delta_enc.
+    """BIO temporal noise floor sets the commit gate's delta_enc.
 
-    Runs the trained BIO head twice per dev sentence window under small input perturbations and measures how far the predicted 
-    closing index (first_closing_o_index, the same statistic the commit gate tracks) moves. Two perturbation families (the spec 
-    names none, so both are reported): (a) drop the leading frame — the stride-phase misalignment a growing buffer produces; 
-    (b) Gaussian keypoint noise sigma on x/y — pose-estimator jitter. delta_enc = ceil(p90 over both families): boundary movement 
-    below the head's own noise floor must not block a commit.
+    Uses the S1 in-system BIO head (the DEPLOYED terminator estimator the FSM runs; §4.4/§7.1), NOT the Moryossef
+    analysis segmenter and NOT the DLM checkpoint. Two reasons it must be the S1 head: (1) δ_enc calibrates the
+    commit gate's cut overlap against the noise of the head the FSM actually contains — the analysis segmenter never
+    runs in the FSM; (2) δ_enc is a gate-GEOMETRY constant needed to TRAIN the DLM (dlm.yaml δ is asserted == this),
+    so it must be measured from the head as it ENTERS stage 2 (checkpoints/bio_s1, produced by train-bio), before
+    the DLM exists — reading it off the DLM checkpoint is an ordering circularity.
+
+    Runs that head twice per dev sentence window under small input perturbations and measures how far the predicted
+    terminator index (first_terminator_index — first O-or-B, the statistic the commit gate tracks) moves. Two
+    perturbation families (the spec names none, so both are reported): (a) drop the leading frame — the stride-phase
+    misalignment a growing buffer produces; (b) Gaussian keypoint noise sigma on x/y — pose-estimator jitter.
+    delta_enc = ceil(p90 over both families): boundary movement below the head's own noise floor must not block a commit.
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
+    from train.bio_pretrain import build_bio_s1_model
     data_cfg = load_yaml(args.data_config)
-    method_cfg = load_yaml(args.stage2_config)
+    cfg = load_yaml(args.bio_config)
+
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, _ = _eval_model_for("stage2_dlm", args, method_cfg, device)
+    device = pick_device(args.device)
+    model = build_bio_s1_model(cfg)
+    checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=f"checkpoints/bio_s1/{args.language}")) / "model.pt")
+    blob = torch.load(checkpoint, map_location="cpu")
+
+    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
+    model.eval().to(device)
+    print(f"[delta-enc] S1 BIO head from {checkpoint}", flush=True)
     sigma = float(args.noise_sigma)
 
     sentences = [(rec, span) for rec in records for span in rec.sentences]
@@ -351,9 +485,8 @@ def delta_enc(args: argparse.Namespace) -> dict:
         poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
         ts = torch.as_tensor(timestamps_np - start_s, dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
-        bio_tap, _, ts_out = model.front_end.extract_bio_tap(poses, mask, ts)
-        tags = model.bio_head(bio_tap, timestamps_s=ts_out).logits.argmax(dim=-1)[0]
-        return first_closing_o_index(tags)
+        tags = model(poses, mask, timestamps_s=ts).logits.argmax(dim=-1)[0]
+        return first_terminator_index(tags)
 
     shifts: dict[str, list[int]] = {"drop_first_frame": [], "keypoint_noise": []}
     for rec, span in sentences:
@@ -394,15 +527,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
     parser.add_argument(
         "--stage", default="dataset-summary",
-        choices=["dataset-summary", "segmenter-infer", "analysis-a", "tail-benefit", "delta-enc"],
+        choices=["dataset-summary", "segmenter-infer", "segmenter-eval", "analysis-a", "analysis-b", "tail-benefit", "delta-enc"],
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument("--segmenter-config", default="configs/segmenter.yaml")
-    parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
-    parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
+    parser.add_argument(
+        "--segmenter-arch", default="external", choices=["external", "s1"],
+        help="segmenter-infer backend: external = independent chunk-trained segmenter (default), s1 = in-system head (ablation)"
+    )
+    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="external segmenter config")
+    parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
+    parser.add_argument("--slt-config", default="configs/dlm.yaml")
+    parser.add_argument("--baseline-config", default="configs/baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--eval-config", default="configs/eval.yaml")
-    parser.add_argument("--language", default="phoenix")
+    parser.add_argument("--language", default=None)  # None -> data.yaml active_languages[0] (never a stale hardcode)
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--predictions", default=None)
@@ -420,16 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    if args.checkpoint is None and args.stage == "segmenter-infer":
-        # Derive from the segmenter config's checkpoint dir (e.g. checkpoints/segmenter/phoenix) instead of
-        # a hardcoded language, so it follows the active dataset and `--language` overrides.
-        seg_cfg = load_yaml(args.segmenter_config)
-        args.checkpoint = str(Path(checkpoint_dir(seg_cfg, default=f"checkpoints/segmenter/{args.language}")) / "model.pt")
+    if args.language is None: args.language = str(load_yaml(args.data_config).get("active_languages", ["csl"])[0])
     if args.stage == "dataset-summary": result = dataset_summary(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
+    elif args.stage == "segmenter-eval": result = segmenter_eval(args)
     elif args.stage == "analysis-a":
         if not args.predictions: raise SystemExit("--predictions is required for --stage analysis-a")
         result = analysis_a(args)
+    elif args.stage == "analysis-b": result = analysis_b(args)
     elif args.stage == "tail-benefit": result = tail_benefit(args)
     elif args.stage == "delta-enc": result = delta_enc(args)
     else: raise ValueError(f"Unsupported stage: {args.stage}")

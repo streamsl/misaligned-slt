@@ -1,23 +1,55 @@
 from __future__ import annotations
-from contextlib import nullcontext
+from typing import Any, Callable, Iterable, Literal
 from dataclasses import dataclass, field
-from typing import Callable, Literal
-from pathlib import Path
+
 import copy, csv, json, sys, time
+from pathlib import Path
+from tqdm.auto import tqdm
+from contextlib import contextmanager, nullcontext
 
 import torch
-from tqdm.auto import tqdm
+from torch.utils.data import DataLoader
+from models.checkpointing import save_model_checkpoint
 from utils import checkpoint_dir, save_best_enabled
+
+
+def move_to_device(value, device: torch.device):
+    # Recursively move tensors in a (possibly nested) batch container onto `device`.
+    if isinstance(value, torch.Tensor): return value.to(device)
+    if isinstance(value, dict): return {k: move_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list): return [move_to_device(v, device) for v in value]
+    return value
+
+
+def build_optimizer(cfg: dict, params) -> torch.optim.Optimizer:
+    """AdamW from a config, reading the SAME keys for every stage.
+
+    Prefers top-level `learning_rate` / `weight_decay` (the slt/bio convention); falls back to nested
+    `optimizer.lr` / `optimizer.weight_decay` so older configs keep working. One place, one convention.
+    """
+    opt = cfg.get("optimizer", {}) or {}
+    lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
+    weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
+@contextmanager
+def eval_mode(model: torch.nn.Module):
+    # `model.eval()` for the block, restoring the prior train/eval state on exit. Shared by every evaluator.
+    was_training = model.training
+    model.eval()
+    try: yield
+    finally:
+        if was_training: model.train()
 
 
 class AmpHelper:
     """Mixed-precision wrapper shared by all training loops.
 
-    `mixed_precision:` config values: "auto" (default — bf16 when the GPU supports it, else fp16
-    with loss scaling), "bf16", "fp16", or "none". CPU always runs fp32. bf16 needs no GradScaler
-    (same exponent range as fp32); fp16 uses one to prevent gradient underflow. F.cross_entropy /
-    softmax run in fp32 under autocast (PyTorch autocast promote list), so the 1/t-weighted BD3LM
-    loss and SPD/DCD confidences keep full precision.
+    `mixed_precision:` config values: "auto" (default — bf16 when the GPU supports it, else fp16 with loss scaling), "bf16", 
+    "fp16", or "none". CPU always runs fp32. bf16 needs no GradScaler (same exponent range as fp32); fp16 uses one to prevent 
+    gradient underflow. F.cross_entropy / softmax run in fp32 under autocast (PyTorch autocast promote list), so the 1/t-weighted 
+    BD3LM loss and SPD/DCD confidences keep full precision.
     """
     def __init__(self, mode: str = "auto", device: torch.device | str = "cpu"):
         device_type = torch.device(device).type
@@ -61,9 +93,8 @@ def _fmt_duration(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 def _fmt_metric(value) -> str:
-    # Fixed-shape number for table columns: 3 decimals in the normal range, 3-sig sci at the
-    # extremes (tiny LRs, huge sums). Within a column the metric magnitude is stable, so the
-    # chosen form is consistent down the column → decimal points line up.
+    # Fixed-shape number for table columns: 3 decimals in the normal range, 3-sig sci at the extremes (tiny LRs, huge sums). 
+    # Within a column the metric magnitude is stable, so the chosen form is consistent down the column → decimal points line up.
     try: v = float(value)
     except (TypeError, ValueError): return str(value)
     if v != v: return "nan"  # NaN
@@ -210,7 +241,16 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         row["ckpt"] = "saved" if saved_path else ""
         self._rows.append(row)
 
-        text = json.dumps(row)
+        # Console line = readable `key=value` fields (each value self-labelled), same column order and cell
+        # formatting as history.csv. epoch shows progress `n/total`; an empty `ckpt` (no save) is omitted.
+        fields = []
+        for col in self._order_columns(row.keys()):
+            if col == "epoch": fields.append(f"epoch={epoch}/{self.epochs}")
+            elif col == "ckpt":
+                if row.get(col): fields.append(f"ckpt={row[col]}")
+            else: fields.append(f"{col}={self._format_cell(row.get(col), col)}")
+
+        text = ", ".join(fields)
         if self._progress is not None: self._progress.write(text)
         else: print(text, flush=True)
         self._save_history_files()
@@ -256,19 +296,6 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
             for row in self._rows: writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
 
 
-    def save_history(self, path: str | Path) -> Path | None:
-        if not self._rows: return None
-        path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-        columns = self._order_columns({key for row in self._rows for key in row})
-
-        with path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(columns)
-            for row in self._rows:
-                writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
-        return path
-
-
     def finish(self) -> None:
         if self._progress is not None:
             try: self._progress.close()
@@ -277,6 +304,68 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         if self._wandb is not None and self._wandb.run is not None:
             try: self._wandb.finish()
             except Exception: pass # noqa: BLE001
+
+
+def run_epoch_loop(
+    *, name: str, model: torch.nn.Module, loader: DataLoader, 
+    optimizer: torch.optim.Optimizer, device: torch.device, epochs: int, cfg: dict, 
+    step_fn: Callable[[dict, int], tuple[torch.Tensor, dict[str, float]]], 
+    evaluate_fn: Callable[[int], dict[str, float]] | None = None,
+    default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min",
+    dev_loader: DataLoader | None = None,
+) -> list[dict[str, float]]:
+    """The one training loop every trainer shares (slt / bio_s1).
+
+    Owns the whole skeleton — scheduler, AMP, best-checkpoint selection, early stop, logging, restore —
+    so a stage only supplies what genuinely differs:
+      step_fn(batch, epoch)  -> (loss_tensor, scalar_log_dict). Runs under this loop's amp.autocast; the
+                                loop does zero_grad / backward / grad-clip(model.parameters()) / step.
+      evaluate_fn(epoch)     -> dev metrics dict (called only on control.should_eval epochs), or None.
+
+    Grad clipping is over model.parameters() for all stages: frozen params carry no grad, so clipping a
+    superset that includes them is identical to clipping only the trainable subset.
+    """
+    model.to(device)
+    model.train()
+    logs: list[dict[str, float]] = []
+
+    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
+    amp = AmpHelper.from_config(cfg, device)
+    control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
+    attach_save_best(control, cfg, name, save_model_checkpoint)
+    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
+    max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+
+    for epoch in range(1, int(epochs) + 1):
+        epoch_logs: list[dict[str, float]] = []
+        for step, batch in enumerate(loader, start=1):
+            batch = move_to_device(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast():
+                loss, step_logs = step_fn(batch, epoch)
+
+            amp.backward(loss)
+            amp.clip_and_step(optimizer, model.parameters(), max_grad_norm)
+            scheduler.step_batch()
+            row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
+            epoch_logs.append(row); logs.append(row)
+            logger.log_step(epoch, step, row)
+
+        scheduler.step_epoch()
+        train_means = mean_logs(epoch_logs)
+        if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
+            metrics = evaluate_fn(epoch)
+            improved = control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
+            if control.stopped_early:
+                print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
+                break
+        else: logger.epoch_summary(epoch, train=train_means)
+
+    control.restore(model)
+    logger.finish()
+    return logs
 
 
 def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, float]:
@@ -390,7 +479,7 @@ def attach_save_best(
 ) -> TrainControl:
     """Wire save-on-best into a TrainControl from the consolidated `checkpoint:` block.
 
-    `checkpoint.dir` (falling back to legacy `output_dir`) is where the best checkpoint and `best.json`
+    `checkpoint.dir` is where the best checkpoint and `best.json`
     land; `checkpoint.save_best: false` disables mid-training saves (end-of-training save only).
     `saver(model, dir)` performs the stage-appropriate write (full model vs visual backbone).
     """

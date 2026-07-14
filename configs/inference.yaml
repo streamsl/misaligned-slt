@@ -1,12 +1,45 @@
 seed: 42
-language: phoenix
+language: csl
 stride_s: 1.0
-buffer_cap_s: 18.0 # Placeholder until Analysis 8.3 writes the measured elbow.
+buffer_cap_s: 18.0 # analyze.py --stage tail-benefit --write-config writes p99_sentence_duration + tail-elbow here
+# (NOT the bare elbow: §8.3's elbow is ~1-3s but §7.2 requires the FSM buffer to hold a WHOLE sentence + tail, so
+# the forced-commit cap is p99 sentence duration + the elbow; both raw values are in outputs/tail_benefit_*.json).
 boundary_stability:
+    # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
+    # delta-enc writes the measured value here):
+    #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
+    #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
+    #      hysteresis_strides strides;
+    #   2. post-commit overlap: the buffer is cut at (terminator − δ), so an estimate late by ≤ δ still leaves
+    #      the next sentence's B in the buffer (the ≤2δ leftover tail is never selected: buffer-start I does
+    #      not open a span, and a mislabelled-B leftover is filtered by span_selection.min_span_frames);
+    #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames: 3
-    hysteresis_strides: 2
+    hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3)
+span_selection:
+    # Λ_min: shortest selectable span, in encoder frames. Filters phantom micro-spans (a spurious B in the
+    # overlap leftover forms a terminated span that would otherwise pass the stability gate unchallenged).
+    # Constraint: 2*delta_enc_frames < Λ_min < shortest real dev sentence (runner asserts the lower bound;
+    # exceeding the upper bound would silently drop real sentences). Measured on synthetic-CSL dev (1061
+    # cues @30fps): p0 = 31 frames (1.03s), p1 = 37 frames — while the phantom scale is ≤ 2δ = 6 frames.
+    # 18 = p1/2 sits an order of magnitude above the noise floor with full margin to the shortest sentence.
+    # Rerun per corpus/fps (PHOENIX @25.5fps differs).
+    min_span_frames: 18
+# Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
+# tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
+# undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.
+# "translate_partial" emits the tail's decode flagged PARTIAL once its terminator appears (best-effort recovery,
+# out-of-training-distribution; ablation only).
+forced_tail_policy: skip
 translation:
-    commit_confidence_tau: 0.75
+    # MEAN per-token confidence floor for the streaming commit gate (infer/commit_gate.CommitGate) — RQ2 only;
+    # unused by RQ1 / --method baseline. CALIBRATE THIS to your deployed model: run the clean point
+    # (`--rq 1 --method dlm --severity-grid-s 0.0`) and read mean_translation_confidence, then set τ a touch below
+    # your model's clean mean so clean sentences commit and genuinely low-confidence decodes defer. It is NOT a
+    # dev-tuned quality knob and it does NOT catch confidently-wrong truncations (Ω does). 0.75 was the old
+    # all-token floor and is far too high for a mean (a label-smoothed AR decode's clean mean is ~0.4); 0.3 is a
+    # permissive placeholder that won't zero streaming recall — tighten it once you've measured your model.
+    commit_confidence_tau: 0.3
     # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
     # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the
     # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces

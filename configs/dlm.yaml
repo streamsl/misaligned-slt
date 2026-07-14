@@ -5,7 +5,11 @@ language: csl # active dataset = CSL-Daily (override --language per dataset).
 language_model:
     name: google/mt5-base
 checkpoint:
-    dir: checkpoints/stage2_dlm/${language} # best model.pt + best.json saved here
+    dir: checkpoints/dlm/${language} # best model.pt + best.json saved here
+    # S1 BIO-head init (train.py --stage train-bio): pre-trained on frozen Uni-Sign features with the same
+    # window sampler. With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent
+    # head from step one (docs/membership_gate.md §1.4). Missing file → warning + fresh head (keep warmup > 0).
+    bio_head_init: checkpoints/bio_s1/${language}/model.pt
     # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint (the mBART ablation loads the
     # pose encoder from it; the mBART LM starts from base).
     from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
@@ -21,10 +25,10 @@ decoder: dlm
 wandb:
     enabled: false
     project: misaligned-slt
-    name: stage2_dlm_${language}
+    name: dlm_${language}
     mode: online # offline / disabled if no network or key
 visual_padding: none # raw windows; the LM encoder masks padding via attention_mask (no boundary halos)
-freeze_backbone: false # Freeze the Uni-Sign pose encoder in stage 2 as an overfitting regularizer.
+freeze_backbone: false # Freeze the Uni-Sign pose encoder during SLT training as an overfitting regularizer.
 freeze_projection: false
 lambda_trans: 1.0
 oput:
@@ -63,6 +67,29 @@ confidence_bound:
     decode_steps: 16
     cache_type: prefix
     window_type: static
+membership_gate:
+    # Condition the DLM decoder on the BIO head's segmentation belief (docs/membership_gate.md): an additive,
+    # query-independent bias Ω(t) on cross-attention = γ·ln(m∨ε)+ln(1−χ+ε). This is the ONLY channel by which
+    # the segmenter's knowledge reaches the decoder at decode time — without it the two heads are separate models
+    # sharing an encoder (§1.1). Gradient from the translation loss flows back into the BIO logits through Ω.
+    # Applies to BOTH decoder arms: the DLM injects Ω in its manual decode; the AR de-risk arm injects the
+    # SAME Ω via HF cross-attention forward-hooks (models.membership_gate.CrossAttnOmegaInjector), so §9.3 is a
+    # gated-vs-gated decoder-family contrast. This block is inherited by ar.yaml (extends dlm).
+    enabled: true
+    # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
+    # MUST match inference.yaml boundary_stability.delta_enc_frames.
+    delta: 3
+    eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
+    min_span_frames: 18 # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (CSL @30fps).
+    # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
+    # Log gate_veto_rate — it should start near 0 and decay.
+    iou_veto: 0.5
+    gt_anchored: false # always-GT ablation row (§3). Leave false for the on-policy method.
+    # Gate warmup — hold the gate off for the first `warmup_epochs` so it never couples to an untrained head
+    # (garbage conditioning, §1.2). Canonical flow: run `train.py --stage train-bio` FIRST → checkpoint.bio_head_init
+    # loads a sharp head → set warmup_epochs: 0 (the coupling trains from step one, §1.4). Default 2 is the
+    # safe value that also works if S1 was skipped (bio_head_init missing → fresh head → it needs the warmup).
+    warmup_epochs: 2
 mode_ratios:
     source: outputs/a_mode_ratios_${language}.json
     # Designed misalignment distribution used directly when no measured file exists AND auto-substituted when the measured
@@ -83,29 +110,34 @@ mode2_subcase_weights:
     left: 0.45
     both: 0.10
 # Pose augmentation — TRAIN windows only (the Mode-2a full-evidence view and dev are never augmented).
-# SPATIAL ops match stage1_pretraining.yaml (centroid rotation + affine/spatial_mask jitter). The `fps` sub-block is the
-# TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden): BIO labels are rebuilt from
-# the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the source rate — the synthetic
-# CSL streams run at 30 fps (data.yaml csl pose.fps), so [15, 30] gives real 0.5–1.0x density variation (RoPE keeps true
-# seconds); max_fps == source draws are native-density no-ops. For 12.5 fps PHOENIX streams use [6.25, 12.5].
+# SPATIAL ops (centroid rotation + affine/spatial_mask jitter) — schema + defaults in poses/augmentation.py.
+# The `fps` sub-block is the TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden):
+# BIO labels are rebuilt from the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the
+# source rate — the synthetic CSL streams run at 30 fps (data.yaml csl pose.fps), so [15, 30] gives real 0.5–1.0x density
+# variation (RoPE keeps true seconds); max_fps == source draws are native-density no-ops.
 augmentation:
     enabled: true
     rotation: { deg: 15.0, prob: 0.5 }
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-# Rare-class CE weighting for the in-model BIO head, which faces a heavy I-dominant imbalance (PHOENIX streams: B≈1.4%
-# of frames, signing density ~0.71; binary Dice has no B-vs-I gradient) and would otherwise collapse toward all-I. Unlike
-# the standalone UNet segmenter (bio_class_weights: null — its skip connections detect B natively and weighting makes that
-# arch over-segment), this UNet-less transformer head keeps a light B:2. null = unweighted.
-bio_class_weights:
-    O: 1.0 # not upweighted: long uncaptioned stretches are UNK-masked, residual O labels stay noisy
-    B: 2.0
-    I: 1.0
-# In-model BIO head temporal Conv1d stem depth (models/bio_head.py TemporalConvStem). The standalone
-# segmenter keeps the full Moryossef UNet; this head reads pose-token features directly with no UNet, so
-# a small conv stem restores the local boundary inductive bias (EXPERIMENTS.md findings 8/23) that the
-# commit gate's δ_enc stability and RQ2 tIoU depend on. 0 = ablation (pure transformer, spec §4.4).
+# BIO loss = Dice(1.5) + PLAIN cross-entropy. Hard Rule §1.4.3 / §4.4 / §6.1: "Do NOT use class-weighted NLL"
+# (Moryossef 2026 ablation: it did not help). So bio_class_weights is null (unweighted CE); the Conv1d stem
+# (bio_conv_stem_layers, below) supplies the local B-detection inductive bias, and Dice carries the imbalance.
+# If the UNet-less head is empirically observed to collapse to all-I on a heavy-I-imbalance corpus, re-introducing
+# a light B-weight is an EXPLICIT ablation to report as a deviation — not the spec-faithful default.
+bio_class_weights: null
+dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
+# In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
+# SLT training and S1 BOTH read these keys and MUST build the identical shape, or checkpoint.bio_head_init fails to
+# strict-load. Keep them here as the single source of truth; do not override in bio_pretrain.yaml.
+#   conv_stem_layers: the standalone Moryossef segmenter keeps the full UNet; this UNet-less head reads
+#   pose-token features directly, so a small Conv1d stem restores the local boundary inductive bias
+#   (EXPERIMENTS.md findings 8/23) the commit gate's δ_enc stability and RQ2 tIoU depend on. 0 = ablation (§4.4).
+bio_hidden_dim: 384
+bio_depth: 4
+bio_nhead: 8
+bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
     source: outputs/a_jitter_${language}.json
@@ -158,7 +190,7 @@ dcd:
     refresh_count: 16
     # NOTE: the DCD window is automatically clipped to the BD3LM attention block (DCD decode_algorithm.py::window_causal_decode
     # semantics for block-causal models). DCD's optional Dynamic Block Extension is not enabled here as this mBART-BD3LM substrate
-    # is trained with fixed block_size; ablate via decode_spd_dcd(window_block_clip=False) only as a controlled non-faithful run.
+    # is trained with fixed block_size.
 spd:
     top_k: 1 # DMax SPD top-k token/mask embedding mixture.
     renormalize: true # DMax Eq. 10 norm restoration.

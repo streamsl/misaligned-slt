@@ -1,5 +1,5 @@
 seed: 42
-languages: [phoenix]
+languages: [csl] # active corpus (documentation only; eval.py resolves --language, default = data.yaml active_languages[0])
 rq1:
     # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
     # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
@@ -11,7 +11,17 @@ rq1:
     severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0] # used only when severity_mode: absolute
     smoke_grid_s: [-1.0, 0.0, 1.0]
     smoke_num_sentences: 10
-    batch_size: 128 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
+    batch_size: 64 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
+    # RQ1 CORPUS POLICY (one curve never mixes corpora). These are documentation of the CLI flags — pass them
+    # per run with `=` (negative-leading lists need it): --severity-grid-head / --severity-grid-tail.
+    #   TRUNCATION sweep (head ≥ 0, tail ≤ 0; the right-truncation linchpin) → --language csl_pretrimmed
+    #     (paper-anchored, seam-free — truncation needs no extra context):
+    #       --severity-grid-head=0,0.05,0.1,0.2,0.3   --severity-grid-tail=0,-0.05,-0.1,-0.2,-0.3
+    #   EXTENSION / contamination (head < 0 or tail > 0; needs a continuous timeline) → --language csl
+    #     (its own (0,0) anchors it as relative degradation; absolute numbers are not literature-comparable):
+    #       --severity-grid-head=-0.3,-0.2,-0.1,-0.05,0   --severity-grid-tail=0,0.05,0.1,0.2,0.3
+    # Every severity row also reports clamped_fraction + realized delta_*_s_mean, so a corpus/grid mismatch is
+    # self-reporting (high clamp = the corpus lacked the requested context).
 rq2:
     tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
 # Clean-trained translator, head fixed at GT start, trailing context swept; the elbow is

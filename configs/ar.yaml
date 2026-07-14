@@ -5,11 +5,11 @@
 # (Analysis-A `mode_ratios` + `jitter` + `mode2_subcase_weights`), identical confidence-bound
 # term (AR-adapted), identical optimization. Otherwise the result conflates "diffusion vs AR"
 # with "robust-window vs clean-window training", which Analysis B already isolates. So this file
-# only overrides the decoder + outputs and inherits the rest from stage2_dlm.yaml (OPUT/SPD/DCD
+# only overrides the decoder + outputs and inherits the rest from dlm.yaml (OPUT/SPD/DCD
 # blocks it inherits are simply unused by the AR path).
-extends: stage2_dlm.yaml
+extends: dlm.yaml
 decoder: ar
 checkpoint:
-    dir: checkpoints/stage2_ar/${language} # override only the save dir; from_pretrained + save_best inherited from stage2_dlm
+    dir: checkpoints/ar/${language} # override only the save dir; from_pretrained + save_best inherited from dlm
 wandb:
-    name: stage2_ar_${language}
+    name: ar_${language}

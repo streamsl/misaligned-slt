@@ -1,0 +1,42 @@
+# S1 — BIO pretrain on FROZEN Uni-Sign pose features (docs/membership_gate.md §1.4; train/bio_pretrain.py).
+#
+# WHY `extends: dlm.yaml` — deliberate and load-bearing. S1 trains the in-system RoPE BIO head on the EXACT
+# window distribution the SLT model will couple it under: same `StreamingWindowDataset` + `WindowSampler`, so it
+# must inherit that pipeline's keys — mode_ratios, jitter, mode2_subcase_weights, augmentation (incl. fps_aug),
+# bio_class_weights, dice_loss_weight — and the BIO-head arch (bio_hidden_dim/depth/nhead/dropout/conv_stem).
+# Inheriting guarantees S1↔SLT window-distribution AND head-shape parity BY CONSTRUCTION (else
+# checkpoint.bio_head_init would fail to strict-load).
+#
+# WHAT is inherited-but-UNUSED here (the BIO-only trainer reads none of these; ignore them):
+#   language_model, decoder, oput, confidence_bound, membership_gate, dcd, spd, block_size, diffusion_steps,
+#   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init. `checkpoint.from_pretrained`
+#   (inherited) IS used — it supplies the FROZEN pose encoder (released Uni-Sign checkpoint).
+extends: dlm.yaml
+
+checkpoint:
+    dir: checkpoints/bio_s1/${language}
+    save_best: true
+    monitor: val_phrase_tiou_f1 # span quality (one-to-one tIoU-matched F1) — what the FSM/gate consume, not frame accuracy
+    mode: max
+    restore_best: true
+wandb:
+    name: bio_s1_${language} # own run name (else inherits dlm's)
+
+# NO circularity: Analysis A is measured by the INDEPENDENT external segmenter (train-segmenter; moryossef26.yaml),
+# NOT this head — so S1 inherits dlm.yaml's mode_ratios.source / jitter.source and trains on the same measured
+# misalignment distribution the SLT model uses (S1↔SLT window-distribution parity). Because the measured errors
+# come from a segmenter the FSM does not contain, there is no loop: S1 is not trained on its own errors. (On clean
+# CSL the measurement is degenerate for ANY segmenter, so both S1 and SLT fall back to the designed mix — that is a
+# corpus property, not a circularity.)
+
+# S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
+epochs: 50
+batch_size: 8
+learning_rate: 1.0e-4
+weight_decay: 1.0e-4
+
+# Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py segmenter-infer /
+# segmenter-eval). Set ≈ the deployment buffer scale (BUFFER_CAP_S × fps): the S1 head runs in the FSM on a buffer
+# capped at BUFFER_CAP_S (~18 s × 30 fps ≈ 540). 1024 (≈ 34 s) is a conservative upper bound; lower it toward
+# buffer_cap_s×fps for a tighter train/deploy match. Unused by stage-1 training (windows are processed whole).
+rope_eval_chunk: 1024

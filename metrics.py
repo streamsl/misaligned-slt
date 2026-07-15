@@ -16,7 +16,10 @@ FRAME-DOMAIN entry points (consume BIO logits/labels; the BIO-head TRAINING moni
                              monitor; an all-`I`/all-`O` collapse cannot game one-to-one matching). The looser
                              overlap seg-F1 and frame-IoU flavors were removed (used for no decision).
   Used by: train/slt.py + train/bio_pretrain.py (the in-system BIO head) and moryossef26/ (the Moryossef segmenter).
-  Segment decoders feeding it: `bio_labels_to_segments` (gold), `signing_runs_with_b_splits` (prediction),
+  ONE decode rule is applied to BOTH prediction and gold (default `signing_runs_with_b_splits`): decoding gold
+  B-required while decoding predictions run-based makes headless gold fragments (left-truncated spans, which
+  make_bio_labels deliberately labels as I-runs with no B) structural false positives even for a PERFECT tagger.
+  Decoders: `bio_labels_to_segments` (B-required), `signing_runs_with_b_splits` (inference rule),
   `likeliest_segments` (parity) — all three are one parameterized core, `_bio_runs`.
 
 TIME-DOMAIN entry points (consume Segment(start_s, end_s) spans in seconds; the FINAL DVC evaluation + Analysis A):
@@ -57,14 +60,15 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
 def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) -> list[dict]:
     """Unified BIO -> [{start,end}] frame-segment decoder. The three public decoders are parameterizations:
 
-      bio_labels_to_segments     split_on_b=True,  open_on_i=False, close_on_unk=False  (gold, B-required)
-      signing_runs_with_b_splits split_on_b=True,  open_on_i=True,  close_on_unk=True   (prediction/inference)
+      bio_labels_to_segments     split_on_b=True,  open_on_i=False, close_on_unk=False  (B-required; full-annotation gold)
+      signing_runs_with_b_splits split_on_b=True,  open_on_i=True,  close_on_unk=True   (inference rule; monitor BOTH sides)
       likeliest_segments         split_on_b=False, open_on_i=True,  close_on_unk=True   (pure run, parity ref)
 
     split_on_b: an interior B closes the open segment and opens a new one (back-to-back sentences with no O gap);
     when False, B only opens if nothing is open (B behaves like I). open_on_i: an I with nothing open starts a
-    segment (first signing frame after a gap = a sentence start). close_on_unk: UNK closes like O; gold decoding
-    keeps UNK non-closing (gold is pre-sliced to valid frames).
+    segment (first signing frame after a gap = a sentence start; also a headless left-truncated fragment — which is
+    why the window monitor decodes GOLD with this rule too, see moryossef_segment_metrics). close_on_unk: UNK
+    closes like O (B-required gold keeps UNK non-closing: full-annotation gold has no interior UNK).
     """
     if isinstance(tags, torch.Tensor): tags = tags.detach().cpu().tolist()
     segments: list[dict] = []
@@ -146,26 +150,41 @@ def moryossef_segment_metrics(
       the all-`I` nor all-`O` collapse can game one-to-one matching. The previous overlap-tolerance `seg_f1`
       and frame-IoU `seg_iou` flavors were looser, collapse-foolable, and used for no decision; removed.
 
-    `decode` picks the predicted-segment rule (`runs_bsplit` = inference decode, default; `bio` = B-required;
-    `likeliest` = raw run). `tiou_threshold` (default 0.5) is the monitor's match threshold.
+    `decode` picks the segment rule applied to BOTH prediction and gold (`runs_bsplit` = inference decode, default;
+    `bio` = B-required; `likeliest` = raw run). `tiou_threshold` (default 0.5) is the monitor's match threshold.
     """
+    # ONE decode rule for BOTH sides. Decoding gold with the B-required rule (Moryossef's own gold decode —
+    # faithful, since HIS gold comes from full annotations where every span onset is visible) is a structural bug
+    # under OUR misaligned windows: make_bio_labels deliberately labels a span truncated at the window's left edge
+    # as a HEADLESS I-run (no B — "buffer-start I never opens"), so B-required gold emits NO segment there while a
+    # PERFECT tagger's run decode emits one → a false positive a perfect head cannot avoid (Mode 2b/2c anchors and
+    # leftover neighbour tails in Mode 1/3 windows all score as FPs; precision caps far below 1). Symmetric decode
+    # restores "perfect tagger → 1.0" on every window mode while leaving fully-visible spans unchanged (gold has a
+    # B at each visible onset, so runs_bsplit(gold) == B-required(gold) there).
+    if decode == "likeliest": decode_fn = lambda t: _bio_runs(t, split_on_b=False, open_on_i=True, close_on_unk=True)
+    elif decode == "bio": decode_fn = bio_labels_to_segments
+    else: decode_fn = signing_runs_with_b_splits
+
     frame_f1s, tiou_f1s, precisions, recalls = [], [], [], []
     for i in range(labels.shape[0]):
         gold = labels[i]
         valid = gold != BIO["UNK"]
-        n = int(valid.sum())
-        if n == 0: continue
+        n_valid = int(valid.sum())
+        if n_valid == 0: continue
 
-        gold_v = gold[:n]
-        logit_v = logits[i, :n]
-        pred_tags = logit_v.argmax(dim=-1)
-        frame_f1s.append(_macro_frame_f1(pred_tags, gold_v))
+        # Trim TRAILING padding (collators pad with UNK on the right); keep interior UNK (untrusted gaps) in place.
+        last = int(torch.nonzero(valid).max().item()) + 1
+        gold_v = gold[:last]
+        pred_tags = logits[i, :last].argmax(dim=-1)
+        interior_unk = gold_v == BIO["UNK"]
+        if bool(interior_unk.any()):
+            # No reliable label inside untrusted gaps: exclude those frames from BOTH sides so `close_on_unk`
+            # splits runs identically for gold and prediction (predictions inside the gap are neither right nor wrong).
+            pred_tags = torch.where(interior_unk, torch.full_like(pred_tags, BIO["UNK"]), pred_tags)
+        frame_f1s.append(_macro_frame_f1(pred_tags[~interior_unk], gold_v[~interior_unk]))
 
-        if decode == "likeliest": pred_segs = likeliest_segments(logit_v)
-        elif decode == "bio": pred_segs = bio_labels_to_segments(pred_tags)
-        else: pred_segs = signing_runs_with_b_splits(pred_tags)
         prf = segmentation_prf(
-            _frame_segments_to_seconds(pred_segs), _frame_segments_to_seconds(bio_labels_to_segments(gold_v)),
+            _frame_segments_to_seconds(decode_fn(pred_tags)), _frame_segments_to_seconds(decode_fn(gold_v)),
             tiou_threshold=tiou_threshold,
         )
         tiou_f1s.append(prf["f1"]); precisions.append(prf["precision"]); recalls.append(prf["recall"])

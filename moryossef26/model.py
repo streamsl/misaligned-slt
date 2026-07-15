@@ -127,11 +127,12 @@ class MoryossefSegmenter(nn.Module):
         return chunked_rope_encode(self.encoder_attn, x, timestamps_s, self.num_frames)
 
     def forward(
-        self, pose_data: torch.Tensor, frame_mask: torch.Tensor | None = None, 
-        timestamps_s: torch.Tensor | None = None
+        self, pose_data: torch.Tensor, frame_mask: torch.Tensor | None = None, timestamps_s: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
         # frame_mask is accepted (and ignored) so the inference wrapper can call MoryossefSegmenter and BioS1Model
-        # with 1 uniform signature; at inference chunks are dense (no padding), and training uses no attn pad mask
-        # (Moryossef 2026's largest negative ablation).
+        # with 1 uniform signature. No attention pad mask here — faithful to Moryossef 2026 (README:66: his mask
+        # "changes training distribution in a way that does not match inference"; removing it was his fix), and
+        # sound in THIS model's regime: chunks are near-uniform 1024 frames, so batch padding is negligible.
+        # (The in-system RoPE head DOES key-mask padding — its window batches span 0.5s-18s; see models/bio_head.py.)
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)
         return {"phrase": self.phrase_bio_head(encoded)}

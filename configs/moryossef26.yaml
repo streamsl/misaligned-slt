@@ -55,18 +55,15 @@ augmentation:
 
 learning_rate: 1.0e-3
 weight_decay: 1.0e-4
-epochs: 500
+epochs: 50
 eval_every_epochs: 1
 early_stopping:
     enabled: true
-    patience: 100
+    patience: 20
     min_delta: 0.0
 scheduler:
-    type: onecycle # Moryossef 2026 repo default optimizer is adamw-onecycle
-    max_lr: 1.0e-3
-    pct_start: 0.1
-    div_factor: 25.0
-    final_div_factor: 10000.0
+    type: cosine
+    eta_min: 1.0e-6
 mixed_precision: auto
 max_grad_norm: 1.0
 # NB: the Analysis-A pred→GT match bar is NOT here — it is an analysis knob (analyze.ANALYSIS_A_MATCH_TIOU = 0.1,

@@ -74,8 +74,8 @@ def predict_phrase_segments(
 
 @torch.no_grad()
 def evaluate_segmenter_whole_video(
-    model, records: list[VideoRecord], device: torch.device,
-    velocity: bool = True, rope_chunk: int | None = None, trusted_gap_s: float | None = TRUSTED_GAP_S,
+    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk: int | None = None, 
+    trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,),
 ) -> dict[str, float]:
     """Moryossef evaluate.py-style STANDALONE eval: process each video whole (encoder chunks internally), build GT
     phrase BIO from caption spans, and average frame-F1 / 1-to-1 tIoU segment P/R/F1 over videos.
@@ -84,10 +84,11 @@ def evaluate_segmenter_whole_video(
     s1` — the way to score the pretrained in-system BIO head on its own, without waiting for joint fine-tuning.
     `trusted_gap_s` defaults to TRUSTED_GAP_S so GT labeling matches training: long uncaptioned stretches become
     UNK (excluded from the metric), not O — else the segmenter is penalized for firing on possibly-uncaptioned signing.
+    `tiou_thresholds`: pass eval.yaml's rq2.tiou_thresholds for numbers directly comparable to RQ2's segmentation
+    block; thresholds beyond the first get an `@t` key suffix (first threshold keeps the bare keys for the monitor).
     """
     model.eval().to(device)
-    if rope_chunk is not None and hasattr(model, "bio_head"): 
-        model.bio_head.chunk_size = int(rope_chunk)
+    if rope_chunk is not None and hasattr(model, "bio_head"): model.bio_head.chunk_size = int(rope_chunk)
     rows: list[dict[str, float]] = []
 
     for record in records:
@@ -99,9 +100,13 @@ def evaluate_segmenter_whole_video(
         )
         logits = _phrase_logits(model, poses, timestamps, device, velocity).detach().cpu()
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
-        rows.append({
-            **bio_frame_metrics(logits, labels, prefix="phrase"),
-            **moryossef_segment_metrics(logits, labels, prefix="phrase"),
-        })
+        # prefix "bio" (trainer convention): bio_f1 is the BINARY signing-vs-not frame F1 — under prefix "phrase"
+        # it would sit next to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
+        row = dict(bio_frame_metrics(logits, labels, prefix="bio"))
+        for j, t in enumerate(tiou_thresholds):
+            seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
+            if j == 0: row.update(seg)
+            else: row.update({f"{k}@{t:g}": v for k, v in seg.items() if k != "phrase_frame_f1"})
+        rows.append(row)
     if not rows: return {}
     return {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}

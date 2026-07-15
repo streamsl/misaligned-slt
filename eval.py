@@ -15,16 +15,18 @@ pd.set_option("display.max_columns", None)         # show all columns
 pd.set_option("display.max_colwidth", None)        # don't truncate long text in cells
 pd.set_option("display.width", None)               # auto-detect terminal width
 pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
-pd.set_option("display.float_format", "{:.4f}".format)
 
 from poses import load_pose_window
 from data.windowing import SentenceSpan
 from data.loader import VideoRecord, load_language_records
+from data.batch import frame_mask_for, repeat_last_frame
+
+from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
-from utils import checkpoint_dir, load_yaml, language_model_name, pretrained_checkpoint
+from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, pretrained_checkpoint
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,33 @@ def _load_segments(path: str | Path) -> list[Segment]:
     return [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows]
 
 
+def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path) -> Path:
+    # Write predicted phrase segments (the segmenter-infer / analysis artifact) as JSON.
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"video_id": video_id, "segments": [{"start_s": float(s.start_s), "end_s": float(s.end_s)} for s in segments]}
+        for video_id, segments in sorted(predictions.items())
+    ]
+    path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
+    # Read a predicted-segments JSON (dict {vid: [{start_s,end_s}]} or list-of-rows form).
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
+    predictions: dict[str, list[Segment]] = {}
+    for row in raw:
+        if "video_id" in row and "segments" in row:
+            predictions[str(row["video_id"])] = [Segment(float(i["start_s"]), float(i["end_s"])) for i in row["segments"]]
+        elif "video_id" in row and "start_s" in row and "end_s" in row:
+            predictions.setdefault(str(row["video_id"]), []).append(Segment(float(row["start_s"]), float(row["end_s"])))
+        else: raise ValueError(f"Unsupported prediction row format: {row}")
+    return predictions
+
+
 def _gold_events(records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]:
     return {record.video_id: [PredictionEvent(
         video_id=record.video_id, start_s=float(span.start_s), end_s=float(span.end_s), text=span.text,
@@ -69,7 +98,7 @@ def _gold_events(records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]
 def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
     """Emit GT sentence spans in the `--segments` schema (load_prediction_file dict form).
 
-    Feeds the RQ2 oracle-input rows: `eval.py --rq 2 --segments <this> --method {stage2_baseline,stage2_dlm}`
+    Feeds the RQ2 oracle-input rows: `eval.py --rq 2 --segments <this> --method {baseline,dlm}`
     gives (clean AR | our DLM) translating GT-trimmed spans offline — the ceiling rows of the RQ2 ladder.
     Identical translation to RQ1 @ delta=0, but DVC-framed so it sits in the same table as the other rungs.
     """
@@ -121,27 +150,34 @@ def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]
 
 
 def controlled_windows(
-    records: list[VideoRecord], grid: list[float], relative: bool = True, max_sentences: int | None = None,
+    records: list[VideoRecord], grid: list[float], relative: bool = True, 
+    max_sentences: int | None = None, tail_grid: list[float] | None = None,
 ) -> list[ControlledWindow]:
     """Build RQ1 signed-offset windows.
 
-    Analysis A defines deltas as predicted boundary minus GT boundary, so perturbed window uses start = gt_start + delta_head 
+    Analysis A defines deltas as predicted boundary minus GT boundary, so perturbed window uses start = gt_start + delta_head
     and end = gt_end + delta_tail. Negative delta_tail is the intended right-truncation stress test.
 
-    `relative=True` (default): each grid value is a FRACTION of the anchor sentence's own duration, so the realized offset scales 
-    with sentence length (delta_s = grid * duration). Absolute-seconds offsets mix regimes — a 0.3s head cut destroys a 1s sentence 
-    but barely touches a 10s one, so the curve would average 2 different stress levels at one x-point. Relative perturbation keeps 
-    every sentence at the same proportional severity. `relative=False` restores absolute-seconds offsets.
+    `relative=True` (default): each grid value is a FRACTION of the anchor sentence's own duration, so the realized offset 
+    scales with sentence length (delta_s = grid * duration). Absolute-seconds offsets mix regimes — a 0.3s head cut destroys a 
+    1s sentence but barely touches a 10s one, so the curve would average 2 different stress levels at one x-point. Relative 
+    perturbation keeps every sentence at the same proportional severity. `relative=False` restores absolute-seconds offsets.
+
+    `tail_grid` (default: same as `grid`) decouples 2 axes. Needed because a corpus dictates which grid SIGNS are meaningful: 
+    truncation points (head ≥ 0, tail ≤ 0) need no context beyond the sentence and run on any corpus incl. official pre-trimmed 
+    releases; extension points (head < 0 / tail > 0) need a continuous timeline (streams) — pre-trimmed clips only carry thin 
+    same-take rest-pose margins, so extensions there mostly clamp.
     """
     windows: list[ControlledWindow] = []
     count = 0
+    tail_values = grid if tail_grid is None else tail_grid
     for record in records:
         for span in record.sentences:
             if max_sentences is not None and count >= int(max_sentences): return windows
             count += 1
             duration = max(1e-6, float(span.end_s) - float(span.start_s))
             for gh in grid:
-                for gt in grid:
+                for gt in tail_values:
                     dh = float(gh) * duration if relative else float(gh)
                     dt = float(gt) * duration if relative else float(gt)
                     start_s = max(0.0, float(span.start_s) + dh)
@@ -151,7 +187,12 @@ def controlled_windows(
                         video_id=record.video_id, reference=span.text,
                         gt_start_s=float(span.start_s), gt_end_s=float(span.end_s),
                         window_start_s=start_s, window_end_s=end_s,
-                        delta_head_s=dh, delta_tail_s=dt, grid_head=float(gh), grid_tail=float(gt),
+                        # REALIZED offsets after clamping to the available timeline — not the requested dh/dt. On pre-trimmed 
+                        # records the context margin around a sentence is finite, so a large negative-head / positive-tail 
+                        # request clamps; reporting the request as if it were realized would overstate severity exactly where 
+                        # the data limits it. grid_head/grid_tail keep the requested coordinate for grouping.
+                        delta_head_s=start_s - float(span.start_s), delta_tail_s=end_s - float(span.end_s),
+                        grid_head=float(gh), grid_tail=float(gt),
                     ))
     return windows
 
@@ -251,50 +292,50 @@ def _parse_grid(value: str | None, fallback: list[float]) -> list[float]:
     if not value: return [float(x) for x in fallback]
     return [float(x.strip()) for x in value.split(",") if x.strip()]
 
-
+METHOD_CONFIGS = { # method -> its default config. Shared by eval + visualize so the map lives in one place.
+    "baseline": "configs/baseline.yaml",
+    "ar": "configs/ar.yaml",
+    "dlm": "configs/dlm.yaml",
+}
 def _method_config_path(args: argparse.Namespace) -> str:
-    if args.method_config: return str(args.method_config)
-    defaults = {
-        "stage2_baseline": "configs/stage2_baseline.yaml",
-        "stage2_ar": "configs/stage2_ar.yaml",
-        "stage2_dlm": "configs/stage2_dlm.yaml",
-    }
-    return defaults[args.method]
+    return str(args.method_config) if args.method_config else METHOD_CONFIGS[args.method]
 
 
-def _build_eval_model(args: argparse.Namespace, data_cfg: dict, method_cfg: dict, device: torch.device):
+def _build_eval_model(method: str, checkpoint: str | None, language: str, data_cfg: dict, method_cfg: dict, device: torch.device):
     """Uni-Sign pose-only model. Everything (the language model via `language_model.name`, and the checkpoint via
     `checkpoint.from_pretrained` / `checkpoint.dir`) is read from the METHOD config — no separate stage-1 config.
-    The `stage2_baseline` method is the released Uni-Sign mT5 model (eval-only)."""
-    from transformers import T5Tokenizer, AutoTokenizer
-    target_lang = data_cfg["languages"][args.language].get("target_lang")
+    The `baseline` method is the released Uni-Sign mT5 model (eval-only). Takes plain scalars (method, checkpoint, 
+    language), not an argparse.Namespace, so non-CLI callers (analyze/visualize) need no fake namespace."""
+    target_lang = data_cfg["languages"][language].get("target_lang")
     prompt_lang = prompt_lang_for_target(target_lang)
     lm_name = language_model_name(method_cfg)
 
-    if args.method == "stage2_baseline":
+    if method == "baseline":
         # The baseline is the RELEASED Uni-Sign mT5 pose-only model (there is no released mBART SLT), evaluated
         # AR-only with beam search — the literature-comparison floor / clean point. It is the SAME
-        # `MisalignedSLTModel(decoder="ar")` as stage2_ar, just with the released weights instead of trained ones
+        # `MisalignedSLTModel(decoder="ar")` as ar, just with the released weights instead of trained ones
         # (its BIO head is unused for translation). `load_unisign_pretrained` strict-loads the front end (pose+mT5).
         mt5_name = lm_name if "mt5" in lm_name.lower() else "google/mt5-base"
         tokenizer = T5Tokenizer.from_pretrained(mt5_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=mt5_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
-        model = MisalignedSLTModel(front_end=front_end, tokenizer=tokenizer, decoder="ar",
-                                   bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)))
+        model = MisalignedSLTModel(
+            front_end=front_end, tokenizer=tokenizer, decoder="ar", 
+            bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384))
+        )
         # Load ONLY from from_pretrained (the released ckpt) — NO fallback to a trained `checkpoint.dir`, so a
-        # concurrent / prior `train-stage2` run can never make the baseline silently pick up trained weights.
-        ckpt = Path(args.checkpoint or pretrained_checkpoint(method_cfg, default="") or "")
-        if not ckpt.exists():
-            raise FileNotFoundError(
-                f"Missing released Uni-Sign checkpoint for stage2_baseline: {ckpt!s}. Set checkpoint.from_pretrained "
-                f"in configs/stage2_baseline.yaml to checkpoints/csl_daily_pose_only_slt.pth, or pass --checkpoint.")
+        # concurrent / prior `train-slt` run can never make the baseline silently pick up trained weights.
+        ckpt = Path(checkpoint or pretrained_checkpoint(method_cfg, default="") or "")
+        if not ckpt.exists(): raise FileNotFoundError(
+            f"Missing released Uni-Sign checkpoint for baseline: {ckpt!s}. Set checkpoint.from_pretrained "
+            f"in configs/baseline.yaml to checkpoints/csl_daily_pose_only_slt.pth, or pass --checkpoint."
+        )
         rep = load_unisign_pretrained(model, ckpt, strict=True)
         print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
               f"{rep['pose_missing'] + rep['mt5_missing']}, unexpected {rep['pose_unexpected'] + rep['mt5_unexpected']})", flush=True)
         model.to(device); model.eval()
         return model, tokenizer
 
-    # Trained stage2_ar / stage2_dlm: the unified MisalignedSLTModel on the Uni-Sign front end (mT5 or mBART) + the
+    # Trained ar / dlm: the unified MisalignedSLTModel on the Uni-Sign front end (mT5 or mBART) + the
     # trained checkpoint. Same pose encoder + prompt either way — only the LM differs (clean mT5-vs-mBART ablation).
     if "mbart" in lm_name.lower():
         tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
@@ -304,14 +345,14 @@ def _build_eval_model(args: argparse.Namespace, data_cfg: dict, method_cfg: dict
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
     model = MisalignedSLTModel(
         front_end=front_end, tokenizer=tokenizer,
-        decoder="ar" if args.method == "stage2_ar" else "dlm",
+        decoder="ar" if method == "ar" else "dlm",
         bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
         block_size=int(method_cfg.get("block_size", 8)),
     )
-    checkpoint = Path(args.checkpoint or checkpoint_dir(method_cfg, default="") or "")
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"Missing checkpoint for {args.method}: {checkpoint}. Train the method first or pass --checkpoint.")
-    load_model_checkpoint(model, checkpoint, strict=False)
+    ckpt = Path(checkpoint or checkpoint_dir(method_cfg, default="") or "")
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Missing checkpoint for {method}: {ckpt}. Train the method first or pass --checkpoint.")
+    load_model_checkpoint(model, ckpt, strict=False)
     model.to(device); model.eval()
     return model, tokenizer
 
@@ -322,17 +363,14 @@ def _prep_window(
     """Window pose tensor + window-relative timestamps + frame mask. Uni-Sign uses raw windows
     (`visual_padding: none`) — the mT5/mBART encoder masks padding via the attention mask; no boundary halos."""
     poses = torch.as_tensor(poses_np, dtype=torch.float32)
-    ts = torch.as_tensor(np.asarray(timestamps_np, dtype=np.float32) - float(start_s), dtype=torch.float32)
-    if visual_padding in {"none", "zero"}: mask = torch.ones(poses.shape[0], dtype=torch.bool)
-    else: raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
-    return poses, ts, mask
+    timestamps = torch.as_tensor(np.asarray(timestamps_np, dtype=np.float32) - float(start_s), dtype=torch.float32)
+    return poses, timestamps, frame_mask_for(poses.shape[0], visual_padding)
 
 
 def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int) -> dict:
-    """Build the `MisalignedSLTModel.generate_from_poses` kwargs for a method. Baseline = AR **beam search** (the
-    literature-comparison floor); stage2_ar / stage2_dlm stay **greedy** (num_beams=1) so §9.3 is a clean
-    AR-vs-DLM contrast — the DLM arm additionally uses the SPD/DCD params (the AR arms ignore them)."""
-    if method == "stage2_baseline":
+    """Build the `MisalignedSLTModel.generate_from_poses` kwargs for a method. Baseline = AR **beam search** (literature-comparison 
+    floor); ar / dlm stay **greedy** (num_beams=1) — the DLM arm additionally uses the SPD/DCD params (the AR arms ignore them)."""
+    if method == "baseline":
         num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
         return {"max_text_tokens": max_tokens, "num_beams": num_beams}
 
@@ -356,6 +394,13 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "dcd_top_p": None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
         "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
         "dcd_refresh_count": int(dcd_cfg.get("refresh_count", 16)),
+        # Membership gate at RQ1: the DLM decodes under the same Ω conditioning it trained with (on-policy
+        # span, no GT, no χ for single-window eval). No-op on the AR arm (generate_from_poses gates DLM only).
+        "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
+        "gate_delta": int(method_cfg.get("membership_gate", {}).get("delta", 3)),
+        "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
+        "gate_min_span_frames": int(method_cfg.get("membership_gate", {}).get("min_span_frames",
+                                    inference_cfg.get("span_selection", {}).get("min_span_frames", 0))),
     }
 
 
@@ -366,27 +411,19 @@ def _translate_windows(
 ) -> list[tuple[str, float]]:
     """Translate a batch of pre-trimmed pose windows -> [(text, mean_token_confidence)].
 
-    ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the
-    released model; stage2_ar = AR greedy; stage2_dlm = SPD/DCD). It returns the REAL per-token confidence (the
-    softmax prob the model assigns its own tokens), so the §9.1 "confidently wrong" claim is measured, not a
-    placeholder. Variable-length windows are right-padded and masked via `frame_mask` (the LM encoder attends only
-    to real frames; SPD/DCD reads per-row lengths), so each row's result is identical to translating it alone."""
+    ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the released model; 
+    ar = AR greedy; dlm = SPD/DCD). It returns REAL per-token confidence (the softmax prob the model assigns its own tokens), so 
+    "confidently wrong" is measured, not a placeholder. Variable-length windows are right-padded and masked via `frame_mask` (LM 
+    enc attends only to real frames; SPD/DCD reads per-row lengths), so each row's result is identical to translating it alone."""
     if not items: return []
     visual_padding = str(method_cfg.get("visual_padding", "none"))
     prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
     max_t = max(int(p.shape[0]) for p, _, _ in prepped)
-    pose_shape = tuple(prepped[0][0].shape[1:])
-    batch = len(items)
-    
-    poses = torch.zeros((batch, max_t, *pose_shape), dtype=torch.float32)
-    timestamps = torch.zeros((batch, max_t), dtype=torch.float32)
-    frame_mask = torch.zeros((batch, max_t), dtype=torch.bool)
-    for i, (p_t, ts_t, m_t) in enumerate(prepped):
-        n = int(p_t.shape[0])
-        poses[i, :n] = p_t
-        timestamps[i, :n] = ts_t
-        frame_mask[i, :n] = m_t
-    poses, timestamps, frame_mask = poses.to(device), timestamps.to(device), frame_mask.to(device)
+    # Same repeat-last-frame pad + frame-mask contract as the training collator (data.batch), so an eval row is
+    # padded exactly as it was in training and each row's result is identical to translating it alone.
+    poses = torch.stack([repeat_last_frame(p, max_t - int(p.shape[0])) for p, _, _ in prepped]).to(device)
+    timestamps = torch.stack([torch.nn.functional.pad(ts, (0, max_t - int(ts.shape[0]))) for _, ts, _ in prepped]).to(device)
+    frame_mask = torch.stack([torch.nn.functional.pad(m, (0, max_t - int(m.shape[0]))) for _, _, m in prepped]).to(device)
 
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
@@ -410,9 +447,12 @@ def _translate_window(
     model, tokenizer, method: str,
     poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float,
     device: torch.device, inference_cfg: dict, method_cfg: dict,
-) -> tuple[str, float]:
-    # Single-window convenience wrapper over `_translate_windows` (used by the RQ2 pipeline floor + analyze.py).
-    return _translate_windows(model, tokenizer, method, [(poses_np, timestamps_np, start_s)], device, inference_cfg, method_cfg)[0]
+) -> tuple[str, float]: # Single-window convenience wrapper over `_translate_windows` (used by the RQ2 pipeline floor + analyze.py).
+    return _translate_windows(
+        model, tokenizer, method, 
+        [(poses_np, timestamps_np, start_s)], 
+        device, inference_cfg, method_cfg
+    )[0]
 
 
 def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
@@ -428,14 +468,18 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     if relative: default_key = "smoke_grid_rel" if args.smoke else "severity_grid_rel"
     else: default_key = "smoke_grid_s" if args.smoke else "severity_grid_s"
     grid = _parse_grid(args.severity_grid_s, rq_cfg.get(default_key, [0.0]))
+    # Optional per-axis grids: truncation-only sweeps (head ≥ 0, tail ≤ 0) are the valid sub-grid on
+    # pre-trimmed corpora; extension points need a continuous corpus. Fall back to the shared grid.
+    head_grid = _parse_grid(args.severity_grid_head, grid)
+    tail_grid = _parse_grid(args.severity_grid_tail, grid)
     max_sentences = args.num_sentences
     if max_sentences is None and args.smoke: max_sentences = int(rq_cfg.get("smoke_num_sentences", 10))
-    windows = controlled_windows(records, grid, relative=relative, max_sentences=max_sentences)
+    windows = controlled_windows(records, head_grid, relative=relative, max_sentences=max_sentences, tail_grid=tail_grid)
 
     records_by_id = {record.video_id: record for record in records}
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = pick_device(args.device)
     inference_cfg = load_yaml(args.inference_config)
-    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
 
     # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch near-uniform length 
     # so padding — and wasted compute — is minimal). Padding is masked, so batching not change any per-window result, only throughput.
@@ -459,31 +503,47 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
         )
         for (window, _poses, _ts), (prediction, confidence) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
-            grouped.setdefault(key, {"predictions": [], "references": [], "confidences": [], "head_s": [], "tail_s": []})
+            grouped.setdefault(key, {
+                "predictions": [], "references": [], "confidences": [],
+                "head_s": [], "tail_s": [], "req_head_s": [], "req_tail_s": [],
+            })
+            duration = window.gt_end_s - window.gt_start_s
             grouped[key]["predictions"].append(prediction)
             grouped[key]["references"].append(window.reference)
             grouped[key]["confidences"].append(confidence)
             grouped[key]["head_s"].append(window.delta_head_s)
             grouped[key]["tail_s"].append(window.delta_tail_s)
+            grouped[key]["req_head_s"].append(window.grid_head * duration if relative else window.grid_head)
+            grouped[key]["req_tail_s"].append(window.grid_tail * duration if relative else window.grid_tail)
             rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence})
 
     severity = []
     for (gh, gt), values in tqdm(sorted(grouped.items()), desc="Computing severity"):
         confs = values["confidences"]
         head_s, tail_s = values["head_s"], values["tail_s"]
+        # Fraction of windows whose REQUESTED offset was clamped by the record's timeline (start/end of the take). High values mean the corpus 
+        # lacks the context this grid point asks for (pre-trimmed clips have thin rest-pose margins) — the realized means below then sit well 
+        # inside the requested point and the row must not be read at face value.
+        clamped = sum(1 for req, real in zip(values["req_head_s"], head_s) if abs(req - real) > 1e-3)
+        clamped += sum(1 for req, real in zip(values["req_tail_s"], tail_s) if abs(req - real) > 1e-3)
         severity.append({
-            # "severity_mode": mode,
             "windows": len(values["predictions"]),
             "grid_head": gh, "grid_tail": gt,  # fraction of sentence duration in relative mode, else seconds
             "delta_head_s_mean": float(sum(head_s) / len(head_s)) if head_s else 0.0,  # realized offset (relative -> varies per sentence)
             "delta_tail_s_mean": float(sum(tail_s) / len(tail_s)) if tail_s else 0.0,
+            "clamped_fraction": float(clamped) / max(1, 2 * len(head_s)),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
         })
-    # summary = {
-    #     "rq": "1", "language": args.language, "split": args.split, "method": args.method,
-    #     "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity,
-    # }
+    # Persist the sweep (summary + every per-window prediction) — RQ1 sweeps are expensive and their artifacts feed the paper plots.
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "rq": "1", "language": args.language, "split": args.split, "method": args.method,
+            "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity, "rows": rows,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[rq1] wrote {out}", flush=True)
     return pd.json_normalize(severity, sep=".").T # one row per (grid_head, grid_tail) severity point
 
 
@@ -499,8 +559,15 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
         stride_s=float(inference_cfg.get("stride_s", 1.0)),
         buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
         delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
-        hysteresis_strides=int(boundary.get("hysteresis_strides", 2)),
+        hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
         token_confidence_tau=float(trans.get("commit_confidence_tau", 0.75)),
+        min_span_frames=int(inference_cfg.get("span_selection", {}).get("min_span_frames", 0)),
+        forced_tail_policy=str(inference_cfg.get("forced_tail_policy", "skip")),
+        # Membership gate: the RQ2 streaming decode runs under the SAME Ω conditioning the decoder trained
+        # with (method config's membership_gate block); χ comes from the runner's own commit log.
+        gate_enabled=bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
+        gate_delta=int(method_cfg.get("membership_gate", {}).get("delta", boundary.get("delta_enc_frames", 3))),
+        gate_eps=float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
         max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 128))),
         diffusion_steps=int(trans.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
         tau_dec=float(dcd.get("tau_dec", trans.get("commit_confidence_tau", 0.75))),
@@ -508,7 +575,10 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
         spd_renormalize=bool(spd.get("renormalize", True)),
         spd_revision=bool(spd.get("revision", True)),
         temperature=float(dcd.get("temperature", 0.0)),
-        dcd_window_length=int(dcd.get("initial_window_length", trans.get("block_size", 8))),
+        # block_size is a MODEL property (the DLM decoder's block), so fall back to the METHOD config — same
+        # source as _generation_kwargs. inference.yaml.translation has no block_size, so the old trans.block_size
+        # fallback silently forced 8 whenever initial_window_length was unset.
+        dcd_window_length=int(dcd.get("initial_window_length", method_cfg.get("block_size", 8))),
         dcd_max_window_length=int(dcd.get("max_window_length", 64)),
         dcd_window_type=str(dcd.get("window_type", "sliding")),
         dcd_decode_algo=str(dcd.get("decode_algo", "threshold")),
@@ -523,17 +593,17 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
 def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     """Drive the sawtooth FSM end-to-end over each video → committed events.
 
-    This is the *usable inference engine* for RQ2: a raw pose stream in, committed `(start, end, text, flagged_partial, commit_time)` 
-    events out — our own BIO head and commit gate, recompute-each-stride, no cross-stride decoder state (§7). Only valid for the FSM 
-    methods (stage2_dlm / stage2_ar); the clean baseline's RQ2 is the segment-then-translate pipeline floor (use --predictions).
+    This is the *usable inference engine* for RQ2: raw pose stream in, committed `(start, end, text, flagged_partial, commit_time)` 
+    events out — our own BIO head and commit gate, recompute-each-stride, no cross-stride decoder state. Only valid for the FSM 
+    methods (dlm / ar); the clean baseline's RQ2 is the segment-then-translate pipeline floor (use --predictions).
     """
-    if args.method == "stage2_baseline":
-        raise SystemExit("Streaming RQ2 uses the FSM (stage2_dlm/stage2_ar). For the baseline pipeline-floor, pass --predictions.")
+    if args.method == "baseline":
+        raise SystemExit("Streaming RQ2 uses the FSM (dlm/ar). For the baseline pipeline-floor, pass --predictions.")
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args))
     inference_cfg = load_yaml(args.inference_config)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
+    device = pick_device(args.device)
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
@@ -566,16 +636,18 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
 @torch.no_grad()
 def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
-    """Segment-then-translate pipeline floor: The retrained Moryossef segmenter's predicted spans (analyze.py --stage segmenter-infer JSON,
-    via --segments) are cut from the pose stream and translated by clean-trained Uni-Sign baseline — natural pipeline with no robustness 
-    training anywhere. Scored by the same tIoU/translation harness as the streaming FSM, so floor and method are directly comparable.
+    """Segment-then-translate pipeline floor: predicted spans (analyze.py --stage segmenter-infer JSON, via --segments)
+    are cut from the pose stream and translated offline. Scored by the same tIoU/translation harness as the streaming FSM.
+
+    Pipeline FLOOR = an independent/external segmenter's spans translated by CLEAN baseline, so pass `--method baseline`. Translation uses 
+    `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT ablation (external spans + our DLM, offline) — a legitimate RQ2 row, 
+    but not the floor. The method is encoded in output filename so the two never collide; just pass the right --method for the row you want.
     """
-    from moryossef26.infer import load_prediction_file
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args))
     inference_cfg = load_yaml(args.inference_config)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, tokenizer = _build_eval_model(args, data_cfg, method_cfg, device)
+    device = pick_device(args.device)
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
 
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
@@ -610,6 +682,16 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     return predicted
 
 
+def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path) -> Path:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(
+        {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}, 
+        indent=2, sort_keys=True
+    ) + "\n", encoding="utf-8")
+    return out
+
+
 def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ2 on test without --allow-test")
     if not args.predictions and not args.stream and not args.segments: raise SystemExit(
@@ -622,26 +704,13 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.stream:
         predicted = run_streaming(args)
-        events_path = Path(f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
-        events_path.parent.mkdir(parents=True, exist_ok=True)
-        events_path.write_text(json.dumps({
-            vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
-        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
     elif args.segments:
         predicted = run_pipeline_floor(args)
-        events_path = Path(f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
-        events_path.parent.mkdir(parents=True, exist_ok=True)
-        events_path.write_text(json.dumps({
-            vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()
-        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
     else: predicted = load_event_predictions(args.predictions)
         
     gold = _gold_events(records)
-    # summary = {
-    #     "rq": "2", "language": args.language, "split": args.split, "method": args.method,
-    #     "predictions": source, "streamed": bool(args.stream),
-    #     **evaluate_predicted_events(predicted, gold, thresholds),
-    # }
     summary = evaluate_predicted_events(predicted, gold, thresholds).get("thresholds", [])
     summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
     summary.set_index("tiou_threshold", inplace=True)
@@ -655,6 +724,74 @@ def run_segment_prf(args: argparse.Namespace) -> dict[str, Any]:
     return segmentation_prf(pred, gold, tiou_threshold=args.tiou_threshold)
 
 
+def _load_segmenter(args):
+    """Build + load a trained segmenter by --segmenter-arch (shared by eval --segmenter-eval and
+    analyze --stage segmenter-infer).
+
+    external (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
+    head — the non-circular Analysis-A/B / RQ2-cascade instrument, gate-doc §1.4). s1: the in-system BIO head, an
+    ablation that swaps the same Uni-Sign head in to isolate system design from segmentation competence.
+    Returns (model, device, velocity, rope_chunk, checkpoint).
+    """
+    device = pick_device(args.device)
+    if args.segmenter_arch == "s1":
+        from train.bio_pretrain import build_bio_s1_model
+        cfg = load_yaml(args.bio_config)
+        model = build_bio_s1_model(cfg)
+        ckpt_default = f"checkpoints/bio_s1/{args.language}"
+        # Uni-Sign features; whole-video chunked RoPE at the head's TRAINED context (rope_eval_chunk in bio_pretrain.yaml = 
+        # BUFFER_CAP_S×fps = 540): training windows are clamped to buffer_cap_s (sampler.py), so a larger eval chunk would 
+        # attend over contexts the head never trained on — exactly Moryossef's train/inference-mismatch lesson.
+        velocity, rope_chunk = False, int(cfg.get("rope_eval_chunk", 540))
+    else:
+        from moryossef26.trainer import build_segmenter
+        cfg = load_yaml(args.segmenter_config)
+        model = build_segmenter(args.segmenter_config)
+        ckpt_default = f"checkpoints/segmenter/{args.language}"
+        velocity, rope_chunk = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
+        
+    # The config's checkpoint.dir had ${language} expanded from the config file's OWN `language:` key at load
+    # time; when the CLI --language differs, that path points at another corpus's checkpoint — fall back to the
+    # default (built from args.language) instead of silently loading e.g. the csl model for --language phoenix.
+    ckpt_dir = checkpoint_dir(cfg, default=ckpt_default)
+    if args.language and str(cfg.get("language", args.language)) != str(args.language): ckpt_dir = ckpt_default
+    checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
+    blob = torch.load(checkpoint, map_location="cpu")
+    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
+    return model, device, velocity, rope_chunk, checkpoint
+
+
+def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
+    """Standalone whole-video segmentation eval (Moryossef evaluate.py protocol): frame-F1 + one-to-one tIoU segment
+    P/R/F1 on a split. The §4.6 acceptance check ("F1 within order-of-magnitude of published"), and — because it runs
+    the SAME protocol for either --segmenter-arch — the ONLY apples-to-apples way to compare the Moryossef segmenter
+    against the in-system S1 head: the two training monitors are NOT comparable (chunk windows vs misaligned windows).
+    For `s1` it also scores the pretrained head on its own, without waiting for stage-2 joint fine-tuning.
+    """
+    if args.split == "test" and not args.allow_test:
+        raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
+    from moryossef26.infer import evaluate_segmenter_whole_video
+    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
+    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
+
+    # Report at RQ2's tIoU grid so these standalone numbers line up 1:1 with the full-system segmentation block.
+    thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
+    metrics = evaluate_segmenter_whole_video(
+        model, records, device=device, velocity=velocity, rope_chunk=rope_chunk, tiou_thresholds=thresholds,
+    )
+    payload = {
+        "language": args.language, "split": args.split, "videos": len(records),
+        "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
+        "tiou_thresholds": list(thresholds), "metrics": metrics,
+    }
+    output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload["output"] = str(output)
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT evaluation entry points")
     parser.add_argument("--rq", choices=["1", "2"], default=None)
@@ -662,25 +799,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--method-config", default=None)
-    parser.add_argument("--language", default="phoenix")
+    parser.add_argument("--language", default=None)
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
-    parser.add_argument("--method", default="stage2_dlm", choices=["stage2_baseline", "stage2_ar", "stage2_dlm"])
+    parser.add_argument("--method", default="dlm", choices=["baseline", "ar", "dlm"])
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument(
-        "--severity-grid-s", default=None, 
-        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)"
-    )
-    parser.add_argument(
-        "--severity-mode", default="relative", choices=["relative", "absolute"], 
-        help="RQ1 perturbation: relative (fraction of sentence duration, default) or absolute seconds"
-    )
-    parser.add_argument("--emit-gold-segments", default=None, help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
+    parser.add_argument("--severity-grid-s", default=None,
+                        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)")
+    # Per-axis overrides (fall back to --severity-grid-s / the eval.yaml grid). Truncation-only sweeps —
+    # the valid sub-grid on pre-trimmed corpora — need head ≥ 0 with tail ≤ 0, which one shared grid's
+    # cross-product cannot express: e.g. --severity-grid-head 0,0.1,0.2,0.3 --severity-grid-tail 0,-0.1,-0.2,-0.3
+    parser.add_argument("--severity-grid-head", default=None,
+                        help="RQ1 head-axis grid override (use --severity-grid-head=-0.3,0 for negative-leading values)")
+    parser.add_argument("--severity-grid-tail", default=None,
+                        help="RQ1 tail-axis grid override (use --severity-grid-tail=-0.3,0 for negative-leading values)")
+    parser.add_argument("--severity-mode", default="relative", choices=["relative", "absolute"], 
+                        help="RQ1 perturbation: relative (fraction of sentence duration, default) or absolute seconds")
+    parser.add_argument("--emit-gold-segments", default=None, 
+                        help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
+    parser.add_argument("--segmenter-eval", action="store_true",
+                        help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
+    parser.add_argument("--segmenter-arch", default="external", choices=["external", "s1"],
+                        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head")
+    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
+    parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
     parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
     parser.add_argument("--stream", action="store_true", help="RQ2: run the streaming FSM engine to produce events")
-    parser.add_argument("--events-out", default=None, help="Where to write streamed RQ2 events JSON")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)
@@ -693,11 +839,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    data_cfg = load_yaml(args.data_config)
+    if args.language is None: args.language = str(data_cfg.get("active_languages", ["csl"])[0])
     if args.emit_gold_segments:
-        records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+        records, _ = load_language_records(data_cfg, args.language, split=args.split)
         path = write_gold_segments(records, args.emit_gold_segments)
         result = {"emit_gold_segments": str(path), "videos": len(records), "segments": sum(len(r.sentences) for r in records)}
         print(json.dumps(result, indent=2, sort_keys=True))
+        raise SystemExit(0)
+    if args.segmenter_eval:
+        print(json.dumps(run_segmenter_eval(args), indent=2, sort_keys=True))
         raise SystemExit(0)
 
     if args.rq == "1": result = run_rq1(args)

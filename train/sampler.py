@@ -63,11 +63,18 @@ class WindowSampler:
         self.anchors = [(ri, si) for ri, rec in enumerate(records) for si, _ in enumerate(rec.sentences)]
         if not self.anchors: raise ValueError("WindowSampler requires at least one sentence anchor.")
 
-        # Anchor windowing: every GT sentence is drawn once per pass through the permutation, so with steps_per_epoch == len(anchors) 
-        # each sentence anchors a window each epoch — random sampling with replacement undersamples short sentences and wastes data. 
-        # The mode is still drawn independently per step. (Requires num_workers=0; each worker would otherwise hold its own cursor.)
-        self._anchor_order = self.rng.permutation(len(self.anchors))
-        self._anchor_cursor = 0
+    def configure_worker(self, seed: int) -> None:
+        """Give a forked DataLoader worker its OWN rng so parallel workers don't replay identical mode/jitter streams.
+
+        fork/spawn copies the sampler's numpy Generator(s) identically into every worker, and PyTorch's per-worker
+        seeding never touches a Generator stored on the dataset — so without this, W workers draw the SAME mode/jitter
+        sequence. (The anchor is index-driven — anchors[index % len] in `sample` — so each worker already visits
+        DIFFERENT anchors via its round-robin index slice, and coverage is exactly one pass per epoch regardless of
+        how the DataLoader partitions indices across workers. This reseed only decorrelates the per-window draws.)
+        Called from data.loader.streaming_loader's worker_init_fn.
+        """
+        self.rng = np.random.default_rng(int(seed))
+        if self.pose_augmentor is not None: self.pose_augmentor.rng = np.random.default_rng(int(seed) + 997)
 
 
     @classmethod
@@ -118,12 +125,13 @@ class WindowSampler:
         probs = probs / probs.sum()
         return str(self.rng.choice(keys, p=probs))
 
-    def _choose_anchor(self) -> tuple[VideoRecord, int]:
-        if self._anchor_cursor >= len(self._anchor_order):
-            self._anchor_order = self.rng.permutation(len(self.anchors))
-            self._anchor_cursor = 0
-        ridx, sidx = self.anchors[int(self._anchor_order[self._anchor_cursor])]
-        self._anchor_cursor += 1
+    def _choose_anchor(self, index: int) -> tuple[VideoRecord, int]:
+        # Anchor is a DETERMINISTIC function of the global sample index: with steps_per_epoch == len(anchors) and
+        # shuffle=False, indices 0..N-1 map bijectively to anchors 0..N-1, so every GT sentence anchors exactly one
+        # window per epoch — with NO cross-call/cross-worker state. (Stateful-cursor sampling gave uneven coverage
+        # under num_workers>0, because DataLoader dispatches whole BATCHES round-robin, so a worker's call count
+        # need not equal any fixed anchor shard.) Mode/jitter stay random (drawn from self.rng, per-worker reseeded).
+        ridx, sidx = self.anchors[int(index) % len(self.anchors)]
         return self.records[ridx], sidx
 
     def _clip_window(self, rec: VideoRecord, start_s: float, end_s: float) -> tuple[float, float]:
@@ -263,8 +271,8 @@ class WindowSampler:
         return WindowSpec(rec.video_id, start_s, end_s, "mode4")
 
 
-    def sample(self) -> WindowSample:
-        rec, anchor_idx = self._choose_anchor()
+    def sample(self, index: int) -> WindowSample:
+        rec, anchor_idx = self._choose_anchor(index)
         mode = self._choose_mode()
         if mode == "mode1": spec = self._mode1_spec(rec, anchor_idx)
         elif mode == "mode2": spec = self._mode2_spec(rec, anchor_idx)

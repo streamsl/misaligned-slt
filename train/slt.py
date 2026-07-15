@@ -86,8 +86,9 @@ def build_slt_components(
         tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
         visual_padding=str(slt_cfg.get("visual_padding", "none")),
     )
-    # streaming_loader clamps TRAIN workers to 0 (the stateful WindowSampler emits identical streams per worker —
-    # duplicate batches, 1/num_workers anchor coverage); deterministic dev loaders keep workers (per-index rng).
+    # streaming_loader: num_workers is a plain throughput knob, safe at any value — the window anchor is index-driven
+    # (every anchor realized once per epoch regardless of worker partitioning) and each worker reseeds its rng to
+    # decorrelate the per-window random draws (see data.loader.streaming_loader / WindowSampler.configure_worker).
     num_workers = int(slt_cfg.get("num_workers", 0))
     train_loader = streaming_loader(train_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
     dev_loader = None

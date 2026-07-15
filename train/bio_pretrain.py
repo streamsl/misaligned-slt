@@ -112,7 +112,8 @@ def build_bio_s1(
     )
     collator = WindowCollator(tokenizer=None)  # BIO-only: no text tokenization
     num_workers = int(cfg.get("num_workers", 0))
-    # streaming_loader clamps train workers to 0 (stateful sampler → identical worker streams); dev keeps them.
+    # streaming_loader: num_workers is safe at any value — the anchor is index-driven (exact per-epoch coverage) and
+    # each worker reseeds its rng to decorrelate window draws (see data.loader.streaming_loader).
     train_loader = streaming_loader(train_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
     dev_loader = streaming_loader(dev_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
 

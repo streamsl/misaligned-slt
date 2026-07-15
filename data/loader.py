@@ -310,8 +310,8 @@ class StreamingWindowDataset(Dataset):
     def __len__(self) -> int:
         return self.steps_per_epoch
 
-    def _sample_item(self) -> dict:
-        sample = self.sampler.sample()
+    def _sample_item(self, index: int) -> dict:
+        sample = self.sampler.sample(index)   # anchor = anchors[index % N] (index-driven, worker-invariant)
         item = self.sampler.to_dict(sample)
         if self.include_full_evidence and sample.full_evidence_spec is not None:
             rec = self.records_by_id[sample.full_evidence_spec.video_id]
@@ -321,40 +321,48 @@ class StreamingWindowDataset(Dataset):
         return item
 
     def __getitem__(self, index: int) -> dict:
-        if not self.deterministic: return self._sample_item()
+        # Anchor is index-driven in both paths (sampler.sample), so every anchor is realized once per epoch.
+        if not self.deterministic: return self._sample_item(index)
+        # Dev monitor: fixed windows across epochs — a per-index rng makes mode/jitter reproducible, and fps_aug
+        # is off (a TRAIN augmentation; Moryossef 2026 gates it on split==TRAIN and evaluates at native fps, so
+        # leaving it on scored the monitor on 15–30fps resampled windows the head never deploys under).
         rng = np.random.default_rng(self.seed * 100_003 + int(index))
-        saved = (self.sampler.rng, self.sampler._anchor_order, self.sampler._anchor_cursor, self.sampler.fps_aug_enabled)
+        saved = (self.sampler.rng, self.sampler.fps_aug_enabled)
         self.sampler.rng = rng
-        # Validation must enumerate GT sentence anchors. A random permutation per index picks only
-        # the first element of many independent permutations, so anchors can duplicate while others
-        # never appear. Force the chosen anchor and let the per-index rng still draw mode/jitter.
-        anchor_idx = int(index) % len(self.sampler.anchors)
-        self.sampler._anchor_order = np.asarray([anchor_idx], dtype=np.int64)
-        self.sampler._anchor_cursor = 0
-        # fps_aug is a TRAIN augmentation (Moryossef 2026 gates it on split==TRAIN; eval runs native fps).
-        # Leaving it on here scored the monitor on 15–30fps resampled windows the head never deploys under.
         self.sampler.fps_aug_enabled = False
-        try: return self._sample_item()  # incl. full-evidence materialization, under the per-index rng
-        finally: (self.sampler.rng, self.sampler._anchor_order,
-                  self.sampler._anchor_cursor, self.sampler.fps_aug_enabled) = saved
+        try: return self._sample_item(index)
+        finally: (self.sampler.rng, self.sampler.fps_aug_enabled) = saved
+
+
+def _streaming_worker_init(worker_id: int) -> None:
+    """Reseed each DataLoader worker's WindowSampler so parallel workers don't replay identical mode/jitter streams.
+
+    Forked/spawned workers inherit the sampler's Generator state IDENTICALLY (PyTorch's per-worker seeding never
+    touches a Generator stored on the dataset), so without this W workers draw the same per-window random sequence.
+    `info.seed` is unique per worker (torch base_seed + worker_id). The ANCHOR is index-driven (anchors[index % N]),
+    so coverage is exact regardless of workers — this reseed only decorrelates the mode/jitter/fps/pose-aug draws.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None: return
+    sampler = getattr(info.dataset, "sampler", None)
+    if sampler is not None and hasattr(sampler, "configure_worker"):
+        sampler.configure_worker(int(info.seed) % (2**32))
 
 
 def streaming_loader(dataset: StreamingWindowDataset, batch_size: int, collate_fn, num_workers: int = 0) -> DataLoader:
     """The ONE DataLoader constructor for StreamingWindowDataset (both trainers route through here).
 
-    The non-deterministic train path draws from a SINGLE stateful WindowSampler rng, and forked/spawned workers
-    inherit IDENTICAL Generator state (PyTorch per-worker seeding never touches a Generator instance stored on the
-    dataset) — num_workers=4 makes batches 0..3, 4..7, ... byte-identical: 4x duplicate gradients and ~1/4 unique
-    anchors per epoch (sampler.py documents the num_workers=0 requirement). So workers are CLAMPED to 0 there.
-    Deterministic (dev) datasets derive their rng from the sample index, so workers are safe and kept.
+    num_workers is a plain throughput knob, safe at any value. The window ANCHOR is a deterministic function of the
+    global sample index (WindowSampler.sample → anchors[index % N]), so every anchor is realized exactly once per
+    epoch no matter how the DataLoader partitions indices across workers — no duplication, no lost coverage. The only
+    thing forked workers would otherwise share is the per-window random stream (mode/jitter/fps/pose-aug); the
+    `_streaming_worker_init` hook reseeds each worker's rng to decorrelate that. Deterministic (dev) datasets seed
+    their rng from the sample index, so they are reproducible and worker-count-invariant either way.
     """
-    if num_workers and not dataset.deterministic:
-        print(f"loader | num_workers {num_workers} -> 0: the stateful WindowSampler emits identical streams in "
-              f"every worker (duplicate batches; see train/sampler.py)", flush=True)
-        num_workers = 0
     return DataLoader(
         dataset, batch_size=int(batch_size), shuffle=False, num_workers=int(num_workers),
         persistent_workers=num_workers > 0, collate_fn=collate_fn,
+        worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
     )
 
 

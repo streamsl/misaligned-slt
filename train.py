@@ -24,7 +24,7 @@ def smoke_data(args: argparse.Namespace) -> dict:
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
 
     sampler = WindowSampler.from_slt_config(records, slt_cfg, inference_cfg)
-    samples = [sampler.to_dict(sampler.sample()) for _ in range(args.num_samples)]
+    samples = [sampler.to_dict(sampler.sample(i)) for i in range(args.num_samples)]
     batch = collate_windows(samples)
     padded_labels = batch["bio_labels"][~batch["frame_mask"]]
     if padded_labels.numel() and not torch.all(padded_labels == BIO["UNK"]): raise AssertionError("Padding labels must be UNK, never O")

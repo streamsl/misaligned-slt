@@ -10,7 +10,7 @@ from data.loader import load_language_records
 from poses import load_pose_window
 
 from infer.commit_gate import first_terminator_index
-from eval import _build_eval_model, _translate_window, load_prediction_file, save_prediction_file
+from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
 from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
 from utils import load_yaml, update_yaml_scalar, pick_device, pretrained_checkpoint, checkpoint_dir
 
@@ -205,35 +205,6 @@ def dataset_summary(args: argparse.Namespace) -> dict:
     }
 
 
-def _load_segmenter(args):
-    """Build + load a trained segmenter by --segmenter-arch (shared by segmenter-infer and segmenter-eval).
-
-    external (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
-    head — the non-circular Analysis-A/B / RQ2-cascade instrument, gate-doc §1.4). s1: the in-system BIO head, an
-    ablation that swaps the same Uni-Sign head in to isolate system design from segmentation competence.
-    Returns (model, device, velocity, rope_chunk, checkpoint).
-    """
-    device = pick_device(args.device)
-    if args.segmenter_arch == "s1":
-        from train.bio_pretrain import build_bio_s1_model
-        cfg = load_yaml(args.bio_config)
-        model = build_bio_s1_model(cfg)
-        ckpt_default = f"checkpoints/bio_s1/{args.language}"
-        # Uni-Sign features; whole-video chunked RoPE at ~the deployment buffer scale (rope_eval_chunk in
-        # bio_pretrain.yaml ≈ BUFFER_CAP_S×fps) — the S1 head runs in the FSM on a buffer capped at BUFFER_CAP_S.
-        velocity, rope_chunk = False, int(cfg.get("rope_eval_chunk", 1024))
-    else:
-        from moryossef26.trainer import build_segmenter
-        cfg = load_yaml(args.segmenter_config)
-        model = build_segmenter(args.segmenter_config)
-        ckpt_default = f"checkpoints/segmenter/{args.language}"
-        velocity, rope_chunk = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
-    checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=ckpt_default)) / "model.pt")
-    blob = torch.load(checkpoint, map_location="cpu")
-    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
-    return model, device, velocity, rope_chunk, checkpoint
-
-
 def segmenter_infer(args: argparse.Namespace) -> dict:
     """Predicted phrase segments on a split — the upstream segmenter for Analysis A / Analysis B / the RQ2 cascade."""
     if args.split == "test" and not args.allow_test:
@@ -251,30 +222,6 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
         "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "predicted_segments": sum(len(v) for v in predictions.values()), "output": str(output),
     }
-
-
-def segmenter_eval(args: argparse.Namespace) -> dict:
-    """Standalone whole-video segmentation eval (Moryossef evaluate.py protocol): frame-F1 + one-to-one tIoU segment
-    P/R/F1 on a split. Works for either --segmenter-arch — including `s1`, so the in-system BIO head can be scored on
-    its own after train-bio, without waiting for joint fine-tuning.
-    """
-    if args.split == "test" and not args.allow_test:
-        raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
-    from moryossef26.infer import evaluate_segmenter_whole_video
-    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
-    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
-    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
-
-    metrics = evaluate_segmenter_whole_video(model, records, device=device, velocity=velocity, rope_chunk=rope_chunk)
-    payload = {
-        "language": args.language, "split": args.split, "videos": len(records),
-        "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint, "metrics": metrics,
-    }
-    output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    payload["output"] = str(output)
-    return payload
 
 
 def analysis_a(args: argparse.Namespace) -> dict:
@@ -527,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
     parser.add_argument(
         "--stage", default="dataset-summary",
-        choices=["dataset-summary", "segmenter-infer", "segmenter-eval", "analysis-a", "analysis-b", "tail-benefit", "delta-enc"],
+        choices=["dataset-summary", "segmenter-infer", "analysis-a", "analysis-b", "tail-benefit", "delta-enc"],
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument(
@@ -561,7 +508,6 @@ if __name__ == "__main__":
     if args.language is None: args.language = str(load_yaml(args.data_config).get("active_languages", ["csl"])[0])
     if args.stage == "dataset-summary": result = dataset_summary(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
-    elif args.stage == "segmenter-eval": result = segmenter_eval(args)
     elif args.stage == "analysis-a":
         if not args.predictions: raise SystemExit("--predictions is required for --stage analysis-a")
         result = analysis_a(args)

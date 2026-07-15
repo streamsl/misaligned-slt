@@ -10,19 +10,20 @@ from data.loader import load_language_records
 from data.windowing import BIO
 
 from models.checkpointing import save_model_checkpoint
+from train.helpers import build_optimizer
 from train.sampler import WindowSampler
-from utils import checkpoint_dir, load_yaml
+from utils import checkpoint_dir, load_yaml, pick_device
 
 
 def smoke_data(args: argparse.Namespace) -> dict:
     data_cfg = load_yaml(args.data_config)
-    stage2_cfg = load_yaml(args.stage2_config)
+    slt_cfg = load_yaml(args.slt_config)
     inference_cfg = load_yaml(args.inference_config)
     language = str(args.language or data_cfg.get("active_languages", ["phoenix"])[0])
     records, splits = load_language_records(data_cfg, language, split=args.split)
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
 
-    sampler = WindowSampler.from_stage2_config(records, stage2_cfg, inference_cfg)
+    sampler = WindowSampler.from_slt_config(records, slt_cfg, inference_cfg)
     samples = [sampler.to_dict(sampler.sample()) for _ in range(args.num_samples)]
     batch = collate_windows(samples)
     padded_labels = batch["bio_labels"][~batch["frame_mask"]]
@@ -41,10 +42,9 @@ def smoke_data(args: argparse.Namespace) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT training utilities")
-    parser.add_argument(
-        "--stage", default="smoke-data",
-        choices=["smoke-data", "train-stage2", "train-segmenter"],
-    )
+    parser.add_argument("--stage", default="smoke-data", choices=["smoke-data", "train-slt", "train-bio", "train-segmenter"])
+    parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml")
+    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml")
     parser.add_argument(
         "--language", default=None, 
         help="Override active language; default falls back to the config's language / data.yaml active_languages"
@@ -54,10 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument("--stage2-config", default="configs/stage2_dlm.yaml")
-    parser.add_argument("--baseline-config", default="configs/stage2_baseline.yaml")
+    parser.add_argument("--slt-config", default="configs/dlm.yaml")
+    parser.add_argument("--baseline-config", default="configs/baseline.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
-    parser.add_argument("--segmenter-config", default="configs/segmenter.yaml")
+    parser.add_argument("--device", default=None, help="override device; default cuda -> mps -> cpu")
     parser.add_argument("--output", default=None)
     return parser
 
@@ -65,52 +65,45 @@ def build_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = build_parser().parse_args()
     if args.stage == "smoke-data": result = smoke_data(args)
-    elif args.stage == "train-stage2":
-        from train.stage2 import build_stage2_components, train_stage2_epochs
-        stage2_cfg = load_yaml(args.stage2_config)
-        segmenter_cfg = load_yaml(args.segmenter_config)
-        epochs = int(args.epochs or stage2_cfg.get("epochs", 1))
-        components = build_stage2_components(
-            data_config=args.data_config,
-            stage2_config=args.stage2_config,
-            inference_config=args.inference_config,
-            decoder=args.decoder,
-            include_dev=True,
+    elif args.stage == "train-bio":
+        from train.bio_pretrain import build_bio_s1, train_bio_s1_epochs
+        model, train_loader, dev_loader, cfg = build_bio_s1(
+            data_config=args.data_config, config=args.bio_config, inference_config=args.inference_config,
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        optimizer = torch.optim.AdamW(
-            [p for p in components.model.parameters() if p.requires_grad],  # skip a frozen backbone
-            lr=float(stage2_cfg.get("learning_rate", 3e-5)),
-            weight_decay=float(stage2_cfg.get("weight_decay", 1e-4)),
-        )
-        logs = train_stage2_epochs(
-            components.model, components.train_loader, optimizer, device=device, epochs=epochs,
-            stage2_cfg=stage2_cfg, segmenter_cfg=segmenter_cfg, dev_loader=components.dev_loader,
-        )
-        path = save_model_checkpoint(components.model, checkpoint_dir(stage2_cfg, default="checkpoints/stage2"))
+        device = pick_device(args.device)
+        epochs = int(args.epochs or cfg.get("epochs", 40))
+        logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
+        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"))
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
-
     elif args.stage == "train-segmenter":
-        from moryossef26.trainer import build_segmenter, build_segmenter_loader, train_segmenter_epochs
-        segmenter_cfg = load_yaml(args.segmenter_config)
-        opt_cfg = segmenter_cfg.get("optimizer", {})
-        epochs = int(args.epochs or opt_cfg.get("epochs", 1))
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        loader = build_segmenter_loader(data_config=args.data_config, segmenter_config=args.segmenter_config, split=args.split)
-        dev_loader = build_segmenter_loader(data_config=args.data_config, segmenter_config=args.segmenter_config, split="dev")
+        # The faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade (spec §4.6; independent of the
+        # FSM head — raw keypoints + UNet, a different input space). Trained standalone on whole-video chunks →
+        # checkpoints/segmenter (never the FSM's bio_head_init).
+        from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
+        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.segmenter_config)
         model = build_segmenter(args.segmenter_config)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=float(opt_cfg.get("lr", 1e-3)),
-            weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
+        device = pick_device(args.device)
+        epochs = int(args.epochs or cfg.get("epochs", 50))
+        logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
+        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/segmenter"))
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
+    elif args.stage == "train-slt":
+        from train.slt import build_slt_components, train_slt_epochs
+        slt_cfg = load_yaml(args.slt_config)
+        epochs = int(args.epochs or slt_cfg.get("epochs", 1))
+        components = build_slt_components(
+            data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
+            decoder=args.decoder, include_dev=True,
         )
-        output = train_segmenter_epochs(
-            model, loader, optimizer, device=device, epochs=epochs,
-            dice_weight=float(segmenter_cfg.get("dice_loss_weight", 1.5)),
-            cfg=segmenter_cfg, dev_loader=dev_loader,
+        device = pick_device(args.device)
+        # Skip a frozen backbone; build_optimizer reads learning_rate/weight_decay (same keys every stage)
+        optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
+        logs = train_slt_epochs(
+            components.model, components.train_loader, optimizer, device=device, epochs=epochs,
+            slt_cfg=slt_cfg, dev_loader=components.dev_loader,
         )
-        path = save_model_checkpoint(model, checkpoint_dir(segmenter_cfg, default="checkpoints/segmenter"))
-        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(output.logs)}
+        path = save_model_checkpoint(components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"))
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 
     text = json.dumps(result, indent=2, sort_keys=True)

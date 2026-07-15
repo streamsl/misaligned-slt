@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from data.batch import WindowCollator
-from data.loader import StreamingWindowDataset, load_language_records
+from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from models.checkpointing import save_model_checkpoint
@@ -86,24 +86,21 @@ def build_slt_components(
         tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
         visual_padding=str(slt_cfg.get("visual_padding", "none")),
     )
-    # num_workers>0 parallelizes pose load + window sampling + tokenization (the CPU bottleneck that otherwise
-    # stalls the GPU). 0 is safest on Windows; set num_workers in the config for Colab/Linux.
+    # streaming_loader clamps TRAIN workers to 0 (the stateful WindowSampler emits identical streams per worker —
+    # duplicate batches, 1/num_workers anchor coverage); deterministic dev loaders keep workers (per-index rng).
     num_workers = int(slt_cfg.get("num_workers", 0))
-    train_loader = DataLoader(
-        train_dataset, batch_size=int(slt_cfg.get("batch_size", 4)), shuffle=False, 
-        num_workers=num_workers, persistent_workers=num_workers > 0, collate_fn=collator,
-    )
+    train_loader = streaming_loader(train_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
-        # Dev scoring should cover the same experimental unit as standard SLT training: 1 sentence anchor, not 1 video. 
+        # Dev scoring should cover the same experimental unit as standard SLT training: 1 sentence anchor, not 1 video.
         # With len(dev_records), validation sampled only 1 fixed window per video and could miss most sentences.
         dev_steps = sum(len(record.sentences) for record in dev_records)
         dev_dataset = StreamingWindowDataset(
             dev_records, slt_cfg=slt_cfg, inference_cfg=inference_cfg,
             steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
         )
-        dev_loader = DataLoader(dev_dataset, batch_size=int(slt_cfg.get("batch_size", 4)), collate_fn=collator)
+        dev_loader = streaming_loader(dev_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
 
     # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
     # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).

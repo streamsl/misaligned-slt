@@ -31,12 +31,12 @@ wandb:
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
 epochs: 50
-batch_size: 8
-learning_rate: 1.0e-4
+batch_size: 128
+learning_rate: 1.0e-3
 weight_decay: 1.0e-4
 
-# Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py segmenter-infer /
-# segmenter-eval). Set ≈ the deployment buffer scale (BUFFER_CAP_S × fps): the S1 head runs in the FSM on a buffer
-# capped at BUFFER_CAP_S (~18 s × 30 fps ≈ 540). 1024 (≈ 34 s) is a conservative upper bound; lower it toward
-# buffer_cap_s×fps for a tighter train/deploy match. Unused by stage-1 training (windows are processed whole).
-rope_eval_chunk: 1024
+# Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py --stage
+# segmenter-infer / eval.py --segmenter-eval). MUST match the head's trained context, not exceed it (Moryossef's
+# core lesson: train/inference context mismatch is his largest negative ablation): training windows are clamped
+# to buffer_cap_s (sampler.py), so the head never attends beyond ~BUFFER_CAP_S × fps = 18 s × 30 fps = 540 frames.
+rope_eval_chunk: 540 # Unused by stage-1 training

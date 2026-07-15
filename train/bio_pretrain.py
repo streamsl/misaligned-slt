@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from backbones import UniSignPoseEncoder
 from data.batch import WindowCollator
-from data.loader import StreamingWindowDataset, load_language_records
+from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
 from models.bio_head import RoPEBIOHead
 
 from metrics import bio_frame_metrics, moryossef_segment_metrics
@@ -69,7 +69,7 @@ class BioS1Model(nn.Module):
     def forward(self, poses, frame_mask, timestamps_s=None):
         with torch.no_grad():
             feats = self.pose_encoder(poses, frame_mask)
-        return self.bio_head(feats, timestamps_s=timestamps_s)
+        return self.bio_head(feats, timestamps_s=timestamps_s, frame_mask=frame_mask)
 
 
 def build_bio_s1_model(cfg: dict) -> BioS1Model:
@@ -112,11 +112,9 @@ def build_bio_s1(
     )
     collator = WindowCollator(tokenizer=None)  # BIO-only: no text tokenization
     num_workers = int(cfg.get("num_workers", 0))
-    train_loader = DataLoader(
-        train_dataset, batch_size=int(cfg.get("batch_size", 8)), shuffle=False,
-        num_workers=num_workers, persistent_workers=num_workers > 0, collate_fn=collator
-    )
-    dev_loader = DataLoader(dev_dataset, batch_size=int(cfg.get("batch_size", 8)), collate_fn=collator)
+    # streaming_loader clamps train workers to 0 (stateful sampler → identical worker streams); dev keeps them.
+    train_loader = streaming_loader(train_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
+    dev_loader = streaming_loader(dev_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
 
     model = build_bio_s1_model(cfg)
     return model, train_loader, dev_loader, cfg
@@ -138,6 +136,15 @@ def evaluate_bio_s1(
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(out.logits, labels, prefix="phrase"))
+            # Per-mode tIoU diagnostic: the headline monitor mixes very different tasks (mode1 complete-span
+            # windows vs mode2 truncated fragments vs mode4 gaps), so a capped average is uninterpretable without
+            # this split — a low val_phrase_tiou_f1 driven by mode2 fragments is a metric-granularity property of
+            # misaligned windows, not head incompetence. NOT comparable to the Moryossef chunk monitor either way.
+            modes = batch.get("mode_names") or []
+            for mode in set(modes):
+                idx = [i for i, m in enumerate(modes) if m == mode]
+                sub = moryossef_segment_metrics(out.logits[idx], labels[idx], prefix=mode)
+                row[f"{mode}_tiou_f1"] = sub[f"{mode}_tiou_f1"]
             rows.append(row)
     return mean_logs(rows, prefix="val")
 

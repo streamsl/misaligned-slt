@@ -211,8 +211,8 @@ class MisalignedSLTModel(nn.Module):
         """Poses → (bio_logits, tokens, confidence). This method owns the BIO tap + the membership gate; every
         decode knob (max_text_tokens / diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id)
         passes straight through to `generate_from_bio_tap` — declared once, there, not re-listed here."""
-        bio_tap, mask, ts = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
-        bio_logits = self.bio_head(bio_tap, timestamps_s=ts).logits
+        bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
+        bio_logits = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=mask).logits
         # Membership gate at inference: on-policy span from the head's own argmax (bio_labels=None → no veto),
         # χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in training (§1.3/§2.8).
         # Both arms: the DLM injects Ω in its decode; the AR arm via HF cross-attn hooks (front_end.ar_generate).
@@ -256,7 +256,7 @@ class MisalignedSLTModel(nn.Module):
         Per-mode losses logged separately. Returns `SLTLossOutput` with the total, the BIO and translation components, and a `logs` dict.
         """
         bio_tap, bio_mask, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
-        bio_out = self.bio_head(bio_tap, timestamps_s=timestamps)
+        bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
         bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
         translation_loss = bio_tap.sum() * 0.0
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
@@ -358,7 +358,7 @@ class MisalignedSLTModel(nn.Module):
             and batch.get("reference_tokens") is not None):
             cb_indices = batch["full_evidence_indices"].to(bio_tap.device)
             full_batch = batch["full_evidence"]
-            full_bio_tap, full_mask, _ = self.front_end.extract_bio_tap(
+            full_bio_tap, full_mask, full_timestamps = self.front_end.extract_bio_tap(
                 full_batch["poses"], full_batch["frame_mask"], full_batch.get("timestamps_s"),
             )
             ref_ids = batch["reference_tokens"]["input_ids"].to(bio_tap.device)[cb_indices]
@@ -379,7 +379,9 @@ class MisalignedSLTModel(nn.Module):
                     commit_mask=chi[cb_indices] if chi is not None else None,
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, iou_veto=gate_iou_veto,
                 )
-                full_cb_bio_logits = self.bio_head(full_bio_tap).logits
+                # Real timestamps + mask (previously dropped: RoPE silently fell back to the 50fps-index
+                # assumption on the full-evidence view — a time-scale mismatch vs the trunc view's real seconds).
+                full_cb_bio_logits = self.bio_head(full_bio_tap, timestamps_s=full_timestamps, frame_mask=full_mask).logits
                 cb_omega_full, _ = self.build_gate_omega(
                     full_cb_bio_logits, None, full_mask, memory_len=prompt_len + int(full_bio_tap.shape[1]),
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,

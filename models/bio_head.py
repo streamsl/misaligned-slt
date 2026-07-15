@@ -56,13 +56,24 @@ class RoPETransformerEncoderLayer(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
 
-    def forward(self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None, key_mask: torch.Tensor | None = None) -> torch.Tensor:
         batch, frames, hidden_dim = x.shape
         # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
         if timestamps_s is None: timestamps_s = torch.arange(frames, device=x.device, dtype=torch.float32) / self.REFERENCE_FPS
         if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
         timestamps_s = timestamps_s.to(device=x.device)
         cos, sin = self._compute_rope(timestamps_s)
+
+        # Key-padding mask (True = real frame). Excluding padded KEYS makes training attention semantics identical to dense unbatched 
+        # inference ("attend to exactly the real frames") — the collator's stated contract (data/batch.py: "Padded frames stay masked 
+        # (attention)"). This is NOT the query/"causal-style" padding mask Moryossef 2026 removed (README:66): his regime (uniform 
+        # 1024-frame chunks) has negligible padding, so REMOVING mask achieved train/inference consistency there; our window batches 
+        # span 0.5s–18s, where UNMASKED ghost keys are heavy at training & absent at inference — the exact mismatch his rule targets.
+        attn_mask = None
+        if key_mask is not None:
+            km = key_mask.to(device=x.device, dtype=torch.bool)
+            km = km | ~km.any(dim=-1, keepdim=True)  # all-padding row (fully-padded chunk): attend anywhere; outputs are loss-ignored
+            attn_mask = km[:, None, None, :]
 
         # RMSNorm in fp32 (cast back after): autocast keeps LayerNorm in fp32 but not rms_norm, so a
         # bf16 input meets the fp32 weight and PyTorch warns + falls back to the unfused kernel.
@@ -73,14 +84,14 @@ class RoPETransformerEncoderLayer(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = q * cos + self._rotate_half(q) * sin
         k = k * cos + self._rotate_half(k) * sin
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop.p if self.training else 0.0)
         x = x + self.out_proj(attn.transpose(1, 2).reshape(batch, frames, hidden_dim))
         return x + self.ffn(self.norm2(x.float()).to(x.dtype))
 
 
 def chunked_rope_encode(
-    layers: nn.ModuleList, x: torch.Tensor, 
-    timestamps_s: torch.Tensor | None, chunk_size: int | None,
+    layers: nn.ModuleList, x: torch.Tensor, timestamps_s: torch.Tensor | None, 
+    chunk_size: int | None, key_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run pre-norm RoPE layers over fixed-size chunks (Moryossef chunked inference).
 
@@ -95,7 +106,7 @@ def chunked_rope_encode(
         timestamps_s = timestamps_s.to(device=x.device)
 
     if chunk_size is None or x.shape[1] <= int(chunk_size):
-        for layer in layers: x = layer(x, timestamps_s)
+        for layer in layers: x = layer(x, timestamps_s, key_mask=key_mask)
         return x
 
     chunks: list[torch.Tensor] = []
@@ -103,7 +114,8 @@ def chunked_rope_encode(
         end = min(x.shape[1], start + int(chunk_size))
         chunk = x[:, start:end]
         chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None else None
-        for layer in layers: chunk = layer(chunk, chunk_ts)
+        chunk_mask = key_mask[:, start:end] if key_mask is not None else None
+        for layer in layers: chunk = layer(chunk, chunk_ts, key_mask=chunk_mask)
         chunks.append(chunk)
     return torch.cat(chunks, dim=1)
 
@@ -182,15 +194,22 @@ class RoPEBIOHead(nn.Module):
         ) for _ in range(depth)])
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
-    def encode(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
+    def encode(
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm under autocast (see layer note)
-        # Conv stem runs on the full sequence BEFORE RoPE chunking (it is local/translation-equivariant,
-        # so it does not reintroduce the absolute-position issue chunked RoPE eliminates).
+        # Conv stem runs on the full sequence BEFORE RoPE chunking (it is local/translation-equivariant, so it does not reintroduce the 
+        # absolute-position issue chunked RoPE eliminates). Padded frames bleed into real ones only within its ~(kernel·layers)-frame 
+        # halo — bounded and local, unlike unmasked attention's global bleed; the affected positions' losses are UNK-ignored anyway.
         if self.conv_stem is not None: x = self.conv_stem(x)
-        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size)
+        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size, key_mask=frame_mask)
 
-    def forward(self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> BIOHeadOutput:
-        hidden = self.encode(features, timestamps_s=timestamps_s)
+    def forward(
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None
+    ) -> BIOHeadOutput:
+        hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
         phrase_logits = self.phrase_bio_head(hidden)
         return BIOHeadOutput(phrase_logits=phrase_logits, logits=phrase_logits, hidden_states=hidden)

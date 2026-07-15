@@ -148,7 +148,9 @@ jitter:
         tail_scale_s: 0.8
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
-num_workers: 4 # DataLoader workers for parallel pose-load + window-sample + tokenize.
+num_workers: 4 # DataLoader workers — DEV/deterministic loaders only (per-index rng, worker-safe). TRAIN loaders are
+               # clamped to 0 by data.loader.streaming_loader: the stateful WindowSampler rng is copied into every
+               # worker, so workers>0 would emit byte-identical batch streams (duplicate gradients, 1/N anchor coverage).
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100

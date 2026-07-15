@@ -36,7 +36,13 @@ learning_rate: 1.0e-3
 weight_decay: 1.0e-4
 
 # Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py --stage
-# segmenter-infer / eval.py --segmenter-eval). MUST match the head's trained context, not exceed it (Moryossef's
-# core lesson: train/inference context mismatch is his largest negative ablation): training windows are clamped
-# to buffer_cap_s (sampler.py), so the head never attends beyond ~BUFFER_CAP_S × fps = 18 s × 30 fps = 540 frames.
-rope_eval_chunk: 540 # Unused by stage-1 training
+# segmenter-infer / eval.py --segmenter-eval), in SECONDS. MUST match the head's trained context, not exceed it
+# (Moryossef's core lesson: train/inference context mismatch is his largest negative ablation): training windows
+# are clamped to buffer_cap_s (sampler.py), so eval chunks at buffer_cap_s too. DATASET-GENERAL — the inference
+# wrapper converts to frames at each stream's own fps (30fps CSL→540, 25fps PHOENIX→450, per-video YouTube fps).
+# DEFAULTS to inference.yaml's buffer_cap_s when unset (the value the FSM also deploys under, so eval matches deploy).
+# CAVEAT for multi-dataset work: buffer_cap_s is one scalar in the shared inference.yaml that tail-benefit rewrites
+# per corpus. A head trains under whatever buffer_cap_s was set THEN; if we later overwrite inference.yaml for another
+# corpus and eval this head, train/deploy context diverge (whole-system, not just eval). Keep one head ↔ one
+# buffer_cap_s (per-dataset configs, or pin it here):
+# rope_eval_chunk_s: 18.0   # explicit override in SECONDS; unused by stage-1 training

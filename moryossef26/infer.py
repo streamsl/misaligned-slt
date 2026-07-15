@@ -51,22 +51,29 @@ def _phrase_logits(
     return out["phrase"] if isinstance(out, dict) else out.logits  # MoryossefSegmenter dict vs BIOHeadOutput
 
 
+def _set_rope_chunk(model, record, rope_chunk_s: float | None) -> None:
+    # S1 head only (Moryossef chunks internally by its train num_frames): chunk RoPE at the head's TRAINED context,
+    # expressed in SECONDS (= buffer_cap_s, the clamp on training windows) and converted to frames at THIS stream's
+    # fps — dataset-general (30fps CSL → 540, 25fps PHOENIX → 450, per-video YouTube fps → its own count).
+    if rope_chunk_s is not None and hasattr(model, "bio_head"):
+        model.bio_head.chunk_size = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
+
+
 @torch.no_grad()
 def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device,
-    velocity: bool = True, rope_chunk: int | None = None,
+    velocity: bool = True, rope_chunk_s: float | None = None,
 ) -> dict[str, list[Segment]]:
     # Predicted phrase segments per video (Analysis A / Analysis B / RQ2 cascade upstream).
     model.eval().to(device)
-    if rope_chunk is not None and hasattr(model, "bio_head"):  # S1 head: chunk RoPE like training
-        model.bio_head.chunk_size = int(rope_chunk)
     predictions: dict[str, list[Segment]] = {}
-    
+
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
             predictions[record.video_id] = []
             continue
+        _set_rope_chunk(model, record, rope_chunk_s)
         tags = _phrase_logits(model, poses, timestamps, device, velocity).argmax(dim=-1)[0].detach().cpu()
         predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
     return predictions
@@ -74,7 +81,7 @@ def predict_phrase_segments(
 
 @torch.no_grad()
 def evaluate_segmenter_whole_video(
-    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk: int | None = None, 
+    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
     trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,),
 ) -> dict[str, float]:
     """Moryossef evaluate.py-style STANDALONE eval: process each video whole (encoder chunks internally), build GT
@@ -82,18 +89,19 @@ def evaluate_segmenter_whole_video(
 
     This is the faithful whole-video test protocol (phrase level only, no sign head), and — for `--segmenter-arch
     s1` — the way to score the pretrained in-system BIO head on its own, without waiting for joint fine-tuning.
+    `rope_chunk_s` (S1 only): the head's trained context in SECONDS (= buffer_cap_s), converted to frames per stream.
     `trusted_gap_s` defaults to TRUSTED_GAP_S so GT labeling matches training: long uncaptioned stretches become
     UNK (excluded from the metric), not O — else the segmenter is penalized for firing on possibly-uncaptioned signing.
     `tiou_thresholds`: pass eval.yaml's rq2.tiou_thresholds for numbers directly comparable to RQ2's segmentation
     block; thresholds beyond the first get an `@t` key suffix (first threshold keeps the bare keys for the monitor).
     """
     model.eval().to(device)
-    if rope_chunk is not None and hasattr(model, "bio_head"): model.bio_head.chunk_size = int(rope_chunk)
     rows: list[dict[str, float]] = []
 
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0: continue
+        _set_rope_chunk(model, record, rope_chunk_s)
         gold = make_bio_labels(
             timestamps, record.sentences, 0.0, float(record.pose.duration_s),
             trusted_gap_s=trusted_gap_s, video_duration_s=record.pose.duration_s,

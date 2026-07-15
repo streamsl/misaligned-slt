@@ -211,10 +211,10 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
         raise SystemExit("Refusing to run segmenter inference on test without --allow-test")
     from moryossef26.infer import predict_phrase_segments
     records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
-    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
+    model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
     print(f"[segmenter-infer] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
 
-    predictions = predict_phrase_segments(model, records, device=device, velocity=velocity, rope_chunk=rope_chunk)
+    predictions = predict_phrase_segments(model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s)
     output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
     save_prediction_file(predictions, output)
     return {

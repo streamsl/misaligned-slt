@@ -731,7 +731,7 @@ def _load_segmenter(args):
     external (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
     head — the non-circular Analysis-A/B / RQ2-cascade instrument, gate-doc §1.4). s1: the in-system BIO head, an
     ablation that swaps the same Uni-Sign head in to isolate system design from segmentation competence.
-    Returns (model, device, velocity, rope_chunk, checkpoint).
+    Returns (model, device, velocity, rope_chunk_s, checkpoint) — rope_chunk_s in SECONDS (S1) or None (external).
     """
     device = pick_device(args.device)
     if args.segmenter_arch == "s1":
@@ -739,17 +739,18 @@ def _load_segmenter(args):
         cfg = load_yaml(args.bio_config)
         model = build_bio_s1_model(cfg)
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
-        # Uni-Sign features; whole-video chunked RoPE at the head's TRAINED context (rope_eval_chunk in bio_pretrain.yaml = 
-        # BUFFER_CAP_S×fps = 540): training windows are clamped to buffer_cap_s (sampler.py), so a larger eval chunk would 
-        # attend over contexts the head never trained on — exactly Moryossef's train/inference-mismatch lesson.
-        velocity, rope_chunk = False, int(cfg.get("rope_eval_chunk", 540))
+        # Uni-Sign features; whole-video chunked RoPE at the head's TRAINED context, in SECONDS: training windows are
+        # clamped to buffer_cap_s (sampler.py), so eval chunks at buffer_cap_s — dataset-general (the wrapper converts
+        # to frames at each stream's own fps). A larger chunk would attend over contexts the head never trained on.
+        buffer_cap_s = float(load_yaml(args.inference_config).get("buffer_cap_s", 18.0))
+        velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s", buffer_cap_s))
     else:
         from moryossef26.trainer import build_segmenter
         cfg = load_yaml(args.segmenter_config)
         model = build_segmenter(args.segmenter_config)
         ckpt_default = f"checkpoints/segmenter/{args.language}"
-        velocity, rope_chunk = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
-        
+        velocity, rope_chunk_s = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
+
     # The config's checkpoint.dir had ${language} expanded from the config file's OWN `language:` key at load
     # time; when the CLI --language differs, that path points at another corpus's checkpoint — fall back to the
     # default (built from args.language) instead of silently loading e.g. the csl model for --language phoenix.
@@ -758,7 +759,7 @@ def _load_segmenter(args):
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
     blob = torch.load(checkpoint, map_location="cpu")
     model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
-    return model, device, velocity, rope_chunk, checkpoint
+    return model, device, velocity, rope_chunk_s, checkpoint
 
 
 def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
@@ -772,13 +773,13 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
     from moryossef26.infer import evaluate_segmenter_whole_video
     records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
-    model, device, velocity, rope_chunk, checkpoint = _load_segmenter(args)
+    model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
     print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
 
     # Report at RQ2's tIoU grid so these standalone numbers line up 1:1 with the full-system segmentation block.
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     metrics = evaluate_segmenter_whole_video(
-        model, records, device=device, velocity=velocity, rope_chunk=rope_chunk, tiou_thresholds=thresholds,
+        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds,
     )
     payload = {
         "language": args.language, "split": args.split, "videos": len(records),

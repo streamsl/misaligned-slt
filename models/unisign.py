@@ -151,6 +151,9 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         )
         return self.lm_head(out.last_hidden_state), out.past_key_values
 
+    def _decoder_stack(self):
+        return self.mbart_decoder  # MBartDecoder — the stack the Ω injector hooks (layers[i].encoder_attn)
+
 # ════════════════════════════════════════════════════════════════════════════
 # mT5 block-diffusion decoder
 # ════════════════════════════════════════════════════════════════════════════
@@ -247,6 +250,9 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         )
         return self.lm_head(out.last_hidden_state * self.lm_head_scale), out.past_key_values
 
+    def _decoder_stack(self):
+        return self.decoder  # T5Stack — the stack the Ω injector hooks (block[i].layer[1])
+
 # ════════════════════════════════════════════════════════════════════════════
 # Uni-Sign front end — shared pose+prompt base; mT5 (primary) / mBART (ablation) LM variants
 # ════════════════════════════════════════════════════════════════════════════
@@ -290,8 +296,10 @@ class UniSignFrontEndBase(SLTFrontEnd):
         device = bio_tap.device
         b = bio_tap.shape[0]
         prefix = self.tokenizer(
+            # No truncation: the prompt is a fixed short constant (never exceeds the model max), so truncation=True
+            # only triggers the "no maximum length is provided" warning while doing nothing.
             [f"Translate sign language video to {self.prompt_lang}: "] * b,
-            padding="longest", truncation=True, return_tensors="pt",
+            padding="longest", return_tensors="pt",
         ).to(device)
         prefix_embeds = self._prompt_token_embeds(prefix["input_ids"])
         inputs_embeds = torch.cat([prefix_embeds, bio_tap * self.pose_embed_scale], dim=1)
@@ -327,7 +335,17 @@ class UniSignFrontEndBase(SLTFrontEnd):
             for p in self.pose_encoder.pose_proj.parameters():
                 p.requires_grad_(True)
                 frozen -= p.numel()
+        self._pose_backbone_frozen = True  # `train()` keeps it in eval so its ST-GCN BatchNorm stats don't drift
+        self.pose_encoder.eval()
         return frozen
+
+    def train(self, mode: bool = True):
+        # A frozen pose backbone must stay in eval: its BatchNorm2d would otherwise use batch stats and update
+        # running_mean/var during SLT training — so it isn't truly frozen, and S2 features drift away from the
+        # S1 features the BIO head was pretrained on (docs/membership_gate.md §1.4). No-op when not frozen.
+        super().train(mode)
+        if getattr(self, "_pose_backbone_frozen", False): self.pose_encoder.eval()
+        return self
 
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
         """Load a released Uni-Sign `*_pose_only_slt.pth` ({'model': {<pose>.*, mt5_model.*}}): pose keys -> `pose_encoder` 

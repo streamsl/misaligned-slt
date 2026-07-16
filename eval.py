@@ -17,7 +17,7 @@ pd.set_option("display.width", None)               # auto-detect terminal width
 pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
 
 from poses import load_pose_window
-from data.windowing import SentenceSpan
+from data.windowing import SentenceSpan, make_bio_labels
 from data.loader import VideoRecord, load_language_records
 from data.batch import frame_mask_for, repeat_last_frame
 
@@ -25,7 +25,7 @@ from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
-from metrics import Segment, match_segments, segmentation_prf, compute_text_metrics
+from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, pretrained_checkpoint
 
 
@@ -150,8 +150,8 @@ def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]
 
 
 def controlled_windows(
-    records: list[VideoRecord], grid: list[float], relative: bool = True, 
-    max_sentences: int | None = None, tail_grid: list[float] | None = None,
+    records: list[VideoRecord], grid: list[float], relative: bool = True, max_sentences: int | None = None, 
+    tail_grid: list[float] | None = None, drop_counts: dict[tuple[float, float], int] | None = None,
 ) -> list[ControlledWindow]:
     """Build RQ1 signed-offset windows.
 
@@ -182,15 +182,20 @@ def controlled_windows(
                     dt = float(gt) * duration if relative else float(gt)
                     start_s = max(0.0, float(span.start_s) + dh)
                     end_s = min(float(record.pose.duration_s), float(span.end_s) + dt)
-                    if end_s <= start_s: continue
+                    if end_s <= start_s:
+                        # Fully-truncated window (mostly absolute mode on short sentences): unrepresentable, so it is dropped — but COUNTED, 
+                        # because a severity row that silently sheds its short sentences averages over a longer-sentence subset than its 
+                        # neighbours (selection bias the dropped_fraction column makes visible, mirroring clamped_fraction).
+                        if drop_counts is not None: drop_counts[(float(gh), float(gt))] = drop_counts.get((float(gh), float(gt)), 0) + 1
+                        continue
                     windows.append(ControlledWindow(
                         video_id=record.video_id, reference=span.text,
                         gt_start_s=float(span.start_s), gt_end_s=float(span.end_s),
                         window_start_s=start_s, window_end_s=end_s,
-                        # REALIZED offsets after clamping to the available timeline — not the requested dh/dt. On pre-trimmed 
-                        # records the context margin around a sentence is finite, so a large negative-head / positive-tail 
-                        # request clamps; reporting the request as if it were realized would overstate severity exactly where 
-                        # the data limits it. grid_head/grid_tail keep the requested coordinate for grouping.
+                        # REALIZED offsets after clamping to the available timeline — not the requested dh/dt. On pre-trimmed records the 
+                        # context margin around a sentence is finite, so a large negative-head / positive-tail request clamps; reporting 
+                        # the request as if it were realized would overstate severity exactly where the data limits it. grid_head/grid_tail 
+                        # keep the requested coordinate for grouping.
                         delta_head_s=start_s - float(span.start_s), delta_tail_s=end_s - float(span.end_s),
                         grid_head=float(gh), grid_tail=float(gt),
                     ))
@@ -234,7 +239,7 @@ def evaluate_predicted_events(
                     pred_texts.append(pred_event.text)
                     ref_texts.append(gold_text)
                     matched_gold_text[(video_id, gold_idx)] = pred_event.text
-                if pred_event.commit_time_s is not None: # Emission latency: commit time minus GT sentence end (spec §9.2).
+                if pred_event.commit_time_s is not None: # Emission latency: commit time minus GT sentence end.
                     latencies.append(float(pred_event.commit_time_s) - float(gold_events[gold_idx].end_s))
 
         ri_hyps: list[str] = []
@@ -474,7 +479,10 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     tail_grid = _parse_grid(args.severity_grid_tail, grid)
     max_sentences = args.num_sentences
     if max_sentences is None and args.smoke: max_sentences = int(rq_cfg.get("smoke_num_sentences", 10))
-    windows = controlled_windows(records, head_grid, relative=relative, max_sentences=max_sentences, tail_grid=tail_grid)
+    drop_counts: dict[tuple[float, float], int] = {}
+    windows = controlled_windows(
+        records, head_grid, relative=relative, max_sentences=max_sentences, tail_grid=tail_grid, drop_counts=drop_counts
+    )
 
     records_by_id = {record.video_id: record for record in records}
     device = pick_device(args.device)
@@ -526,12 +534,16 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
         # inside the requested point and the row must not be read at face value.
         clamped = sum(1 for req, real in zip(values["req_head_s"], head_s) if abs(req - real) > 1e-3)
         clamped += sum(1 for req, real in zip(values["req_tail_s"], tail_s) if abs(req - real) > 1e-3)
+        dropped = int(drop_counts.get((float(gh), float(gt)), 0))
         severity.append({
             "windows": len(values["predictions"]),
             "grid_head": gh, "grid_tail": gt,  # fraction of sentence duration in relative mode, else seconds
             "delta_head_s_mean": float(sum(head_s) / len(head_s)) if head_s else 0.0,  # realized offset (relative -> varies per sentence)
             "delta_tail_s_mean": float(sum(tail_s) / len(tail_s)) if tail_s else 0.0,
             "clamped_fraction": float(clamped) / max(1, 2 * len(head_s)),
+            # Fully-truncated (unrepresentable) windows dropped at this grid point: a high value means this row
+            # averages over a LONGER-sentence subset than its neighbours — read it like clamped_fraction.
+            "dropped_fraction": float(dropped) / max(1, dropped + len(values["predictions"])),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
         })
@@ -541,7 +553,10 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "rq": "1", "language": args.language, "split": args.split, "method": args.method,
-            "severity_mode": mode, "grid": grid, "windows": len(rows), "severity": severity, "rows": rows,
+            # Per-axis grids as ACTUALLY swept — --severity-grid-head/--severity-grid-tail override the shared
+            # grid, so persisting only `grid` would misdescribe the artifact's axes. `grid` kept for old readers.
+            "severity_mode": mode, "grid": grid, "grid_head": head_grid, "grid_tail": tail_grid,
+            "windows": len(rows), "severity": severity, "rows": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[rq1] wrote {out}", flush=True)
     return pd.json_normalize(severity, sep=".").T # one row per (grid_head, grid_tail) severity point
@@ -561,7 +576,9 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
         delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
         hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
         token_confidence_tau=float(trans.get("commit_confidence_tau", 0.75)),
-        min_span_frames=int(inference_cfg.get("span_selection", {}).get("min_span_frames", 0)),
+        # None (missing key) → the runner derives the minimal spec-safe Λ_min = 2δ+1; 0-fallback will silently
+        # disabled the frozen Λ_min > 2δ invariant for any config lacking span_selection.
+        min_span_frames=inference_cfg.get("span_selection", {}).get("min_span_frames"),
         forced_tail_policy=str(inference_cfg.get("forced_tail_policy", "skip")),
         # Membership gate: the RQ2 streaming decode runs under the SAME Ω conditioning the decoder trained
         # with (method config's membership_gate block); χ comes from the runner's own commit log.
@@ -608,8 +625,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     predicted: dict[str, list[PredictionEvent]] = {}
+    fsm_bio_rows: list[dict[str, float]] = []
     for record in tqdm(records, desc="Processing records"):
-        poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
             predicted[record.video_id] = []
             continue
@@ -621,6 +639,19 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             flagged_partial=bool(ev.flagged_partial), commit_time_s=float(ev.commit_time_s),
         ) for ev in events]
 
+        # "Moryossef-style BIO precision/recall/F1 on the FSM's internal BIO predictions": score the runner's
+        # stitched per-frame argmax timeline against GT caption labels — the deployed head's segmentation quality,
+        # as the FSM actually saw it stride-by-stride (latest estimate per frame).
+        if runner._bio_timeline is not None:
+            gold = make_bio_labels(
+                timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s,
+            )
+            tags = runner._bio_timeline
+            logits_1hot = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=4).float().unsqueeze(0) * 10.0
+            fsm_bio_rows.append(moryossef_segment_metrics(
+                logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio",
+            ))
+
     # Why-did-it-(not)-commit summary. Low streaming recall with near-perfect frame BIO is the gate
     # suppressing emission; this shows which signal blocks. spans_seen = complete spans the FSM saw;
     # boundary_ok / translation_ok = how many passed each gate signal; committed = actual emissions.
@@ -631,6 +662,12 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         f"translation_ok={s.get('translation_ok',0)} committed={s.get('committed',0)} "
         f"forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
         f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True)
+    if fsm_bio_rows:
+        fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
+        print("[stream] FSM BIO (stitched per-frame argmax vs GT): "
+              + " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
+        run_streaming.last_fsm_bio = fsm_bio  # picked up by run_rq2 for the output payload
+    else: run_streaming.last_fsm_bio = None
     return predicted
 
 
@@ -705,6 +742,10 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     if args.stream:
         predicted = run_streaming(args)
         _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
+        fsm_bio = getattr(run_streaming, "last_fsm_bio", None)
+        if fsm_bio:  # FSM-internal BIO metric, persisted alongside the events
+            path = Path(f"outputs/rq2_fsm_bio_{args.method}_{args.language}_{args.split}.json")
+            path.write_text(json.dumps(fsm_bio, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif args.segments:
         predicted = run_pipeline_floor(args)
         _write_events_json(predicted, f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
@@ -757,8 +798,7 @@ def _load_segmenter(args):
     ckpt_dir = checkpoint_dir(cfg, default=ckpt_default)
     if args.language and str(cfg.get("language", args.language)) != str(args.language): ckpt_dir = ckpt_default
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
-    blob = torch.load(checkpoint, map_location="cpu")
-    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
+    load_model_checkpoint(model, checkpoint, strict=True)
     return model, device, velocity, rope_chunk_s, checkpoint
 
 

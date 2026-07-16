@@ -91,11 +91,6 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
             [target is not None for target in out["translation_targets"]],
             dtype=torch.bool,
         )
-        out["confidence_bound_candidates"] = torch.tensor([
-            mode == "mode2" and subcase == "right" and anchor is not None
-            for mode, subcase, anchor in zip(out["mode_names"], out["mode2_subcases"], out["anchor_spans"])
-        ], dtype=torch.bool)
-
         if self.tokenizer is not None:
             target_texts = [
                 target["text"] if isinstance(target, dict) else (target.text if target is not None else "")

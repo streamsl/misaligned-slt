@@ -17,7 +17,7 @@ pd.set_option("display.width", None)               # auto-detect terminal width
 pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
 
 from poses import load_pose_window
-from data.windowing import SentenceSpan, make_bio_labels
+from data.windowing import make_bio_labels
 from data.loader import VideoRecord, load_language_records
 from data.batch import frame_mask_for, repeat_last_frame
 

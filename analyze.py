@@ -12,8 +12,8 @@ from poses import load_pose_window
 from infer.commit_gate import first_terminator_index
 from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
 from models.checkpointing import load_model_checkpoint
-from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
-from utils import load_yaml, update_yaml_scalar, pick_device, pretrained_checkpoint, checkpoint_dir
+from metrics import Segment, match_segments, compute_text_metrics
+from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir
 
 # Analysis-A pred↔GT matching bar: deliberately LOW so near-misses count as matched pairs feeding the 
 # (Δ_head, Δ_tail) jitter CDF, not as phantom/skip events. A high bar biases the DF toward near-zero 

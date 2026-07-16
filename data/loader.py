@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re, random, csv, html
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Any, Iterable
 from pathlib import Path
 

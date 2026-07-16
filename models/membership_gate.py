@@ -199,8 +199,9 @@ class CrossAttnOmegaInjector:
 
     @staticmethod
     def _cross_attn_modules(lm_model: torch.nn.Module) -> list[torch.nn.Module]:
-        dec = getattr(lm_model, "decoder", None) or getattr(getattr(lm_model, "model", None), "decoder", None)
-        if dec is None: return []
+        # Accepts a full HF encoder-decoder OR a bare decoder stack (T5Stack / MBartDecoder) — the DLM's
+        # prefix-KV-cache path holds only the stack, and Ω injection is identical either way.
+        dec = getattr(lm_model, "decoder", None) or getattr(getattr(lm_model, "model", None), "decoder", None) or lm_model
         if hasattr(dec, "block"):   # T5 / mT5 stack: block[i].layer[1] == T5LayerCrossAttention
             return [blk.layer[1] for blk in dec.block]
         if hasattr(dec, "layers"):  # mBART: layers[i].encoder_attn == MBartAttention (cross)

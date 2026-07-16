@@ -189,7 +189,11 @@ class StreamingSLTRunner:
                 self._after_forced = False
                 if lead_term >= max(1, self.min_span_frames):
                     self._bump("committed"); self._bump("forced_tail_commit")
-                    tokens, confidence = self._decode_span(bio_tap, mask, slice(0, lead_term), omega_bias=omega_bias)
+                    # NO gate on this decode: the stride's Ω is anchored on a span selection in which the
+                    # buffer-start I-run can never open, so it would floor exactly the frames [0, lead_term)
+                    # being decoded (attention ×~1e-4 on the fragment's own evidence). The fragment decode is
+                    # already declared best-effort/out-of-distribution (ablation only) — run it ungated.
+                    tokens, confidence = self._decode_span(bio_tap, mask, slice(0, lead_term), omega_bias=None)
                     self.commit_gate.reset()
                     return StreamingEvent(
                         start_s=float(start_s + ts_b[0, 0].item()), end_s=float(start_s + ts_b[0, lead_term].item()),

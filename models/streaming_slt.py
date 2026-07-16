@@ -11,6 +11,7 @@ from models.bio_head import RoPEBIOHead
 from models.front_end import SLTFrontEnd
 from models.membership_gate import build_omega, omega_cross_bias
 from infer.commit_gate import open_span_start, select_target_span
+from data.windowing import BIO
 
 
 @dataclass
@@ -98,6 +99,10 @@ class MisalignedSLTModel(nn.Module):
         device = bio_logits.device
         lengths = frame_mask.to(device).long().sum(dim=1) if frame_mask is not None else torch.full((B,), T, device=device)
         pred_tags = bio_logits.detach().argmax(dim=-1)  # selection carries no gradient (§0)
+        # UNK closes like O — the SAME remap the FSM applies before its selection (infer/stream.py). Without it the
+        # gate's anchor selection sees UNK as neither O nor B: a span the FSM terminates stays open here, and the
+        # committed span vs the Ω anchor (s, τ, bands, cliff) silently diverge on argmax-UNK frames.
+        pred_tags = torch.where(pred_tags == BIO["UNK"], torch.full_like(pred_tags, BIO["O"]), pred_tags)
 
         starts, terms, has_term = [], [], []
         vetoed, n_gt = 0, 0  # veto rate is over windows that HAVE a GT target (§1.6 diagnostic)
@@ -151,9 +156,12 @@ class MisalignedSLTModel(nn.Module):
                 if open_s is not None:
                     starts.append(int(open_s)); terms.append(-1); has_term.append(False)
                 else:
-                    # Genuinely no span (all-gap / buffer-start-I leftover). Ω here is never decoded — the FSM
-                    # skips these (all-gap → no target; left-truncated → forced_tail_policy 'skip') — so the value
-                    # is inert; anchor past the end so logm stays ≈0 rather than suppressing from frame 0.
+                    # Genuinely no span (all-gap / buffer-start-I leftover). This Ω is INERT — never decoded
+                    # against: the FSM skips these buffers (all-gap → no target; left-truncated fragment →
+                    # 'skip', and the 'translate_partial' ablation decodes UNgated), and in training no-span
+                    # rows carry no translation loss. The anchor value is arbitrary; n−1 is just a valid index
+                    # (NOT neutral — frames < n−1−δ sit behind the left wall — which is fine only because
+                    # nothing reads it).
                     starts.append(max(0, n - 1)); terms.append(-1); has_term.append(False)
 
         out = build_omega(
@@ -184,7 +192,16 @@ class MisalignedSLTModel(nn.Module):
                 decode_algo=dcd_decode_algo, decode_param=dcd_decode_param, sample_top_k=dcd_sample_top_k,
                 top_p=dcd_top_p, cache_type=dcd_cache_type, refresh_count=dcd_refresh_count, omega_bias=omega_bias,
             )
-            return result.sequences, result.confidence
+            # Report PRODUCED-token confidence only, matching the AR arm's per-produced-token vector: canvas slot 0 
+            # is the synthetic BOS (confidence 1.0) and every slot after the first EOS is pad bookkeeping (also 1.0) 
+            # — averaged over a max_text_tokens canvas they pin the mean the commit gate reads near 1 for any short 
+            # sentence (a ~10-token sentence on a 128 canvas → mean ≥ 0.92 regardless of decode quality, i.e. 
+            # `translation_confident` would always fire).
+            seq, conf = result.sequences[:, 1:], result.confidence[:, 1:]
+            if seq.shape[0] == 1:  # every live caller decodes one window/buffer at a time
+                hits = (seq[0] == int(self.dlm_decoder.eos_index)).nonzero(as_tuple=False)
+                if hits.numel(): seq, conf = seq[:, : int(hits[0]) + 1], conf[:, : int(hits[0]) + 1]
+            return seq, conf
 
         # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns the
         # REAL per-token confidence (softmax prob of each produced token), aligned with `generated`. `num_beams>1`

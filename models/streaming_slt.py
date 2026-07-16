@@ -108,9 +108,20 @@ class MisalignedSLTModel(nn.Module):
             else:
                 gt = select_target_span(bio_labels[b, :n], min_span_frames)
                 if gt is not None: n_gt += 1
-                if gt_anchored:                 # always-GT ablation row
+                if gt_anchored:                 # ablation row: "GT-anchored with ±δ jitter" (gate-doc §3 table)
+                    # The ±δ jitter is part of the ablation's definition, not decoration: exact GT anchors would
+                    # hand the gate boundary information the deployed on-policy head can never supply, conflating
+                    # "teacher-forced m" with "oracle boundaries". Jitter keeps the anchors GT-DERIVED but
+                    # δ-imprecise — the same tolerance the gate's ramp/bands are built around.
                     span = gt
-                    if gt is not None: vetoed += 1
+                    if gt is not None:
+                        vetoed += 1
+                        if n > 2 and delta > 0:
+                            j_s = int(torch.randint(-int(delta), int(delta) + 1, (1,)).item())
+                            j_t = int(torch.randint(-int(delta), int(delta) + 1, (1,)).item())
+                            s_j = min(max(int(gt[0]) + j_s, 0), n - 2)
+                            t_j = min(max(int(gt[1]) + j_t, s_j + 1), n - 1)
+                            span = (s_j, t_j)
                 elif gt is not None and (pred is None or self._span_iou(pred, gt) < float(iou_veto)):
                     span = gt; vetoed += 1       # policy failed on a window that had a target → veto to GT
                 else: 
@@ -122,12 +133,21 @@ class MisalignedSLTModel(nn.Module):
                 # No TERMINATED span. If an OPEN (terminator-less) span runs to the buffer edge — Mode-2a
                 # right-truncation or a buffer-cap forced commit — anchor Ω at ITS true start s (doc §2.8 forced
                 # path: γ≡γ_s, no right cliff → Ω≈0 for the all-I interior). Anchoring at frame 0 instead would
-                # sweep the opening B and floor the entire span the gate is meant to OPEN (attention ×0.01). Use
-                # the GT open start at training (honest teacher-forced anchor for cb_omega_trunc), else predicted.
-                src = bio_labels[b, :n] if bio_labels is not None else pred_tags[b, :n]
-                open_s = open_span_start(src)
-                if open_s is None and bio_labels is not None:
-                    open_s = open_span_start(pred_tags[b, :n])
+                # sweep the opening B and floor the entire span the gate is meant to OPEN (attention ×0.01).
+                # SAME anchoring policy as the terminated branch above (doc §1.4/§1.5): ON-POLICY first — the
+                # predicted open start, which is what inference uses — with GT only as the logged veto fallback
+                # when the prediction is missing or off by more than δ (the single-endpoint analog of the IoU
+                # veto; within δ the ramp/band geometry is unchanged). GT-first here would train the decoder on
+                # teacher-forced anchors it never sees deployed, invisibly to the §1.6 veto-rate diagnostic.
+                pred_open = open_span_start(pred_tags[b, :n])
+                if bio_labels is None: open_s = pred_open  # inference: on-policy, no veto
+                else:
+                    gt_open = open_span_start(bio_labels[b, :n])
+                    if gt_open is not None: n_gt += 1
+                    if pred_open is not None and (gt_open is None or abs(pred_open - gt_open) <= int(delta)):
+                        open_s = pred_open
+                    elif gt_open is not None: open_s = gt_open; vetoed += 1
+                    else: open_s = pred_open
                 if open_s is not None:
                     starts.append(int(open_s)); terms.append(-1); has_term.append(False)
                 else:
@@ -287,7 +307,7 @@ class MisalignedSLTModel(nn.Module):
                 supervised_modes = [mode_names[int(i)] for i in idx_list]
                 invalid = sorted({mode for mode in supervised_modes if mode not in {"mode1", "mode3"}})
                 if invalid: raise ValueError(
-                    "Translation supervision is allowed only for complete-conditioning Mode 1/Mode 3 windows; got {invalid}"
+                    f"Translation supervision is allowed only for complete-conditioning Mode 1/Mode 3 windows; got {invalid}"
                 )
                 for mode in ("mode1", "mode3"):
                     selected = [int(i) for i in idx_list if mode_names[int(i)] == mode]
@@ -318,7 +338,6 @@ class MisalignedSLTModel(nn.Module):
                 labels = target_tokens["labels"].to(bio_tap.device)
                 if mode_to_indices:
                     weighted_losses: list[tuple[torch.Tensor, torch.Tensor]] = []
-                    masked_weights: list[tuple[torch.Tensor, torch.Tensor]] = []
                     for mode, mode_idx in mode_to_indices.items():
                         dlm_out = self.dlm_decoder.oput_forward(
                             enc_hidden=enc_hidden[mode_idx], enc_mask=enc_mask[mode_idx],
@@ -334,7 +353,6 @@ class MisalignedSLTModel(nn.Module):
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=dlm_out["translation_loss"].dtype).clamp(min=1)
                         weighted_losses.append((dlm_out["translation_loss"], weight))
-                        masked_weights.append((dlm_out["oput_masked_fraction"], weight))
 
 
                     total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
@@ -384,6 +402,10 @@ class MisalignedSLTModel(nn.Module):
                 full_cb_bio_logits = self.bio_head(full_bio_tap, timestamps_s=full_timestamps, frame_mask=full_mask).logits
                 cb_omega_full, _ = self.build_gate_omega(
                     full_cb_bio_logits, None, full_mask, memory_len=prompt_len + int(full_bio_tap.shape[1]),
+                    # χ on BOTH views (mirroring cb_omega_trunc): the full-evidence rows carry their own commit_mask,
+                    # so a committed predecessor tail straddling the left edge is floored here too — else the two
+                    # views would differ by a left-edge conditioning change, not only the right-truncation.
+                    commit_mask=full_batch.get("commit_mask"),
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
                 )
 

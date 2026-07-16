@@ -99,6 +99,14 @@ def confidence_bound_gate(
     if pad_token_id is not None:
         active = active & (full_tokens != int(pad_token_id))
         if reference_tokens is not None: active = active & (reference_tokens != int(pad_token_id))
+        # TRUNC pads too: the decoder back-fills every slot after a committed EOS with pad @ FABRICATED
+        # confidence 1.0 (infer/decode.py bookkeeping — π_j was never computed there). A right-truncated decode
+        # legitimately ends earlier than the full-evidence one, so without this the whole post-EOS tail passes
+        # (conf 1.0 > τ) & (pad != f) & (f == r) and receives dense CE toward the reference continuation — the
+        # exact partial-target-on-truncated-input supervision P1 forbids ("uncertainty below τ_cb is free"
+        # bypassed by a confidence the model never expressed). The early-EOS slot ITSELF keeps its real commit
+        # confidence and stays eligible — confidently ending where full evidence continues IS a P1 error.
+        active = active & (trunc_tokens != int(pad_token_id))
     return active
 
 

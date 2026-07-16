@@ -10,7 +10,7 @@ import numpy as np
 from data.jitter import JitterSampler, normalized_mode_ratios
 from data.loader import VideoRecord
 from data.windowing import (
-    BIO, TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
+    TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
 )
 from poses import load_pose_window, build_pose_augmentor, apply_fps_aug
@@ -307,17 +307,38 @@ class WindowSampler:
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
         target, full_evidence_spec = None, None
 
-        # Realized-mode relabel: a Mode-1 draw whose jitter also captured a complete neighbour IS a Mode-3 window (≥2 complete spans; 
-        # the target below is the first complete span either way — supervision is identical, per the shared rule). Relabelling keeps 
-        # the logged per-mode losses / mode-proportion drift check honest; forcing the anchor to be first instead (rejection) would 
-        # distort the measured jitter CDF conditional on corpus sentence spacing, a distribution the segmenter does not have.
-        if spec.mode == "mode1" and count_complete_spans(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps) >= 2:
-            spec = replace(spec, mode="mode3")
+        # The mode names must describe what the window CONTAINS after jitter + buffer-cap clip, because supervision follows content: 
+        # inference's first-complete-span rule selects whatever complete span is present, regardless of which mode drew the window. 
+        # Relabelling keeps the logged per-mode losses / drift check honest AND closes 2 train/inference expectation gaps; 
+        # rejection-resampling instead would distort the measured jitter CDF.
+        eps = 1.0 / rec.pose.fps
+        n_complete = count_complete_spans(rec.sentences, spec.start_s, spec.end_s, eps)
+        if spec.mode == "mode1" and n_complete >= 2:
+            spec = replace(spec, mode="mode3")  # jitter captured a complete neighbour → ≥2 complete spans
+        elif spec.mode == "mode2" and n_complete >= 1:
+            # The jittered edge swallowed a COMPLETE sentence (e.g. 'left' whose tail jitter pulled the successor fully inside). FSM 
+            # would select & translate it — training must supervise it identically, not leave the window target-less as a nominal mode2.
+            spec = replace(spec, mode="mode3" if n_complete >= 2 else "mode1", subcase=None)
+        elif spec.mode in {"mode1", "mode3"} and n_complete == 0 and spec.anchor_index is not None:
+            # The buffer-cap clip (anchor longer than buffer_cap_s) cut the anchor's terminator: no complete span was realized, so this 
+            # IS a right-truncated window — mode2a semantics (BIO-only + the CB machinery), not a silently-unsupervised "mode1".
+            spec = replace(spec, mode="mode2", subcase="right")
+        elif spec.mode == "mode2" and spec.anchor_index is not None:
+            # Subcase honesty after clipping: e.g. a 'left' window whose kept tail exceeded buffer_cap_s lost the anchor's terminator too 
+            # → realized geometry is 'both'. Supervision is unchanged (2b/2c are both BIO-only).
+            realized = classify_anchor_visibility(rec.sentences[spec.anchor_index], spec.start_s, spec.end_s)
+            if realized in {"right", "left", "both"} and realized != spec.subcase: spec = replace(spec, subcase=realized)
 
         if spec.mode in {"mode1", "mode3"}: target = first_complete_span(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps)
         elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
             target = None
-            full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
+            # Attach the CB full-evidence view ONLY if the WHOLE anchor fits in a ≤buffer_cap_s window. An over-cap
+            # anchor (the buffer-cap-clip relabel above) can't be seen complete even by the "full-evidence" view, so
+            # its y_full self-target would itself be truncated — keep it BIO-only rather than supervise CB against a
+            # truncated target.
+            anchor = rec.sentences[spec.anchor_index]
+            if anchor.end_s - anchor.start_s <= self.buffer_cap_s:
+                full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
 
         # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. 
         # In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content 

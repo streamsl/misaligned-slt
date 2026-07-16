@@ -68,12 +68,6 @@ def select_target_span(bio_tags: torch.Tensor | list[int], min_span_frames: int 
     return None
 
 
-def first_complete_bio_span(bio_tags: torch.Tensor | list[int]) -> tuple[int, int] | None:
-    # First complete span with NO minimum length (cf. select_target_span, which applies Λ_min). Test helper.
-    spans = bio_complete_spans(bio_tags)
-    return spans[0] if spans else None
-
-
 def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
     """Start index of a TERMINATOR-LESS span that runs to the buffer edge (Mode-2a right-truncation, or a
     buffer-cap forced commit), or None if the buffer ends outside a span.

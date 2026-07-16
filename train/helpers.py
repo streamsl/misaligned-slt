@@ -164,23 +164,6 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
     def _numeric(row: dict) -> dict:
         return {k: v for k, v in row.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
-    @staticmethod
-    def _public_key(key: str) -> str:
-        return {
-            "train_total_loss": "train_loss",
-            "train_phrase_bio_loss": "train_loss",
-            "train_baseline_ce_loss": "train_loss",
-            "train_vlp_loss": "train_loss",
-        }.get(key, key)
-
-    @classmethod
-    def _public_metrics(cls, row: dict) -> dict:
-        out = {}
-        for key, value in row.items():
-            public = cls._public_key(str(key))
-            if public in out and public != key: continue # Prefer an explicitly named target over an alias collision.
-            out[public] = value
-        return out
 
     def log_step(self, epoch: int, step: int, row: dict) -> None:
         self._global_step += 1
@@ -235,7 +218,7 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         mean_epoch_s = sum(elapsed_epochs) / max(1, len(elapsed_epochs))
         remaining_s = max(0, int(self.epochs) - int(epoch)) * mean_epoch_s
 
-        row: dict = {"epoch": epoch, **self._public_metrics({**train_num, **val_num})}
+        row: dict = {"epoch": epoch, **train_num, **val_num}
         if took is not None: row["took"] = took
         row["eta"] = remaining_s
         row["ckpt"] = "saved" if saved_path else ""
@@ -263,13 +246,16 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
 
     def _order_columns(self, keys) -> list[str]:
         keys = list(keys)
-        train = sorted(k for k in keys if k.startswith("train_"))
-        val = sorted(k for k in keys if k.startswith("val_"))
 
-        # Pin *_loss first within each group, but only when present: train-only epochs (no dev_loader, or a
-        # non-eval epoch) emit no val_* columns, so an unconditional remove() would crash _save_history_files.
-        if "train_loss" in train: train.remove("train_loss"); train.insert(0, "train_loss")
-        if "val_loss" in val: val.remove("val_loss"); val.insert(0, "val_loss")
+        def group(prefix: str) -> list[str]:
+            # ONE sort per group; the tuple key ranks (bare `{prefix}loss`) < (other `*_loss` columns, A–Z) <
+            # (everything else, A–Z). So val reads val_loss, val_bio_loss, val_translation_loss, … mirroring the
+            # train row, instead of scattering the component losses through the alphabetical metrics. Empty group
+            # (train-only or non-eval epoch, no val_* columns) is naturally [].
+            return sorted((k for k in keys if k.startswith(prefix)),
+                          key=lambda k: (k != f"{prefix}loss", not k.endswith("_loss"), k))
+
+        train, val = group("train_"), group("val_")
         tail = [k for k in ("took", "eta", "ckpt") if k in keys]
         other = [k for k in keys if k not in {"epoch", *train, *val, *tail}]
         return ["epoch", *train, *val, *other, *tail]

@@ -7,7 +7,7 @@ from infer.decode import (
     spd_dcd_decode,
     spd_hybrid_embeddings,
 )
-from infer.commit_gate import bio_complete_spans, first_complete_bio_span, first_terminator_index, select_target_span
+from infer.commit_gate import bio_complete_spans, first_terminator_index, select_target_span
 
 __all__ = [
     "DecodeStep",
@@ -18,7 +18,6 @@ __all__ = [
     "spd_dcd_decode",
     "spd_hybrid_embeddings",
     "bio_complete_spans",
-    "first_complete_bio_span",
     "first_terminator_index",
     "select_target_span",
 ]

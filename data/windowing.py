@@ -94,7 +94,7 @@ def make_bio_labels(
         if not in_span.any(): continue
 
         first = int(np.argmax(in_span))
-        if span.start_s >= window_start_s and frame_times_s[first] >= span.start_s:
+        if span.start_s >= window_start_s:  # frame_times_s[first] >= span.start_s holds by construction of in_span
             labels[first] = BIO["B"]
             labels[in_span & (np.arange(len(labels)) != first)] = BIO["I"]
         else: labels[in_span] = BIO["I"]

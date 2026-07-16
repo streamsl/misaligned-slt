@@ -30,7 +30,7 @@ wandb:
 # corpus property, not a circularity.)
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
-epochs: 50
+epochs: 20
 batch_size: 128
 learning_rate: 1.0e-3
 weight_decay: 1.0e-4

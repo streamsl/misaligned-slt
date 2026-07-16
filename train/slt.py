@@ -73,7 +73,7 @@ def build_slt_components(
             mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer,
         )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(lm_name, legacy=False)
+        tokenizer = AutoTokenizer.from_pretrained(lm_name)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
 
     pose_augment_cfg = slt_cfg.get("augmentation")  # train-only spatial aug; dev dataset below passes None
@@ -140,7 +140,8 @@ def build_slt_components(
 
 @torch.no_grad()
 def evaluate_slt(
-    model: MisalignedSLTModel, loader: DataLoader, device: torch.device, slt_cfg: dict, gate_active: bool | None = None,
+    model: MisalignedSLTModel, loader: DataLoader, device: torch.device, slt_cfg: dict,
+    gate_active: bool | None = None, cb_active: bool | None = None,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -152,9 +153,12 @@ def evaluate_slt(
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
 
-    # Dev must be scored under the SAME gate state the current training epoch uses (during gate warmup the
-    # decoder has never seen Ω — evaluating it gated would report a conditioning it wasn't trained under).
+    # Dev must be scored under the SAME gate AND CB state the current training epoch uses (during warmup the
+    # decoder has never seen Ω / the CB self-target — evaluating with either on reports a conditioning/objective
+    # it wasn't trained under, and runs an expensive CB decode on not-yet-trustworthy full-evidence targets).
+    # cb_active=None (standalone eval, no epoch) reports the full objective.
     gate_on = bool(gate_cfg.get("enabled", False)) if gate_active is None else bool(gate_active)
+    cb_on = True if cb_active is None else bool(cb_active)
     gate_kwargs = dict(
         gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
         gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
@@ -174,8 +178,10 @@ def evaluate_slt(
             oput_t_low=float(oput_cfg.get("t_low", 0.3)),
             oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
+            oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
+            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", 32)),
             confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)),
-            confidence_bound_active=True,
+            confidence_bound_active=cb_on,
             confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),
             cb_lambda=float(confidence_cfg.get("lambda", 0.3)),
             verified_full_evidence_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
@@ -311,8 +317,9 @@ def train_slt_epochs(
         return output.loss, {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
 
     def evaluate_fn(epoch: int):
-        # Dev must be scored under the SAME gate state the epoch trained under (see evaluate_slt).
-        return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg, gate_active=_gate_active(epoch))
+        # Dev must be scored under the SAME gate AND CB warmup state the epoch trained under (see evaluate_slt).
+        return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg,
+                            gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
 
     return run_epoch_loop(
         name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device,

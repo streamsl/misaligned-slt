@@ -76,22 +76,9 @@ def load_yaml(path: str | Path) -> dict:
     under the child. This lets e.g. `ar.yaml` inherit the entire `dlm.yaml` recipe (sampler, Analysis-A ratios/jitter, 
     confidence-bound, optimization) and override only the decoder + output dir — so the AR-vs-DLM comparison isolates the decoder alone.
     `${key}` placeholders are then resolved from the merged config's own top-level scalars (see resolve_placeholders) — chiefly `${language}`.
+    `_load_yaml_raw` already does the `extends` deep-merge (unresolved); this just resolves placeholders on the merged child.
     """
-    path = Path(path)
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    extends = cfg.pop("extends", None)
-    if not extends: return resolve_placeholders(cfg)
-    if isinstance(extends, str): extends = [extends]
-    merged: dict = {}
-    for parent in extends:
-        parent_path = Path(parent)
-        if not parent_path.is_absolute(): parent_path = path.parent / parent_path
-        # Parents are loaded raw (placeholder resolution deferred to the merged child, so the child's
-        # `language` governs inherited templated paths — e.g. ar inherits dlm's templates).
-        merged = _deep_merge(merged, _load_yaml_raw(parent_path))
-    return resolve_placeholders(_deep_merge(merged, cfg))
+    return resolve_placeholders(_load_yaml_raw(Path(path)))
 
 
 def _load_yaml_raw(path: str | Path) -> dict:

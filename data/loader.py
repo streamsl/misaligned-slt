@@ -5,7 +5,7 @@ from typing import Any, Iterable
 from pathlib import Path
 
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
 from poses.pose_io import META_FILENAME, load_video_meta
@@ -342,7 +342,7 @@ def _streaming_worker_init(worker_id: int) -> None:
     `info.seed` is unique per worker (torch base_seed + worker_id). The ANCHOR is index-driven (anchors[index % N]),
     so coverage is exact regardless of workers — this reseed only decorrelates the mode/jitter/fps/pose-aug draws.
     """
-    info = torch.utils.data.get_worker_info()
+    info = get_worker_info()
     if info is None: return
     sampler = getattr(info.dataset, "sampler", None)
     if sampler is not None and hasattr(sampler, "configure_worker"):
@@ -366,11 +366,3 @@ def streaming_loader(dataset: StreamingWindowDataset, batch_size: int, collate_f
     )
 
 
-def build_streaming_window_dataset(
-    records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any],
-    steps_per_epoch: int | None = None, pose_augment_cfg: dict | None = None,
-) -> StreamingWindowDataset:
-    return StreamingWindowDataset(
-        records=records, slt_cfg=slt_cfg, inference_cfg=inference_cfg,
-        steps_per_epoch=steps_per_epoch, pose_augment_cfg=pose_augment_cfg,
-    )

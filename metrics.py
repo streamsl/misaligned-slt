@@ -19,15 +19,15 @@ FRAME-DOMAIN entry points (consume BIO logits/labels; the BIO-head TRAINING moni
   ONE decode rule is applied to BOTH prediction and gold (default `signing_runs_with_b_splits`): decoding gold
   B-required while decoding predictions run-based makes headless gold fragments (left-truncated spans, which
   make_bio_labels deliberately labels as I-runs with no B) structural false positives even for a PERFECT tagger.
-  Decoders: `bio_labels_to_segments` (B-required), `signing_runs_with_b_splits` (inference rule),
-  `likeliest_segments` (parity) — all three are one parameterized core, `_bio_runs`.
+  Decoders: `bio_labels_to_segments` (B-required) and `signing_runs_with_b_splits` (inference rule) — both
+  parameterizations of one core, `_bio_runs`.
 
 TIME-DOMAIN entry points (consume Segment(start_s, end_s) spans in seconds; the FINAL DVC evaluation + Analysis A):
   Segment / temporal_iou / match_segments  greedy one-to-one tIoU matching.
   segmentation_prf                         the SAME P/R/F1 the monitor uses, on seconds spans.
   Used by: eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
 
-TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT) + token_accuracy.
+TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -62,7 +62,7 @@ def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) ->
 
       bio_labels_to_segments     split_on_b=True,  open_on_i=False, close_on_unk=False  (B-required; full-annotation gold)
       signing_runs_with_b_splits split_on_b=True,  open_on_i=True,  close_on_unk=True   (inference rule; monitor BOTH sides)
-      likeliest_segments         split_on_b=False, open_on_i=True,  close_on_unk=True   (pure run, parity ref)
+      (decode="likeliest")       split_on_b=False, open_on_i=True,  close_on_unk=True   (pure run, parity ref)
 
     split_on_b: an interior B closes the open segment and opens a new one (back-to-back sentences with no O gap);
     when False, B only opens if nothing is open (B behaves like I). open_on_i: an I with nothing open starts a
@@ -90,10 +90,6 @@ def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) ->
 def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
     # GOLD decode (Moryossef metrics.py): B-required. Turns GT BIO labels into reference segments.
     return _bio_runs(bio, split_on_b=True, open_on_i=False, close_on_unk=False)
-
-def likeliest_segments(logits: torch.Tensor) -> list[dict]:
-    # Parity reference: Moryossef's raw argmax run decode (interior B does not split). Takes LOGITS.
-    return _bio_runs(logits.detach().cpu().argmax(dim=-1), split_on_b=False, open_on_i=True, close_on_unk=True)
 
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
     """PREDICTION/inference decode: contiguous signing runs, split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
@@ -335,16 +331,3 @@ def compute_text_metrics(
     return {f"{prefix}_{key}": float(value) for key, value in scores.items()}
 
 
-def token_accuracy(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "translation") -> dict[str, float]:
-    # Teacher-forced token accuracy, ignoring -100 labels.
-    valid = labels != -100
-    if logits.shape[1] != labels.shape[1]:
-        labels = labels[:, : logits.shape[1]]
-        valid = valid[:, : logits.shape[1]]
-    pred = logits.argmax(dim=-1)
-    correct = ((pred == labels) & valid).sum().float()
-    total = valid.sum().clamp(min=1)
-    return {
-        f"{prefix}_token_acc": float((correct / total).detach().cpu().item()),
-        f"{prefix}_tokens": float(valid.sum().detach().cpu().item()),
-    }

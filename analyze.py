@@ -11,6 +11,7 @@ from poses import load_pose_window
 
 from infer.commit_gate import first_terminator_index
 from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
+from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, temporal_iou, compute_text_metrics
 from utils import load_yaml, update_yaml_scalar, pick_device, pretrained_checkpoint, checkpoint_dir
 
@@ -416,9 +417,7 @@ def delta_enc(args: argparse.Namespace) -> dict:
     device = pick_device(args.device)
     model = build_bio_s1_model(cfg)
     checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=f"checkpoints/bio_s1/{args.language}")) / "model.pt")
-    blob = torch.load(checkpoint, map_location="cpu")
-
-    model.load_state_dict(blob.get("model", blob) if isinstance(blob, dict) else blob, strict=True)
+    load_model_checkpoint(model, checkpoint, strict=True)
     model.eval().to(device)
     print(f"[delta-enc] S1 BIO head from {checkpoint}", flush=True)
     sigma = float(args.noise_sigma)

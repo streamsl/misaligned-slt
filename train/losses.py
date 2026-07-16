@@ -154,7 +154,13 @@ def confidence_bound_loss(
     if not active.any(): loss = logits.sum() * 0.0
     else:
         token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), full.reshape(-1), reduction="none").reshape_as(full)
-        loss = (token_loss * active.to(token_loss.dtype)).sum() / active.sum().clamp(min=1)
+        # Normalize by the VALID reference slots, not the gated slots: spec §6.3 writes L_cb as a position sum in the same form 
+        # as OPUT's (which is per-valid-token). A per-ACTIVE-slot mean is sparsity-invariant — 1 gated slot in the batch would 
+        # carry the same gradient magnitude as a fully-gated batch, giving Mode-2a windows (~9% of the batch) the majority of 
+        # the translation gradient (the epoch-4 loss shock).
+        denom = (valid_mask[:, :seq_len].to(device=token_loss.device, dtype=token_loss.dtype).sum()
+                 if valid_mask is not None else token_loss.new_tensor(float(active.numel())))
+        loss = (token_loss * active.to(token_loss.dtype)).sum() / denom.clamp(min=1)
     return ConfidenceBoundStats(
         loss=loss, active_positions=active, active_count=active.sum(),
         trunc_tokens=trunc_pred, trunc_confidence=trunc_conf,

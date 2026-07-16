@@ -296,6 +296,7 @@ class MisalignedSLTModel(nn.Module):
         bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
         bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
         translation_loss = bio_tap.sum() * 0.0
+        trans_weight = translation_loss.detach() * 0.0  # token weight of the OPUT pool (0 when no supervised windows)
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
@@ -343,14 +344,17 @@ class MisalignedSLTModel(nn.Module):
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=loss.dtype).clamp(min=1)
                         weighted_losses.append((loss, weight))
+                        logs[f"oput_{mode}"] = loss.detach()  # per-mode losses
 
-                    total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
-                    translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
+                    trans_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
+                    translation_loss = sum(loss * weight for loss, weight in weighted_losses) / trans_weight
                 else:
                     translation_loss = self.front_end.ar_loss(
                         enc_hidden[idx], enc_mask[idx], labels[idx],
                         omega_bias=None if omega_bias is None else omega_bias[idx]
                     )
+                    trans_weight = ((labels[idx] != -100) & (labels[idx] != self.tokenizer.pad_token_id)).sum()
+                    trans_weight = trans_weight.to(dtype=translation_loss.dtype).clamp(min=1)
             else:
                 labels = target_tokens["labels"].to(bio_tap.device)
                 if mode_to_indices:
@@ -370,10 +374,10 @@ class MisalignedSLTModel(nn.Module):
                         weight = ((labels[mode_idx] != -100) & (labels[mode_idx] != self.tokenizer.pad_token_id)).sum()
                         weight = weight.to(dtype=dlm_out["translation_loss"].dtype).clamp(min=1)
                         weighted_losses.append((dlm_out["translation_loss"], weight))
+                        logs[f"oput_{mode}"] = dlm_out["translation_loss"].detach()  # per-mode losses
 
-
-                    total_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
-                    translation_loss = sum(loss * weight for loss, weight in weighted_losses) / total_weight
+                    trans_weight = sum(weight for _, weight in weighted_losses).clamp(min=1)
+                    translation_loss = sum(loss * weight for loss, weight in weighted_losses) / trans_weight
                 else:
                     dlm_out = self.dlm_decoder.oput_forward(
                         enc_hidden=enc_hidden[idx], enc_mask=enc_mask[idx],
@@ -387,6 +391,8 @@ class MisalignedSLTModel(nn.Module):
                         omega_bias=None if omega_bias is None else omega_bias[idx],
                     )
                     translation_loss = dlm_out["translation_loss"]
+                    trans_weight = ((labels[idx] != -100) & (labels[idx] != self.tokenizer.pad_token_id)).sum()
+                    trans_weight = trans_weight.to(dtype=translation_loss.dtype).clamp(min=1)
 
         if (confidence_bound_enabled and confidence_bound_active and batch.get("full_evidence") is not None
             and batch.get("full_evidence_indices") is not None and batch["full_evidence_indices"].numel() > 0
@@ -499,7 +505,14 @@ class MisalignedSLTModel(nn.Module):
                     tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
                     enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
                 )
-                translation_loss = translation_loss + float(cb_lambda) * cb.loss
+                # Fold CB into the SAME token-weighted pool as the OPUT modes (L_translation per window: L_OPUT for 1/3, L_cb for 2a). 
+                # A flat add would weight the 2a term independently of its batch share — ~9% of windows supplying the majority of the 
+                # translation gradient (the epoch-4 loss shock). λ_cb=1.0 then IS the spec composition; ≠1 is an explicit deviation.
+                cb_weight = cb_ref_mask.to(dtype=translation_loss.dtype).sum().clamp(min=1)
+                translation_loss = (translation_loss * trans_weight + float(cb_lambda) * cb_weight * cb.loss) \
+                    / (trans_weight + cb_weight).clamp(min=1)
+                logs["cb_loss"] = cb.loss.detach()                              # per-mode losses (spec §6.4)
+                logs["cb_active_count"] = cb.active_count.detach().to(translation_loss.dtype)
 
         total = bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()

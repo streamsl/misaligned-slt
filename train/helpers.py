@@ -30,7 +30,15 @@ def build_optimizer(cfg: dict, params) -> torch.optim.Optimizer:
     opt = cfg.get("optimizer", {}) or {}
     lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
     weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
-    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): the reference recipes do the same split
+    # (Uni-Sign via timm create_optimizer filter_bias_and_bn=True; standard HF practice) — decaying norm gains
+    # regularizes the wrong thing. Accepts a generator or a param list.
+    params = [p for p in params if p.requires_grad]
+    decay = [p for p in params if p.ndim > 1]
+    no_decay = [p for p in params if p.ndim <= 1]
+    groups = [g for g in ({"params": decay, "weight_decay": weight_decay},
+                          {"params": no_decay, "weight_decay": 0.0}) if g["params"]]
+    return torch.optim.AdamW(groups, lr=lr)
 
 
 @contextmanager
@@ -513,9 +521,17 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
         return SchedulerBundle(scheduler=scheduler, interval="step")
 
     if sched_type in {"cosine", "cosine_annealing"}:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, int(epochs)),
-            eta_min=float(sched_cfg.get("eta_min", 0.0)),
+        # Optional linear warmup (scheduler.warmup_epochs, fractional ok): every A2D/OPUT reference warms up when
+        # retraining a pretrained model (dllm 0.1 of steps, DMax 0.03) — full LR from step one on a converged
+        # checkpoint knocks it out of its basin before any signal accumulates. Stepped per-STEP so warmup and the
+        # cosine tail are smooth within epochs (a per-epoch step over a short horizon is a staircase).
+        warmup_epochs = float(sched_cfg.get("warmup_epochs", 0.0))
+        warmup_steps = int(round(warmup_epochs * max(1, int(steps_per_epoch))))
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=float(sched_cfg.get("eta_min", 0.0)),
         )
-        return SchedulerBundle(scheduler=scheduler, interval="epoch")
+        if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine, interval="step")
+        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+        return SchedulerBundle(scheduler=scheduler, interval="step")
     raise ValueError(f"Unsupported scheduler type: {sched_type}")

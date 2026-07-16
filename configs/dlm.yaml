@@ -43,12 +43,16 @@ oput:
     # the distribution inference sees. true = faithful (1 extra no-grad decoder forward on Mode 1/3 batches); false = reuse the
     # dropout-noised L_mask logits (cheaper approximation).
     rollout_eval_mode: true
-    # Supervise the first K canvas slots after [.., eos, lang] with EOS targets.
-    # dLLM AppendEOSBlockWrapper pads labels to the block boundary with eos;
-    # DMax data_transform keeps loss on the first 32 trailing eos. Without this the
-    # post-sentence canvas is never trained and decodes to confident garbage before
-    # EOS commits (hallucinated tails; corrupted commit-gate confidence). 0 disables.
-    eos_supervision_tokens: 32
+    # Supervise the first K canvas slots after [.., eos, lang] with EOS targets. Without this the post-sentence canvas is never
+    # trained and decodes to confident garbage before EOS commits (hallucinated tails; corrupted commit-gate confidence).
+    # HOW TO SET (any dataset): K is DECODER GEOMETRY, not a corpus constant — one block (= block_size) is exactly the
+    # region the block-causal decode can visit past the sentence end before a committed EOS truncates the canvas
+    # (eos_pos), i.e. the dLLM AppendEOSBlockWrapper pad-to-block-boundary analog. Omit the key and the code defaults
+    # to block_size automatically; it never needs per-dataset tuning. (DMax's K=32 is calibrated to its 2048-4096
+    # canvas ≈1% of supervised mass; on our 128-slot targets with ~10-20-token sentences it was 62-76% — early-EOS
+    # bias the SPD/DCD decode turns into truncation.) Diagnose with val_translation_len_ratio: <1 and falling = too
+    # much EOS pressure (or commit threshold too low); hallucinated tails past sentence end = too little.
+    eos_supervision_tokens: 4 # = block_size; 0 to disable
 confidence_bound:
     # Right-truncated (Mode 2a) term. The full-evidence decode is a no-grad stop-grad self-target; the gate reads the real
     # SPD+DCD decode's confidence; the CE gradient flows through ONE cheap forward on the decoded sequence with the gated slots
@@ -60,7 +64,13 @@ confidence_bound:
     # trains 2a at a fraction of the specced calibration pressure. FALLBACK: if CB destabilizes training right after its warmup
     # (translation-loss spikes on the 2a slice), drop to the prior de-risk value 0.3 and record the deviation.
     lambda: 1.0
-    warmup_epochs: 3 # hold CB off until the full-evidence self-target is trustworthy
+    # 0 is CORRECT with verified_full_evidence_gate: true — trust in the self-target is enforced PER SLOT by the
+    # f==r check (an untrustworthy full-evidence slot is simply inactive, never a wrong label), so a batch-level
+    # "wait until trustworthy" warmup is redundant: early on few slots pass verification (small cb_active_count,
+    # little signal, no harm) and the active set grows as the decode improves — self-annealing. This mirrors the
+    # gate's §1.4 resolution: S0 (the released translator) IS the competence stage CB leans on; no separate stage
+    # or warmup needed. Watch cb_active_count grow; set >0 only if verified_full_evidence_gate is ever disabled.
+    warmup_epochs: 0
     # SPEED: the Mode-2a self-target runs TWO full SPD/DCD decodes per batch (full-evidence + truncated) — the
     # dominant DLM training cost. It is internal (it only picks 'confidently wrong' slots), so it decodes FAST and
     # need NOT match the inference decode: few settle steps + the (verified-exact) static-window prefix KV-cache.
@@ -157,9 +167,15 @@ num_workers:
     4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any
     # value: data.loader.streaming_loader gives each worker its own rng + a disjoint anchor shard
     # (WindowSampler.configure_worker), so workers partition the stream instead of replaying it identically.
-learning_rate: 2.0e-4
+# CONVERGED-CHECKPOINT fine-tune LR. The init (released Uni-Sign SLT) is already converged on CSL — Uni-Sign's own
+# 3e-4 is for fine-tuning from its stage-2 PRETRAIN checkpoint, and the closest analog to our setting (DMax adding
+# OPUT to a converged model) uses 2e-6. 2e-4 near-constant reproduced the observed best-BLEU-at-epoch-1-then-decay
+# signature (train_trans 1.02→0.36 in 3 epochs while val_trans rose): the model is pushed out of its basin at full LR.
+learning_rate: 5.0e-5
 weight_decay: 1.0e-4
-epochs: 100
+# T_max horizon must be the horizon you actually run: at epochs:100 the per-epoch cosine sat at ≥93% of peak LR
+# through epoch 17 (never annealed before early stopping could fire). ~20-30 matches Uni-Sign's stage-3 budget.
+epochs: 30
 eval_every_epochs: 1
 early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
     enabled: true # enabled: false to train the full `epochs`.
@@ -168,6 +184,9 @@ early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `che
 scheduler:
     type: cosine
     eta_min: 1.0e-6
+    # Linear warmup (in epochs; fractional ok). All three A2D/OPUT references warm up when retraining a pretrained
+    # model (dllm 10% of steps, DMax 3%); 1/30 epochs ≈ 3%. Cosine now steps per-STEP over the epochs horizon.
+    warmup_epochs: 1
 max_grad_norm: 1.0
 max_text_tokens: 128
 validation:

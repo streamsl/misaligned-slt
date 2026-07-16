@@ -228,9 +228,16 @@ def spd_dcd_decode(
 
     After all masks are committed, if `spd_revision` is on, remaining budget is spent on DMax-style settle passes: 
     revise committed tokens with each pass's argmax until nothing changes or every position's confidence reaches
-    `settle_confidence` (DMax dInfer parallel_strategy.py decode_uniform Breakflag: 0.9). Under block-causal 
-    attention a whole-sequence settle pass gives each block the same attention context as DMax's per-block 
-    settle (later blocks are invisible to earlier blocks either way).
+    `settle_confidence` (DMax dInfer parallel_strategy.py decode_uniform Breakflag: 0.9).
+
+    Settle ORDERING is faithful to DMax: dInfer runs the Breakflag settle PER BLOCK, to convergence, BEFORE the
+    sampler advances, so block b+1 is denoised conditioned on the SETTLED block b. We reproduce that here — the DCD
+    commit loop settles the committed prefix (`_settle`) every time its window crosses an attention-block boundary,
+    then commits the next block; a final settle cleans up the last block. This matters, not just for efficiency: a
+    later block can commit EOS, and `eos_pos` freezes that truncation IRREVERSIBLY, so it must be decided against a
+    settled prefix — a whole-sequence-settle-only-at-the-end order (an earlier version) could truncate against a
+    half-decoded prefix and never undo it. `steps` bounds the final settle; each per-block settle is bounded by the
+    block size, exactly as DMax's `while step < block_length`.
     """
     del refresh_count
     cache_type = str(cache_type)
@@ -276,9 +283,12 @@ def spd_dcd_decode(
     # the threshold rule commits >=1 token/step, so a decode finishes in <= (#generated slots) forwards.
     # `steps` (diffusion_steps) is therefore NOT a commit budget here — capping the commit loop by it would
     # force-fill the tail whenever a hard/long sequence needs more passes than `steps`, the premature
-    # termination DMax/DCD are built to avoid. We bound the commit loop only by a non-termination safety cap
-    # (>= worst-case forwards incl. static-window jumps); `steps` is spent on the DMax settle phase below.
-    commit_cap = 2 * (full_length - prompt_length) + int(window_length or full_length) + 1
+    # termination DMax/DCD are built to avoid. We bound the commit loop only by a non-termination safety cap;
+    # `steps` is spent on the DMax settle phase below. The cap scales with BATCH: the window tracks the min
+    # first-mask over rows, so the per-iteration guarantee is >=1 commit GLOBALLY (the window-defining row always
+    # has an in-window candidate), not per row — with adversarially desynchronized rows the worst case approaches
+    # batch * (#generated slots), which a batch-independent cap would silently force-fill mid-decode.
+    commit_cap = 2 * batch * (full_length - prompt_length) + int(window_length or full_length) + 1
     win_len = int(window_length or (full_length - prompt_length))
     win_len = max(1, min(win_len, full_length - prompt_length))
     max_win = int(max_window_length or full_length)
@@ -297,6 +307,42 @@ def spd_dcd_decode(
         accepts_window = len(logits_fn_params) >= 3
     except (TypeError, ValueError): accepts_window = cache_aware
 
+    generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
+    positions_row = torch.arange(full_length, device=device).unsqueeze(0)
+    _block_start = (lambda p: (p // block) * block) if block is not None else (lambda p: prompt_length)
+
+    def _full_forward(ids: torch.Tensor, embeds: torch.Tensor | None) -> torch.Tensor:
+        if cache_type != "none" and accepts_window: return logits_fn(ids, embeds, None)
+        return logits_fn(ids, embeds)
+
+    def _settle(budget: int, soft: torch.Tensor | None) -> None:
+        """DMax `decode_uniform` Breakflag revision of the currently-COMMITTED region, to self-consistency (stop
+        when all active confidences clear settle_confidence=0.9 OR nothing changes). Only committed (non-mask,
+        pre-EOS) tokens are revisable — masked later blocks are untouched. Called PER BLOCK (when the DCD window
+        crosses a boundary, so each new block's commits — including its EOS/truncation — condition on a SETTLED
+        prefix, exactly DMax's settle-before-advance ordering) AND once at the end for the final block.
+        """
+        nonlocal token_ids, commit_logits, eos_pos, last_logits, used_steps
+        if not spd_revision: return
+        for _ in range(max(1, int(budget))):
+            revisable = (token_ids != int(mask_token_id)) & generated_region
+            revisable &= positions_row < eos_pos.unsqueeze(1)
+            if pad_id is not None: revisable &= token_ids != int(pad_id)
+            if not revisable.any(): return
+            full_logits = _suppress_mask(_full_forward(token_ids, soft))
+            last_logits = full_logits
+            conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
+            changed = revisable & (pred != token_ids)
+            token_ids = torch.where(revisable, pred, token_ids)
+            confidence_out[revisable] = conf[revisable]
+            if changed.any():
+                if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
+                commit_logits = torch.where(changed.unsqueeze(-1), full_logits, commit_logits)
+                eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
+            used_steps += 1
+            if not changed.any() or bool((conf[revisable] >= float(settle_confidence)).all().item()): return
+
+    settled_block_start = _block_start(prompt_length)  # blocks whose commits are already settled-before-advance
     for step in range(commit_cap):
         generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
         if not ((token_ids == int(mask_token_id)) & generated_region).any(): break
@@ -304,6 +350,15 @@ def spd_dcd_decode(
         if window_type == "sliding":
             while window_left < full_length and (token_ids[:, window_left] != int(mask_token_id)).all():
                 window_left += 1
+
+        # Settle-before-advance (DMax order): whenever the DCD window has moved into a NEW attention block, the
+        # block(s) it just left are fully committed — settle them to Breakflag NOW, so the block we are about to
+        # commit (and any EOS it commits, which eos_pos freezes irreversibly) conditions on a settled prefix, not a
+        # half-decoded one. Without this the whole-sequence settle runs only at the end, after a premature EOS
+        # against an unsettled prefix has already truncated the row un-revisably (the ordering bug this replaces).
+        if block is not None and _block_start(window_left) > settled_block_start:
+            _settle(block, None)  # committed prefix → HARD embeddings (soft state is scoped to the live window)
+            settled_block_start = _block_start(window_left)
 
         if window_left >= full_length: break
         window_right = max(window_right, window_left + 1)
@@ -411,16 +466,13 @@ def spd_dcd_decode(
         )
         used_steps = step + 1
 
-    generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
-    positions_row = torch.arange(full_length, device=device).unsqueeze(0)
-
-    def _full_forward(ids: torch.Tensor, embeds: torch.Tensor | None) -> torch.Tensor:
-        if cache_type != "none" and accepts_window: return logits_fn(ids, embeds, None)
-        return logits_fn(ids, embeds)
-
     # Step budget exhausted with masks left: fill them in 1 forced pass so no [MASK] id ever reaches the tokenizer or commit gate.
     leftover = (token_ids == int(mask_token_id)) & generated_region
     if fill_leftover_masks and leftover.any():
+        # This should be unreachable in normal operation (the commit loop's cap covers the batch worst case) —
+        # if it fires, the decode was force-terminated early, which DMax/DCD are built to avoid. Say so loudly.
+        print(f"[decode] WARNING: commit loop hit its safety cap with {int(leftover.sum())} masked slots left; "
+              f"force-filling in one pass (premature termination — investigate confidence/threshold settings)", flush=True)
         full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
         last_logits = full_logits
         conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
@@ -432,38 +484,11 @@ def spd_dcd_decode(
         eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, leftover, eos_token_id, pad_id)
         used_steps += 1
 
-    # DMax settle: the convergence-stopped revision phase (DMax dInfer parallel_strategy.py decode_uniform
-    # Breakflag, arXiv 2604.08302 — stop when all active confidences clear `settle_confidence`=0.9 OR nothing
-    # changed). `steps` (diffusion_steps) bounds ONLY this phase, counted separately from the commit loop so a
-    # long commit can never starve the settle; in practice it converges in 1-3 passes far below the bound.
-    settle_used, settle_budget = 0, max(1, int(steps))
-    if spd_revision and not ((token_ids == int(mask_token_id)) & generated_region).any():
-        while settle_used < settle_budget:
-            revisable = (token_ids != int(mask_token_id)) & generated_region
-            revisable &= positions_row < eos_pos.unsqueeze(1)
-            if pad_id is not None: revisable &= token_ids != int(pad_id)
-            if not revisable.any(): break
-
-            full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
-            last_logits = full_logits
-            conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
-            changed = revisable & (pred != token_ids)
-            token_ids = torch.where(revisable, pred, token_ids)
-            confidence_out[revisable] = conf[revisable]
-
-            if changed.any():
-                if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
-                commit_logits = torch.where(changed.unsqueeze(-1), full_logits, commit_logits)
-                eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
-
-            settle_used += 1
-            used_steps += 1
-            if not changed.any() or bool((conf[revisable] >= float(settle_confidence)).all().item()): break
-            soft_embeds, _ = spd_hybrid_embeddings(
-                embedding_layer=embedding_layer, token_ids=token_ids,
-                logits=full_logits, active_mask=revisable & (positions_row < eos_pos.unsqueeze(1)),
-                mask_token_id=mask_token_id, top_k=top_k, renormalize=spd_renormalize,
-            )
+    # Final settle of the LAST block (earlier blocks were already settled-before-advance at their boundary
+    # crossings). `steps` (diffusion_steps) bounds ONLY this phase, counted separately so a long commit never
+    # starves it; it converges in 1-3 passes far below the bound. Uses the last window's soft state.
+    if not ((token_ids == int(mask_token_id)) & generated_region).any():
+        _settle(max(1, int(steps)), soft_embeds)
 
     return SPDDecodeResult(
         sequences=token_ids, confidence=confidence_out, steps=used_steps, 

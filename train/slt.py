@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, T5Tokenizer
 
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
@@ -72,7 +72,7 @@ def build_slt_components(
             mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer,
         )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(lm_name)
+        tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
 
     pose_augment_cfg = slt_cfg.get("augmentation")  # train-only spatial aug; dev dataset below passes None
@@ -178,7 +178,7 @@ def evaluate_slt(
             oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
-            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", 32)),
+            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
             confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)),
             confidence_bound_active=cb_on,
             confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),
@@ -250,6 +250,11 @@ def evaluate_slt(
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
         metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
+        # Hypothesis/reference length ratio (the BLEU brevity-penalty input, char-level for CJK): the direct
+        # early-EOS-truncation diagnostic — a ratio < 1 and FALLING across epochs means the decode is committing
+        # EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr then punish as brevity.
+        total_ref = sum(len(r) for r in ref_texts)
+        metrics["val_translation_len_ratio"] = float(sum(len(p) for p in pred_texts)) / max(1, total_ref)
     return metrics
 
 
@@ -284,7 +289,7 @@ def train_slt_epochs(
             oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
-            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", 32)),
+            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
             confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)),
             confidence_bound_active=epoch > cb_warmup_epochs,
             confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),

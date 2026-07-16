@@ -158,7 +158,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0,
         block_size: int = 4, sampling_eps_min: float = 1e-3, sampling_eps_max: float = 1.0,
         antithetic_sampling: bool = True, ignore_bos: bool = True, temperature: float = 0.0,
-        remasking: str = "low_confidence", steps_per_block: int | None = None, eos_supervision_tokens: int = 32,
+        remasking: str = "low_confidence", steps_per_block: int | None = None, eos_supervision_tokens: int | None = None,
     ) -> None:
         self.d_model = d_model
         self.embed_scale = float(embed_scale)
@@ -167,7 +167,10 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         self.sampling_eps_max = sampling_eps_max
         self.antithetic_sampling = antithetic_sampling
         self.ignore_bos = ignore_bos
-        self.eos_supervision_tokens = int(eos_supervision_tokens)
+        # Default = block_size: EOS supervision is DECODER GEOMETRY, not a corpus constant. One block past the
+        # sentence end is exactly the region the block-causal decode can visit before a committed EOS truncates
+        # the canvas (eos_pos) — the dLLM AppendEOSBlockWrapper pad-to-block-boundary analog. Corpus-independent.
+        self.eos_supervision_tokens = int(eos_supervision_tokens) if eos_supervision_tokens is not None else int(block_size)
         self.neg_infinity = -1e9
 
         # ── Inference params (dLLM-style) ─────────────────────────────────────

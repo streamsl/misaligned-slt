@@ -315,17 +315,19 @@ def spd_dcd_decode(
         if cache_type != "none" and accepts_window: return logits_fn(ids, embeds, None)
         return logits_fn(ids, embeds)
 
-    def _settle(budget: int, soft: torch.Tensor | None) -> None:
-        """DMax `decode_uniform` Breakflag revision of the currently-COMMITTED region, to self-consistency (stop
-        when all active confidences clear settle_confidence=0.9 OR nothing changes). Only committed (non-mask,
-        pre-EOS) tokens are revisable — masked later blocks are untouched. Called PER BLOCK (when the DCD window
-        crosses a boundary, so each new block's commits — including its EOS/truncation — condition on a SETTLED
-        prefix, exactly DMax's settle-before-advance ordering) AND once at the end for the final block.
+    def _settle(budget: int, soft: torch.Tensor | None, lo: int, hi: int) -> None:
+        """DMax `decode_uniform` Breakflag revision of the block(s) in [lo, hi), to self-consistency (stop when all
+        active max-probs clear settle_confidence=0.9 OR nothing changes). Only committed (non-mask, pre-EOS) tokens
+        inside [lo, hi) are revisable — DMax never re-enters a FINISHED block (`decode_uniform` writes only
+        `x[:, block_start:block_end]`): a block settled earlier has later blocks committed AGAINST it, so re-revising
+        it would silently invalidate them. Called PER BLOCK at boundary crossings (settle-before-advance) with
+        [previous settled edge, new block start), AND once at the end for the final block.
         """
         nonlocal token_ids, commit_logits, eos_pos, last_logits, used_steps
         if not spd_revision: return
         for _ in range(max(1, int(budget))):
             revisable = (token_ids != int(mask_token_id)) & generated_region
+            revisable &= (positions_row >= int(lo)) & (positions_row < int(hi))
             revisable &= positions_row < eos_pos.unsqueeze(1)
             if pad_id is not None: revisable &= token_ids != int(pad_id)
             if not revisable.any(): return
@@ -339,8 +341,17 @@ def spd_dcd_decode(
                 if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
                 commit_logits = torch.where(changed.unsqueeze(-1), full_logits, commit_logits)
                 eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
+                if soft is not None:
+                    # Hard-refresh revised positions so the NEXT settle pass sees this pass's revisions —
+                    # `inputs_embeds` REPLACES ids, and DMax hard-refreshes changed positions every iteration
+                    # (parallel_strategy). Without this, multi-pass settling over a soft state degenerates to one
+                    # effective pass (later passes re-score the pre-settle tokens).
+                    soft = torch.where(changed.unsqueeze(-1), embedding_layer(token_ids), soft)
             used_steps += 1
-            if not changed.any() or bool((conf[revisable] >= float(settle_confidence)).all().item()): return
+            # Breakflag on the clean ARGMAX max-prob (DMax `max_probs >= 0.9`), not the sampled token's prob —
+            # identical at temperature=0, but at temperature>0 the sampled prob would gate on noise.
+            maxp = full_logits.softmax(dim=-1).max(dim=-1).values
+            if not changed.any() or bool((maxp[revisable] >= float(settle_confidence)).all().item()): return
 
     settled_block_start = _block_start(prompt_length)  # blocks whose commits are already settled-before-advance
     for step in range(commit_cap):
@@ -357,8 +368,15 @@ def spd_dcd_decode(
         # half-decoded one. Without this the whole-sequence settle runs only at the end, after a premature EOS
         # against an unsettled prefix has already truncated the row un-revisably (the ordering bug this replaces).
         if block is not None and _block_start(window_left) > settled_block_start:
-            _settle(block, None)  # committed prefix → HARD embeddings (soft state is scoped to the live window)
+            # Settle ONLY the block(s) just left, [settled edge, new block start) — earlier blocks are frozen
+            # (later blocks committed against them), the new block is not yet complete. HARD embeddings (None).
+            _settle(block, None, settled_block_start, _block_start(window_left))
             settled_block_start = _block_start(window_left)
+            # Settle may have revised prefix tokens; the carried soft state still embeds the PRE-settle prefix
+            # (inputs_embeds replaces ids), so rebuild it HARD from the current token_ids — DMax's embeddings
+            # reset at each new block. Rebuilding (not dropping to None) keeps inputs_embeds available for the
+            # prefix-cache window forward, whose native embedding has no [MASK] row.
+            soft_embeds = embedding_layer(token_ids)
 
         if window_left >= full_length: break
         window_right = max(window_right, window_left + 1)
@@ -484,11 +502,11 @@ def spd_dcd_decode(
         eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, leftover, eos_token_id, pad_id)
         used_steps += 1
 
-    # Final settle of the LAST block (earlier blocks were already settled-before-advance at their boundary
-    # crossings). `steps` (diffusion_steps) bounds ONLY this phase, counted separately so a long commit never
-    # starves it; it converges in 1-3 passes far below the bound. Uses the last window's soft state.
+    # Final settle of the LAST block only, [settled edge, end) — earlier blocks were already settled-before-advance
+    # at their boundary crossings and are frozen. `steps` (diffusion_steps) bounds ONLY this phase, counted
+    # separately so a long commit never starves it; it converges in 1-3 passes far below the bound.
     if not ((token_ids == int(mask_token_id)) & generated_region).any():
-        _settle(max(1, int(steps)), soft_embeds)
+        _settle(max(1, int(steps)), soft_embeds, settled_block_start, full_length)
 
     return SPDDecodeResult(
         sequences=token_ids, confidence=confidence_out, steps=used_steps, 

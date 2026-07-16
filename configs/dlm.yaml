@@ -56,7 +56,10 @@ confidence_bound:
     enabled: true
     verified_full_evidence_gate: true # penalize only where full-evidence decode == reference
     tau_cb: 0.75
-    lambda: 0.3 # λ_cb; prior de-risk found ~0.3 stable
+    # Makes τ_cb "the only new training-time hyperparameter" and weights Mode-2a's L_cb by λ_trans alone — an extra multiplier
+    # trains 2a at a fraction of the specced calibration pressure. FALLBACK: if CB destabilizes training right after its warmup
+    # (translation-loss spikes on the 2a slice), drop to the prior de-risk value 0.3 and record the deviation.
+    lambda: 1.0
     warmup_epochs: 3 # hold CB off until the full-evidence self-target is trustworthy
     # SPEED: the Mode-2a self-target runs TWO full SPD/DCD decodes per batch (full-evidence + truncated) — the
     # dominant DLM training cost. It is internal (it only picks 'confidently wrong' slots), so it decodes FAST and
@@ -150,9 +153,10 @@ jitter:
         tail_scale_s: 0.8
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
-num_workers: 4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any
-               # value: data.loader.streaming_loader gives each worker its own rng + a disjoint anchor shard
-               # (WindowSampler.configure_worker), so workers partition the stream instead of replaying it identically.
+num_workers:
+    4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any
+    # value: data.loader.streaming_loader gives each worker its own rng + a disjoint anchor shard
+    # (WindowSampler.configure_worker), so workers partition the stream instead of replaying it identically.
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 100

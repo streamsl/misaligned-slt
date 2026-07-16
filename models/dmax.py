@@ -161,6 +161,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
                 try: return self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias)
                 finally: self.train(was_training)
 
+        # "conditioning c is held fixed and complete across both forward passes... must be enforced as an assertion 
+        # in code". The closures above share this one enc_hidden; `_version` catches any in-place mutation.
+        enc_version = enc_hidden._version
         out = oput_two_pass_loss(
             clean_ids=x0, valid_mask=valid,
             decode_fn=lambda noisy_ids: self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias),
@@ -168,6 +171,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             loss_over_all_positions=loss_over_all_positions, sample_rollout=sample_rollout,
             rollout_decode_fn=rollout_decode_fn,
         )
+        assert enc_hidden._version == enc_version, "OPUT conditioning mutated between passes (fixed c)"
         return {
             "translation_loss": out.loss, "oput_mask_loss": out.mask_loss.detach(),
             "oput_pred_loss": out.pred_loss.detach(), "oput_masked_fraction": out.masked_positions.float().mean().detach(),

@@ -219,7 +219,7 @@ def evaluate_slt(
                 idx = supervised.nonzero(as_tuple=False).flatten()
                 if max_translation_samples > 0: idx = idx[: max_translation_samples - len(pred_texts)]
                 if idx.numel() > 0:
-                    _, tokens, _ = model.generate_from_poses(
+                    _, tokens, _, _ = model.generate_from_poses(
                         poses=batch["poses"][idx], frame_mask=batch["frame_mask"][idx],
                         timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
                         max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),

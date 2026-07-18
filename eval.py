@@ -400,7 +400,8 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
         "dcd_refresh_count": int(dcd_cfg.get("refresh_count", 16)),
         # Membership gate at RQ1: the DLM decodes under the same Ω conditioning it trained with (on-policy
-        # span, no GT, no χ for single-window eval). No-op on the AR arm (generate_from_poses gates DLM only).
+        # span, no GT, no χ for single-window eval). BOTH arms are gated: the DLM injects Ω in its manual
+        # decode; the AR arm receives the same Ω through HF cross-attention forward-hooks (front_end.ar_generate).
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
         "gate_delta": int(method_cfg.get("membership_gate", {}).get("delta", 3)),
         "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
@@ -413,8 +414,8 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
 def _translate_windows(
     model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
     device: torch.device, inference_cfg: dict, method_cfg: dict,
-) -> list[tuple[str, float]]:
-    """Translate a batch of pre-trimmed pose windows -> [(text, mean_token_confidence)].
+) -> list[tuple[str, float, bool]]:
+    """Translate a batch of pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)].
 
     ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the released model; 
     ar = AR greedy; dlm = SPD/DCD). It returns REAL per-token confidence (the softmax prob the model assigns its own tokens), so 
@@ -432,7 +433,7 @@ def _translate_windows(
 
     max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
     gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
-    _, tokens, confidence = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
+    _, tokens, confidence, gate_skip = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
     tok = tokens.detach().cpu()
     conf = confidence.detach().float().cpu()
     texts = [t.strip() for t in tokenizer.batch_decode(tok, skip_special_tokens=True)]
@@ -444,7 +445,11 @@ def _translate_windows(
     valid = tok != int(tokenizer.pad_token_id)
     if n: valid[:, 0] = False
     confs = ((conf * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)).tolist()
-    return list(zip(texts, [float(c) for c in confs]))
+    # gate_skip: the deployed FSM would never decode this window (no span — all-gap or headless fragment). The
+    # decode above still ran (its text is reported), but RQ1 must be able to split "translation failed" from
+    # "the system's policy is to defer/skip here" — conflating them charges the gate's refusal as garbage BLEU.
+    skips = [bool(s) for s in gate_skip.tolist()]
+    return list(zip(texts, [float(c) for c in confs], skips))
 
 
 @torch.no_grad()
@@ -452,7 +457,7 @@ def _translate_window(
     model, tokenizer, method: str,
     poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float,
     device: torch.device, inference_cfg: dict, method_cfg: dict,
-) -> tuple[str, float]: # Single-window convenience wrapper over `_translate_windows` (used by the RQ2 pipeline floor + analyze.py).
+) -> tuple[str, float, bool]: # Single-window wrapper over `_translate_windows` (RQ2 pipeline floor + analyze.py).
     return _translate_windows(
         model, tokenizer, method, 
         [(poses_np, timestamps_np, start_s)], 
@@ -509,21 +514,22 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk],
             device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
         )
-        for (window, _poses, _ts), (prediction, confidence) in zip(chunk, results):
+        for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
             grouped.setdefault(key, {
-                "predictions": [], "references": [], "confidences": [],
+                "predictions": [], "references": [], "confidences": [], "gate_skips": [],
                 "head_s": [], "tail_s": [], "req_head_s": [], "req_tail_s": [],
             })
             duration = window.gt_end_s - window.gt_start_s
             grouped[key]["predictions"].append(prediction)
             grouped[key]["references"].append(window.reference)
             grouped[key]["confidences"].append(confidence)
+            grouped[key]["gate_skips"].append(bool(gate_skip))
             grouped[key]["head_s"].append(window.delta_head_s)
             grouped[key]["tail_s"].append(window.delta_tail_s)
             grouped[key]["req_head_s"].append(window.grid_head * duration if relative else window.grid_head)
             grouped[key]["req_tail_s"].append(window.grid_tail * duration if relative else window.grid_tail)
-            rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence})
+            rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence, "gate_would_skip": bool(gate_skip)})
 
     severity = []
     for (gh, gt), values in tqdm(sorted(grouped.items()), desc="Computing severity"):
@@ -546,6 +552,16 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
             "dropped_fraction": float(dropped) / max(1, dropped + len(values["predictions"])),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
+            # Deployment-honest split for GATED methods (baseline: skip rate 0, decoded == all). A window with no span at all (headless 
+            # left-truncation, all-gap) is a state the FSM SKIPS by design — force-decoding it against the inert no-span Ω yields near-empty 
+            # hallucinations whose brevity penalty tanks the corpus BLEU of whole cell superlinearly. Read gated robustness as: decoded-only 
+            # quality (windows the system would actually translate) TOGETHER WITH gate_skip_rate (its refusal/deferral rate); the all-windows 
+            # text_metrics above stays as the coverage-pessimistic bound (mirrors RQ2's matched-only vs recall-inclusive dual).
+            "gate_skip_rate": float(sum(values["gate_skips"])) / max(1, len(values["gate_skips"])),
+            "text_metrics_decoded_only": compute_text_metrics(
+                [p for p, s in zip(values["predictions"], values["gate_skips"]) if not s],
+                [r for r, s in zip(values["references"], values["gate_skips"]) if not s],
+            ),
         })
     # Persist the sweep (summary + every per-window prediction) — RQ1 sweeps are expensive and their artifacts feed the paper plots.
     if args.output:
@@ -709,7 +725,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
         for span in spans:
             poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
             if poses.shape[0] == 0: continue
-            text, _ = _translate_window(
+            text, _, _ = _translate_window(
                 model=model, tokenizer=tokenizer, method=args.method,
                 poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
                 device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,

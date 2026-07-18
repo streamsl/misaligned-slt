@@ -198,11 +198,18 @@ def dataset_summary(args: argparse.Namespace) -> dict:
     cfg = load_yaml(args.data_config)
     records, splits = load_language_records(cfg, args.language, split=args.split)
     durations = [span.duration_s for rec in records for span in rec.sentences]
+    # Λ_min derivation (inference.yaml span_selection): p1/2 of dev sentence durations × median fps — an order of
+    # magnitude above the ≤2δ phantom scale with full margin to the shortest real sentence. Per-corpus, per-fps:
+    # set inference.yaml min_span_frames (+ the dlm.yaml membership_gate mirror) from this when switching corpus.
+    p1_s = float(np.percentile(durations, 1)) if durations else 0.0
+    median_fps = float(np.median([float(rec.pose.fps) for rec in records])) if records else 0.0
     return {
         "language": args.language, "split": args.split or "all", "records": len(records),
         "sentences": len(durations), "split_sizes": {k: len(v) for k, v in splits.items()},
         "mean_sentence_s": sum(durations) / len(durations) if durations else 0.0,
         "max_sentence_s": max(durations) if durations else 0.0,
+        "p1_sentence_s": p1_s, "median_fps": median_fps,
+        "suggested_min_span_frames": int(math.ceil(p1_s / 2.0 * median_fps)) if durations else 0,
     }
 
 
@@ -278,9 +285,10 @@ def analysis_b(args: argparse.Namespace) -> dict:
     def _translate(start_s, end_s, rec):
         poses, ts = load_pose_window(rec.pose, start_s, end_s, normalize=True)
         if poses.shape[0] == 0: return None
-        text, _ = _translate_window(model=model, tokenizer=tokenizer, method="baseline",
-                                    poses_np=poses, timestamps_np=ts, start_s=start_s,
-                                    device=device, inference_cfg=inference_cfg, method_cfg=base_cfg)
+        text, _, _ = _translate_window(
+            model=model, tokenizer=tokenizer, method="baseline", poses_np=poses, timestamps_np=ts, 
+            start_s=start_s, device=device, inference_cfg=inference_cfg, method_cfg=base_cfg
+        )
         return text
 
     # Clean point: GT-trimmed windows.
@@ -356,7 +364,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
             end_s = min(rec.pose.duration_s, span.end_s + dt)
             poses, timestamps = load_pose_window(rec.pose, span.start_s, end_s, normalize=True)
             if poses.shape[0] == 0: continue
-            text, _ = _translate_window(
+            text, _, _ = _translate_window(
                 model=model, tokenizer=tokenizer, method="baseline",
                 poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
                 device=device, inference_cfg=inference_cfg, method_cfg=base_cfg,

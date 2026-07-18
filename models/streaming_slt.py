@@ -14,6 +14,26 @@ from infer.commit_gate import open_span_start, select_target_span
 from data.windowing import BIO
 
 
+def gate_skip_flags(bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0) -> torch.Tensor:
+    """Per-row 'the FSM would SKIP this window' flag (B,) from the BIO head's own argmax.
+
+    True when window has NO terminated span AND NO open span — the all-gap / headless-left-truncated states the deployed FSM 
+    never decodes (buffer-start I never opens; no-span Ω is inert by construction). Single-window eval (RQ1) force-decodes those 
+    states against a suppressed memory and scores hallucinations vs full reference; this flag lets it report the deployment-honest 
+    split: decoded-only quality + skip rate. Same selection rules as build_gate_omega: UNK→O remap, select_target_span, open_span_start.
+    """
+    tags = bio_logits.detach().argmax(dim=-1)
+    tags = torch.where(tags == BIO["UNK"], torch.full_like(tags, BIO["O"]), tags)
+    B, T = tags.shape
+    lengths = frame_mask.long().sum(dim=1) if frame_mask is not None else torch.full((B,), T)
+    skip = torch.zeros(B, dtype=torch.bool)
+    for b in range(B):
+        n = max(1, int(lengths[b].item()))
+        row = tags[b, :n]
+        if select_target_span(row, min_span_frames) is None and open_span_start(row) is None: skip[b] = True
+    return skip
+
+
 @dataclass
 class SLTLossOutput:
     loss: torch.Tensor
@@ -244,22 +264,26 @@ class MisalignedSLTModel(nn.Module):
         self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
         gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
         commit_mask: torch.Tensor | None = None, **decode_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Poses → (bio_logits, tokens, confidence). This method owns the BIO tap + the membership gate; every
-        decode knob (max_text_tokens / diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id)
-        passes straight through to `generate_from_bio_tap` — declared once, there, not re-listed here."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Poses → (bio_logits, tokens, confidence, gate_skip). This method owns the BIO tap + the membership gate; every decode knob 
+        (max_text_tokens / diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) passes straight through to 
+        `generate_from_bio_tap` — declared once, there, not re-listed here. `gate_skip` (B, bool) marks windows the deployed FSM would 
+        never decode (no span at all); all-False when the gate is off."""
         bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
         bio_logits = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=mask).logits
         # Membership gate at inference: on-policy span from the head's own argmax (bio_labels=None → no veto),
         # χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in training (§1.3/§2.8).
         # Both arms: the DLM injects Ω in its decode; the AR arm via HF cross-attn hooks (front_end.ar_generate).
         omega_bias = None
-        if gate_enabled: omega_bias, _ = self.build_gate_omega(
-            bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]),
-            commit_mask=commit_mask, delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
-        )
+        gate_skip = torch.zeros(poses.shape[0], dtype=torch.bool)
+        if gate_enabled:
+            omega_bias, _ = self.build_gate_omega(
+                bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]),
+                commit_mask=commit_mask, delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
+            )
+            gate_skip = gate_skip_flags(bio_logits, mask, min_span_frames=gate_min_span_frames)
         tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
-        return bio_logits, tokens, confidence
+        return bio_logits, tokens, confidence, gate_skip
 
 
     def forward_loss(

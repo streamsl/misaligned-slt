@@ -1,0 +1,22 @@
+# Core
+torch>=2.1
+# PIN <5 (hard). The Uni-Sign decoders use transformers 4.x INTERNALS — the manual T5Stack/T5Attention layer loop +
+# position_bias passthrough, MBartScaledWordEmbedding, EncoderDecoderCache, AttentionMaskConverter._expand_mask,
+# cache_position. transformers 5.x changes these and SILENTLY degrades output (baseline BLEU4 ~21 -> ~0.01, no error).
+# Verified on 4.57.3. (models/unisign.py warns loudly at import if a non-4.x transformers is detected.)
+transformers>=4.40,<5
+numpy>=1.24
+pyyaml>=6.0
+einops>=0.7
+
+# Data (Colab)
+huggingface_hub>=0.23
+tqdm>=4.66             # HF-style global training progress bar
+
+# Metrics (lazy-loaded; eval degrades gracefully if a backend is missing)
+evaluate>=0.4
+sacrebleu>=2.4
+rouge>=1.0             # pltrdy ROUGE-L — the package Uni-Sign reports with (metrics._rouge_l)
+rouge_score>=0.1      # fallback ROUGE if `rouge` is absent
+nltk>=3.8             # meteor
+# BLEURT: pip install git+https://github.com/google-research/bleurt.git ; set BLEURT_CHECKPOINT_PATH

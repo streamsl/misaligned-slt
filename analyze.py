@@ -6,6 +6,7 @@ import json, argparse, math
 
 import torch
 import numpy as np
+from tqdm import tqdm
 from data.loader import load_language_records
 from poses import load_pose_window
 
@@ -276,7 +277,7 @@ def analysis_b(args: argparse.Namespace) -> dict:
     if not args.predictions:
         raise SystemExit("--predictions required: the external segmenter's spans (analyze.py --stage segmenter-infer)")
     data_cfg = load_yaml(args.data_config)
-    base_cfg = load_yaml(args.baseline_config)
+    base_cfg = load_yaml(args.baseline_config, language=args.language)  # re-point ${language} paths like every other load
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
@@ -291,28 +292,26 @@ def analysis_b(args: argparse.Namespace) -> dict:
         )
         return text
 
-    # Clean point: GT-trimmed windows.
+    # Clean point: GT-trimmed windows (flatten so the progress bar shows total sentences, not videos).
     clean_pred, clean_ref = [], []
-    for rec in records:
-        for s in rec.sentences:
-            t = _translate(float(s.start_s), float(s.end_s), rec)
-            if t is not None: clean_pred.append(t); clean_ref.append(s.text)
+    clean_items = [(rec, s) for rec in records for s in rec.sentences]
+    for rec, s in tqdm(clean_items, desc="Analysis B: clean (GT spans)"):
+        t = _translate(float(s.start_s), float(s.end_s), rec)
+        if t is not None: clean_pred.append(t); clean_ref.append(s.text)
 
     # Realistic point: the external segmenter's predicted spans; reference = the max-overlap GT sentence.
     predicted = load_prediction_file(args.predictions)
-    real_pred, real_ref = [], []
     by_id = {r.video_id: r for r in records}
-    for vid, spans in predicted.items():
-        rec = by_id.get(vid)
-        if rec is None: continue
-        for span in spans:
-            best, best_ov = None, 0.0
-            for gt in rec.sentences:
-                ov = max(0.0, min(span.end_s, gt.end_s) - max(span.start_s, gt.start_s))
-                if ov > best_ov: best_ov, best = ov, gt
-            if best is None: continue  # phantom span in a gap → no GT reference; excluded from the corpus score
-            t = _translate(float(span.start_s), float(span.end_s), rec)
-            if t is not None: real_pred.append(t); real_ref.append(best.text)
+    real_items = [(by_id[vid], span) for vid, spans in predicted.items() if vid in by_id for span in spans]
+    real_pred, real_ref = [], []
+    for rec, span in tqdm(real_items, desc="Analysis B: realistic (segmenter spans)"):
+        best, best_ov = None, 0.0
+        for gt in rec.sentences:
+            ov = max(0.0, min(span.end_s, gt.end_s) - max(span.start_s, gt.start_s))
+            if ov > best_ov: best_ov, best = ov, gt
+        if best is None: continue  # phantom span in a gap → no GT reference; excluded from the corpus score
+        t = _translate(float(span.start_s), float(span.end_s), rec)
+        if t is not None: real_pred.append(t); real_ref.append(best.text)
 
     clean = compute_text_metrics(clean_pred, clean_ref, prefix="clean") if clean_pred else {}
     realistic = compute_text_metrics(real_pred, real_ref, prefix="realistic") if real_pred else {}
@@ -343,7 +342,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
-    base_cfg = load_yaml(args.baseline_config)
+    base_cfg = load_yaml(args.baseline_config, language=args.language)  # re-point ${language} paths like every other load
     inference_cfg = load_yaml(args.inference_config)
     tb_cfg = eval_cfg.get("tail_benefit", {})
     grid = [float(x) for x in tb_cfg.get("tail_grid_s", [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])]

@@ -166,9 +166,10 @@ jitter:
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
 num_workers:
-    4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any
-    # value: data.loader.streaming_loader gives each worker its own rng + a disjoint anchor shard
-    # (WindowSampler.configure_worker), so workers partition the stream instead of replaying it identically.
+    4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any value:
+    # exact per-epoch coverage comes from the INDEX-driven anchor (sampler.sample(index) -> anchors[index % N], and
+    # DataLoader partitions indices across workers); WindowSampler.configure_worker only RESEEDS each worker's rng so
+    # the per-window jitter/mode draws decorrelate. (configure_worker does NOT partition anchors — the index does.)
 # CONVERGED-CHECKPOINT fine-tune LR. The init (released Uni-Sign SLT) is already converged on CSL — Uni-Sign's own
 # 3e-4 is for fine-tuning from its stage-2 PRETRAIN checkpoint, and the closest analog to our setting (DMax adding
 # OPUT to a converged model) uses 2e-6. 2e-4 near-constant reproduced the observed best-BLEU-at-epoch-1-then-decay

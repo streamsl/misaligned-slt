@@ -157,10 +157,17 @@ class TemporalConvStem(nn.Module):
         self.norms = nn.ModuleList([nn.RMSNorm(hidden_dim) for _ in range(num_layers)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, T, D)
+    def forward(self, x: torch.Tensor, key_mask: torch.Tensor | None = None) -> torch.Tensor:  # (B, T, D), key_mask (B,T) True=real
+        # Zero padded positions before AND after each conv so they never leak into real frames: masking the input alone is not enough 
+        # since each Conv1d BIAS regenerates a nonzero value at padded positions, which NEXT layer then convolves back into trailing 
+        # real frames. With padded positions held at 0, a real frame's conv window reads zeros over padding — identical to streaming 
+        # inference, where 'same' padding zero-pads past sequence end (no train/infer mismatch & no dependence on batch padding length).
+        m = None if key_mask is None else key_mask.to(x.dtype).unsqueeze(-1)  # (B, T, 1)
+        if m is not None: x = x * m
         for conv, norm in zip(self.convs, self.norms):
             h = conv(x.transpose(1, 2)).transpose(1, 2)            # (B, T, D): local temporal mix
             h = self.dropout(F.gelu(norm(h.float()).to(h.dtype)))  # fp32 RMSNorm under autocast (see layer note)
+            if m is not None: h = h * m                            # kill conv-bias values at padded positions
             x = x + h                                              # residual; length preserved
         return x
 
@@ -176,10 +183,8 @@ class RoPEBIOHead(nn.Module):
     front-end provides but this UNet-less head otherwise lacks (see that class).
     """
     def __init__(
-        self, input_dim: int, hidden_dim: int = 384, depth: int = 4,
-        nhead: int = 8, ff_mult: int = 2, dropout: float = 0.1,
-        num_classes: int = 4, chunk_size: int | None = None,
-        conv_stem_layers: int = 2, conv_stem_kernel: int = 5,
+        self, input_dim: int, hidden_dim: int = 384, depth: int = 4, nhead: int = 8, ff_mult: int = 2, dropout: float = 0.1,
+        num_classes: int = 4, chunk_size: int | None = None, conv_stem_layers: int = 2, conv_stem_kernel: int = 5,
     ):
         super().__init__()
         self.chunk_size = chunk_size
@@ -195,15 +200,14 @@ class RoPEBIOHead(nn.Module):
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(
-        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
-        frame_mask: torch.Tensor | None = None
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm under autocast (see layer note)
         # Conv stem runs on the full sequence BEFORE RoPE chunking (it is local/translation-equivariant, so it does not reintroduce the 
-        # absolute-position issue chunked RoPE eliminates). Padded frames bleed into real ones only within its ~(kernel·layers)-frame 
-        # halo — bounded and local, unlike unmasked attention's global bleed; the affected positions' losses are UNK-ignored anyway.
-        if self.conv_stem is not None: x = self.conv_stem(x)
+        # absolute-position issue chunked RoPE eliminates). It is mask-aware: padded frames are held at 0 so they never leak into real 
+        # (loss-computed) frames — making training identical to unbatched streaming inference (see TemporalConvStem).
+        if self.conv_stem is not None: x = self.conv_stem(x, key_mask=frame_mask)
         return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size, key_mask=frame_mask)
 
     def forward(

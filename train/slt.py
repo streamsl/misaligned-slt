@@ -131,6 +131,17 @@ def build_slt_components(
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
         head_sd = {k[len("bio_head."):]: v for k, v in sd.items() if k.startswith("bio_head.")}
+        # The S1 head reads pose features at feat_dim; the SLT model's bio_head reads front_end.bio_tap_dim (= the
+        # LM's d_model: 768 mT5 / 1024 mBART). These MUST match for §1.4 ("S1 features == S2 initial features") and
+        # for this strict-load. The released Uni-Sign checkpoints (and thus train-bio's frozen encoder) are mT5-768,
+        # so the mBART ablation needs an mBART-dim S1 (bio_pretrain feat_dim=1024) + a 1024 pose encoder — fail loud
+        # here rather than with a cryptic size-mismatch, since no 1024 release exists to warm-start from.
+        s1_dim = head_sd.get("input_proj.weight")
+        if s1_dim is not None and int(s1_dim.shape[1]) != int(front_end.bio_tap_dim): raise ValueError(
+            f"bio_head_init dim mismatch: S1 head reads {int(s1_dim.shape[1])}-d features but this SLT model's "
+            f"bio_tap is {int(front_end.bio_tap_dim)}-d ({lm_name}). Retrain train-bio with feat_dim="
+            f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml), or use the mT5 arm (the released checkpoints are mT5-768)."
+        )
         model.bio_head.load_state_dict(head_sd, strict=True)
         print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors)", flush=True)
     elif bio_init:

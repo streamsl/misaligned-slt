@@ -243,6 +243,12 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
         video_meta=video_meta,
     )
+    if not pose_index:  # empty/missing poses/ → 0 records everywhere; fail loud, not silently
+        raise FileNotFoundError(
+            f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
+            f"For SignVerse-2M languages (asf/bfi) run `python prepare_data.py --stage all --languages {language}` "
+            f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
+        )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
     if missing_meta: print(
         f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from "
@@ -255,6 +261,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
     records: list[VideoRecord] = []
+    dropped_no_caption = 0
     for video_id in selected_ids:
         subtitle_path = find_best_subtitle(
             root / "subs", video_id,
@@ -267,7 +274,9 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             flattened_max_chars_per_second=float(subtitle_cfg.get("flattened_max_chars_per_second", 120.0)),
             drop_noise=drop_noise,
         )
-        if subtitle_path is None: continue
+        if subtitle_path is None:
+            dropped_no_caption += 1
+            continue
         captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
@@ -277,6 +286,10 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             if min_dur <= (e - s) <= max_dur and e <= pose_index[video_id].duration_s + 1.0
         )
         if spans: records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
+    if dropped_no_caption: print(
+        f"[loader] {language}/{split or 'all'}: {dropped_no_caption}/{len(selected_ids)} videos dropped "
+        f"(no usable caption in {root / 'subs'}).", flush=True
+    )
     return records, splits
 
 

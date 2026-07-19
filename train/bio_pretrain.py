@@ -33,7 +33,7 @@ from models.bio_head import RoPEBIOHead
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
-from utils import load_yaml, pretrained_checkpoint
+from utils import load_yaml, pretrained_checkpoint, resolve_pretrained
 
 
 class BioS1Model(nn.Module):
@@ -72,11 +72,14 @@ class BioS1Model(nn.Module):
         return self.bio_head(feats, timestamps_s=timestamps_s, frame_mask=frame_mask)
 
 
-def build_bio_s1_model(cfg: dict) -> BioS1Model:
+def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
     """Construct BioS1Model from a config and load the FROZEN Uni-Sign pose encoder.
 
-    SINGLE source of truth for the head shape: both training (build_bio_s1) and inference (analyze.segmenter_infer) go through 
+    SINGLE source of truth for the head shape: both training (build_bio_s1) and inference (analyze.segmenter_infer) go through
     here, so the S1 checkpoint always strict-loads and SLT model's `bio_head_init` shape parity is guaranteed by construction.
+    `pretrained_path` overrides which released checkpoint the frozen pose encoder loads (per-language warm-start; the
+    caller resolves it). At inference the trained bio_s1 checkpoint later overwrites these weights, so it only bites
+    at train time — but keeping it per-language avoids depending on the CSL file on an English-only machine.
     """
     model = BioS1Model(
         pose_hidden_dim=int(cfg.get("pose_hidden_dim", 256)), feat_dim=int(cfg.get("feat_dim", 768)),
@@ -84,7 +87,7 @@ def build_bio_s1_model(cfg: dict) -> BioS1Model:
         bio_nhead=int(cfg.get("bio_nhead", 8)), bio_dropout=float(cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(cfg.get("bio_conv_stem_layers", 2)),
     )
-    pose_ckpt = pretrained_checkpoint(cfg, default="checkpoints/csl_daily_pose_only_slt.pth")
+    pose_ckpt = pretrained_path or pretrained_checkpoint(cfg, default="checkpoints/csl_daily_pose_only_slt.pth")
     n = model.load_unisign_pose(pose_ckpt)
     print(f"bio_s1 | frozen pose encoder from {pose_ckpt} ({n} tensors); "
           f"trainable head: {sum(p.numel() for p in model.bio_head.parameters()) / 1e6:.2f}M params", flush=True)
@@ -92,13 +95,16 @@ def build_bio_s1_model(cfg: dict) -> BioS1Model:
 
 
 def build_bio_s1(
-    data_config: str = "configs/data.yaml", config: str = "configs/bio_pretrain.yaml", 
-    inference_config: str = "configs/inference.yaml",
+    data_config: str = "configs/data.yaml", config: str = "configs/bio_pretrain.yaml",
+    inference_config: str = "configs/inference.yaml", language: str | None = None,
 ) -> tuple[BioS1Model, DataLoader, DataLoader, dict]:
-    cfg = load_yaml(config)
     data_cfg = load_yaml(data_config)
+    cfg = load_yaml(config)
+    # Effective language: CLI --language > config's own language: > data.yaml active_languages. Reload with the
+    # override only when it changes, so ${language} in checkpoint.dir re-points to the right dataset dir.
+    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
+    if language != cfg.get("language"): cfg = load_yaml(config, language=language)
     inference_cfg = load_yaml(inference_config)
-    language = str(cfg.get("language", data_cfg.get("active_languages", ["csl"])[0]))
 
     train_records, _ = load_language_records(data_cfg, language, split="train")
     train_dataset = StreamingWindowDataset(
@@ -117,7 +123,10 @@ def build_bio_s1(
     train_loader = streaming_loader(train_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
     dev_loader = streaming_loader(dev_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
 
-    model = build_bio_s1_model(cfg)
+    # Frozen pose encoder from the language's released Uni-Sign checkpoint (OpenASL for English asf/bfi, CSL for
+    # Chinese csl) — this MUST match the SLT model's warm-start so S1 features == S2 initial features (§1.4).
+    pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth")
+    model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg
 
 

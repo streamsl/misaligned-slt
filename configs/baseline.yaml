@@ -15,9 +15,10 @@ confidence_bound:
     enabled: false        # no Mode-2a CB term on the baseline
 checkpoint:
     dir: checkpoints/baseline/${language}  # output dir (best.json / any optional retrain)
-    # EVAL loads ONLY checkpoint.from_pretrained (the released Uni-Sign pose-only SLT checkpoint, inherited) with
-    # NO fallback to a trained checkpoint dir — enforced in eval._build_eval_model, so a concurrent/prior
-    # train-slt run can never make the baseline silently pick up trained/empty weights (the BLEU 21 -> 0.01 footgun).
+    # EVAL loads ONLY the released Uni-Sign pose-only SLT checkpoint — resolved PER LANGUAGE from data.yaml
+    # `pretrained_slt` (OpenASL for asf/bfi, CSL for csl; utils.resolve_pretrained) — with NO fallback to a trained
+    # checkpoint dir (enforced in eval._build_eval_model), so a concurrent/prior train-slt run can never make the
+    # baseline silently pick up trained/empty weights (the BLEU 21 -> 0.01 footgun).
 wandb:
     enabled: false
     name: baseline_${language}

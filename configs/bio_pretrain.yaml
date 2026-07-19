@@ -9,8 +9,10 @@
 #
 # WHAT is inherited-but-UNUSED here (the BIO-only trainer reads none of these; ignore them):
 #   language_model, decoder, oput, confidence_bound, membership_gate, dcd, spd, block_size, diffusion_steps,
-#   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init. `checkpoint.from_pretrained`
-#   (inherited) IS used — it supplies the FROZEN pose encoder (released Uni-Sign checkpoint).
+#   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init.
+# The FROZEN pose encoder is loaded from the language's released Uni-Sign checkpoint, resolved PER LANGUAGE from
+# data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained) — the SAME warm-start the SLT model uses,
+# so S1 features == S2 initial features (§1.4). OpenASL for English asf/bfi, CSL for Chinese csl.
 extends: dlm.yaml
 
 checkpoint:

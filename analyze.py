@@ -13,7 +13,7 @@ from infer.commit_gate import first_terminator_index
 from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, compute_text_metrics
-from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir
+from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, resolve_pretrained
 
 # Analysis-A pred↔GT matching bar: deliberately LOW so near-misses count as matched pairs feeding the 
 # (Δ_head, Δ_tail) jitter CDF, not as phantom/skip events. A high bar biases the DF toward near-zero 
@@ -419,11 +419,12 @@ def delta_enc(args: argparse.Namespace) -> dict:
     if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
     from train.bio_pretrain import build_bio_s1_model
     data_cfg = load_yaml(args.data_config)
-    cfg = load_yaml(args.bio_config)
-
+    cfg = load_yaml(args.bio_config, language=args.language)  # ${language} in checkpoint.dir -> the right bio_s1 dir
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     device = pick_device(args.device)
-    model = build_bio_s1_model(cfg)
+
+    pretrained = resolve_pretrained(cfg, data_cfg, args.language, default="checkpoints/csl_daily_pose_only_slt.pth")
+    model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=f"checkpoints/bio_s1/{args.language}")) / "model.pt")
     load_model_checkpoint(model, checkpoint, strict=True)
     model.eval().to(device)

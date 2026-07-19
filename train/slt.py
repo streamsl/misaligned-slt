@@ -15,7 +15,7 @@ from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from train.losses import bio_class_weight_tensor
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import load_yaml, language_model_name, pretrained_checkpoint
+from utils import load_yaml, language_model_name, resolve_pretrained
 
 
 @dataclass
@@ -54,12 +54,16 @@ def build_slt_components(
     inference_config: str = "configs/inference.yaml",
     decoder: str | None = None,
     include_dev: bool = False,
+    language: str | None = None,
 ) -> SLTComponents:
     data_cfg = load_yaml(data_config)
     slt_cfg = load_yaml(slt_config)
+    # Effective language: CLI --language > config's own language: > active_languages. Reload with the override only
+    # when it changes, so ${language} in checkpoint.dir (+ ar/baseline children) re-points to the right dataset dir.
+    language = str(language or slt_cfg.get("language") or data_cfg.get("active_languages", ["phoenix"])[0])
+    if language != slt_cfg.get("language"): slt_cfg = load_yaml(slt_config, language=language)
     inference_cfg = load_yaml(inference_config)
     _assert_gate_inference_consistency(slt_cfg, inference_cfg)
-    language = str(slt_cfg.get("language", data_cfg.get("active_languages", ["phoenix"])[0]))
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     # Uni-Sign front end; the LANGUAGE MODEL (and its tokenizer) is selected by this config's language_model.name:
@@ -115,7 +119,8 @@ def build_slt_components(
         bio_nhead=int(slt_cfg.get("bio_nhead", 8)),
         bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(slt_cfg.get("bio_conv_stem_layers", 2)),
-        pretrained_path=pretrained_checkpoint(slt_cfg),
+        # Per-language warm-start (data.yaml pretrained_slt; e.g. OpenASL for asf/bfi English, CSL for csl Chinese).
+        pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth"),
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f'Model initialized with {total_params / 1e6:.2f}M parameters')

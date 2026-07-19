@@ -10,9 +10,11 @@ checkpoint:
     # window sampler. With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent
     # head from step one (docs/membership_gate.md §1.4). Missing file → warning + fresh head (keep warmup > 0).
     bio_head_init: checkpoints/bio_s1/${language}/model.pt
-    # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint (the mBART ablation loads the
-    # pose encoder from it; the mBART LM starts from base).
-    from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
+    # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint. Resolved PER LANGUAGE from
+    # data.yaml `languages[lang].pretrained_slt` (CSL→Chinese mT5, OpenASL→English mT5; utils.resolve_pretrained),
+    # because the right warm-start depends on the target language. Uncomment `from_pretrained` below to force one
+    # checkpoint regardless of language (an ablation override):
+    # from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
     save_best: true # write on every new best dev value (not just end of training)
     # Best-checkpoint SELECTION (separate from early stopping). Select on dev BLEU, not val_loss: the composite
     # val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the small corpus while BLEU is still

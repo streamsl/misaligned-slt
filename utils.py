@@ -47,6 +47,20 @@ def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `overri
     return out
 
 
+def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: str | None = None) -> str | None:
+    """Uni-Sign warm-start checkpoint for a language — a per-TARGET-LANGUAGE property (like target_lang), so it
+    lives in data.yaml `languages[lang].pretrained_slt`. Chinese-sign CSL and English-sign OpenASL ship DIFFERENT
+    released checkpoints (same arch; the mT5 LM is tuned to emit Chinese vs English, the pose encoder saw CSL vs
+    ASL), so the CSL checkpoint is the wrong warm-start for an English-output language and vice-versa.
+
+    Resolution order: an explicit `checkpoint.from_pretrained` in the model/method config wins (ablation override);
+    else the language's `pretrained_slt`; else `default`."""
+    explicit = cfg_get(model_cfg, "checkpoint", "from_pretrained", default=None)
+    if explicit: return explicit
+    lang_ckpt = ((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("pretrained_slt")
+    return lang_ckpt or default
+
+
 def resolve_placeholders(cfg: dict) -> dict:
     """Substitute `${key}` in string values using the config's own TOP-LEVEL scalar keys.
 
@@ -69,16 +83,22 @@ def resolve_placeholders(cfg: dict) -> dict:
     return walk(cfg)
 
 
-def load_yaml(path: str | Path) -> dict:
+def load_yaml(path: str | Path, language: str | None = None) -> dict:
     """Load a YAML config, resolving an optional `extends:` key and `${key}` placeholders.
 
-    `extends` may be a path (or list of paths), relative to the child file, to a parent config that is loaded first and deep-merged 
-    under the child. This lets e.g. `ar.yaml` inherit the entire `dlm.yaml` recipe (sampler, Analysis-A ratios/jitter, 
+    `extends` may be a path (or list of paths), relative to the child file, to a parent config that is loaded first and deep-merged
+    under the child. This lets e.g. `ar.yaml` inherit the entire `dlm.yaml` recipe (sampler, Analysis-A ratios/jitter,
     confidence-bound, optimization) and override only the decoder + output dir — so the AR-vs-DLM comparison isolates the decoder alone.
     `${key}` placeholders are then resolved from the merged config's own top-level scalars (see resolve_placeholders) — chiefly `${language}`.
     `_load_yaml_raw` already does the `extends` deep-merge (unresolved); this just resolves placeholders on the merged child.
+
+    `language` overrides the config's own top-level `language:` BEFORE placeholder resolution — so a single
+    `--language asf` re-points BOTH the active dataset AND every `${language}`-templated path (checkpoints/bio_s1/asf,
+    …) without editing the shared configs. This is what makes the runbook language-parameterized.
     """
-    return resolve_placeholders(_load_yaml_raw(Path(path)))
+    merged = _load_yaml_raw(Path(path))
+    if language is not None: merged["language"] = str(language)
+    return resolve_placeholders(merged)
 
 
 def _load_yaml_raw(path: str | Path) -> dict:

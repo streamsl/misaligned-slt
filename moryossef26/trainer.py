@@ -21,10 +21,12 @@ from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
 
-def build_segmenter_loaders(data_config: str, segmenter_config: str) -> tuple[DataLoader, DataLoader, dict]:
+def build_segmenter_loaders(data_config: str, segmenter_config: str, language: str | None = None) -> tuple[DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(segmenter_config)
-    language = str(cfg.get("language", data_cfg.get("active_languages", ["csl"])[0]))
+    # CLI --language > config's own language: > active_languages; reload so ${language} in checkpoint.dir re-points.
+    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
+    if language != cfg.get("language"): cfg = load_yaml(segmenter_config, language=language)
     aug_cfg = cfg.get("augmentation", {}) or {}
     fps_cfg = aug_cfg.get("fps", {})
     trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)

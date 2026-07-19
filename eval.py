@@ -26,7 +26,7 @@ from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisig
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
-from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, pretrained_checkpoint
+from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
 
 @dataclass(frozen=True)
@@ -327,12 +327,13 @@ def _build_eval_model(method: str, checkpoint: str | None, language: str, data_c
             front_end=front_end, tokenizer=tokenizer, decoder="ar", 
             bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384))
         )
-        # Load ONLY from from_pretrained (the released ckpt) — NO fallback to a trained `checkpoint.dir`, so a
-        # concurrent / prior `train-slt` run can never make the baseline silently pick up trained weights.
-        ckpt = Path(checkpoint or pretrained_checkpoint(method_cfg, default="") or "")
+        # Load ONLY the released ckpt (NO fallback to a trained `checkpoint.dir`, so a concurrent/prior train-slt
+        # run can never make the baseline silently pick up trained weights). Resolved PER LANGUAGE: the baseline
+        # floor for asf/bfi is the released OpenASL (English) model, for csl the CSL (Chinese) one.
+        ckpt = Path(checkpoint or resolve_pretrained(method_cfg, data_cfg, language, default="") or "")
         if not ckpt.exists(): raise FileNotFoundError(
-            f"Missing released Uni-Sign checkpoint for baseline: {ckpt!s}. Set checkpoint.from_pretrained "
-            f"in configs/baseline.yaml to checkpoints/csl_daily_pose_only_slt.pth, or pass --checkpoint."
+            f"Missing released Uni-Sign checkpoint for baseline (language '{language}'): {ckpt!s}. Set "
+            f"languages.{language}.pretrained_slt in configs/data.yaml (or checkpoint.from_pretrained / --checkpoint)."
         )
         rep = load_unisign_pretrained(model, ckpt, strict=True)
         print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
@@ -469,7 +470,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ1 on test without --allow-test")
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
-    method_cfg = load_yaml(_method_config_path(args))
+    method_cfg = load_yaml(_method_config_path(args), language=args.language)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     rq_cfg = eval_cfg.get("rq1", {})
@@ -633,7 +634,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     if args.method == "baseline":
         raise SystemExit("Streaming RQ2 uses the FSM (dlm/ar). For the baseline pipeline-floor, pass --predictions.")
     data_cfg = load_yaml(args.data_config)
-    method_cfg = load_yaml(_method_config_path(args))
+    method_cfg = load_yaml(_method_config_path(args), language=args.language)
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
@@ -697,7 +698,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     but not the floor. The method is encoded in output filename so the two never collide; just pass the right --method for the row you want.
     """
     data_cfg = load_yaml(args.data_config)
-    method_cfg = load_yaml(_method_config_path(args))
+    method_cfg = load_yaml(_method_config_path(args), language=args.language)
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
@@ -793,8 +794,9 @@ def _load_segmenter(args):
     device = pick_device(args.device)
     if args.segmenter_arch == "s1":
         from train.bio_pretrain import build_bio_s1_model
-        cfg = load_yaml(args.bio_config)
-        model = build_bio_s1_model(cfg)
+        cfg = load_yaml(args.bio_config, language=args.language)
+        pretrained = resolve_pretrained(cfg, load_yaml(args.data_config), args.language, default="checkpoints/csl_daily_pose_only_slt.pth")
+        model = build_bio_s1_model(cfg, pretrained_path=pretrained)
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
         # Uni-Sign features; whole-video chunked RoPE at the head's TRAINED context, in SECONDS: training windows are
         # clamped to buffer_cap_s (sampler.py), so eval chunks at buffer_cap_s — dataset-general (the wrapper converts
@@ -803,7 +805,7 @@ def _load_segmenter(args):
         velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s", buffer_cap_s))
     else:
         from moryossef26.trainer import build_segmenter
-        cfg = load_yaml(args.segmenter_config)
+        cfg = load_yaml(args.segmenter_config, language=args.language)
         model = build_segmenter(args.segmenter_config)
         ckpt_default = f"checkpoints/segmenter/{args.language}"
         velocity, rope_chunk_s = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames

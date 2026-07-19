@@ -68,7 +68,8 @@ if __name__ == "__main__":
     elif args.stage == "train-bio":
         from train.bio_pretrain import build_bio_s1, train_bio_s1_epochs
         model, train_loader, dev_loader, cfg = build_bio_s1(
-            data_config=args.data_config, config=args.bio_config, inference_config=args.inference_config,
+            data_config=args.data_config, config=args.bio_config,
+            inference_config=args.inference_config, language=args.language,
         )
         device = pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
@@ -80,7 +81,7 @@ if __name__ == "__main__":
         # FSM head — raw keypoints + UNet, a different input space). Trained standalone on whole-video chunks →
         # checkpoints/segmenter (never the FSM's bio_head_init).
         from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
-        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.segmenter_config)
+        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.segmenter_config, language=args.language)
         model = build_segmenter(args.segmenter_config)
         device = pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
@@ -89,11 +90,12 @@ if __name__ == "__main__":
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs
-        slt_cfg = load_yaml(args.slt_config)
+        # language override (--language) re-points ${language} in checkpoint.dir for both training and the save below.
+        slt_cfg = load_yaml(args.slt_config, language=args.language)
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
-            decoder=args.decoder, include_dev=True,
+            decoder=args.decoder, include_dev=True, language=args.language,
         )
         device = pick_device(args.device)
         # Skip a frozen backbone; build_optimizer reads learning_rate/weight_decay (same keys every stage)

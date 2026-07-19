@@ -123,15 +123,12 @@ def _subtitle_score(path: Path, preferred_suffixes: list[str], reject_suffixes: 
 
 def looks_flattened_transcript(
     captions: list[tuple[float, float, str]],
-    max_cues: int = 2,
-    min_chars: int = 500,
-    max_chars_per_second: float = 120.0,
+    max_cues: int = 2, min_chars: int = 500, max_chars_per_second: float = 120.0,
 ) -> bool:
     """Reject YouTube VTT variants that put the whole transcript in one short cue.
 
-    ASF commonly ships paired files where `.en-GB.vtt` has normal cue timing but `.en-en-GB.vtt`
-    contains thousands of characters in the first few seconds and empty cues afterwards. Such files
-    are unusable for pose-text alignment and should lose to any non-flattened candidate.
+    ASF commonly ships paired files where `.en-GB.vtt` has normal cue timing but `.en-en-GB.vtt` contains thousands of characters in first 
+    few seconds and empty cues afterwards. Such files are unusable for pose-text alignment and should lose to any non-flattened candidate.
     """
     if not captions or len(captions) > int(max_cues): return False
     total_chars = sum(len(text) for _, _, text in captions)
@@ -146,12 +143,9 @@ def looks_flattened_transcript(
 def find_best_subtitle(
     subtitle_root: str | Path, video_id: str,
     preferred_suffixes: list[str], reject_suffixes: list[str],
-    min_caption_chars: int = 2,
-    reject_flattened_transcripts: bool = True,
-    flattened_max_cues: int = 2,
-    flattened_min_chars: int = 500,
-    flattened_max_chars_per_second: float = 120.0,
-    drop_noise: bool = False,
+    min_caption_chars: int = 2, reject_flattened_transcripts: bool = True,
+    flattened_max_cues: int = 2, flattened_min_chars: int = 500, 
+    flattened_max_chars_per_second: float = 120.0, drop_noise: bool = False,
 ) -> Path | None:
     subtitle_root = Path(subtitle_root)
     candidates = sorted(subtitle_root.glob(f"{video_id}*.vtt"))
@@ -163,8 +157,8 @@ def find_best_subtitle(
         char_count = sum(len(text) for _, _, text in parsed)
         if char_count < min_caption_chars: continue
         if reject_flattened_transcripts and looks_flattened_transcript(
-            parsed, max_cues=flattened_max_cues,
-            min_chars=flattened_min_chars, max_chars_per_second=flattened_max_chars_per_second,
+            parsed, max_cues=flattened_max_cues, min_chars=flattened_min_chars, 
+            max_chars_per_second=flattened_max_chars_per_second,
         ): continue
         score = _subtitle_score(path, preferred_suffixes, reject_suffixes)
         scored.append(((score[0], -char_count, score[2]), path))
@@ -197,10 +191,18 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
     signverse = _load_signverse_splits(Path(split_cfg.get("signverse_csv", "")))
     if signverse:
         splits = {"train": [], "dev": [], "test": []}
+        unmatched = 0
         for video_id in video_ids:
             split = signverse.get(video_id)
             if split in splits: splits[split].append(video_id)
-        if any(splits.values()): return {k: sorted(v) for k, v in splits.items()}
+            else: unmatched += 1
+
+        if any(splits.values()):
+            if unmatched: print(
+                f"[loader] {unmatched}/{len(video_ids)} pose videos absent from the split CSV (dropped from all splits). "
+                f"Add them to {split_cfg.get('signverse_csv', '')} to include them.", flush=True
+            )
+            return {k: sorted(v) for k, v in splits.items()}
 
     rng = random.Random(int(split_cfg.get("fallback_seed", 42)))
     ids = sorted(video_ids)
@@ -231,9 +233,8 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         return load_pretrimmed_records(data_cfg, language, split=split)
 
     root = Path(lang_cfg["root"])
-    # Per-video fps from the video_meta.json sidecar (poses were extracted at native/2 fps, which
-    # VARIES per YouTube video: 12.0-15.0 measured). config pose_fps is fallback-only; with no
-    # sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
+    # Per-video fps from video_meta.json sidecar (poses were extracted at native/2 fps, which VARIES per YouTube video: 12.0-15.0 measured). 
+    # config pose_fps is fallback-only; with no sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
     video_meta = load_video_meta(root / META_FILENAME)
     pose_cfg = lang_cfg.get("pose", {}) or {}
     fps_fallback = float(pose_cfg.get("fps", 25.0))
@@ -243,12 +244,11 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
         video_meta=video_meta,
     )
-    if not pose_index:  # empty/missing poses/ → 0 records everywhere; fail loud, not silently
-        raise FileNotFoundError(
-            f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
-            f"For SignVerse-2M languages (asf/bfi) run `python prepare_data.py --stage all --languages {language}` "
-            f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
-        )
+    if not pose_index: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud, not silently
+        f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
+        f"For SignVerse-2M languages (asf/bfi) run `python prepare_data.py --stage all --languages {language}` "
+        f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
+    )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
     if missing_meta: print(
         f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from "
@@ -260,6 +260,20 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     selected_ids = splits.get(split, []) if split else sorted(pose_index.keys())
     drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
+    # Human-caption-only splits (default: test). NLLB machine-translated references are noisy BLEU targets — scoring 
+    # against them measures "agreement with NLLB", not translation quality — so drop MT-captioned videos on those 
+    # splits. Provenance is video_meta.csv `caption_source` (written by `prepare_data.py --stage subs`); the excluded
+    # sources default to just "mt" (raw-shard captions are kept — usually human uploads). Absent → nothing excluded.
+    human_only = set(subtitle_cfg.get("human_only_splits", ["test"]) or [])
+    exclude_sources = set(subtitle_cfg.get("human_only_exclude_sources", ["mt"]) or [])
+    if split in human_only:
+        drop_ids = {vid for vid, m in video_meta.items() if (m.get("caption_source") in exclude_sources)}
+        before = len(selected_ids)
+        selected_ids = [v for v in selected_ids if v not in drop_ids]
+        if before != len(selected_ids): print(
+            f"[loader] {language}/{split}: excluded {before - len(selected_ids)} video(s) with "
+            f"{'/'.join(sorted(exclude_sources))} captions (human references only; subtitles.human_only_splits).", flush=True
+        )
     records: list[VideoRecord] = []
     dropped_no_caption = 0
     for video_id in selected_ids:

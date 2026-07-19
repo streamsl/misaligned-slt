@@ -105,6 +105,13 @@ splits:
     # test split is the remainder (1 - train - dev), computed by build_splits.
 
 subtitles:
+    # Caption resolution per video: pick the best usable .vtt in <root>/subs/ (suffix priority below). subs/ is
+    # delivered COMPLETE at prep time by `prepare_data.py --stage subs` (curated SignVerse English, provenance in
+    # video_meta.csv caption_source), so there is no load-time fallback dir — a video with no vtt is genuinely
+    # caption-less and dropped. human_only_splits: on these splits, exclude videos whose caption_source is in
+    # human_only_exclude_sources (default just `mt` = NLLB machine-translation) so BLEU scores against human refs.
+    human_only_splits: [test]
+    human_only_exclude_sources: [mt]
     preferred_suffixes:
         - .en-GB.vtt
         - .en-en-GB.vtt

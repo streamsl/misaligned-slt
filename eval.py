@@ -736,6 +736,69 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     return predicted
 
 
+@torch.no_grad()
+def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
+    """FINAL joint fine-tuned SLT model deployed OFFLINE. Its OWN jointly-trained BIO head segments each video — chunked at buffer_cap 
+    so the head's attention span matches training, NOT one full-length pass — and the SAME model translates each resulting span, split 
+    into <=buffer_cap sub-windows so no decode window exceeds training scale (a span merged across chunks can be longer than buffer_cap; 
+    the FSM would force-commit it): no streaming FSM, no online commit/hysteresis, no cross-stride refinement.
+
+    This is NOT the pipeline floor: here the boundaries come from the deployed model's own head. Held against streaming (`--stream`) at 
+    the SAME model. This is to measure what the streaming machinery buys over offline deployment — folding in the cost of causal 
+    (vs offline-bidirectional) segmentation, so this is a conservative baseline, not a pure-refinement control.
+    """
+    if args.method == "baseline": raise SystemExit(
+        "Offline RQ2 (row 5) uses the trained model's own BIO head (dlm/ar); the baseline has no "
+        "trained head. For the external-segmenter cascade floor, pass --segments."
+    )
+    from moryossef26.infer import bio_tags_to_segments
+    data_cfg = load_yaml(args.data_config)
+    method_cfg = load_yaml(_method_config_path(args), language=args.language)
+    inference_cfg = load_yaml(args.inference_config)
+    device = pick_device(args.device)
+
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
+
+    predicted: dict[str, list[PredictionEvent]] = {}
+    for record in tqdm(records, desc="Offline (self-segment + translate)"):
+        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+        if poses.shape[0] == 0:
+            predicted[record.video_id] = []
+            continue
+        # Segment the whole video with the model's OWN BIO head, chunked at the trained buffer scale (a full-length
+        # single RoPE pass would attend over a context the head never trained on — Moryossef's train/infer lesson).
+        poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)
+        ts_t = torch.as_tensor(timestamps, dtype=torch.float32, device=device).unsqueeze(0)
+        mask_t = torch.ones(poses_t.shape[:2], dtype=torch.bool, device=device)
+        bio_tap, bio_mask, ts_out = model.front_end.extract_bio_tap(poses_t, mask_t, ts_t)
+        model.bio_head.chunk_size = max(1, int(round(buffer_cap_s * float(record.pose.fps))))
+        tags = model.bio_head(bio_tap, timestamps_s=ts_out, frame_mask=bio_mask).logits.argmax(dim=-1)[0].cpu()
+        segments = bio_tags_to_segments(tags, timestamps.tolist())
+
+        events: list[PredictionEvent] = []
+        for span in segments:
+            # The head can leave a span longer than buffer_cap (a continuous I-run merged across chunk boundaries).
+            # Translating that in one shot feeds the decoder a window longer than ANY it trained on (windows are
+            # clamped to buffer_cap by the sampler, and the streaming FSM force-commits at buffer_cap) — OOD RoPE +
+            # attention. Mirror the FSM offline: split an over-long span into <=buffer_cap sub-windows, translate each.
+            sub_start = float(span.start_s)
+            while sub_start < float(span.end_s) - 1e-6:
+                sub_end = min(float(span.end_s), sub_start + buffer_cap_s)
+                span_poses, span_ts = load_pose_window(record.pose, sub_start, sub_end, normalize=True)
+                if span_poses.shape[0] > 0:
+                    text, _, _ = _translate_window(
+                        model=model, tokenizer=tokenizer, method=args.method,
+                        poses_np=span_poses, timestamps_np=span_ts, start_s=sub_start,
+                        device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
+                    )
+                    events.append(PredictionEvent(video_id=record.video_id, start_s=sub_start, end_s=sub_end, text=text))
+                sub_start = sub_end
+        predicted[record.video_id] = events
+    return predicted
+
+
 def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -748,8 +811,9 @@ def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | 
 
 def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ2 on test without --allow-test")
-    if not args.predictions and not args.stream and not args.segments: raise SystemExit(
-        "--rq 2 needs --stream (FSM engine), --segments (segment-then-translate pipeline floor), or --predictions (score an events JSON)"
+    if not args.predictions and not args.stream and not args.segments and not args.offline: raise SystemExit(
+        "--rq 2 needs --stream (streaming FSM), --offline (final model self-segments offline), "
+        "--segments (external-segmenter cascade floor, rows 3/4), or --predictions (score an events JSON)"
     )
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
@@ -763,9 +827,15 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
         if fsm_bio:  # FSM-internal BIO metric, persisted alongside the events
             path = Path(f"outputs/rq2_fsm_bio_{args.method}_{args.language}_{args.split}.json")
             path.write_text(json.dumps(fsm_bio, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    elif args.offline:
+        predicted = run_offline(args)
+        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json")
     elif args.segments:
         predicted = run_pipeline_floor(args)
-        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_events_{args.method}_{args.language}_{args.split}.json")
+        # Name by the SPAN SOURCE (the --segments stem already carries arch+lang+split) AND method, so the cascade
+        # rows never collide (external+dlm vs external+baseline, etc.).
+        src = Path(args.segments).stem
+        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json")
     else: predicted = load_event_predictions(args.predictions)
         
     gold = _gold_events(records)
@@ -885,7 +955,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
     parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
-    parser.add_argument("--stream", action="store_true", help="RQ2: run the streaming FSM engine to produce events")
+    parser.add_argument("--stream", action="store_true", help="RQ2 row 6: run the streaming FSM engine to produce events")
+    parser.add_argument("--offline", action="store_true",
+                        help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)

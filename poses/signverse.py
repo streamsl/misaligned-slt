@@ -51,9 +51,17 @@ def _part_arrays(payload: dict, part: str, count: int) -> tuple[np.ndarray, np.n
     sc = np.asarray(sc, dtype=np.float32).reshape(-1)
     if kp.shape != (count, 2) or sc.shape != (count,): return None
 
-    # Extraction bug (verified ~4% of frames): scores hold the indices 0..N-1 instead of confidences. A real
-    # confidence vector can never equal arange(N) (scores are bounded ~[0, 1.1]), so the signature is exact.
-    if count > 2 and np.allclose(sc, np.arange(count, dtype=np.float32)): sc = np.ones((count,), dtype=np.float32)
+    # Extraction bug (the DOMINANT case on real shards): scores hold the joint INDEX (0..N-1) instead of a confidence, 
+    # MIXED with -1 failed-detection sentinels, e.g. [0,1,2,...,7,-1,-1,10,...]. A real confidence is bounded ~[0,1.1], 
+    # so an entry equal to its own index >= 2 is an impossible confidence — the unambiguous tell. When every non-(-1) 
+    # score equals its index (and at least 1 such index >= 2 confirms the pattern), the frame is a bug frame: replace 
+    # the index-scores with 1.0 (present); the -1 slots stay and are zeroed below as absences. (`allclose(sc, arange)` 
+    # check never matched these hybrid frames, so it deleted the nose — index 0, value 0.0 — in ~100% of body-detected 
+    # frames and leaked raw indices in as confidences.)
+    idx = np.arange(count, dtype=np.float32)
+    is_idx = sc == idx
+    if count > 2 and bool((is_idx | (sc == -1.0)).all()) and bool((is_idx & (idx >= 2)).any()):
+        sc = np.where(is_idx, 1.0, sc)
     # Off-screen sentinel coords (far outside the normalized frame) are absences, not detections.
     off = (kp[:, 0] < -_COORD_TOLERANCE) | (kp[:, 0] > 1 + _COORD_TOLERANCE) | \
           (kp[:, 1] < -_COORD_TOLERANCE) | (kp[:, 1] > 1 + _COORD_TOLERANCE)
@@ -91,7 +99,15 @@ def payload_to_coco133(payload: dict, width: float, height: float) -> np.ndarray
 
 def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int]:
     z = np.load(npz_path, allow_pickle=True)
-    fps = float(np.asarray(z["fps"]).item()) if "fps" in z.files else SIGNVERSE_DEFAULT_FPS
+    # SignVerse is a UNIFORM 24 fps corpus (dataset card; verified on real shards). Pin to SIGNVERSE_DEFAULT_FPS so
+    # convert_video and prepare_data._backfill_meta (which has only the .npy, no fps) agree by construction; warn if
+    # a header ever disagrees rather than silently using a per-video rate the crash-recovery path can't reproduce.
+    header_fps = float(np.asarray(z["fps"]).item()) if "fps" in z.files else SIGNVERSE_DEFAULT_FPS
+    if abs(header_fps - SIGNVERSE_DEFAULT_FPS) > 0.5: print(
+        f"[signverse] WARNING: {npz_path} header fps={header_fps} != {SIGNVERSE_DEFAULT_FPS}; "
+        f"using {SIGNVERSE_DEFAULT_FPS}", flush=True
+    )
+    fps = SIGNVERSE_DEFAULT_FPS
     total = int(np.asarray(z["total_frames"]).item()) if "total_frames" in z.files else 0
     indices = np.asarray(z["frame_indices"]).astype(np.int64)   # 1-based video frame numbers
     payloads = z["frame_payloads"]

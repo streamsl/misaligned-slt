@@ -7,7 +7,9 @@ from .preprocessing import normalize_keypoints_unisign
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
-META_FIELDS = ("video_id", "duration_s", "width", "height")
+# caption_source: provenance of this video's English caption — human | mt (NLLB machine-translation) | shard
+# (raw bundled YouTube track) | none. Blank for the own-extraction (ase) path, which does not resolve captions here.
+META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source")
 # Default --format for the metadata fetch. Must match the yt-dlp --format the videos were 
 # downloaded with, so metadata width/height describe the downloaded stream; override per language via 
 # `python -m poses <lang_root> --format SEL` when a language was downloaded at a different (e.g. higher) 
@@ -66,6 +68,7 @@ def load_video_meta(path: str | Path) -> dict[str, dict]:
             meta[video_id] = {
                 "duration_s": float(duration),
                 "width": _opt_int(row.get("width")), "height": _opt_int(row.get("height")),
+                "caption_source": (row.get("caption_source") or "").strip() or None,
             }
     return meta
 
@@ -80,6 +83,7 @@ def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
                 video_id, m.get("duration_s"),
                 "" if m.get("width") is None else m["width"],
                 "" if m.get("height") is None else m["height"],
+                m.get("caption_source") or "",
             ])
 
 

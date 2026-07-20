@@ -305,10 +305,16 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
+        # `s < duration`: the sentence ONSET must fall within the extracted poses, or it has no visible signing to
+        # anchor a window on. Real SignVerse streams end before their caption timeline (duration = pose_frames/24
+        # underestimates the true video), so late captions can start past the poses; `e <= duration + 1.0` only
+        # bounds the END (right-truncation slack) and does not catch this. A no-op for stream corpora (poses cover
+        # captions exactly). Without it the window sampler builds start_s > end_s windows → load_pose_frames raises.
+        dur = pose_index[video_id].duration_s
         spans = tuple(
             SentenceSpan(video_id=video_id, start_s=s, end_s=e, text=t)
             for s, e, t in captions
-            if min_dur <= (e - s) <= max_dur and e <= pose_index[video_id].duration_s + 1.0
+            if min_dur <= (e - s) <= max_dur and s < dur and e <= dur + 1.0
         )
         if spans: records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
     if dropped_no_caption: print(

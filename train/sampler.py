@@ -135,10 +135,14 @@ class WindowSampler:
         return self.records[ridx], sidx
 
     def _clip_window(self, rec: VideoRecord, start_s: float, end_s: float) -> tuple[float, float]:
-        start_s = max(0.0, float(start_s))
-        end_s = min(float(end_s), rec.pose.duration_s)
+        # Clamp BOTH ends into the pose stream. start_s must leave room for >=1 frame — a right-truncated anchor's
+        # cut time (Mode 2a) or a caption whose onset sits past the extracted poses can arrive > duration, and
+        # clamping only end_s left start_s > end_s → load_pose_frames("Invalid frame range") on real data.
+        dur = float(rec.pose.duration_s)
+        start_s = min(max(0.0, float(start_s)), max(0.0, dur - 1.0 / rec.pose.fps))
+        end_s = min(float(end_s), dur)
         if end_s - start_s > self.buffer_cap_s: end_s = start_s + self.buffer_cap_s
-        if end_s <= start_s: end_s = min(rec.pose.duration_s, start_s + 1.0 / rec.pose.fps)
+        if end_s <= start_s: end_s = min(dur, start_s + 1.0 / rec.pose.fps)
         return start_s, end_s
 
     def _cut_time(self, anchor, lo: float = 0.05, hi: float = 0.95) -> float:

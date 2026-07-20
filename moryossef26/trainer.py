@@ -7,13 +7,14 @@ Analysis A's calibration non-circular. Trained standalone on whole-video chunks 
 FSM head's bio_head_init. Reuses the shared training infra (run_epoch_loop); the whole model trains end-to-end.
 """
 from __future__ import annotations
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
-
 from data.windowing import TRUSTED_GAP_S
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
-from moryossef26.model import MoryossefSegmenter
+from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
@@ -52,12 +53,18 @@ def build_segmenter_loaders(data_config: str, segmenter_config: str, language: s
 def build_segmenter(segmenter_config: str) -> MoryossefSegmenter:
     cfg = load_yaml(segmenter_config)
     pose_dim = 6 if bool(cfg.get("velocity", True)) else 3  # +velocity doubles the per-keypoint channel dim
-    return MoryossefSegmenter(
+    model = MoryossefSegmenter(
         pose_dims=(int(cfg.get("pose_joints", 69)), pose_dim),
         hidden_dim=int(cfg.get("hidden_dim", 384)), encoder_depth=int(cfg.get("encoder_depth", 4)),
         attn_nhead=int(cfg.get("attn_nhead", 8)), attn_ff_mult=int(cfg.get("attn_ff_mult", 2)),
         attn_dropout=float(cfg.get("attn_dropout", 0.1)), num_frames=int(cfg.get("num_frames", 1024)),
     )
+    # Optional cross-modality warm-start from the released Moryossef 2026 weights (vs random init). See
+    # load_moryossef_pretrained: not zero-shot — train-segmenter still fine-tunes on our DWPose data.
+    pretrained = (cfg.get("checkpoint", {}) or {}).get("from_pretrained")
+    if pretrained and Path(pretrained).exists(): load_moryossef_pretrained(model, pretrained)
+    elif pretrained: print(f"segmenter | WARNING: from_pretrained {pretrained} not found — random init", flush=True)
+    return model
 
 
 @torch.no_grad()

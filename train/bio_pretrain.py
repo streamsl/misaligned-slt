@@ -146,10 +146,15 @@ def evaluate_bio_s1(
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(out.logits, labels, prefix="phrase"))
-            # Per-mode tIoU diagnostic: the headline monitor mixes very different tasks (mode1 complete-span
-            # windows vs mode2 truncated fragments vs mode4 gaps), so a capped average is uninterpretable without
-            # this split — a low val_phrase_tiou_f1 driven by mode2 fragments is a metric-granularity property of
-            # misaligned windows, not head incompetence. NOT comparable to the Moryossef chunk monitor either way.
+            # Per-mode tIoU diagnostic. This is a SEGMENTATION metric (predicted BIO spans vs the GT BIO spans),
+            # well-defined for EVERY mode because the head is supervised on all modes' bio_labels — independent of
+            # translation ("complete-sentence") supervision, which only some modes carry (OPUT on 1/3, CB on 2a,
+            # none on 2b/2c/4). So the split is legitimate for modes 2 and 4; only the INTERPRETATION differs:
+            #   mode1/3 = span boundary quality; mode2 = truncated-fragment localization;
+            #   mode4 (gaps) = PHANTOM-AVOIDANCE — gold has 0 spans (all-O; long all-UNK gaps are skipped), so
+            #                  tiou_f1 is 1.0 iff the head stays silent and 0.0 if it fires. It scores ABSENCE, not overlap.
+            # A capped headline average mixing these is uninterpretable without the split (a low val_phrase_tiou_f1
+            # driven by mode2 fragments is a metric-granularity property of misaligned windows, not head incompetence).
             modes = batch.get("mode_names") or []
             for mode in set(modes):
                 idx = [i for i, m in enumerate(modes) if m == mode]

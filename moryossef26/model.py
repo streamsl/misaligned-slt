@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import namedtuple
+from pathlib import Path
 from typing import List
 
 import torch
@@ -136,3 +137,80 @@ class MoryossefSegmenter(nn.Module):
         # (The in-system RoPE head DOES key-mask padding — its window batches span 0.5s-18s; see models/bio_head.py.)
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)
         return {"phrase": self.phrase_bio_head(encoded)}
+
+
+_FC_KEY = "frame_cnn.0.fc.weight"
+# Part boundaries in each model's keypoint ordering, for the frame_cnn.0.fc [384, num_kp] input projection (column
+# j = keypoint j). Their reduce_holistic(pose + L/R hands): 8 upper-body + 21 + 21 = 50 (datasets/common.py body-part
+# dropout zeros [8:29] and [29:50]). Ours: poses.normalize_keypoints_unisign order [body 9 | L 21 | R 21 | face 18].
+_THEIR_HANDS = {"lhand": (8, 29), "rhand": (29, 50)}
+_OUR_HANDS = {"lhand": (9, 30), "rhand": (30, 51)}
+
+
+def _transfer_hand_fc_columns(their_fc: torch.Tensor, our_fc: torch.Tensor) -> int:
+    """Copy left/right-hand fc columns their→our (in place on our_fc). MediaPipe and DWPose hands are both the canonical 21-point 
+    topology in SAME order (wrist, thumb..pinky), so the columns map index-for-index. Body (8 MediaPipe upper-body vs 9 COCO body 
+    — different points) and face (they have none) are left at our init."""
+    cols = 0
+    for part, (ts, te) in _THEIR_HANDS.items():
+        os_, oe = _OUR_HANDS[part]
+        if (te - ts) == (oe - os_):
+            our_fc[:, os_:oe].copy_(their_fc[:, ts:te].to(our_fc.dtype))
+            cols += oe - os_
+    return cols # Return the number of columns transferred (42 for released 50→69 checkpoint)
+
+
+def load_moryossef_pretrained(model: "MoryossefSegmenter", checkpoint: str | Path) -> dict[str, int]:
+    """CROSS-MODALITY warm-start of MoryossefSegmenter from the released Moryossef 2026 weights.
+
+    The released checkpoint is a DIFFERENT POSE MODALITY, so this is a warm-start, NOT zero-shot (fine-tune with
+    `train-segmenter` afterwards). Their model: MediaPipe-Holistic 50 keypoints (8 upper-body + 21+21 hands,
+    `reduce_holistic`), 3D XYZ + 3D velocity = 6 channels, `normalize_mean_std`. Ours: DWPose/Uni-Sign 69 keypoints
+    (incl. 18 face), 2D + confidence + velocity, bbox-normalized. The bridge:
+      - `sentence_bio_head.*` → `phrase_bio_head.*`  (their sentence head IS our phrase head)
+      - `sign_bio_head.*`     → DROPPED  (no sign-level supervision on our corpora)
+      - `frame_cnn.0.fc.weight` [384,50] vs our [384,69] — the only keypoint-count-dependent tensor. We transfer the
+        LEFT/RIGHT-HAND columns index-for-index (both are the canonical 21-pt hand topology, same order → 42/69
+        columns), and reinit only the body (8→9, different points) + face (they have none) columns. fc.bias loads.
+      - everything else (temporal UNet convs incl. BatchNorm stats, RoPE encoder_attn, input_norm, phrase head)
+        loads by shape — transferring the learned temporal-boundary inductive bias.
+    The conv channel semantics differ (their z vs our confidence) and the normalization differs, so the front-end
+    still adapts during fine-tuning; the transfer value is the deep temporal filters + attention + BIO head + hands.
+    Returns a {loaded, renamed, dropped_sign, fc_hand_cols, reinit} summary.
+    """
+    from safetensors.torch import load_file
+    raw = load_file(str(checkpoint))
+    renamed = 0
+    src: dict[str, torch.Tensor] = {}
+    for k, v in raw.items():
+        if k.startswith("sign_bio_head."): continue
+        tk = k.replace("sentence_bio_head.", "phrase_bio_head.")
+        if tk != k: renamed += 1
+        src[tk] = v
+
+    model_sd = model.state_dict()
+    loaded = 0
+    for k, tgt in model_sd.items():
+        v = src.get(k)
+        if v is not None and tuple(v.shape) == tuple(tgt.shape):
+            tgt.copy_(v.to(tgt.dtype))  # BF16 checkpoint → our fp32
+            loaded += 1
+
+    # frame_cnn.0.fc.weight: shapes differ (50 vs 69 kp), so the loop above left it at our init. Transfer the hand
+    # columns; body+face columns stay reinit. Guarded on the exact released geometry (their 50, our 69).
+    fc_hand_cols = 0
+    their_fc = src.get(_FC_KEY)
+    our_fc = model_sd[_FC_KEY]
+    if their_fc is not None and their_fc.shape[0] == our_fc.shape[0] and their_fc.shape[1] == 50 and our_fc.shape[1] == 69:
+        fc_hand_cols = _transfer_hand_fc_columns(their_fc, our_fc)
+
+    model.load_state_dict(model_sd, strict=True)
+    fc_reinit = "partial (body+face)" if fc_hand_cols else "full"
+    summary = {
+        "loaded": loaded, "renamed": renamed, "dropped_sign": sum(1 for k in raw if k.startswith("sign_bio_head.")),
+        "fc_hand_cols": fc_hand_cols, "reinit": 1,  # frame_cnn.0.fc.weight (partially, if hands transferred)
+    }
+    print(f"segmenter | warm-started from {checkpoint} (cross-modality: MediaPipe-50 → DWPose-69): "
+          f"loaded {loaded}, renamed sentence→phrase {renamed}, dropped sign head {summary['dropped_sign']}, "
+          f"{_FC_KEY} hand-columns transferred {fc_hand_cols}/69 ({fc_reinit} reinit)", flush=True)
+    return summary

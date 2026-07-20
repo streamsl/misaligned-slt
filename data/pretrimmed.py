@@ -17,8 +17,9 @@ Format (Uni-Sign datasets.py S2T_Dataset / load_pose):
 Each pkl becomes one single-sentence VideoRecord on its own timeline: sentence span = [start/fps, end/fps), pose = the WHOLE take 
 (context included). Poses are materialized once into (T,133,3) .npy next to the pkls (poses_npy/) so `PoseIndex`/`load_pose_window` 
 — and therefore normalization, augmentation hooks, and every consumer — run the exact same code path as the other corpora. Coordinates 
-stay in the stored normalized [0,1] frame: `normalize_keypoints_unisign` is bbox-relative and resolution-independent (w_h feeds only 
-the RGB branch upstream, which we drop).
+stay in the stored normalized [0,1] frame (x/W, y/H) — the domain the released weights were trained on. `normalize_keypoints_unisign`'s 
+crop_scale is bbox-relative and UNIFORM-scale invariant but aspect-ratio DEPENDENT, so coords must NOT be converted to pixels; w_h 
+feeds only the RGB branch upstream, which we drop).
 """
 from __future__ import annotations
 from dataclasses import dataclass

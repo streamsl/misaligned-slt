@@ -47,10 +47,11 @@ def base_video_id(path_or_stem: str | Path) -> str:
 
 
 def load_video_meta(path: str | Path) -> dict[str, dict]:
-    """Read the video_meta.csv sidecar -> {video_id: {duration_s, width, height}}.
+    """Read the video_meta.csv sidecar -> {video_id: {duration_s, width, height, caption_source}}.
 
-    CSV columns: video_id, duration_s, width, height. width/height may be blank (yt-dlp can omit them); 
-    a blank/zero duration row is skipped (the loader then falls back to config pose_fps).
+    CSV columns: video_id, duration_s, width, height, caption_source. width/height may be blank 
+    (yt-dlp can omit them); caption_source (human|mt|shard|none) may be blank; a blank/zero duration 
+    row is skipped (the loader then falls back to config pose_fps).
     """
     path = Path(path)
     if not path.exists(): return {}

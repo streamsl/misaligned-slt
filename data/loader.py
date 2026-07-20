@@ -144,11 +144,15 @@ def find_best_subtitle(
     subtitle_root: str | Path, video_id: str,
     preferred_suffixes: list[str], reject_suffixes: list[str],
     min_caption_chars: int = 2, reject_flattened_transcripts: bool = True,
-    flattened_max_cues: int = 2, flattened_min_chars: int = 500, 
-    flattened_max_chars_per_second: float = 120.0, drop_noise: bool = False,
+    flattened_max_cues: int = 2, flattened_min_chars: int = 500, flattened_max_chars_per_second: float = 120.0, 
+    drop_noise: bool = False, lang_prefix: str | None = None,
 ) -> Path | None:
     subtitle_root = Path(subtitle_root)
-    candidates = sorted(subtitle_root.glob(f"{video_id}*.vtt"))
+    # `lang_prefix` restricts to `<vid>.<prefix>*.vtt` (e.g. "en" → .en-GB/.en; "de" → .de*). The preferred/reject
+    # suffix lists are English-oriented and do NOT encode language, so harvesting shard tracks for a non-English
+    # target needs this to avoid picking an English track and labelling it the target language.
+    pattern = f"{video_id}.{lang_prefix}*.vtt" if lang_prefix else f"{video_id}*.vtt"
+    candidates = sorted(subtitle_root.glob(pattern))
     scored: list[tuple[tuple[int, int, str], Path]] = []
     for path in candidates:
         try: parsed = parse_vtt(path, drop_noise=drop_noise)
@@ -163,6 +167,23 @@ def find_best_subtitle(
         score = _subtitle_score(path, preferred_suffixes, reject_suffixes)
         scored.append(((score[0], -char_count, score[2]), path))
     return min(scored, default=(None, None))[1] if scored else None
+
+
+def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, lang_prefix: str | None = None) -> Path | None:
+    """`find_best_subtitle` driven by the `subtitles:` config block — the ONE selection rule, shared by the loader
+    (load time; lang_prefix=None, the canonical `<vid>.<target>.vtt` is the only file) and prepare_data (harvesting
+    a video's single caption from its shard tracks, lang_prefix=target so it only considers target-language ones)."""
+    return find_best_subtitle(
+        subtitle_root, video_id,
+        preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
+        reject_suffixes=list(subtitle_cfg.get("reject_suffixes", [".en-orig.vtt"])),
+        min_caption_chars=int(subtitle_cfg.get("min_caption_chars", 2)),
+        reject_flattened_transcripts=bool(subtitle_cfg.get("reject_flattened_transcripts", True)),
+        flattened_max_cues=int(subtitle_cfg.get("flattened_max_cues", 2)),
+        flattened_min_chars=int(subtitle_cfg.get("flattened_min_chars", 500)),
+        flattened_max_chars_per_second=float(subtitle_cfg.get("flattened_max_chars_per_second", 120.0)),
+        drop_noise=bool(subtitle_cfg.get("drop_noise_captions", True)), lang_prefix=lang_prefix,
+    )
 
 
 def _load_signverse_splits(path: Path) -> dict[str, str]:
@@ -233,7 +254,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         return load_pretrimmed_records(data_cfg, language, split=split)
 
     root = Path(lang_cfg["root"])
-    # Per-video fps from video_meta.json sidecar (poses were extracted at native/2 fps, which VARIES per YouTube video: 12.0-15.0 measured). 
+    # Per-video fps from the video_meta.csv sidecar (own-extraction poses vary per video; SignVerse poses are a fixed 24 fps).
     # config pose_fps is fallback-only; with no sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
     video_meta = load_video_meta(root / META_FILENAME)
     pose_cfg = lang_cfg.get("pose", {}) or {}
@@ -277,17 +298,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     records: list[VideoRecord] = []
     dropped_no_caption = 0
     for video_id in selected_ids:
-        subtitle_path = find_best_subtitle(
-            root / "subs", video_id,
-            preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
-            reject_suffixes=list(subtitle_cfg.get("reject_suffixes", [".en-orig.vtt"])),
-            min_caption_chars=int(subtitle_cfg.get("min_caption_chars", 2)),
-            reject_flattened_transcripts=bool(subtitle_cfg.get("reject_flattened_transcripts", True)),
-            flattened_max_cues=int(subtitle_cfg.get("flattened_max_cues", 2)),
-            flattened_min_chars=int(subtitle_cfg.get("flattened_min_chars", 500)),
-            flattened_max_chars_per_second=float(subtitle_cfg.get("flattened_max_chars_per_second", 120.0)),
-            drop_noise=drop_noise,
-        )
+        subtitle_path = best_subtitle(root / "subs", video_id, subtitle_cfg)
         if subtitle_path is None:
             dropped_no_caption += 1
             continue

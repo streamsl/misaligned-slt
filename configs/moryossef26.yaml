@@ -61,11 +61,11 @@ augmentation:
 
 learning_rate: 1.0e-3
 weight_decay: 1.0e-4
-epochs: 20
+epochs: 50
 eval_every_epochs: 1
 early_stopping:
     enabled: true
-    patience: 10
+    patience: 20
     min_delta: 0.0
 scheduler:
     type: cosine

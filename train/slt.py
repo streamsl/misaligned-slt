@@ -131,11 +131,12 @@ def build_slt_components(
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
         head_sd = {k[len("bio_head."):]: v for k, v in sd.items() if k.startswith("bio_head.")}
-        # The S1 head reads pose features at feat_dim; the SLT model's bio_head reads front_end.bio_tap_dim (= the
-        # LM's d_model: 768 mT5 / 1024 mBART). These MUST match for §1.4 ("S1 features == S2 initial features") and
-        # for this strict-load. The released Uni-Sign checkpoints (and thus train-bio's frozen encoder) are mT5-768,
-        # so the mBART ablation needs an mBART-dim S1 (bio_pretrain feat_dim=1024) + a 1024 pose encoder — fail loud
-        # here rather than with a cryptic size-mismatch, since no 1024 release exists to warm-start from.
+        # The S1 head reads pose features at feat_dim; the SLT model's bio_head reads front_end.bio_tap_dim (= the LM's 
+        # d_model: 768 mT5 / 1024 mBART). These MUST match for "S1 features == S2 initial features" and for this strict-load. 
+        # The released Uni-Sign checkpoints (which seed train-bio's encoder) are mT5-768, so mBART ablation needs an mBART-dim 
+        # S1 (bio_pretrain feat_dim=1024) + a 1024 pose encoder — fail loud here rather than with a cryptic size-mismatch, 
+        # since no 1024 release exists to warm-start from. (Whether S1 froze or fine-tuned that encoder, its adapted weights 
+        # are carried into S2 below, so "S1 features == S2 initial features" parity holds either way.)
         s1_dim = head_sd.get("input_proj.weight")
         if s1_dim is not None and int(s1_dim.shape[1]) != int(front_end.bio_tap_dim): raise ValueError(
             f"bio_head_init dim mismatch: S1 head reads {int(s1_dim.shape[1])}-d features but this SLT model's "
@@ -143,7 +144,15 @@ def build_slt_components(
             f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml), or use the mT5 arm (the released checkpoints are mT5-768)."
         )
         model.bio_head.load_state_dict(head_sd, strict=True)
-        print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors)", flush=True)
+        # Carry S1's pose encoder into S2 so the head meets the SAME features it was trained on ("S1 features == S2 initial 
+        # features"). When S1 ran freeze_backbone:true its encoder == the released one loaded above, so this is a no-op; 
+        # when S1 ran freeze_backbone:false the head was trained on the ADAPTED encoder, and without carrying it the head 
+        # would meet features it never saw (silent warm-start corruption). Same UniSignPoseEncoder on both sides (dims 
+        # already checked via bio_tap_dim), so strict-load.
+        pose_sd = {k[len("pose_encoder."):]: v for k, v in sd.items() if k.startswith("pose_encoder.")}
+        if pose_sd: model.front_end.pose_encoder.load_state_dict(pose_sd, strict=True)
+        print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); carried S1 pose encoder "
+              f"{f'({len(pose_sd)} tensors) for S1 features == S2 initial features' if pose_sd else ''}", flush=True)
     elif bio_init:
         print(f"slt | WARNING: bio_head_init {bio_init} not found — BIO head starts FRESH; keep "
               f"membership_gate.warmup_epochs > 0 (the gate must not couple to an untrained head)", flush=True)

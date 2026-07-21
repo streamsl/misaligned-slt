@@ -25,17 +25,17 @@ wandb:
     name: bio_s1_${language} # own run name (else inherits dlm's)
 
 # NO circularity: Analysis A is measured by the INDEPENDENT external segmenter (train-segmenter; moryossef26.yaml),
-# NOT this head — so S1 inherits dlm.yaml's mode_ratios.source / jitter.source and trains on the same measured
-# misalignment distribution the SLT model uses (S1↔SLT window-distribution parity). Because the measured errors
-# come from a segmenter the FSM does not contain, there is no loop: S1 is not trained on its own errors. (On clean
-# CSL the measurement is degenerate for ANY segmenter, so both S1 and SLT fall back to the designed mix — that is a
-# corpus property, not a circularity.)
+# NOT this head — so S1 inherits dlm.yaml's mode_ratios / jitter and trains on the SAME misalignment distribution
+# the SLT model uses (S1↔SLT window-distribution parity). dlm.yaml now pins source=null → both use the DESIGNED mix
+# on every corpus (the Moryossef segmenter is degenerate on CSL / too weak on YouTube to calibrate; see dlm.yaml).
+# There was never a loop anyway: the analysis segmenter is not in the FSM, so S1 is not trained on its own errors.
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
-epochs: 20
-batch_size: 128
+epochs: 50
+batch_size: 8
 learning_rate: 1.0e-3
 weight_decay: 1.0e-4
+freeze_backbone: false
 
 # Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py --stage
 # segmenter-infer / eval.py --segmenter-eval), in SECONDS. MUST match the head's trained context, not exceed it

@@ -84,8 +84,11 @@ class RoPETransformerEncoderLayer(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = q * cos + self._rotate_half(q) * sin
         k = k * cos + self._rotate_half(k) * sin
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop.p if self.training else 0.0)
-        x = x + self.out_proj(attn.transpose(1, 2).reshape(batch, frames, hidden_dim))
+        # Dropout is applied to the attention OUTPUT (residual dropout), not via SDPA's dropout_p: the fused MPS
+        # SDPA kernel raises NotImplementedError on in-kernel dropout, and residual dropout is the standard,
+        # device-portable placement (negligible difference from attention-weight dropout at p=0.1).
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = x + self.attn_drop(self.out_proj(attn.transpose(1, 2).reshape(batch, frames, hidden_dim)))
         return x + self.ffn(self.norm2(x.float()).to(x.dtype))
 
 

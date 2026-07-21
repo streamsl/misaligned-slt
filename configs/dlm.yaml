@@ -108,11 +108,15 @@ membership_gate:
     # safe value that also works if S1 was skipped (bio_head_init missing → fresh head → it needs the warmup).
     warmup_epochs: 0
 mode_ratios:
-    source: outputs/a_mode_ratios_${language}.json
-    # Designed misalignment distribution used directly when no measured file exists AND auto-substituted when the measured
-    # Analysis-A ratios are DEGENERATE (mode1 >= degenerate_mode1_threshold) — i.e. the segmenter is too clean (PHOENIX) to
-    # produce real misalignment. Without this the sampler would train ~98% Mode-1 (no robustness). Robustness is still
-    # evaluated by the segmenter-agnostic RQ1 sweep.
+    # source: null → sampler ALWAYS uses the DESIGNED `fallback` mix below, on every dataset. DELIBERATE: Analysis-A
+    # calibration needs a segmenter that makes REALISTIC errors, and the faithful Moryossef segmenter delivers neither
+    # regime here — near-perfect (degenerate) on clean CSL, and too weak on the onset-noisy YouTube corpora (asf/bfi)
+    # to yield a trustworthy error distribution. Feeding either into sampler is garbage-in, so training runs on the
+    # designed mix and Analysis A becomes DESCRIPTIVE, not calibration. This also removes the train-order coupling
+    # (analysis-A no longer has to precede train-bio/SLT). To re-enable measured calibration later (e.g. a stronger
+    # segmenter): point source back at outputs/a_mode_ratios_${language}.json — the degenerate-mode1 guard still
+    # auto-falls-back on clean corpora.
+    source: null
     degenerate_mode1_threshold: 0.9
     fallback:
         mode1: 0.55
@@ -138,11 +142,16 @@ augmentation:
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-# BIO loss = Dice(1.5) + PLAIN cross-entropy. Hard Rule §1.4.3 / §4.4 / §6.1: "Do NOT use class-weighted NLL"
-# (Moryossef 2026 ablation: it did not help). So bio_class_weights is null (unweighted CE); the Conv1d stem
-# (bio_conv_stem_layers, below) supplies the local B-detection inductive bias, and Dice carries the imbalance.
-# If the UNet-less head is empirically observed to collapse to all-I on a heavy-I-imbalance corpus, re-introducing
-# a light B-weight is an EXPLICIT ablation to report as a deviation — not the spec-faithful default.
+# BIO loss = Dice(1.5) + PLAIN cross-entropy (Moryossef recipe). Hard Rule: Dice carries the imbalance; no
+# class-weighted NLL. bio_class_weights stays null.
+#   REAL-DATA FINDING (docs/implementation_notes.md): on YouTube-SL-25 (asf/bfi) back-to-back sentence boundaries
+#   (~57% of Auslan boundaries; 47% of adjacent caption cues chain at gap=0.000s) are NOT recoverable from the pose
+#   stream — the frame `B` collapses to all-`I` under every per-frame loss (plain/focal/macro-Dice/class-weights)
+#   AND under a separate soft-boundary-regression head, whether the encoder is frozen or unfrozen, all plateauing at
+#   val_phrase_tiou_f1 ≈ 0.55. This is a DATA limit (kinematically invisible boundaries + sub-second caption noise),
+#   not a loss/head/encoder deficiency; boundary placement for these is left to the integrated streaming model
+#   (DLM terminator + commit gate + membership gate), which decides splits with LINGUISTIC evidence the pose lacks.
+#   On clean gap-separated corpora (csl) `B` is not needed to split (the O gap does), so this recipe is fine there.
 bio_class_weights: null
 dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
 # In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
@@ -157,7 +166,7 @@ bio_nhead: 8
 bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
-    source: outputs/a_jitter_${language}.json
+    source: null # same rationale as mode_ratios.source above — designed fallback_laplace on every dataset
     fallback_laplace:
         head_loc_s: 0.0
         head_scale_s: 0.6
@@ -178,7 +187,7 @@ learning_rate: 5.0e-5
 weight_decay: 1.0e-4
 # T_max horizon must be the horizon you actually run: at epochs:100 the per-epoch cosine sat at ≥93% of peak LR
 # through epoch 17 (never annealed before early stopping could fire). ~20-30 matches Uni-Sign's stage-3 budget.
-epochs: 30
+epochs: 50
 eval_every_epochs: 1
 early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
     enabled: true # enabled: false to train the full `epochs`.
@@ -189,7 +198,7 @@ scheduler:
     eta_min: 1.0e-6
     # Linear warmup (in epochs; fractional ok). All three A2D/OPUT references warm up when retraining a pretrained
     # model (dllm 10% of steps, DMax 3%); 1/30 epochs ≈ 3%. Cosine now steps per-STEP over the epochs horizon.
-    warmup_epochs: 1
+    warmup_epochs: 0
 max_grad_norm: 1.0
 max_text_tokens: 128
 validation:

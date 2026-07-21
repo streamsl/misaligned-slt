@@ -55,9 +55,9 @@ class MisalignedSLTModel(nn.Module):
     sampler, FSM, and commit gate are identical, which is what makes the AR-vs-DLM comparison a clean test.
     """
     def __init__(
-        self, front_end: SLTFrontEnd | None = None, tokenizer=None, decoder: str = "dlm",
-        block_size: int = 8, bio_hidden_dim: int = 384, bio_depth: int = 4, bio_nhead: int = 8,
-        bio_dropout: float = 0.1, bio_conv_stem_layers: int = 2, pretrained_path: str | None = None,
+        self, front_end: SLTFrontEnd | None = None, tokenizer=None, decoder: str = "dlm", block_size: int = 8, 
+        bio_hidden_dim: int = 384, bio_depth: int = 4, bio_nhead: int = 8, bio_dropout: float = 0.1, 
+        bio_conv_stem_layers: int = 2, pretrained_path: str | None = None,
     ):
         super().__init__()
         # Front end: caller passes one (UniSignMT5FrontEnd / UniSignMBartFrontEnd — both live in models/unisign.py).

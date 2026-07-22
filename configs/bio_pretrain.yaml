@@ -35,7 +35,8 @@ epochs: 50
 batch_size: 8
 learning_rate: 1.0e-3
 weight_decay: 1.0e-4
-freeze_backbone: false
+freeze_backbone: true
+# backbone_lr: 1.0e-4  # optional: encoder LR when freeze_backbone: false (default learning_rate×0.1)
 
 # Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py --stage
 # segmenter-infer / eval.py --segmenter-eval), in SECONDS. MUST match the head's trained context, not exceed it

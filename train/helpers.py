@@ -21,23 +21,30 @@ def move_to_device(value, device: torch.device):
     return value
 
 
-def build_optimizer(cfg: dict, params) -> torch.optim.Optimizer:
+def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Optimizer:
     """AdamW from a config, reading the SAME keys for every stage.
 
     Prefers top-level `learning_rate` / `weight_decay` (the slt/bio convention); falls back to nested
     `optimizer.lr` / `optimizer.weight_decay` so older configs keep working. One place, one convention.
+
+    `backbone_params`: optional second param set trained at `backbone_lr` (default learning_rate × 0.1) —
+    discriminative fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
     """
     opt = cfg.get("optimizer", {}) or {}
     lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
     weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
+
     # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): the reference recipes do the same split
     # (Uni-Sign via timm create_optimizer filter_bias_and_bn=True; standard HF practice) — decaying norm gains
     # regularizes the wrong thing. Accepts a generator or a param list.
-    params = [p for p in params if p.requires_grad]
-    decay = [p for p in params if p.ndim > 1]
-    no_decay = [p for p in params if p.ndim <= 1]
-    groups = [g for g in ({"params": decay, "weight_decay": weight_decay},
-                          {"params": no_decay, "weight_decay": 0.0}) if g["params"]]
+    def wd_split(ps, group_lr):
+        ps = [p for p in ps if p.requires_grad]
+        return [g for g in ({"params": [p for p in ps if p.ndim > 1], "weight_decay": weight_decay, "lr": group_lr},
+                            {"params": [p for p in ps if p.ndim <= 1], "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
+
+    groups = wd_split(params, lr)
+    if backbone_params is not None:
+        groups += wd_split(backbone_params, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.1))))
     return torch.optim.AdamW(groups, lr=lr)
 
 

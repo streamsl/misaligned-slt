@@ -187,9 +187,11 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
-    # Frozen encoder → optimize the head only; unfrozen (freeze_backbone: false) → optimize everything that needs grad.
-    params = model.bio_head.parameters() if model.freeze_encoder else (p for p in model.parameters() if p.requires_grad)
-    optimizer = build_optimizer(cfg, params)
+    # Frozen encoder → optimize the head only. Unfrozen (freeze_backbone: false) → head at learning_rate, the
+    # PRETRAINED encoder at backbone_lr (default lr×0.1, see build_optimizer): a single head-scale LR on the
+    # released Uni-Sign weights degrades them — measured on asf, unfrozen-at-1e-3 trained WORSE than frozen.
+    if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
+    else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
     def step_fn(batch, epoch: int):
         out = model(batch["poses"], batch["frame_mask"], timestamps_s=batch["timestamps_s"])

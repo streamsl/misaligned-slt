@@ -79,6 +79,21 @@ def predict_phrase_segments(
     return predictions
 
 
+def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: tuple[float, ...]) -> dict[str, float]:
+    # One video's segment metrics under the CONSISTENT key convention:
+    seg_keys = ("phrase_tiou_f1", "phrase_seg_precision", "phrase_seg_recall")
+    row: dict[str, float] = {}
+    per_key: dict[str, list[float]] = {k: [] for k in seg_keys}
+    for t in tiou_thresholds:
+        seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
+        row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
+        for k in seg_keys:
+            row[f"{k}@{t:g}"] = seg[k]
+            per_key[k].append(seg[k])
+    for k in seg_keys: row[f"{k}_avg"] = float(sum(per_key[k]) / len(per_key[k]))
+    return row
+
+
 @torch.no_grad()
 def evaluate_segmenter_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
@@ -92,8 +107,13 @@ def evaluate_segmenter_whole_video(
     `rope_chunk_s` (S1 only): the head's trained context in SECONDS (= buffer_cap_s), converted to frames per stream.
     `trusted_gap_s` defaults to TRUSTED_GAP_S so GT labeling matches training: long uncaptioned stretches become
     UNK (excluded from the metric), not O — else the segmenter is penalized for firing on possibly-uncaptioned signing.
-    `tiou_thresholds`: pass eval.yaml's rq2.tiou_thresholds for numbers directly comparable to RQ2's segmentation
-    block; thresholds beyond the first get an `@t` key suffix (first threshold keeps the bare keys for the monitor).
+    `tiou_thresholds`: pass eval.yaml's rq2.tiou_thresholds for numbers directly comparable to RQ2 segmentation block.
+
+    NB the whole-video numbers are STRUCTURALLY far below the training monitor's `val_phrase_tiou_f1` — that is a
+    protocol difference, not a train/infer bug: the monitor macro-averages over short sampler windows whose EDGES
+    truncate merged signing runs (a free segmenter) and which hold few sentences each, while here a single
+    undersplit run can span dozens of captions and match at most one (docs/implementation_notes.md, "Monitor vs
+    whole-video"). Do not compare `val_phrase_tiou_f1` with these numbers.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []
@@ -111,10 +131,7 @@ def evaluate_segmenter_whole_video(
         # prefix "bio" (trainer convention): bio_f1 is the BINARY signing-vs-not frame F1 — under prefix "phrase"
         # it would sit next to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
         row = dict(bio_frame_metrics(logits, labels, prefix="bio"))
-        for j, t in enumerate(tiou_thresholds):
-            seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
-            if j == 0: row.update(seg)
-            else: row.update({f"{k}@{t:g}": v for k, v in seg.items() if k != "phrase_frame_f1"})
+        row.update(_segment_rows(logits, labels, tiou_thresholds))
         rows.append(row)
     if not rows: return {}
     return {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}

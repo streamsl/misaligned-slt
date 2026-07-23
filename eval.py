@@ -25,6 +25,7 @@ from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
+from moryossef26.infer import duration_decode_params, evaluate_segmenter_whole_video, fit_duration_prior
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
@@ -494,6 +495,14 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     device = pick_device(args.device)
     inference_cfg = load_yaml(args.inference_config)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
+    # Gate-side duration decode (same inference.yaml switch as streaming/training): generate_from_poses builds Ω
+    # from the model's duration_prior, so the single-window gate selects the same duration-split anchors the
+    # trained decoder was conditioned on. Only relevant when the gate is on; harmless otherwise.
+    if bool(method_cfg.get("membership_gate", {}).get("enabled", False)):
+        dd = duration_decode_params(inference_cfg)
+        if dd is not None:
+            train_records, _ = load_language_records(data_cfg, args.language, split="train")
+            model.duration_prior = fit_duration_prior(train_records, **dd)
 
     # Materialize every non-empty window, then translate in length-sorted batches (sorting keeps each batch near-uniform length 
     # so padding — and wasted compute — is minimal). Padding is masked, so batching not change any per-window result, only throughput.
@@ -579,7 +588,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     return pd.json_normalize(severity, sep=".").T # one row per (grid_head, grid_tail) severity point
 
 
-def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
+def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, duration_prior=None):
     from infer.stream import StreamingSLTRunner
     trans = inference_cfg.get("translation", {})
     dcd = trans.get("dcd", {})
@@ -620,6 +629,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict):
         dcd_cache_type=str(dcd.get("cache_type", "none")),
         dcd_refresh_count=int(dcd.get("refresh_count", 16)),
         decode_conditioning=str(trans.get("decode_conditioning", "window")),
+        duration_prior=duration_prior,
     )
 
 
@@ -638,7 +648,17 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
-    runner = _build_streaming_runner(model, inference_cfg, method_cfg)
+    # Opt-in buffer-level semi-Markov duration decode (inference.yaml duration_decode: true, or a mapping with the
+    # per-language tuned {split_bias, snap_radius_s} from `analyze --stage tune-decode`; see infer/duration_decode.py).
+    duration_prior = None
+    dd = duration_decode_params(inference_cfg)
+    if dd is not None:
+        train_records, _ = load_language_records(data_cfg, args.language, split="train")
+        duration_prior = fit_duration_prior(train_records, **dd)
+        if duration_prior is not None: print(f"[streaming] buffer duration decode ON (prior from {len(train_records)} train videos"
+                                            + (f"; tuned {dd}" if dd else "") + ")", flush=True)
+        else: print(f"[streaming] duration_decode requested but <10 usable train captions — decoding plain argmax", flush=True)
+    runner = _build_streaming_runner(model, inference_cfg, method_cfg, duration_prior=duration_prior)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     predicted: dict[str, list[PredictionEvent]] = {}
@@ -897,22 +917,32 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     against the in-system S1 head: the two training monitors are NOT comparable (chunk windows vs misaligned windows).
     For `s1` it also scores the pretrained head on its own, without waiting for stage-2 joint fine-tuning.
     """
-    if args.split == "test" and not args.allow_test:
-        raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
-    from moryossef26.infer import evaluate_segmenter_whole_video
-    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+    if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
+    data_cfg = load_yaml(args.data_config)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
-    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
+    # Per-arch decode defaults: `s1` (OUR system's head) -> the semi-Markov duration re-split, this system's contribution 
+    # (infer/duration_decode.py); `external` -> `plain` argmax. Override either way with --segmenter-decode.
+    decode = args.segmenter_decode or ("duration" if args.segmenter_arch == "s1" else "plain")
+    duration_prior = None
+    if decode == "duration":
+        # Enablement is per-arch/CLI (above), but the PARAMETERS come from inference.yaml's duration_decode mapping
+        # when present — the tuned per-language pair must be shared by every consumer of the decode.
+        dd = duration_decode_params(load_yaml(args.inference_config)) or {}
+        train_records, _ = load_language_records(data_cfg, args.language, split="train")
+        duration_prior = fit_duration_prior(train_records, **dd)
+        if duration_prior is None: print("[segmenter-eval] WARNING: too few train captions to fit duration prior; plain decode", flush=True)
+    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={'duration' if duration_prior else 'plain'})", flush=True)
+    decode = "duration" if duration_prior else "plain"
 
     # Report at RQ2's tIoU grid so these standalone numbers line up 1:1 with the full-system segmentation block.
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     metrics = evaluate_segmenter_whole_video(
-        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds,
+        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds, duration_prior=duration_prior,
     )
     payload = {
-        "language": args.language, "split": args.split, "videos": len(records),
-        "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
-        "tiou_thresholds": list(thresholds), "metrics": metrics,
+        "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
+        "decode": decode, "tiou_thresholds": list(thresholds), "metrics": metrics,
     }
     output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -932,8 +962,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--method", default="dlm", choices=["baseline", "ar", "dlm"])
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--severity-grid-s", default=None,
-                        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)")
+    parser.add_argument(
+        "--severity-grid-s", default=None,
+        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)"
+    )
     # Per-axis overrides (fall back to --severity-grid-s / the eval.yaml grid). Truncation-only sweeps —
     # the valid sub-grid on pre-trimmed corpora — need head ≥ 0 with tail ≤ 0, which one shared grid's
     # cross-product cannot express: e.g. --severity-grid-head 0,0.1,0.2,0.3 --severity-grid-tail 0,-0.1,-0.2,-0.3
@@ -947,8 +979,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
     parser.add_argument("--segmenter-eval", action="store_true",
                         help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
-    parser.add_argument("--segmenter-arch", default="external", choices=["external", "s1"],
-                        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head")
+    parser.add_argument(
+        "--segmenter-decode", default=None, choices=["duration", "plain"],
+        help="whole-video decode; default per arch: s1 -> duration (our semi-Markov re-split), external -> plain (faithful Moryossef argmax)"
+    )
+    parser.add_argument(
+        "--segmenter-arch", default="external", choices=["external", "s1"],
+        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head"
+    )
     parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--num-sentences", type=int, default=None)
@@ -956,8 +994,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
     parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
     parser.add_argument("--stream", action="store_true", help="RQ2 row 6: run the streaming FSM engine to produce events")
-    parser.add_argument("--offline", action="store_true",
-                        help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span")
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span"
+    )
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)

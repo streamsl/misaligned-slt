@@ -159,6 +159,19 @@ def build_slt_components(
     if bool(slt_cfg.get("freeze_backbone", False)):
         n = model.front_end.freeze_pose_backbone(freeze_projection=bool(slt_cfg.get("freeze_projection", False)))
         print(f"slt | froze pose backbone ({n / 1e6:.2f}M parameters)", flush=True)
+    # Gate-side duration decode (inference.yaml duration_decode, the SAME switch the streaming FSM reads): the
+    # membership gate's anchor selection re-splits merged back-to-back runs inside build_gate_omega, so stage-2
+    # trains under the tag stream deployment actually gates on (§1.3 on-policy symmetry). Prior fit on TRAIN
+    # captions only; no-op when the gate is disabled (build_gate_omega is then never called).
+    if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)):
+        from infer.duration_decode import duration_decode_params, fit_duration_prior
+        params = duration_decode_params(inference_cfg)
+        if params is not None:
+            model.duration_prior = fit_duration_prior(train_records, **params)
+            if model.duration_prior is not None:
+                p = model.duration_prior
+                print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s "
+                      f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g}", flush=True)
     return SLTComponents(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader)
 
 

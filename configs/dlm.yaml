@@ -108,15 +108,18 @@ membership_gate:
     # safe value that also works if S1 was skipped (bio_head_init missing → fresh head → it needs the warmup).
     warmup_epochs: 0
 mode_ratios:
-    # source: null → sampler ALWAYS uses the DESIGNED `fallback` mix below, on every dataset. DELIBERATE: Analysis-A
-    # calibration needs a segmenter that makes REALISTIC errors, and the faithful Moryossef segmenter delivers neither
-    # regime here — near-perfect (degenerate) on clean CSL, and too weak on the onset-noisy YouTube corpora (asf/bfi)
-    # to yield a trustworthy error distribution. Feeding either into sampler is garbage-in, so training runs on the
-    # designed mix and Analysis A becomes DESCRIPTIVE, not calibration. This also removes the train-order coupling
-    # (analysis-A no longer has to precede train-bio/SLT). To re-enable measured calibration later (e.g. a stronger
-    # segmenter): point source back at outputs/a_mode_ratios_${language}.json — the degenerate-mode1 guard still
-    # auto-falls-back on clean corpora.
-    source: null
+    # MEASURED calibration (Analysis A): stage-2 trains under the window-error distribution the DEPLOYED segmenter
+    # (duration decode, infer/duration_decode.py) actually produces — the injection path that carries the improved
+    # segmentation into joint training. Regenerate per language BEFORE train-slt, with the deployed decode as the
+    # instrument (order coupling is back, deliberately):
+    #   python analyze.py --stage segmenter-infer --segmenter-arch external --segmenter-decode duration --language <lang> --split dev
+    #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_external_<lang>_dev.json --language <lang>
+    # Measure on DEV, not train: both segmenters were fit on train, so train-split errors are optimistically biased.
+    # asf (external+duration, 2026-07): mode1 0.034 / mode2 0.473 / mode3 0.409 / mode4 0.085 — clean complete
+    # anchors are RARE at deployment; the designed fallback below now only covers missing/degenerate measurements
+    # (the mode1>=0.9 guard still auto-falls-back on too-clean corpora, e.g. pre-trimmed CSL). NB a_mode_ratios_csl
+    # in outputs/ predates the duration decode — regenerate before training csl with a measured mix.
+    source: outputs/a_mode_ratios_${language}.json
     degenerate_mode1_threshold: 0.9
     fallback:
         mode1: 0.55
@@ -166,7 +169,10 @@ bio_nhead: 8
 bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
-    source: null # same rationale as mode_ratios.source above — designed fallback_laplace on every dataset
+    # Measured boundary-offset distribution (same Analysis-A run as mode_ratios.source; Laplace loc/scale fitted
+    # from matched-pair offsets — empirically the right family: the deployed decode's placement errors are heavily
+    # leptokurtic, excess kurtosis ~+3.9, Laplace beats Gaussian in held-out log-lik on both head and tail).
+    source: outputs/a_jitter_${language}.json
     fallback_laplace:
         head_loc_s: 0.0
         head_scale_s: 0.6

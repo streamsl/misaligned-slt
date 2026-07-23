@@ -8,20 +8,22 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from data.loader import load_language_records
+from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 
+
+from infer.duration_decode import duration_split_tags
 from infer.commit_gate import first_terminator_index
+from moryossef26.infer import _phrase_logits, _set_rope_chunk, duration_decode_params, fit_duration_prior, predict_phrase_segments
 from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
 from models.checkpointing import load_model_checkpoint
-from metrics import Segment, match_segments, compute_text_metrics
+from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics
 from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, resolve_pretrained
 
-# Analysis-A pred↔GT matching bar: deliberately LOW so near-misses count as matched pairs feeding the 
-# (Δ_head, Δ_tail) jitter CDF, not as phantom/skip events. A high bar biases the DF toward near-zero 
-# offsets and miscalibrates the mode ratios. A corpus-level analysis knob, not a segmenter setting, 
-# so it lives here; override per-run with --tiou-threshold.
+# Analysis-A pred↔GT matching bar: deliberately LOW so near-misses count as matched pairs feeding the (Δ_head, Δ_tail) jitter CDF, 
+# not as phantom/skip events. A high bar biases the DF toward near-zero offsets and miscalibrates the mode ratios. A corpus-level 
+# analysis knob, not a segmenter setting, so it lives here; override per-run with --tiou-threshold.
 ANALYSIS_A_MATCH_TIOU = 0.1
-
 
 @dataclass(frozen=True)
 class JitterSample:
@@ -99,21 +101,11 @@ def analyze_segmenter_errors(
                     overlapping_pred_by_gold.setdefault(gold_idx, []).append(pred_idx)
                     overlapping_gold_by_pred.setdefault(pred_idx, []).append(gold_idx)
 
-        overseg_gold = {
-            gold_idx for gold_idx, pred_indices in overlapping_pred_by_gold.items()
-            if len(pred_indices) >= 2
-        }
-        underseg_pred = {
-            pred_idx for pred_idx, gold_indices in overlapping_gold_by_pred.items()
-            if len(gold_indices) >= 2
-        }
-        underseg_gold = {
-            gold_idx for pred_idx in underseg_pred
-            for gold_idx in overlapping_gold_by_pred.get(pred_idx, [])
-        }
+        overseg_gold = {gold_idx for gold_idx, pred_indices in overlapping_pred_by_gold.items() if len(pred_indices) >= 2}
+        underseg_pred = {pred_idx for pred_idx, gold_indices in overlapping_gold_by_pred.items() if len(gold_indices) >= 2}
+        underseg_gold = {gold_idx for pred_idx in underseg_pred for gold_idx in overlapping_gold_by_pred.get(pred_idx, [])}
         phantom_pred = {
-            pred_idx for pred_idx, pred in enumerate(pred_segments)
-            if pred_idx not in overlapping_gold_by_pred
+            pred_idx for pred_idx, pred in enumerate(pred_segments) if pred_idx not in overlapping_gold_by_pred
             and pred.start_s >= 0.0 and pred.end_s <= float(durations.get(video_id, pred.end_s))
         }
         counts["oversegmentation"] += len(overseg_gold)
@@ -215,15 +207,26 @@ def dataset_summary(args: argparse.Namespace) -> dict:
 
 
 def segmenter_infer(args: argparse.Namespace) -> dict:
-    """Predicted phrase segments on a split — the upstream segmenter for Analysis A / Analysis B / the RQ2 cascade."""
-    if args.split == "test" and not args.allow_test:
-        raise SystemExit("Refusing to run segmenter inference on test without --allow-test")
-    from moryossef26.infer import predict_phrase_segments
-    records, _ = load_language_records(load_yaml(args.data_config), args.language, split=args.split)
+    # Predicted phrase segments on a split — the upstream segmenter for Analysis A / Analysis B / the RQ2 cascade.
+    if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run segmenter inference on test without --allow-test")
+    data_cfg = load_yaml(args.data_config)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
-    print(f"[segmenter-infer] {args.segmenter_arch} segmenter from {checkpoint}", flush=True)
+    # Same per-arch decode defaults as eval --segmenter-eval: s1 -> our semi-Markov duration re-split (infer/duration_decode.py), external 
+    # -> faithful Moryossef argmax. NB for Analysis A/B as a MEASUREMENT instrument you may want `--segmenter-decode duration` even with 
+    # the external arch (measure the deployed decode's error modes, not the published baseline's); the flag exists for exactly that.
+    decode = args.segmenter_decode or ("duration" if args.segmenter_arch == "s1" else "plain")
+    duration_prior = None
+    if decode == "duration":
+        dd = duration_decode_params(load_yaml(args.inference_config)) or {}  # tuned per-language pair, if pinned
+        train_records, _ = load_language_records(data_cfg, args.language, split="train")
+        duration_prior = fit_duration_prior(train_records, **dd)
+    print(f"[segmenter-infer] {args.segmenter_arch} segmenter from {checkpoint} "
+          f"(decode={'duration' if duration_prior else 'plain'})", flush=True)
 
-    predictions = predict_phrase_segments(model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s)
+    predictions = predict_phrase_segments(
+        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, duration_prior=duration_prior,
+    )
     output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
     save_prediction_file(predictions, output)
     return {
@@ -233,16 +236,86 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
     }
 
 
+def tune_decode(args: argparse.Namespace) -> dict:
+    """Two-fold dev tuning of the semi-Markov decode pair (split_bias, snap_radius_s) — infer/duration_decode.py.
+
+    F1(split_bias) is a knife edge, not a plateau (the bias is the Lagrange multiplier of a segment-count constraint against a 
+    near-constant per-segment normalisation cost, so the DP's split count responds almost step-wise), and the two knobs interact 
+    (a larger snap radius partially rescues an oversplitting bias — a marginal sweep at the wrong bias misleads about the radius). 
+    Hence: joint FINE grid, predictions computed ONCE per video, decode-only re-sweep, per-fold macro F1@0.5, and a fold-consistent 
+    selection (max of min(foldA, foldB)). Pin the selected pair in inference.yaml `duration_decode: {split_bias, snap_radius_s}` —
+    a deliberate human step, never auto-applied, so eval runs stay tuning-free.
+    """
+    if args.split == "test": raise SystemExit("tune-decode is dev-only: tuning on test is test contamination")
+    data_cfg = load_yaml(args.data_config)
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    train_records, _ = load_language_records(data_cfg, args.language, split="train")
+    prior = fit_duration_prior(train_records)
+    if prior is None: raise SystemExit("too few train captions to fit a duration prior")
+    model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
+    model.eval().to(device)
+    print(f"[tune-decode] {args.segmenter_arch} segmenter from {checkpoint}; one forward per video, then decode-only sweep", flush=True)
+
+    cached = []  # (video_id, tags, pB, gold, fps) — predictions computed once; the sweep is decode-only
+    with torch.no_grad():
+        for rec in records:
+            poses, timestamps = load_pose_window(rec.pose, 0.0, rec.pose.duration_s, normalize=True)
+            if poses.shape[0] == 0: continue
+            _set_rope_chunk(model, rec, rope_chunk_s)
+            logits = _phrase_logits(model, poses, timestamps, device, velocity)[0].float().cpu()
+            gold = torch.as_tensor(np.asarray(make_bio_labels(
+                timestamps, rec.sentences, 0.0, float(rec.pose.duration_s),
+                trusted_gap_s=TRUSTED_GAP_S, video_duration_s=rec.pose.duration_s
+            ))).long()
+            pB = torch.softmax(logits, dim=-1)[:, BIO["B"]].numpy()  # snap evidence; matches duration_decode_tags
+            cached.append((rec.video_id, logits.argmax(-1).numpy(), pB, gold, float(rec.pose.fps)))
+    cached.sort(key=lambda c: c[0])
+    folds = (cached[::2], cached[1::2])
+
+    def fold_f1(fold, bias, radius):
+        f1s = []
+        for _, tags, pB, gold, fps in fold:
+            t = duration_split_tags(tags, pB, fps, prior, split_bias=bias, snap_radius_s=radius)
+            oh = torch.nn.functional.one_hot(torch.as_tensor(t).long(), num_classes=4).float().unsqueeze(0)
+            f1s.append(moryossef_segment_metrics(oh, gold.unsqueeze(0), prefix="p", tiou_threshold=0.5)["p_tiou_f1"])
+        return float(np.mean(f1s)) if f1s else 0.0
+
+    grid_bias = [round(float(b), 2) for b in np.arange(2.5, 6.01, 0.25)]
+    grid_radius = [0.0, 0.5, 1.0, 1.5]
+    rows, best = [], None
+    for bias in grid_bias:
+        for radius in grid_radius:
+            a, b = fold_f1(folds[0], bias, radius), fold_f1(folds[1], bias, radius)
+            rows.append({"split_bias": bias, "snap_radius_s": radius, "foldA_f1@0.5": round(a, 4), "foldB_f1@0.5": round(b, 4)})
+            key = (min(a, b), (a + b) / 2)  # fold-consistent first, mean as tie-break
+            if best is None or key > best[0]: best = (key, rows[-1])
+        print(f"[tune-decode] bias={bias:4.2f}: " + " ".join(
+            f"r={r['snap_radius_s']:.1f}:{r['foldA_f1@0.5']:.3f}/{r['foldB_f1@0.5']:.3f}" for r in rows[-len(grid_radius):]
+        ), flush=True)
+
+    selected = dict(best[1])
+    output = Path(args.output or f"outputs/tune_decode_{args.segmenter_arch}_{args.language}_{args.split}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "language": args.language, "split": args.split, "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
+        "videos": len(cached), "prior": {"mu_log_s": prior.mu_log_s, "sd_log_s": prior.sd_log_s, "cap_s": prior.cap_s},
+        "selected": selected, "grid": rows,
+        "pin_as": {"duration_decode": {"split_bias": selected["split_bias"], "snap_radius_s": selected["snap_radius_s"]}},
+    }
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[tune-decode] selected split_bias={selected['split_bias']} snap_radius_s={selected['snap_radius_s']} "
+          f"(F1@0.5 {selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}); pin it in inference.yaml duration_decode", flush=True)
+    payload_out = dict(payload); payload_out["output"] = str(output)
+    payload_out.pop("grid")  # the full grid lives in the JSON; keep the stage's stdout summary short
+    return payload_out
+
+
 def analysis_a(args: argparse.Namespace) -> dict:
-    if args.split == "test" and not args.allow_test:
-        raise SystemExit("Analysis A must run on dev; use --allow-test only for smoke debugging")
+    if args.split == "test" and not args.allow_test: raise SystemExit("Analysis A must run on dev; --allow-test only for smoke debugging")
     cfg = load_yaml(args.data_config)
     records, _ = load_language_records(cfg, args.language, split=args.split)
     predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
-    gold_segments = {
-        record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences]
-        for record in records
-    }
+    gold_segments = {record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences] for record in records}
     durations = {record.video_id: float(record.pose.duration_s) for record in records}
     analysis = analyze_segmenter_errors(
         predicted=predictions, gold=gold_segments, durations=durations,
@@ -250,9 +323,8 @@ def analysis_a(args: argparse.Namespace) -> dict:
     )
     paths = write_analysis_a_outputs(analysis, args.output_dir, args.language)
     return {
-        "language": args.language, "split": args.split, "event_counts": analysis.event_counts, 
-        "mode_ratios": analysis.mode_ratios, "matched_pairs": analysis.matched_pairs,
-        "regular_matches": analysis.regular_matches, "outputs": paths,
+        "language": args.language, "split": args.split, "event_counts": analysis.event_counts, "mode_ratios": analysis.mode_ratios, 
+        "matched_pairs": analysis.matched_pairs, "regular_matches": analysis.regular_matches, "outputs": paths,
     }
 
 
@@ -272,10 +344,8 @@ def analysis_b(args: argparse.Namespace) -> dict:
     windows. The controlled severity CURVE (§8.2 Step 2b / §9.1 no-robustness floor) is the SAME machinery as
     `eval.py --rq 1 --method baseline --split dev` — run that for the curve; this stage assembles the realistic gap.
     """
-    if args.split == "test" and not args.allow_test:
-        raise SystemExit("Analysis B runs on dev; --allow-test only for smoke debugging")
-    if not args.predictions:
-        raise SystemExit("--predictions required: the external segmenter's spans (analyze.py --stage segmenter-infer)")
+    if args.split == "test" and not args.allow_test: raise SystemExit("Analysis B runs on dev; --allow-test only for smoke debugging")
+    if not args.predictions: raise SystemExit("--predictions required: external segmenter's spans (analyze.py --stage segmenter-infer)")
     data_cfg = load_yaml(args.data_config)
     base_cfg = load_yaml(args.baseline_config, language=args.language)  # re-point ${language} paths like every other load
     inference_cfg = load_yaml(args.inference_config)
@@ -402,18 +472,16 @@ def tail_benefit(args: argparse.Namespace) -> dict:
 def delta_enc(args: argparse.Namespace) -> dict:
     """BIO temporal noise floor sets the commit gate's delta_enc.
 
-    Uses the S1 in-system BIO head (the DEPLOYED terminator estimator the FSM runs; §4.4/§7.1), NOT the Moryossef
-    analysis segmenter and NOT the DLM checkpoint. Two reasons it must be the S1 head: (1) δ_enc calibrates the
-    commit gate's cut overlap against the noise of the head the FSM actually contains — the analysis segmenter never
-    runs in the FSM; (2) δ_enc is a gate-GEOMETRY constant needed to TRAIN the DLM (dlm.yaml δ is asserted == this),
-    so it must be measured from the head as it ENTERS stage 2 (checkpoints/bio_s1, produced by train-bio), before
-    the DLM exists — reading it off the DLM checkpoint is an ordering circularity.
+    Uses the S1 in-system BIO head (the DEPLOYED terminator estimator the FSM runs), NOT Moryossef analysis segmenter and NOT DLM checkpoint. 
+    2 reasons it must be S1 head: (1) δ_enc calibrates commit gate's cut overlap against the noise of the head the FSM actually contains — 
+    analysis segmenter never runs in FSM; (2) δ_enc is a gate-GEOMETRY constant needed to TRAIN the DLM (dlm.yaml δ is asserted == this), so 
+    it must be measured from the head as it ENTERS stage 2 (checkpoints/bio_s1, produced by train-bio), before the DLM exists — reading it 
+    off the DLM checkpoint is an ordering circularity.
 
-    Runs that head twice per dev sentence window under small input perturbations and measures how far the predicted
-    terminator index (first_terminator_index — first O-or-B, the statistic the commit gate tracks) moves. Two
-    perturbation families (the spec names none, so both are reported): (a) drop the leading frame — the stride-phase
-    misalignment a growing buffer produces; (b) Gaussian keypoint noise sigma on x/y — pose-estimator jitter.
-    delta_enc = ceil(p90 over both families): boundary movement below the head's own noise floor must not block a commit.
+    Runs that head twice per dev sentence window under small input perturbations and measures how far the predicted terminator index 
+    (first_terminator_index — first O-or-B, the statistic the commit gate tracks) moves. 2 perturbation families: (a) drop the leading frame 
+    — the stride-phase misalignment a growing buffer produces; (b) Gaussian keypoint noise sigma on x/y — pose-estimator jitter. delta_enc 
+    = ceil(p90 over both families): boundary movement below the head's own noise floor must not block a commit.
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
     from train.bio_pretrain import build_bio_s1_model
@@ -481,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
     parser.add_argument(
         "--stage", default="dataset-summary",
-        choices=["dataset-summary", "segmenter-infer", "analysis-a", "analysis-b", "tail-benefit", "delta-enc"],
+        choices=["dataset-summary", "segmenter-infer", "tune-decode", "analysis-a", "analysis-b", "tail-benefit", "delta-enc"],
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument(
@@ -489,6 +557,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="segmenter-infer backend: external = independent chunk-trained segmenter (default), s1 = in-system head (ablation)"
     )
     parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="external segmenter config")
+    parser.add_argument(
+        "--segmenter-decode", default=None, choices=["duration", "plain"],
+        help="whole-video decode; default per arch: s1 -> duration (our semi-Markov re-split), external -> plain (faithful Moryossef argmax)"
+    )
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/baseline.yaml")
@@ -515,6 +587,7 @@ if __name__ == "__main__":
     if args.language is None: args.language = str(load_yaml(args.data_config).get("active_languages", ["csl"])[0])
     if args.stage == "dataset-summary": result = dataset_summary(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
+    elif args.stage == "tune-decode": result = tune_decode(args)
     elif args.stage == "analysis-a":
         if not args.predictions: raise SystemExit("--predictions is required for --stage analysis-a")
         result = analysis_a(args)

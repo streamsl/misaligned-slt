@@ -165,7 +165,7 @@ def build_slt_components(
     # captions only; no-op when the gate is disabled (build_gate_omega is then never called).
     if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)):
         from infer.duration_decode import duration_decode_params, fit_duration_prior
-        params = duration_decode_params(inference_cfg)
+        params = duration_decode_params(inference_cfg, language)
         if params is not None:
             model.duration_prior = fit_duration_prior(train_records, **params)
             if model.duration_prior is not None:

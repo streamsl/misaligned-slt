@@ -61,12 +61,28 @@ class DurationPrior:
     snap_radius_s: float = SNAP_RADIUS_S
 
 
-def duration_decode_params(inference_cfg: dict) -> dict | None:
-    """Parse inference.yaml `duration_decode`: false/absent -> None (decode off); true -> {} (module defaults);
-    mapping -> {split_bias, snap_radius_s} per-language tuned overrides (from `analyze --stage tune-decode`)."""
-    v = (inference_cfg or {}).get("duration_decode", False)
+def _coerce_decode_entry(v) -> dict | None:
+    # one duration_decode value -> None (off) | {} (on, module defaults) | {split_bias?, snap_radius_s?} (tuned).
     if isinstance(v, dict): return {k: float(v[k]) for k in ("split_bias", "snap_radius_s") if v.get(k) is not None}
     return {} if bool(v) else None
+
+
+def duration_decode_params(inference_cfg: dict, language: str | None = None) -> dict | None:
+    """Resolve inference.yaml `duration_decode` for a language. Returns None (decode OFF), {} (ON, module
+    defaults), or {split_bias, snap_radius_s} (ON, tuned).
+
+    split_bias is corpus-specific (a Lagrange multiplier pinned to the duration prior's normalisation scale —
+    F1(bias) is a knife edge), so ONE global value is wrong across corpora. Three accepted shapes:
+      false / true                                -> global off / global on-with-defaults
+      {split_bias: .., snap_radius_s: ..}         -> global tuned pair (single-corpus configs)
+      {default: <entry>, <lang>: <entry>, ...}    -> PER-LANGUAGE; each entry is any of the scalars/maps above
+    A per-language map is detected by any key other than the two param names; an untuned language falls to
+    `default` (recommend false — leave the decode OFF until `analyze --stage tune-decode` pins its pair)."""
+    v = (inference_cfg or {}).get("duration_decode", False)
+    if isinstance(v, dict) and not ({"split_bias", "snap_radius_s"} & set(v)):
+        entry = v.get(str(language), v.get("default", False)) if language is not None else v.get("default", False)
+        return _coerce_decode_entry(entry)
+    return _coerce_decode_entry(v)
 
 
 def fit_duration_prior(
@@ -110,11 +126,21 @@ def duration_split_tags(
     fps = float(fps)
     split_bias = float(prior.split_bias if split_bias is None else split_bias)
     snap_radius_s = float(prior.snap_radius_s if snap_radius_s is None else snap_radius_s)
-    lmax = max(2, round(prior.cap_s * fps))
-    # Lognormal over seconds evaluated at L/fps, with the −log(fps) change-of-variables term so the density is
-    # over FRAMES — this constant per segment is what makes `split_bias` transfer across corpora with other fps.
+    # Cap lmax at the sequence length: no segment can exceed the whole input, and this bounds the LP array +
+    # per-run DP to O(T) even if a degenerate (near-constant) timestamp stream drives fps → a huge value at the
+    # caller's `1/median(dt)` estimate (the estimate can blow up; the DP cost must not).
+    lmax = max(2, min(round(prior.cap_s * fps), len(tags)))
+    # Lognormal is over DURATION IN SECONDS; evaluate at L/fps and add the −log(fps) change-of-variables Jacobian
+    # (d(seconds)/d(frames) = 1/fps) so LP is a proper density over integer FRAME lengths — required for the 
+    # segmental DP to be a correct MAP over frame-partitions. The count-dependent part of a run's score is exactly
+    # K·(split_bias − log fps), K = #segments: split_bias and the Jacobian's −log fps BOTH act on segment count, so
+    # the effective count-penalty is fps-dependent. This is NOT a transfer device — split_bias is corpus-specific
+    # (different μ_ln/σ_ln AND different fps both move the F1 peak) and is re-tuned per language by
+    # `analyze --stage tune-decode`; do NOT reuse one corpus's value.
+    # log N(L_s | μ_ln, σ_ln) = −log(L_s·σ_ln·√(2π)) − (log(L_s) − μ_ln)² / (2·σ_ln²)
     L_s = np.arange(1, lmax + 1, dtype=float) / fps
-    logp = -np.log(L_s * prior.sd_log_s * np.sqrt(2 * np.pi)) - (np.log(L_s) - prior.mu_log_s) ** 2 / (2 * prior.sd_log_s ** 2) - np.log(fps)
+    logp = -np.log(L_s * prior.sd_log_s * np.sqrt(2 * np.pi)) \
+           - (np.log(L_s) - prior.mu_log_s) ** 2 / (2 * prior.sd_log_s ** 2) - np.log(fps)
     LP = np.concatenate([[-1e18], logp])  # LP[L_frames], L>=1
 
     out = np.array(tags, copy=True)
@@ -137,19 +163,28 @@ def duration_split_tags(
             rng = np.arange(i0, j)
             cand = D[rng] + LP[j - rng] + (rng > 0) * split_bias
             k = int(np.argmax(cand)); D[j] = cand[k]; arg[j] = i0 + k
+        raw = []  # DP interior split frames for this run, collected then snapped LEFT-TO-RIGHT
         j = L
         while j > 0:
             i = int(arg[j])
-            if i > 0:
-                p = a + i
-                lo, hi = max(a + 1, p - snap_r), min(b, p + snap_r + 1)
-                if hi > lo:
-                    q = lo + int(np.argmax(boundary_prob[lo:hi]))
-                    # Move only when the peak genuinely beats the DP position — flat evidence keeps the
-                    # duration-optimal split instead of drifting to the window edge (argmax-of-constant).
-                    if boundary_prob[q] > boundary_prob[p]: p = q
-                splits.append(p)
+            if i > 0: raw.append(a + i)
             j = i
+        raw.sort()
+        # Snap each split to its P(B) peak, but CLAMP the search window between the neighbouring splits (prev
+        # snapped position on the left, next raw DP split on the right) so two adjacent splits can never both
+        # collapse onto one peak (set()-dedup would silently drop a segment) nor reorder past each other — the
+        # snapped splits stay strictly increasing, one per DP-chosen segment.
+        prev = a
+        for idx, p in enumerate(raw):
+            nxt = raw[idx + 1] if idx + 1 < len(raw) else b + 1
+            lo, hi = max(prev + 1, p - snap_r), min(nxt, p + snap_r + 1)
+            q = p
+            if hi > lo:
+                cand = lo + int(np.argmax(boundary_prob[lo:hi]))
+                # Move only when the peak genuinely beats the DP position — flat evidence keeps the
+                # duration-optimal split instead of drifting to the window edge (argmax-of-constant).
+                if boundary_prob[cand] > boundary_prob[p]: q = cand
+            splits.append(q); prev = q
         if mark_onsets: splits.append(a)  # run onset stays a segment start (first signing frame after a gap)
     for p in sorted(set(splits)): out[p] = BIO["B"]
     return out

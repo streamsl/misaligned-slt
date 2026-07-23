@@ -499,7 +499,7 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     # from the model's duration_prior, so the single-window gate selects the same duration-split anchors the
     # trained decoder was conditioned on. Only relevant when the gate is on; harmless otherwise.
     if bool(method_cfg.get("membership_gate", {}).get("enabled", False)):
-        dd = duration_decode_params(inference_cfg)
+        dd = duration_decode_params(inference_cfg, args.language)
         if dd is not None:
             train_records, _ = load_language_records(data_cfg, args.language, split="train")
             model.duration_prior = fit_duration_prior(train_records, **dd)
@@ -651,7 +651,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     # Opt-in buffer-level semi-Markov duration decode (inference.yaml duration_decode: true, or a mapping with the
     # per-language tuned {split_bias, snap_radius_s} from `analyze --stage tune-decode`; see infer/duration_decode.py).
     duration_prior = None
-    dd = duration_decode_params(inference_cfg)
+    dd = duration_decode_params(inference_cfg, args.language)
     if dd is not None:
         train_records, _ = load_language_records(data_cfg, args.language, split="train")
         duration_prior = fit_duration_prior(train_records, **dd)
@@ -921,17 +921,18 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     data_cfg = load_yaml(args.data_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
-    # Per-arch decode defaults: `s1` (OUR system's head) -> the semi-Markov duration re-split, this system's contribution 
-    # (infer/duration_decode.py); `external` -> `plain` argmax. Override either way with --segmenter-decode.
-    decode = args.segmenter_decode or ("duration" if args.segmenter_arch == "s1" else "plain")
+    # Per-arch decode DEFAULT, following inference.yaml's per-language switch as the ONE source of truth: `s1` (OUR head) -> the semi-Markov 
+    # duration re-split IFF this language has it enabled (infer/duration_decode.py); `external` and any language with duration OFF -> `plain` 
+    # argmax. --segmenter-decode overrides either way (an explicit `duration` on an OFF/untuned language uses module-default params).
+    dd = duration_decode_params(load_yaml(args.inference_config), args.language)
+    decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
     duration_prior = None
     if decode == "duration":
-        # Enablement is per-arch/CLI (above), but the PARAMETERS come from inference.yaml's duration_decode mapping
-        # when present — the tuned per-language pair must be shared by every consumer of the decode.
-        dd = duration_decode_params(load_yaml(args.inference_config)) or {}
         train_records, _ = load_language_records(data_cfg, args.language, split="train")
-        duration_prior = fit_duration_prior(train_records, **dd)
+        duration_prior = fit_duration_prior(train_records, **(dd or {}))
         if duration_prior is None: print("[segmenter-eval] WARNING: too few train captions to fit duration prior; plain decode", flush=True)
+        elif dd is None: print(f"[segmenter-eval] NOTE: --segmenter-decode duration on a language with duration OFF/untuned in "
+                               f"inference.yaml; using module-default params", flush=True)
     print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={'duration' if duration_prior else 'plain'})", flush=True)
     decode = "duration" if duration_prior else "plain"
 

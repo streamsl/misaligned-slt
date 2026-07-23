@@ -215,12 +215,12 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
     # Same per-arch decode defaults as eval --segmenter-eval: s1 -> our semi-Markov duration re-split (infer/duration_decode.py), external 
     # -> faithful Moryossef argmax. NB for Analysis A/B as a MEASUREMENT instrument you may want `--segmenter-decode duration` even with 
     # the external arch (measure the deployed decode's error modes, not the published baseline's); the flag exists for exactly that.
-    decode = args.segmenter_decode or ("duration" if args.segmenter_arch == "s1" else "plain")
+    dd = duration_decode_params(load_yaml(args.inference_config), args.language)  # per-language switch = source of truth
+    decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
     duration_prior = None
     if decode == "duration":
-        dd = duration_decode_params(load_yaml(args.inference_config)) or {}  # tuned per-language pair, if pinned
         train_records, _ = load_language_records(data_cfg, args.language, split="train")
-        duration_prior = fit_duration_prior(train_records, **dd)
+        duration_prior = fit_duration_prior(train_records, **(dd or {}))
     print(f"[segmenter-infer] {args.segmenter_arch} segmenter from {checkpoint} "
           f"(decode={'duration' if duration_prior else 'plain'})", flush=True)
 

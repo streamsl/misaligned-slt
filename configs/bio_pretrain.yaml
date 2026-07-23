@@ -26,9 +26,11 @@ wandb:
 
 # NO circularity: Analysis A is measured by the INDEPENDENT external segmenter (train-segmenter; moryossef26.yaml),
 # NOT this head — so S1 inherits dlm.yaml's mode_ratios / jitter and trains on the SAME misalignment distribution
-# the SLT model uses (S1↔SLT window-distribution parity). dlm.yaml now pins source=null → both use the DESIGNED mix
-# on every corpus (the Moryossef segmenter is degenerate on CSL / too weak on YouTube to calibrate; see dlm.yaml).
-# There was never a loop anyway: the analysis segmenter is not in the FSM, so S1 is not trained on its own errors.
+# the SLT model uses (S1↔SLT window-distribution parity). dlm.yaml now points those sources at the MEASURED
+# outputs/a_*_${language}.json (from Analysis A run with the deployed duration decode), so S1 must be (re)trained
+# AFTER analysis-a for this language — regenerate both if the segmenter/decode changes. Clean corpora (CSL,
+# measured mode1>=0.9) auto-fall-back to the DESIGNED mix via the sampler's degenerate guard. There is no loop:
+# the analysis segmenter is not in the FSM, so S1 is never trained on its own errors.
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
 epochs: 50

@@ -1,6 +1,12 @@
 seed: 42
 language: csl
 stride_s: 1.0
+# Semi-Markov duration decode (infer/duration_decode.py): false = off; true = on with module defaults; or a
+# mapping pinning the per-language tuned pair from `analyze.py --stage tune-decode` (re-tune when switching
+# language — the F1(split_bias) peak sits at the corpus prior's normalisation scale and is a knife edge).
+# ONE switch for every consumer: the streaming FSM's tag stream, the membership gate's anchor selection
+# (training + inference — build_gate_omega), and the tuned pair for segmenter-eval/segmenter-infer.
+duration_decode: {split_bias: 4.0, snap_radius_s: 1.0} # asf, tune_decode_s1_asf_dev.json (folds .524/.525)
 buffer_cap_s: 18.0 # analyze.py --stage tail-benefit --write-config writes p99_sentence_duration + tail-elbow here
 # (NOT the bare elbow: §8.3's elbow is ~1-3s but §7.2 requires the FSM buffer to hold a WHOLE sentence + tail, so
 # the forced-commit cap is p99 sentence duration + the elbow; both raw values are in outputs/tail_benefit_*.json).

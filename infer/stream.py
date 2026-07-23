@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 from data.windowing import BIO
 from infer.commit_gate import CommitGate, open_span_start, select_target_span
+from infer.duration_decode import duration_split_tags
 
 
 def leading_i_run_end(bio_tags: torch.Tensor) -> int | None:
@@ -42,7 +43,7 @@ class StreamingSLTRunner:
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
         dcd_top_p: float | None = None, dcd_cache_type: str = "none", dcd_refresh_count: int = 16,
         decode_conditioning: str = "window", min_span_frames: int | None = None, forced_tail_policy: str = "skip",
-        gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4,
+        gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4, duration_prior=None,
     ):
         # decode_conditioning: "window" (default) decodes under the FULL buffer's features — exactly the
         # training conditioning, where Mode 1/3 windows feed the whole jittered window to the encoder and
@@ -82,6 +83,18 @@ class StreamingSLTRunner:
                 f"min_span_frames ({self.min_span_frames}) must exceed 2*delta_enc_frames ({2 * int(delta_enc_frames)}); "
                 "otherwise the post-commit overlap leftover is a selectable span."
             )
+        # Optional buffer-level semi-Markov duration decode (infer.duration_decode, inference.yaml duration_decode).
+        # Injects interior B splits into CLOSED signing runs of each stride's tags — back-to-back sentences inside
+        # the buffer become separate selectable spans instead of one merged run. The run touching the buffer end
+        # is left unsplit (right-truncated: its total duration is unknown mid-stream) and onsets are not re-marked
+        # B (opening keys on the O→signing transition, so span-opening and the forced-commit path are untouched).
+        # Opt-in until validated end-to-end in RQ2 (whole-video eval: asf dev tiou F1@0.5 0.19->0.51).
+        self.duration_prior = duration_prior
+        # The membership gate's anchor selection re-splits tags INSIDE build_gate_omega from the model's own
+        # duration_prior — hand it the same prior, or _stride_omega would gate on raw-argmax merged runs while the
+        # FSM above commits duration-split spans (the exact train/infer divergence the injection exists to prevent).
+        if duration_prior is not None and hasattr(self.model, "duration_prior"):
+            self.model.duration_prior = duration_prior
 
         self.spd_top_k = int(spd_top_k)
         self.spd_renormalize = bool(spd_renormalize)
@@ -141,7 +154,7 @@ class StreamingSLTRunner:
         chi = (ts_b + float(start_s)) < self._committed_until_s  # (1, T') bool, absolute timeline
         omega_bias, _ = self.model.build_gate_omega(
             bio_logits, None, mask, memory_len=self.model.front_end.prompt_length() + int(bio_logits.shape[1]),
-            commit_mask=chi, delta=self.gate_delta, eps=self.gate_eps, min_span_frames=self.min_span_frames,
+            commit_mask=chi, delta=self.gate_delta, eps=self.gate_eps, min_span_frames=self.min_span_frames, timestamps_s=ts_b,
         )
         return omega_bias
 
@@ -172,6 +185,15 @@ class StreamingSLTRunner:
         # terminator-less (deferring the commit to the buffer cap → spurious PARTIAL) and an O→UNK→I sequence never
         # opens (_span_opens needs prev==O exactly) — the FSM would silently diverge from the shared decode rule.
         bio_tags = torch.where(bio_tags == BIO["UNK"], torch.full_like(bio_tags, BIO["O"]), bio_tags)
+        if self.duration_prior is not None and bio_tags.numel() > 2:
+            dt = ts[0, 1:] - ts[0, :-1]
+            # Clamp to [1,120] fps: a degenerate ~0 median dt would otherwise give fps ~1e6 -> lmax OOM in the DP.
+            fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0) if dt.numel() else 24.0
+            pB = torch.softmax(bio_logits[0].float(), dim=-1)[:, BIO["B"]].cpu().numpy()
+            bio_tags = torch.as_tensor(
+                duration_split_tags(bio_tags.cpu().numpy(), pB, fps_b, self.duration_prior, mark_onsets=False, split_open_tail=False),
+                device=bio_tags.device, dtype=bio_tags.dtype,
+            )
         # FSM-internal BIO record: stitch this stride's per-frame argmax into the whole-stream timeline
         # (latest estimate wins on re-visited frames) so RQ2 can score the deployed head's segmentation directly.
         if self._bio_timeline is not None and bio_tags.numel() == int(in_buffer.sum().item()):

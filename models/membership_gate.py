@@ -163,6 +163,16 @@ def build_omega(
     near_s = near_s | (~has_terminator.view(B, 1))
     gamma = torch.where(near_s, gamma_s.view(B, 1), gamma_tau.view(B, 1))  # (B, T), detached
 
+    # ── right wall (mirror of the left wall at s−δ): frames beyond τ+δ are non-members regardless of evidence ──
+    # The capped-odds membership is EVIDENCE-driven: past τ, m only decays where hinge(−ℓ) > 0, i.e. where frames stop 
+    # being confident-I — which is exactly a GAP. A back-to-back successor sentence is confident-I throughout, so without 
+    # a wall Ω ≈ 0 past τ and the gate cannot mask the neighbour — precisely the contamination the duration re-split 
+    # anchors exist to prevent. A no-op for gap-terminated spans (O frames' own hinge already floors m within δ of τ) and 
+    # inert on the open/forced path (no terminator); the same hard floor as left wall, so gradient below it is exactly 0.
+    right_wall = has_terminator.view(B, 1) & (t > terminators.view(B, 1) + int(delta))
+    ln_eps = torch.log(torch.tensor(float(eps), device=device, dtype=logm.dtype))
+    logm = torch.where(right_wall, ln_eps.expand_as(logm), logm)
+
     # ── fact: commit mask, unconditional, OUTSIDE γ (doc §2.7) ────────────────
     omega = gamma * logm
     if commit_mask is not None:

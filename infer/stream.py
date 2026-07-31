@@ -190,8 +190,12 @@ class StreamingSLTRunner:
             # Clamp to [1,120] fps: a degenerate ~0 median dt would otherwise give fps ~1e6 -> lmax OOM in the DP.
             fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0) if dt.numel() else 24.0
             pB = torch.softmax(bio_logits[0].float(), dim=-1)[:, BIO["B"]].cpu().numpy()
+            # split_open_tail="survival": the run touching buffer end is right-censored, so its LAST segment is scored by 
+            # lognormal log-survival while the observed prefix still gets interior splits. With the legacy False, a b2b 
+            # stretch longer than the buffer never closed inside ANY buffer and never got split at all — the censored tail 
+            # itself stays open, so the premature-commit protection is unchanged.
             bio_tags = torch.as_tensor(
-                duration_split_tags(bio_tags.cpu().numpy(), pB, fps_b, self.duration_prior, mark_onsets=False, split_open_tail=False),
+                duration_split_tags(bio_tags.cpu().numpy(), pB, fps_b, self.duration_prior, mark_onsets=False, split_open_tail="survival"),
                 device=bio_tags.device, dtype=bio_tags.dtype,
             )
         # FSM-internal BIO record: stitch this stride's per-frame argmax into the whole-stream timeline

@@ -25,7 +25,7 @@ from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
-from moryossef26.infer import duration_decode_params, evaluate_segmenter_whole_video, fit_duration_prior
+from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
@@ -780,6 +780,15 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
+    # Same deployed decode as every other consumer of the inference.yaml switch: without this, offline self-segments with plain argmax 
+    # while streaming duration-decodes its buffers — the rows would compare decodes, not deployments. Whole-video flags (input ended → 
+    # nothing right-censored), unlike the FSM's "survival" buffers.
+    dd = duration_decode_params(inference_cfg, args.language)
+    duration_prior = None
+    if dd is not None:
+        train_records, _ = load_language_records(data_cfg, args.language, split="train")
+        duration_prior = fit_duration_prior(train_records, **dd)
+        print(f"[offline] whole-video duration decode ON (prior from {len(train_records)} train videos)", flush=True)
 
     predicted: dict[str, list[PredictionEvent]] = {}
     for record in tqdm(records, desc="Offline (self-segment + translate)"):
@@ -794,7 +803,9 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         mask_t = torch.ones(poses_t.shape[:2], dtype=torch.bool, device=device)
         bio_tap, bio_mask, ts_out = model.front_end.extract_bio_tap(poses_t, mask_t, ts_t)
         model.bio_head.chunk_size = max(1, int(round(buffer_cap_s * float(record.pose.fps))))
-        tags = model.bio_head(bio_tap, timestamps_s=ts_out, frame_mask=bio_mask).logits.argmax(dim=-1)[0].cpu()
+        bio_logits = model.bio_head(bio_tap, timestamps_s=ts_out, frame_mask=bio_mask).logits
+        if duration_prior is not None: tags = duration_decode_tags(bio_logits, float(record.pose.fps), duration_prior).cpu()
+        else: tags = bio_logits.argmax(dim=-1)[0].cpu()
         segments = bio_tags_to_segments(tags, timestamps.tolist())
 
         events: list[PredictionEvent] = []

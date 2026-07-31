@@ -329,5 +329,3 @@ def compute_text_metrics(
             scores["bleurt"] = float(sum(bleurt_scores) / max(1, len(bleurt_scores)))
         except Exception: pass
     return {f"{prefix}_{key}": float(value) for key, value in scores.items()}
-
-

@@ -131,11 +131,13 @@ class MisalignedSLTModel(nn.Module):
         duration_prior = getattr(self, "duration_prior", None)  # getattr: test fakes drive this method unbound
         if duration_prior is not None:
             # Semi-Markov duration re-split BEFORE anchor selection — the same re-decode the deployed FSM applies to its tag stream 
-            # (infer/stream.py step()), with the SAME flags. Without it the gate is off-policy the moment the FSM decodes with duration: 
-            # on a back-to-back window the raw argmax yields ONE merged run, select_target_span anchors Ω on it, and the decoder trains 
-            # against neighbour-sentence features the deployed gate would have masked. Flags mirror streaming: onsets are not re-marked 
-            # B (opening keys on the O→signing transition, so this is inert for span selection) and the run touching the window end stays 
-            # unsplit (right-censored mid-stream; in training that is exactly the Mode-2a right-truncation the open-anchor branch handles).
+            # (infer/stream.py step()), with the SAME flags. Without it the gate is off-policy the moment the FSM decodes with duration:
+            # on a back-to-back window the raw argmax yields ONE merged run, select_target_span anchors Ω on it, and the decoder trains
+            # against neighbour-sentence features the deployed gate would have masked. Flags mirror streaming: onsets are not re-marked
+            # B (opening keys on the O→signing transition, so this is inert for span selection) and the run touching the window end is
+            # decoded under the right-censored "survival" rule — its observed prefix gets interior splits (so a b2b Mode-1/3 window still
+            # separates its complete anchor from the truncated neighbour) while the censored tail segment itself stays open, which is
+            # exactly the Mode-2a right-truncation state the open-anchor branch handles.
             pB = torch.softmax(bio_logits.detach().float(), dim=-1)[..., BIO["B"]].cpu().numpy()
             tags_np = pred_tags.cpu().numpy()
             for b in range(B):
@@ -148,7 +150,7 @@ class MisalignedSLTModel(nn.Module):
                     # give fps ~1e6 -> lmax = cap_s*fps blows the LP array and the O(T*lmax) DP up to OOM.
                     if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
                 tags_np[b, :n] = duration_split_tags(
-                    tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail=False,
+                    tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
                 )
             pred_tags = torch.as_tensor(tags_np, device=device, dtype=pred_tags.dtype)
 

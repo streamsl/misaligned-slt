@@ -92,10 +92,12 @@ languages:
     ase:
         name: ASL
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth # OpenASL is native ASL→English — exact match
+        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         root: data/youtube-sl-25/ase
         pose:
-            fps: 25.0 # own extraction (native/2, varies per video — see header note); NOT SignVerse
+            fps: 24.0
+            width: 1920
+            height: 1080
 
 splits:
     signverse_csv: data/youtube-sl-25/SignVerse-2M-metadata_split.csv

@@ -14,9 +14,13 @@ is a GEOMETRIC (monotone-decreasing, memoryless) duration law — with flat `B` 
 splits, and per-frame threshold rules (Moryossef 2023 Algorithm 1) fail the same way. An interior-mode duration
 law requires hypothesising segment LENGTHS — the O(T·L_max) segmental DP below.
 
-Used by `eval --segmenter-eval` and `analyze --stage segmenter-infer` (Analysis A/B + RQ2 cascade upstream) via
-`moryossef26.infer`, where `--segmenter-decode plain` keeps faithful argmax protocol. Streaming FSM/commit-gate 
-do NOT use this yet — buffer-level duration decoding is a coherent system-wide change deferred to gate refactor.
+Consumers (all keyed on ONE inference.yaml `duration_decode` switch, resolved per-language by
+`duration_decode_params`): whole-video eval + Analysis A/B via `moryossef26.infer` (`--segmenter-decode plain`
+keeps the faithful argmax protocol for the external baseline row); the streaming FSM's tag stream
+(`infer.stream.step`) and the membership gate's anchor selection (`build_gate_omega`) — both with the
+streaming flags (`mark_onsets=False, split_open_tail="survival"`), which is what keeps the gate on-policy
+with the deployed decode; and `analyze --stage delta-enc`, which must measure the terminator statistic under
+the SAME deployed decode or it reports the raw-argmax instability instead of the head's noise floor.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -103,7 +107,7 @@ def fit_duration_prior(
 def duration_split_tags(
     tags: np.ndarray, boundary_prob: np.ndarray, fps: float, prior: DurationPrior,
     split_bias: float | None = None, snap_radius_s: float | None = None,
-    mark_onsets: bool = True, split_open_tail: bool = True,
+    mark_onsets: bool = True, split_open_tail: bool | str = True,
 ) -> np.ndarray:
     """Semi-Markov MAP re-decode of argmax `tags`: keep the (reliable) signing/non-signing runs, re-place ALL
     interior sentence boundaries by segmental Viterbi under the duration prior, then snap each split to the
@@ -119,9 +123,22 @@ def duration_split_tags(
     decode opens on the O→signing transition, not on `B` specifically. `mark_onsets=False` (streaming-buffer,
     `infer.stream` + the gate's `build_gate_omega`) omits those onset B's: run onsets stay `I`, which is INERT
     for span opening (same O→signing rule) — so span-opening semantics are untouched even though an argmax onset
-    B, if any, is not preserved verbatim. `split_open_tail=False` leaves a run that touches the LAST frame
-    unsplit — a right-truncated run's total length is unknown mid-stream, so duration evidence about where to cut
-    it is not yet valid (the buffer-cap forced commit already bounds the pathological case).
+    B, if any, is not preserved verbatim. 
+    
+    `split_open_tail` handles the run touching the LAST frame — the one run whose total length is RIGHT-CENSORED 
+    mid-stream (the sentence may continue past the buffer):
+      True        (whole-video): the input ended, nothing is censored — split it like any other run.
+      "survival"  (streaming): treat the run's LAST segment as right-censored — score it by the lognormal's
+                  log-SURVIVAL log S(L) = log P(dur > L) (a probability, not a density: no Jacobian, and it is
+                  the correct likelihood for "still open at the buffer edge") while every earlier segment keeps
+                  the usual density + split_bias. The DP then commits the interior splits of the run's observed
+                  PREFIX and leaves only the censored tail segment open. Without this, a b2b signing stretch
+                  longer than the buffer NEVER closes inside any buffer and therefore never receives interior
+                  splits at all — the whole-video decode splits it, the stitched stream tags did not (asf dev:
+                  stitched fsm_bio_tiou 0.27 vs 0.51 whole-video). S(L)→0 beyond the prior's tail also FORCES
+                  splits on implausibly long observed runs, bounding the censored segment by cap_s.
+      False       (legacy): leave the tail run entirely unsplit. Retained for the premature-cut-averse
+                  behaviour, but it is what starves long runs of splits — prefer "survival" in streaming.
     """
     fps = float(fps)
     split_bias = float(prior.split_bias if split_bias is None else split_bias)
@@ -142,6 +159,14 @@ def duration_split_tags(
     logp = -np.log(L_s * prior.sd_log_s * np.sqrt(2 * np.pi)) \
            - (np.log(L_s) - prior.mu_log_s) ** 2 / (2 * prior.sd_log_s ** 2) - np.log(fps)
     LP = np.concatenate([[-1e18], logp])  # LP[L_frames], L>=1
+    LS = None
+    if split_open_tail == "survival":
+        # Lognormal log-survival log P(dur > L): S(x) = ½·erfc((ln x − μ)/(σ√2)). A probability over the
+        # censored observation, so no −log(fps) Jacobian. Clamped: erfc underflows to exactly 0 in the far
+        # tail, and log(0) would poison the DP argmax instead of merely disfavouring the length.
+        z = (np.log(L_s) - prior.mu_log_s) / (prior.sd_log_s * np.sqrt(2.0))
+        surv = 0.5 * torch.special.erfc(torch.as_tensor(z, dtype=torch.float64)).numpy()
+        LS = np.concatenate([[0.0], np.log(np.maximum(surv, 1e-300))])  # LS[L_frames]; LS[0] unused
 
     out = np.array(tags, copy=True)
     out[out == BIO["B"]] = BIO["I"]
@@ -150,7 +175,8 @@ def duration_split_tags(
     for run in _bio_runs(out, split_on_b=False, open_on_i=True, close_on_unk=True):
         a, b = int(run["start"]), int(run["end"])
         L = b - a + 1
-        if not split_open_tail and b == len(out) - 1:
+        censored = split_open_tail != True and b == len(out) - 1  # noqa: E712 — "survival" is also != True
+        if split_open_tail is False and censored:
             if mark_onsets: splits.append(a)
             continue
         if L <= 2:
@@ -163,8 +189,19 @@ def duration_split_tags(
             rng = np.arange(i0, j)
             cand = D[rng] + LP[j - rng] + (rng > 0) * split_bias
             k = int(np.argmax(cand)); D[j] = cand[k]; arg[j] = i0 + k
-        raw = []  # DP interior split frames for this run, collected then snapped LEFT-TO-RIGHT
-        j = L
+            
+        if censored:
+            # Right-censored tail: pick the censored segment's start i* maximising fully-segmented-prefix score
+            # + survival of the open tail. i* = 0 (whole run still one open sentence) is only reachable while
+            # L <= lmax — an observed run beyond the prior's cap has S ~ 0 mass left, so splits are forced.
+            i_rng = np.arange(max(0, L - lmax), L)
+            cand = D[i_rng] + (i_rng > 0) * split_bias + LS[L - i_rng]
+            j = int(i_rng[int(np.argmax(cand))])
+            tail_start = j  # backtrace covers the prefix [0, j); j itself is the censored segment's opening split
+        else: j = L; tail_start = 0
+
+        raw = []  # DP split frames for this run, collected then snapped LEFT-TO-RIGHT
+        if tail_start > 0: raw.append(a + tail_start)
         while j > 0:
             i = int(arg[j])
             if i > 0: raw.append(a + i)

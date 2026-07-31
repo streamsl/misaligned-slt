@@ -498,16 +498,34 @@ def delta_enc(args: argparse.Namespace) -> dict:
     print(f"[delta-enc] S1 BIO head from {checkpoint}", flush=True)
     sigma = float(args.noise_sigma)
 
+    # δ_enc must be measured under the DEPLOYED terminator decode. When inference.yaml's duration_decode is on, the FSM duration-re-splits 
+    # every buffer BEFORE reading terminators (infer/stream.py step()), so the raw argmax statistic is the wrong instrument: on back-to-back 
+    # corpora the first argmax O-or-B jumps by WHOLE SENTENCES under a one-frame perturbation (the b2b terminator simply is not in the argmax 
+    # tags), and p90 of that instability is the argmax decoder's pathology, not the head's noise floor, which forced min_span_frames past the 
+    # buffer cap and broke FSM span selection outright. Under the deployed decode the terminator moves by DP/snap jitter instead.
+    dd = duration_decode_params(load_yaml(args.inference_config), args.language)
+    duration_prior = None
+    if dd is not None:
+        train_records, _ = load_language_records(data_cfg, args.language, split="train")
+        duration_prior = fit_duration_prior(train_records, **dd)
+    print(f"[delta-enc] terminator decode: {'duration (deployed)' if duration_prior else 'plain argmax'}", flush=True)
+
     sentences = [(rec, span) for rec in records for span in rec.sentences]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
     rng = np.random.default_rng(int(args.seed))
 
     @torch.no_grad()
-    def closing_index(poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float) -> int | None:
+    def closing_index(poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float, fps: float) -> int | None:
         poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
         ts = torch.as_tensor(timestamps_np - start_s, dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
-        tags = model(poses, mask, timestamps_s=ts).logits.argmax(dim=-1)[0]
+        logits = model(poses, mask, timestamps_s=ts).logits
+        tags = logits.argmax(dim=-1)[0]
+        if duration_prior is not None and tags.numel() > 2:
+            pB = torch.softmax(logits[0].float(), dim=-1)[:, BIO["B"]].cpu().numpy()
+            tags = torch.as_tensor(duration_split_tags(
+                tags.cpu().numpy(), pB, fps, duration_prior, mark_onsets=False, split_open_tail="survival"
+            ))
         return first_terminator_index(tags)
 
     shifts: dict[str, list[int]] = {"drop_first_frame": [], "keypoint_noise": []}
@@ -516,15 +534,16 @@ def delta_enc(args: argparse.Namespace) -> dict:
         end_s = min(rec.pose.duration_s, span.end_s + 1.0)
         poses, timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
         if poses.shape[0] < 3: continue
-        base = closing_index(poses, timestamps, start_s)
+        fps = float(rec.pose.fps)
+        base = closing_index(poses, timestamps, start_s, fps)
         if base is None: continue
 
-        dropped = closing_index(poses[1:], timestamps[1:], start_s)
+        dropped = closing_index(poses[1:], timestamps[1:], start_s, fps)
         # The dropped buffer's indices sit one frame earlier on the original timeline.
         if dropped is not None: shifts["drop_first_frame"].append(abs((dropped + 1) - base))
         noisy = poses.copy()
         noisy[..., :2] = noisy[..., :2] + rng.normal(0.0, sigma, size=noisy[..., :2].shape).astype(noisy.dtype)
-        perturbed = closing_index(noisy, timestamps, start_s)
+        perturbed = closing_index(noisy, timestamps, start_s, fps)
         if perturbed is not None: shifts["keypoint_noise"].append(abs(perturbed - base))
 
     stats = {family: {

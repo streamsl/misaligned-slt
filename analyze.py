@@ -11,12 +11,11 @@ from data.loader import load_language_records
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 
-
-from infer.duration_decode import duration_split_tags
-from infer.commit_gate import first_terminator_index
-from moryossef26.infer import _phrase_logits, _set_rope_chunk, duration_decode_params, fit_duration_prior, predict_phrase_segments
-from eval import _build_eval_model, _load_segmenter, _translate_window, load_prediction_file, save_prediction_file
 from models.checkpointing import load_model_checkpoint
+from infer.duration_decode import duration_split_tags
+from infer.commit_gate import first_terminator_index, select_target_span
+from moryossef26.infer import _phrase_logits, _set_rope_chunk, duration_decode_params, fit_duration_prior, predict_phrase_segments
+from eval import _build_eval_model, _load_segmenter, _translate_windows, load_prediction_file, save_prediction_file
 from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics
 from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, resolve_pretrained
 
@@ -42,11 +41,10 @@ class SegmenterErrorAnalysis:
     matched_pairs: int
     regular_matches: int
     videos: int
-    # Relative position in (0,1) of each spurious internal cut the segmenter placed inside an
-    # over-segmented GT sentence. This is what Mode 2 needs (where truncation lands), and it is NOT
-    # captured by the matched-pair (Δ_head, Δ_tail) CDF — those are one-to-one boundary noise. The
-    # Mode-2 window sampler draws its cut depth from this distribution (§5.0/§5.2); uniform is only a
-    # last-resort fallback when no over-segmentation was observed.
+    # Relative position in (0,1) of each spurious internal cut the segmenter placed inside an over-segmented GT sentence. 
+    # This is what Mode 2 needs (where truncation lands), and it is NOT captured by the matched-pair (Δ_head, Δ_tail) CDF 
+    # — those are one-to-one boundary noise. The Mode-2 window sampler draws its cut depth from this distribution; uniform 
+    # is only a last-resort fallback when no over-segmentation was observed.
     overseg_cut_positions: list[float]
 
 def _laplace_fit(values: list[float]) -> dict[str, float]:
@@ -61,8 +59,7 @@ def normalize_counts(counts: dict[str, int | float]) -> dict[str, float]:
     return {key: float(max(0, value) / total) for key, value in counts.items()}
 
 def mode_weights_from_events(counts: dict[str, int]) -> dict[str, float]:
-    # Per streaming_slt_prompt.md §5.5: skip mass is split between
-    # truncated-window and multi-complete-window training cases.
+    # Per streaming_slt_prompt.md §5.5: skip mass is split between truncated-window and multi-complete-window training cases.
     skipped_half = 0.5 * float(counts["skipped"])
     return {
         "mode1": float(counts["matched"]),
@@ -294,17 +291,27 @@ def tune_decode(args: argparse.Namespace) -> dict:
         ), flush=True)
 
     selected = dict(best[1])
+    # Held-out estimate — the number to QUOTE: re-select using each fold alone, evaluate that pair on the other
+    # fold, average. The selected pair's own cells are in-selection maxima and overstate the gain.
+    heldout = []
+    for sel_i, eval_i in ((0, 1), (1, 0)):
+        key_col = f"fold{'AB'[sel_i]}_f1@0.5"
+        by_sel = max(rows, key=lambda r: r[key_col])
+        heldout.append(by_sel[f"fold{'AB'[eval_i]}_f1@0.5"])
+        
+    heldout_f1 = round(sum(heldout) / 2, 4)
     output = Path(args.output or f"outputs/tune_decode_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "language": args.language, "split": args.split, "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "videos": len(cached), "prior": {"mu_log_s": prior.mu_log_s, "sd_log_s": prior.sd_log_s, "cap_s": prior.cap_s},
-        "selected": selected, "grid": rows,
+        "selected": selected, "heldout_f1@0.5": heldout_f1, "heldout_per_fold": [round(h, 4) for h in heldout], "grid": rows,
         "pin_as": {"duration_decode": {"split_bias": selected["split_bias"], "snap_radius_s": selected["snap_radius_s"]}},
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"[tune-decode] selected split_bias={selected['split_bias']} snap_radius_s={selected['snap_radius_s']} "
-          f"(F1@0.5 {selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}); pin it in inference.yaml duration_decode", flush=True)
+          f"(in-selection F1@0.5 {selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}; HELD-OUT estimate {heldout_f1} — "
+          f"quote the held-out number); pin the pair in inference.yaml duration_decode", flush=True)
     payload_out = dict(payload); payload_out["output"] = str(output)
     payload_out.pop("grid")  # the full grid lives in the JSON; keep the stage's stdout summary short
     return payload_out
@@ -335,14 +342,12 @@ def _eval_model_for(method: str, args: argparse.Namespace, method_cfg: dict, dev
 
 
 def analysis_b(args: argparse.Namespace) -> dict:
-    """Analysis B (§8.2) — the paper's MOTIVATING experiment: a CLEAN SLT model degrades under a REALISTIC
-    upstream segmenter's boundary errors. Runs on dev, before SLT training, and is method-INDEPENDENT (the clean
-    baseline is not our method). Produces the clean-vs-realistic headline table.
+    """Analysis B — the paper's MOTIVATING experiment: a CLEAN SLT model degrades under a REALISTIC upstream segmenter's boundary errors. 
+    Runs on dev, before SLT training, and is method-INDEPENDENT (clean baseline is not our method). Produce clean-vs-realistic table.
 
-    Realistic point: translate the windows the EXTERNAL segmenter actually cut (`--predictions`, the segmenter-infer
-    output), with each window's reference = the GT sentence it most overlaps. Clean point: translate the GT-trimmed
-    windows. The controlled severity CURVE (§8.2 Step 2b / §9.1 no-robustness floor) is the SAME machinery as
-    `eval.py --rq 1 --method baseline --split dev` — run that for the curve; this stage assembles the realistic gap.
+    Realistic point: translate the windows the EXTERNAL segmenter actually cut (`--predictions`, the segmenter-infer output), with each 
+    window's reference = the GT sentence it most overlaps. Clean point: translate the GT-trimmed windows. The controlled severity CURVE 
+    is the SAME machinery as `eval.py --rq 1 --method baseline --split dev` — run that for the curve; this stage assembles realistic gap.
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Analysis B runs on dev; --allow-test only for smoke debugging")
     if not args.predictions: raise SystemExit("--predictions required: external segmenter's spans (analyze.py --stage segmenter-infer)")
@@ -353,43 +358,56 @@ def analysis_b(args: argparse.Namespace) -> dict:
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, tokenizer = _eval_model_for("baseline", args, base_cfg, device)
 
-    def _translate(start_s, end_s, rec):
-        poses, ts = load_pose_window(rec.pose, start_s, end_s, normalize=True)
-        if poses.shape[0] == 0: return None
-        text, _, _ = _translate_window(
-            model=model, tokenizer=tokenizer, method="baseline", poses_np=poses, timestamps_np=ts, 
-            start_s=start_s, device=device, inference_cfg=inference_cfg, method_cfg=base_cfg
-        )
-        return text
+    def _translate_all(spans_with_refs, desc):
+        # Load (I/O-bound, tqdm'd) then decode in --batch-size chunks — the one-window-per-model-call version of
+        # this stage was wall-clock-dominated by per-window beam decodes and per-window pose-file opens.
+        items, refs = [], []
+        for rec, start_s, end_s, ref in tqdm(spans_with_refs, desc=f"{desc}: load"):
+            poses, ts = load_pose_window(rec.pose, start_s, end_s, normalize=True)
+            if poses.shape[0] == 0: continue
+            items.append((poses, ts, start_s)); refs.append(ref)
+        preds = [t for t, _, _ in _translate_windows(
+            model, tokenizer, "baseline", items, device, inference_cfg, base_cfg, batch_size=int(args.batch_size)
+        )]
+        return preds, refs
 
-    # Clean point: GT-trimmed windows (flatten so the progress bar shows total sentences, not videos).
-    clean_pred, clean_ref = [], []
-    clean_items = [(rec, s) for rec in records for s in rec.sentences]
-    for rec, s in tqdm(clean_items, desc="Analysis B: clean (GT spans)"):
-        t = _translate(float(s.start_s), float(s.end_s), rec)
-        if t is not None: clean_pred.append(t); clean_ref.append(s.text)
+    clean_pred, clean_ref = _translate_all( # Clean point: GT-trimmed windows
+        [(rec, float(s.start_s), float(s.end_s), s.text) for rec in records for s in rec.sentences], "Analysis B: clean (GT spans)"
+    )
 
     # Realistic point: the external segmenter's predicted spans; reference = the max-overlap GT sentence.
     predicted = load_prediction_file(args.predictions)
     by_id = {r.video_id: r for r in records}
-    real_items = [(by_id[vid], span) for vid, spans in predicted.items() if vid in by_id for span in spans]
-    real_pred, real_ref = [], []
-    for rec, span in tqdm(real_items, desc="Analysis B: realistic (segmenter spans)"):
-        best, best_ov = None, 0.0
-        for gt in rec.sentences:
-            ov = max(0.0, min(span.end_s, gt.end_s) - max(span.start_s, gt.start_s))
-            if ov > best_ov: best_ov, best = ov, gt
-        if best is None: continue  # phantom span in a gap → no GT reference; excluded from the corpus score
-        t = _translate(float(span.start_s), float(span.end_s), rec)
-        if t is not None: real_pred.append(t); real_ref.append(best.text)
+    real_spans, covered, phantoms = [], set(), 0
+    for vid, spans in predicted.items():
+        rec = by_id.get(vid)
+        if rec is None: continue
+        for span in spans:
+            best, best_ov = None, 0.0
+            for gt in rec.sentences:
+                ov = max(0.0, min(span.end_s, gt.end_s) - max(span.start_s, gt.start_s))
+                if ov > best_ov: best_ov, best = ov, gt
+            if best is None:
+                phantoms += 1; continue  # phantom span in a gap → no GT reference; excluded from the corpus score
+            covered.add((vid, float(best.start_s)))
+            real_spans.append((rec, float(span.start_s), float(span.end_s), best.text))
 
+    real_pred, real_ref = _translate_all(real_spans, "Analysis B: realistic (segmenter spans)")
     clean = compute_text_metrics(clean_pred, clean_ref, prefix="clean") if clean_pred else {}
     realistic = compute_text_metrics(real_pred, real_ref, prefix="realistic") if real_pred else {}
+    n_gold = sum(len(r.sentences) for r in records)
     payload = {
         "language": args.language, "split": args.split, "clean": clean, "realistic": realistic,
         "clean_windows": len(clean_pred), "realistic_windows": len(real_pred),
         "delta_bleu4": float(clean.get("clean_bleu4", 0.0) - realistic.get("realistic_bleu4", 0.0)),
-        "note": "Controlled severity curve = eval.py --rq 1 --method baseline --split dev (the §9.1 no-robustness floor).",
+        # Accounting visibility: the realistic point scores MATCHED windows only — GT sentences no window overlaps
+        # cost nothing, phantom windows cost nothing, and several windows may share one reference. These counters
+        # keep that visible (report gold_coverage next to delta_bleu4; a low coverage means the gap understates
+        # the true segmentation damage). Kept matched-only deliberately: the recall-inclusive accounting lives in
+        # RQ2's event scoring — Analysis B is the per-window conditional quality gap, not the system recall story.
+        "gold_sentences_total": n_gold, "gold_sentences_covered": len(covered), "gold_coverage": round(len(covered) / max(n_gold, 1), 4),
+        "phantom_windows_excluded": phantoms, "duplicate_reference_windows": len(real_pred) - len(covered),
+        "note": "Controlled severity curve = eval.py --rq 1 --method baseline --split dev (no-robustness floor).",
     }
     output = Path(args.output or f"outputs/analysis_b_{args.language}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -427,24 +445,40 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     sentences = [(rec, span) for rec in records for span in rec.sentences]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
 
-    per_tail: dict[float, dict[str, list[str]]] = {dt: {"predictions": [], "references": []} for dt in grid}
-    for rec, span in sentences:
+    # ONE pose read per sentence at the LONGEST tail, sliced per grid point in memory (normalization is
+    # per-frame, so a slice of the normalized long window == the short window loaded directly), then decode in
+    # --batch-size chunks. The previous shape — len(grid) separate pose-file reads AND len(grid) single-window
+    # beam decodes per sentence — was wall-clock-dominated by both (hours on a network filesystem).
+    max_tail = max(grid)
+    per_tail: dict[float, dict[str, list]] = {dt: {"items": [], "references": [], "clamped": 0} for dt in grid}
+    for rec, span in tqdm(sentences, desc="tail-benefit: load"):
+        poses, timestamps = load_pose_window(rec.pose, span.start_s, min(rec.pose.duration_s, span.end_s + max_tail), normalize=True)
+        if poses.shape[0] == 0: continue
         for dt in grid:
             end_s = min(rec.pose.duration_s, span.end_s + dt)
-            poses, timestamps = load_pose_window(rec.pose, span.start_s, end_s, normalize=True)
-            if poses.shape[0] == 0: continue
-            text, _, _ = _translate_window(
-                model=model, tokenizer=tokenizer, method="baseline",
-                poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
-                device=device, inference_cfg=inference_cfg, method_cfg=base_cfg,
-            )
-            per_tail[dt]["predictions"].append(text)
+            n = int(np.searchsorted(timestamps, end_s, side="left"))
+            if n == 0: continue
+            per_tail[dt]["items"].append((poses[:n], timestamps[:n], float(span.start_s)))
             per_tail[dt]["references"].append(span.text)
+            # Track end-of-video clamping: a clamped row got LESS trailing context than this grid point claims,
+            # so a flat marginal-BLEU step at large dt can be "no more benefit" OR "no more video" — without this
+            # fraction the elbow (and the persisted buffer_cap_s) can be an artifact of the corpus's tail margins.
+            if end_s < span.end_s + dt - 1e-6: per_tail[dt]["clamped"] += 1
 
     curve = []
     for dt in grid:
-        bleu = compute_text_metrics(per_tail[dt]["predictions"], per_tail[dt]["references"])["translation_bleu4"]
-        curve.append({"delta_tail_s": dt, "bleu4": float(bleu), "n": len(per_tail[dt]["predictions"])})
+        preds = [t for t, _, _ in _translate_windows(
+            model, tokenizer, "baseline", per_tail[dt]["items"], device, inference_cfg, base_cfg, batch_size=int(args.batch_size)
+        )]
+        bleu = compute_text_metrics(preds, per_tail[dt]["references"])["translation_bleu4"]
+        n = len(preds)
+        clamped_fraction = per_tail[dt]["clamped"] / max(n, 1)
+        curve.append({"delta_tail_s": dt, "bleu4": float(bleu), "n": n, "clamped_fraction": round(clamped_fraction, 4)})
+        print(f"[tail-benefit] tail={dt:.1f}s BLEU4={bleu:.2f} (n={n}, clamped={clamped_fraction:.1%})", flush=True)
+
+    heavy = [c for c in curve if c["clamped_fraction"] > 0.2]
+    if heavy: print(f"[tail-benefit] WARNING: {len(heavy)} grid point(s) have >20% end-of-video clamping "
+                    f"(from tail={heavy[0]['delta_tail_s']}s); the elbow may reflect missing video, not saturated benefit.", flush=True)
 
     elbow = grid[-1]
     for prev, cur in zip(curve, curve[1:]):
@@ -508,42 +542,58 @@ def delta_enc(args: argparse.Namespace) -> dict:
     if dd is not None:
         train_records, _ = load_language_records(data_cfg, args.language, split="train")
         duration_prior = fit_duration_prior(train_records, **dd)
-    print(f"[delta-enc] terminator decode: {'duration (deployed)' if duration_prior else 'plain argmax'}", flush=True)
+    # The statistic must be the terminator the deployed commit gate TRACKS: the terminator of the SELECTED span (select_target_span with the 
+    # deployed Λ_min), not first_terminator_index over raw tags — the latter includes terminators of phantom micro-spans (1-frame flickers) 
+    # that Λ_min filters at deployment, so its perturbation jitter calibrates δ on spans the gate can never commit.
+    min_span = int((load_yaml(args.inference_config).get("span_selection", {}) or {}).get("min_span_frames", 0))
+    print(f"[delta-enc] terminator decode: {'duration (deployed)' if duration_prior else 'plain argmax'}; "
+          f"Lambda_min={min_span} frames", flush=True)
 
     sentences = [(rec, span) for rec in records for span in rec.sentences]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
     rng = np.random.default_rng(int(args.seed))
 
     @torch.no_grad()
-    def closing_index(poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float, fps: float) -> int | None:
-        poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
-        ts = torch.as_tensor(timestamps_np - start_s, dtype=torch.float32, device=device).unsqueeze(0)
-        mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
+    def closing_indices(variants: list[tuple[np.ndarray, np.ndarray]], start_s: float, fps: float) -> list[int | None]:
+        # ONE batched forward for all perturbation variants of a sentence (they differ by <=1 frame in length;
+        # right-pad by repeating the last frame with frame_mask=False — the training collator's pad contract).
+        T = max(p.shape[0] for p, _ in variants)
+        poses = torch.stack([torch.cat([
+            torch.as_tensor(p, dtype=torch.float32), torch.as_tensor(p[-1:], dtype=torch.float32).expand(T - p.shape[0], -1, -1)
+        ]) for p, _ in variants]).to(device)
+        ts = torch.stack([torch.nn.functional.pad(
+            torch.as_tensor(t - start_s, dtype=torch.float32), (0, T - t.shape[0])
+        ) for _, t in variants]).to(device)
+
+        mask = torch.stack([torch.arange(T) < p.shape[0] for p, _ in variants]).to(device)
         logits = model(poses, mask, timestamps_s=ts).logits
-        tags = logits.argmax(dim=-1)[0]
-        if duration_prior is not None and tags.numel() > 2:
-            pB = torch.softmax(logits[0].float(), dim=-1)[:, BIO["B"]].cpu().numpy()
-            tags = torch.as_tensor(duration_split_tags(
-                tags.cpu().numpy(), pB, fps, duration_prior, mark_onsets=False, split_open_tail="survival"
-            ))
-        return first_terminator_index(tags)
+        out: list[int | None] = []
+
+        for i, (p, _) in enumerate(variants):
+            n = int(p.shape[0])
+            tags = logits[i, :n].argmax(dim=-1)
+            if duration_prior is not None and n > 2:
+                pB = torch.softmax(logits[i, :n].float(), dim=-1)[:, BIO["B"]].cpu().numpy()
+                tags = torch.as_tensor(duration_split_tags(
+                    tags.cpu().numpy(), pB, fps, duration_prior, mark_onsets=False, split_open_tail="survival"
+                ))
+            span = select_target_span(tags, min_span)
+            out.append(int(span[1]) if span is not None else first_terminator_index(tags))
+        return out
 
     shifts: dict[str, list[int]] = {"drop_first_frame": [], "keypoint_noise": []}
-    for rec, span in sentences:
+    for rec, span in tqdm(sentences, desc="delta-enc"):
         start_s = max(0.0, span.start_s - 1.0)
         end_s = min(rec.pose.duration_s, span.end_s + 1.0)
         poses, timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
         if poses.shape[0] < 3: continue
         fps = float(rec.pose.fps)
-        base = closing_index(poses, timestamps, start_s, fps)
-        if base is None: continue
-
-        dropped = closing_index(poses[1:], timestamps[1:], start_s, fps)
-        # The dropped buffer's indices sit one frame earlier on the original timeline.
-        if dropped is not None: shifts["drop_first_frame"].append(abs((dropped + 1) - base))
         noisy = poses.copy()
         noisy[..., :2] = noisy[..., :2] + rng.normal(0.0, sigma, size=noisy[..., :2].shape).astype(noisy.dtype)
-        perturbed = closing_index(noisy, timestamps, start_s, fps)
+        base, dropped, perturbed = closing_indices([(poses, timestamps), (poses[1:], timestamps[1:]), (noisy, timestamps)], start_s, fps)
+        if base is None: continue
+        # The dropped buffer's indices sit one frame earlier on the original timeline.
+        if dropped is not None: shifts["drop_first_frame"].append(abs((dropped + 1) - base))
         if perturbed is not None: shifts["keypoint_noise"].append(abs(perturbed - base))
 
     stats = {family: {
@@ -593,6 +643,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--tiou-threshold", type=float, default=None)
     parser.add_argument("--num-sentences", type=int, default=None)
+    parser.add_argument(
+        "--batch-size", type=int, default=8,
+        help="windows per translate/forward batch in loop-decode paths (RQ2 rows, analysis-b, tail-benefit, delta-enc)"
+    )
     parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--write-config", action="store_true", help="Persist the measured constant into configs/inference.yaml")

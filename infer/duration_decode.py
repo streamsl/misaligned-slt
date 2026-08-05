@@ -1,13 +1,12 @@
 """Semi-Markov (HSMM-style) duration decode — THIS SYSTEM'S contribution, not part of the Moryossef protocol.
 
-Whole-video argmax BIO decoding under-segments catastrophically on caption-supervised YouTube corpora: ~half of
-adjacent captions are back-to-back (no O gap), so argmax never wins `B` there, and under one-to-one tIoU matching
-a merged run spanning k captions matches at most one (asf dev: 7.9 predicted vs 33.8 gold segments/video). The
-fix is inference, not learning: the signing/non-signing runs are excellent (binary frame F1 ~0.96), and the
-information that is missing from the frames — "sentences last ~4 s, not 40 s" — is exactly what a two-moment
-lognormal duration prior carries. MAP decoding under that prior (exact segmental Viterbi per signing run, then
-snapping each split to the segmenter's own P(B) peak) lifts asf dev whole-video tiou F1@0.5 0.19→0.51 (S1 head)
-and 0.25→0.46 (external Moryossef segmenter) with NO model change.
+Whole-video argmax BIO decoding under-segments catastrophically on caption-supervised YouTube corpora: a large
+fraction of adjacent captions are back-to-back (no O gap), so argmax never wins `B` there, and under one-to-one
+tIoU matching a merged run spanning k captions matches at most one. The fix is inference, not learning: the
+signing/non-signing runs are reliable, and the information missing from the frames — how long a sentence
+plausibly lasts — is exactly what a two-moment lognormal duration prior carries. MAP decoding under that prior
+(exact segmental Viterbi per signing run, then snapping each split to the segmenter's own P(B) peak) recovers
+the merged boundaries with NO model change, for the in-system head and the external segmenter alike.
 
 Why this must be semi-Markov: a linear-chain CRF/HMM encodes duration implicitly through self-transitions, which
 is a GEOMETRIC (monotone-decreasing, memoryless) duration law — with flat `B` evidence its Viterbi path never
@@ -33,18 +32,16 @@ from metrics import _bio_runs
 
 
 # Per-split log-score bonus, the decode's ONE real hyperparameter. It must roughly offset the per-segment
-# lognormal normalisation cost (-max LP ~= 4.8 for asf@24fps) or the DP never/always splits — the F1(mu) curve
-# is a sharp peak, NOT a plateau: mu<=3 -> zero splits, mu>=6 -> oversplit collapse. mu=4.0 was grid-selected
-# and replicated in all four (dev-fold x arch) cells; exact normalisation cancellation (mu = -max LP) oversplits
-# by ~0.15 F1, so it cannot be auto-derived — for a NEW corpus, run `analyze.py --stage tune-decode` on its dev
+# lognormal normalisation cost or the DP never/always splits — F1(bias) is a sharp peak, not a plateau, and
+# exact normalisation cancellation oversplits, so the value cannot be auto-derived. The peak's location follows
+# the corpus's duration prior: for a NEW corpus, run `analyze.py --stage tune-decode` on its dev
 # (the same two-fold protocol; decode-only sweep on cached predictions) and pin the pair in inference.yaml's
 # `duration_decode` mapping rather than trusting this constant.
 DURATION_SPLIT_BIAS = 4.0
 # Splits are snapped to the segmenter's own P(B) argmax within this radius (only when the peak actually beats
-# the DP position): duration decides HOW MANY, the model's boundary posterior decides WHERE. Swept 0..1.5s on
-# both folds x both arches: monotone gains to 1.0s at BOTH tIoU 0.5 and 0.7 (s1 0.503->0.529/0.515->0.524),
-# fold-inconsistent beyond -> capped at 1.0s. Using P(B) INSIDE the DP objective instead was tuned to zero
-# weight — weak evidence may perturb positions, never counts.
+# the DP position): duration decides HOW MANY, the model's boundary posterior decides WHERE. Weak boundary
+# evidence must only perturb positions, never counts — folding P(B) into the DP objective instead tunes to zero
+# weight. Tuned jointly with DURATION_SPLIT_BIAS by `analyze --stage tune-decode`; re-tune per corpus.
 SNAP_RADIUS_S = 1.0
 
 
@@ -128,17 +125,13 @@ def duration_split_tags(
     `split_open_tail` handles the run touching the LAST frame — the one run whose total length is RIGHT-CENSORED 
     mid-stream (the sentence may continue past the buffer):
       True        (whole-video): the input ended, nothing is censored — split it like any other run.
-      "survival"  (streaming): treat the run's LAST segment as right-censored — score it by the lognormal's
-                  log-SURVIVAL log S(L) = log P(dur > L) (a probability, not a density: no Jacobian, and it is
-                  the correct likelihood for "still open at the buffer edge") while every earlier segment keeps
-                  the usual density + split_bias. The DP then commits the interior splits of the run's observed
-                  PREFIX and leaves only the censored tail segment open. Without this, a b2b signing stretch
-                  longer than the buffer NEVER closes inside any buffer and therefore never receives interior
-                  splits at all — the whole-video decode splits it, the stitched stream tags did not (asf dev:
-                  stitched fsm_bio_tiou 0.27 vs 0.51 whole-video). S(L)→0 beyond the prior's tail also FORCES
-                  splits on implausibly long observed runs, bounding the censored segment by cap_s.
-      False       (legacy): leave the tail run entirely unsplit. Retained for the premature-cut-averse
-                  behaviour, but it is what starves long runs of splits — prefer "survival" in streaming.
+      "survival"  (streaming): score the run's LAST segment by the lognormal log-survival log P(dur > L) — the
+                  correct likelihood for a still-open segment (a probability, so no Jacobian) — and every earlier
+                  segment as usual. Interior splits of the observed prefix commit; only the censored tail stays
+                  open. Without this a signing stretch longer than the buffer never closes inside any buffer and
+                  never gets split; vanishing survival mass beyond the prior's tail also forces splits on
+                  implausibly long observed runs.
+      False       (legacy): leave the tail run entirely unsplit — starves long runs of splits; prefer "survival".
     """
     fps = float(fps)
     split_bias = float(prior.split_bias if split_bias is None else split_bias)

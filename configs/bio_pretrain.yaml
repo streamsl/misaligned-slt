@@ -18,7 +18,13 @@ extends: dlm.yaml
 checkpoint:
     dir: checkpoints/bio_s1/${language}
     save_best: true
-    monitor: val_phrase_tiou_f1 # span quality (one-to-one tIoU-matched F1) — what the FSM/gate consume, not frame accuracy
+    # val_mode3_tiou_f1, NOT the val_phrase_tiou_f1 headline: the headline is a per-window macro over a mix whose
+    # single-span windows (mode1+mode2, ~58% under the measured asf mix) are near-saturated by ANY signing detector
+    # under the symmetric run-decode, and within a run the headline ANTI-correlates with 2 slices that carry boundary
+    # information (asf: corr(headline, mode3)=-0.54, corr(headline, mode4)=-0.69, corr(headline, bio_recall)=+0.95 —
+    # it is a recall detector). mode3 (>=2 complete spans -> interior-B quality) is the one slice whose geometry matches
+    # whole-video deployment; its all-I floor is 0.219 vs the trained head's 0.27-0.38 — real separation.
+    monitor: val_mode3_tiou_f1
     mode: max
     restore_best: true
 wandb:

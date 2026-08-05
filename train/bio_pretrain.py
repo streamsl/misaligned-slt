@@ -25,9 +25,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from backbones import UniSignPoseEncoder
+from data.windowing import BIO
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
+from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 
 from metrics import bio_frame_metrics, moryossef_segment_metrics
@@ -47,9 +48,7 @@ class BioS1Model(nn.Module):
     features == S2 initial features and the head transfers without an input-distribution jump.
     `freeze_encoder=False` (`freeze_backbone: false`): the encoder trains too, adapting the translation-optimized
     features to the segmentation objective. NB this does NOT recover back-to-back sentence boundaries on YouTube
-    corpora — that signal is absent from the captions themselves (docs/implementation_notes.md: the boundary-head +
-    unfrozen-encoder recovery attempts all plateaued at val_phrase_tiou_f1 ≈ 0.55, an established data limit, not a
-    head/loss/encoder deficiency); it is kept as a general feature-adaptation lever, not a boundary fix.
+    corpora — that signal is absent from the captions themselves.
     """
     def __init__(
         self, pose_hidden_dim: int = 256, feat_dim: int = 768, bio_hidden_dim: int = 384, bio_depth: int = 4, 
@@ -163,6 +162,11 @@ def evaluate_bio_s1(
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(out.logits, labels, prefix="phrase"))
+            # Collapse floor: the SAME segment metric on a CONSTANT all-I prediction. Under the symmetric run-decode
+            # any single-span window is near-free for a signing detector, so a monitor sitting within noise of this
+            # floor is measuring the window mix, not the head. Logged every epoch so saturation is visible mid-run.
+            alli = torch.zeros_like(out.logits); alli[..., BIO["I"]] = 1.0
+            row["alli_tiou_f1"] = moryossef_segment_metrics(alli, labels, prefix="alli")["alli_tiou_f1"]
             # Per-mode tIoU diagnostic. This is a SEGMENTATION metric (predicted BIO spans vs the GT BIO spans),
             # well-defined for EVERY mode because the head is supervised on all modes' bio_labels — independent of
             # translation ("complete-sentence") supervision, which only some modes carry (OPUT on 1/3, CB on 2a,
@@ -187,9 +191,8 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
-    # Frozen encoder → optimize the head only. Unfrozen (freeze_backbone: false) → head at learning_rate, the
-    # PRETRAINED encoder at backbone_lr (default lr×0.1, see build_optimizer): a single head-scale LR on the
-    # released Uni-Sign weights degrades them — measured on asf, unfrozen-at-1e-3 trained WORSE than frozen.
+    # Frozen encoder → optimize the head only. Unfrozen (freeze_backbone: false) → head at learning_rate, the PRETRAINED encoder 
+    # at backbone_lr (default lr×0.1, see build_optimizer): a single head-scale LR on Uni-Sign weights empirically degrades them.
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
     else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -202,5 +205,5 @@ def train_bio_s1_epochs(
         name="bio_s1", model=model, loader=train_loader, optimizer=optimizer,
         device=device, epochs=epochs, cfg=cfg, step_fn=step_fn,
         evaluate_fn=lambda epoch: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader,
+        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader,
     )

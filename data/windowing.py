@@ -1,6 +1,5 @@
-"""Window primitives: BIO label construction from GT boundaries and the
-first-complete-span rule shared by Mode-3 training and streaming inference. UNK is
-the padding/ignore class — padding is never labelled O (Hard Rule §1.4.1)."""
+"""Window primitives: BIO label construction from GT boundaries and the first-complete-span rule shared by Mode-3 training and 
+streaming inference. UNK is the padding/ignore class — padding is never labelled O."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
@@ -11,11 +10,10 @@ BIO_IGNORE_INDEX = BIO["UNK"]
 ModeName = Literal["mode1", "mode2", "mode3", "mode4"]
 Mode2Subcase = Literal["right", "left", "both"]
 
-# Uncaptioned stretches longer than this carry no trustworthy non-signing evidence (see
-# make_bio_labels). Measured on the Auslan train split: inter-caption gaps have median 0.53s /
-# p90 2.4s (genuine pauses), while video heads/tails have median 4.6s / p90 11.4s and are
-# intros/outros/credits whose signing status is unknown. 8s keeps ~92% of gap time supervised
-# and drops the unknown-status mass. Overridable via data.yaml subtitles.trusted_gap_s.
+# Uncaptioned stretches longer than this carry no trustworthy non-signing evidence (see make_bio_labels). Measured on Auslan 
+# train split: inter-caption gaps have median 0.53s / p90 2.4s (genuine pauses), while video heads/tails have median 4.6s / p90 
+# 11.4s and are intros/outros/credits whose signing status is unknown. 8s keeps ~92% of gap time supervised and drops the 
+# unknown-status mass. Overridable via data.yaml subtitles.trusted_gap_s.
 TRUSTED_GAP_S = 8.0
 
 @dataclass(frozen=True)
@@ -49,10 +47,9 @@ class WindowSample:
     translation_target: SentenceSpan | None
     anchor_span: SentenceSpan | None = None
     full_evidence_spec: WindowSpec | None = None
-    # χ (membership gate, docs/membership_gate.md §2.7): frames of LEFT-TRUNCATED predecessor sentences —
-    # a sentence whose B lies before the window edge is, in the streaming interpretation, one the FSM already
-    # committed (the window's left edge mimics the post-commit cut). A FACT from sampler bookkeeping, not a
-    # model belief; at inference the FSM supplies the same mask from its commit log.
+    # χ (membership gate, docs/membership_gate.md §2.7): frames of LEFT-TRUNCATED predecessor sentences — a sentence whose B lies 
+    # before the window edge is, in the streaming interpretation, one the FSM already committed (the window's left edge mimics the 
+    # post-commit cut). A FACT from sampler bookkeeping, not a model belief; at infer FSM supplies same mask from its commit log.
     commit_mask: np.ndarray | None = None
 
 
@@ -74,11 +71,10 @@ def make_bio_labels(
 ) -> np.ndarray:
     """Build BIO labels from GT boundaries; padding is caller-masked as UNK.
 
-    `O` is supervised only where caption absence is evidence of a real pause: inside uncaptioned
-    stretches up to `trusted_gap_s` long. Longer stretches (video intros/outros/credits — 42% of
-    all uncaptioned time on the Auslan split) may well contain uncaptioned signing, so labelling
-    them `O` teaches "signing → O" on exactly the frames that look most like signing; they get UNK
-    (no loss) instead. `trusted_gap_s=None` restores the old label-everything-O behaviour.
+    `O` is supervised only where caption absence is evidence of a real pause: inside uncaptioned stretches up to 
+    `trusted_gap_s` long. Longer stretches (video intros/outros/credits — 42% of all uncaptioned time on Auslan split) 
+    may well contain uncaptioned signing, so labelling them `O` teaches "signing → O" on exactly the frames that look 
+    most like signing; they get UNK (no loss) instead. `trusted_gap_s=None` restores the old label-everything-O behaviour.
     """
     labels = np.full((len(frame_times_s),), BIO["O"], dtype=np.int64)
 
@@ -107,20 +103,24 @@ def make_bio_labels(
 
 def first_complete_span(
     spans: tuple[SentenceSpan, ...],
-    window_start_s: float,
-    window_end_s: float,
-    min_tail_s: float = 1e-6,
+    window_start_s: float, window_end_s: float,
+    min_tail_s: float = 1e-6, min_span_s: float = 0.0,
 ) -> SentenceSpan | None:
-    """Earliest span whose B and TERMINATOR are inside the same window (first-complete-span, Hard Rule §1.4.8).
+    """Earliest span whose B and TERMINATOR are inside the same window (first-complete-span).
 
-    Timestamp form of the terminator rule: a span is complete when its end lies ≥ `min_tail_s` inside the window,
-    i.e. the window contains at least the frame AFTER the span's last frame. That frame carries the terminator
-    label — `O` when a gap follows, or the next sentence's `B` when sentences are back-to-back (adjacent sentences
-    have no closing `O`; requiring one would misclassify a completed anchor as right-truncated). The label-space
-    twin of this rule is `infer.commit_gate.bio_complete_spans` (terminate on O-or-B); both must stay in sync —
-    same selection at training (GT labels) and inference (predicted labels).
+    Timestamp form of the terminator rule: a span is complete when its end lies ≥ `min_tail_s` inside the window, i.e. the window 
+    contains at least the frame AFTER the span's last frame. That frame carries the terminator label — `O` when a gap follows, or 
+    next sentence's `B` when sentences are back-to-back (adjacent sentences have no closing `O`; requiring one would misclassify 
+    a completed anchor as right-truncated). The label-space twin of this rule is `infer.commit_gate.bio_complete_spans` (terminate 
+    on O-or-B); both must stay in sync — same selection at training (GT labels) and inference (predicted labels).
+
+    `min_span_s` is Λ_min in seconds — the deployed commit gate's `select_target_span` skips complete spans shorter than 
+    `span_selection.min_span_frames`, so the TRAINING target rule must skip them too: without the same floor, a window whose 
+    earliest complete span is sub-Λ_min supervises translation of a sentence the gate will never anchor, silently conditioning 
+    the decoder on the wrong sentence's Ω mask.
     """
     for span in sorted(spans, key=lambda s: (s.start_s, s.end_s)):
+        if span.end_s - span.start_s < min_span_s: continue  # Λ_min: never a deployable commit target
         has_b = span.start_s >= window_start_s
         has_terminator = span.end_s + min_tail_s <= window_end_s
         if has_b and has_terminator: return span
@@ -137,12 +137,13 @@ def classify_anchor_visibility(span: SentenceSpan, start_s: float, end_s: float)
 
 def count_complete_spans(
     spans: tuple[SentenceSpan, ...],
-    window_start_s: float,
-    window_end_s: float,
-    min_tail_s: float = 1e-6,
+    window_start_s: float, window_end_s: float,
+    min_tail_s: float = 1e-6, min_span_s: float = 0.0,
 ) -> int:
-    # Same terminator semantics as first_complete_span: end ≥ min_tail_s inside the window (O-or-B terminator frame).
+    # Same terminator semantics AND the same Λ_min floor as first_complete_span — the sampler's mode-relabel logic counts with 
+    # this function and targets with that one; a floor applied to only one of them would let a sub-Λ_min-only window stay a 
+    # nominal mode1 with target=None (silently unsupervised).
     return sum(
-        1 for span in spans
-        if span.start_s >= window_start_s and span.end_s + min_tail_s <= window_end_s
+        1 for span in spans if span.end_s - span.start_s >= min_span_s
+        and span.start_s >= window_start_s and span.end_s + min_tail_s <= window_end_s
     )

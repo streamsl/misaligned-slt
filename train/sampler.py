@@ -1,6 +1,5 @@
-"""Misalignment-aware window sampler (spec §5). Turns GT sentence anchors into
-real-timeline training windows across four modes whose mix is calibrated by
-Analysis A's measured segmenter-error rates."""
+"""Misalignment-aware window sampler. Turns GT sentence anchors into real-timeline training windows across 4 modes whose 
+mix is calibrated by Analysis A's measured segmenter-error rates."""
 from __future__ import annotations
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -29,8 +28,8 @@ class WindowSampler:
     - **Mode 3** — ≥2 complete sentences; target = earliest complete span (first-complete-span rule, identical at train and inference).
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
 
-    Truncation happens only here, by *window shaping* — never by relabelling text
-    (premise P1). BIO labels come from GT boundaries; padding is masked, never `O`.
+    Truncation happens only here, by *window shaping* — never by relabelling text (premise P1). 
+    BIO labels come from GT boundaries; padding is masked, never `O`.
     """
     DEFAULT_MODE2_SUBCASE_WEIGHTS = {"right": 0.45, "left": 0.45, "both": 0.10}
 
@@ -39,12 +38,16 @@ class WindowSampler:
         mode_ratios: dict[str, float], buffer_cap_s: float,
         seed: int = 42, mode2_subcase_weights: dict[str, float] | None = None,
         fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
-        pose_augment_cfg: dict | None = None,
+        pose_augment_cfg: dict | None = None, min_span_frames: int = 0,
     ):
         self.records = records
         self.jitter = jitter
         self.mode_ratios = normalized_mode_ratios(mode_ratios)
         self.buffer_cap_s = float(buffer_cap_s)
+        # Λ_min mirror of the commit gate's span_selection.min_span_frames: the training target/complete-span
+        # rules must skip sub-Λ_min sentences exactly like the deployed select_target_span, or a window whose
+        # earliest complete span is sub-Λ_min supervises a sentence the gate never anchors (wrong-sentence Ω).
+        self.min_span_frames = int(min_span_frames)
         # Spatial pose augmentation (train only), with its own rng so it does not perturb the window-sampling
         # rng stream. None on dev (deterministic monitor) and never applied to the Mode-2a full-evidence view.
         self.pose_augmentor = build_pose_augmentor(pose_augment_cfg, np.random.default_rng(int(seed) + 997))
@@ -66,12 +69,11 @@ class WindowSampler:
     def configure_worker(self, seed: int) -> None:
         """Give a forked DataLoader worker its OWN rng so parallel workers don't replay identical mode/jitter streams.
 
-        fork/spawn copies the sampler's numpy Generator(s) identically into every worker, and PyTorch's per-worker
-        seeding never touches a Generator stored on the dataset — so without this, W workers draw the SAME mode/jitter
-        sequence. (The anchor is index-driven — anchors[index % len] in `sample` — so each worker already visits
-        DIFFERENT anchors via its round-robin index slice, and coverage is exactly one pass per epoch regardless of
-        how the DataLoader partitions indices across workers. This reseed only decorrelates the per-window draws.)
-        Called from data.loader.streaming_loader's worker_init_fn.
+        fork/spawn copies the sampler's numpy Generator(s) identically into every worker, and PyTorch's per-worker seeding never touches 
+        a Generator stored on the dataset — so without this, W workers draw the SAME mode/jitter sequence. (The anchor is index-driven — 
+        anchors[index % len] in `sample` — so each worker already visits DIFFERENT anchors via its round-robin index slice, and coverage 
+        is exactly one pass per epoch regardless of how the DataLoader partitions indices across workers. This reseed only decorrelates 
+        the per-window draws.) Called from data.loader.streaming_loader's worker_init_fn.
         """
         self.rng = np.random.default_rng(int(seed))
         if self.pose_augmentor is not None: self.pose_augmentor.rng = np.random.default_rng(int(seed) + 997)
@@ -88,6 +90,16 @@ class WindowSampler:
         if source and Path(source).exists():
             loaded = json.loads(Path(source).read_text(encoding="utf-8"))
             measured = loaded.get("mode_ratios", loaded)
+        elif source:
+            # FAIL, don't fall back: a configured-but-missing measurement file (typo, wrong CWD, Analysis A not run) would otherwise 
+            # silently train the DESIGNED mix while every log and the paper claim the MEASURED one — a methodological substitution no 
+            # one can detect afterwards. `mode_ratios.source: null` is the one explicit way to request the designed mix.
+            raise FileNotFoundError(
+                f"mode_ratios.source is set but missing: {source!r} (cwd={Path.cwd()}). Run `analyze.py --stage segmenter-infer` + "
+                f"`--stage analysis-a` for this language first, or set mode_ratios.source: null to explicitly train the designed fallback."
+            )
+        print(f"[sampler] mode_ratios: {'MEASURED ' + str(source) if measured is not None else 'designed fallback'} "
+              f"-> {normalized_mode_ratios(measured if measured is not None else fallback_ratios)}", flush=True)
 
         jitter_cfg = dict(slt_cfg.get("jitter", {}))
         mode_ratios = measured if measured is not None else fallback_ratios
@@ -112,6 +124,7 @@ class WindowSampler:
         return cls(
             records=records, jitter=JitterSampler.from_config(jitter_cfg),
             mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
+            min_span_frames=int((inference_cfg.get("span_selection", {}) or {}).get("min_span_frames", 0)),
             seed=int(slt_cfg.get("seed", 42)), mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"),
             fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
             fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
@@ -126,11 +139,10 @@ class WindowSampler:
         return str(self.rng.choice(keys, p=probs))
 
     def _choose_anchor(self, index: int) -> tuple[VideoRecord, int]:
-        # Anchor is a DETERMINISTIC function of the global sample index: with steps_per_epoch == len(anchors) and
-        # shuffle=False, indices 0..N-1 map bijectively to anchors 0..N-1, so every GT sentence anchors exactly one
-        # window per epoch — with NO cross-call/cross-worker state. (Stateful-cursor sampling gave uneven coverage
-        # under num_workers>0, because DataLoader dispatches whole BATCHES round-robin, so a worker's call count
-        # need not equal any fixed anchor shard.) Mode/jitter stay random (drawn from self.rng, per-worker reseeded).
+        # Anchor is a DETERMINISTIC function of the global sample index: with steps_per_epoch == len(anchors) and shuffle=False, indices 
+        # 0..N-1 map bijectively to anchors 0..N-1, so every GT sentence anchors exactly 1 window/epoch — with NO cross-call/cross-worker 
+        # state. (Stateful-cursor sampling gave uneven coverage under num_workers>0, as DataLoader dispatches whole BATCHES round-robin, 
+        # so worker's call count needn't equal any fixed anchor shard.) Mode/jitter stay random (drawn from self.rng, per-worker reseeded).
         ridx, sidx = self.anchors[int(index) % len(self.anchors)]
         return self.records[ridx], sidx
 
@@ -168,34 +180,31 @@ class WindowSampler:
 
 
     def _full_evidence_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec:
-        """Mode-1-equivalent window for the §6.3 full-evidence decode, with 1 extra constraint: the anchor
-        must be the window's FIRST complete span. The full-evidence decode has no explicit target — the model
-        (trained on the first-complete-span rule, §5.3) translates the earliest complete sentence in its
-        conditioning. A plain `_mode1_spec` window whose head jitter pulls in a complete earlier neighbour
-        would therefore yield y_full for the *neighbour*, not the anchor the truncated view shows: the verified
-        gate (f==r) then never fires (dead CB batch), and the unverified ablation would supervise toward the
-        wrong sentence's text. Falls back to the clean anchor clip, where anchor-first is guaranteed (an
-        earlier sentence cannot have its B inside a window that starts at the anchor's start)."""
+        """Mode-1-equivalent window for full-evidence decode, with 1 extra constraint: the anchor must be the window's FIRST complete span. 
+        The full-evidence decode has no explicit target — the model (trained on first-complete-span rule) translates the earliest complete 
+        sentence in its conditioning. A plain `_mode1_spec` window whose head jitter pulls in a complete earlier neighbour would therefore 
+        yield y_full for the *neighbour*, not the anchor the truncated view shows: the verified gate (f==r) then never fires (dead CB batch), 
+        and the unverified ablation would supervise toward wrong sentence's text. Falls back to the clean anchor clip, where anchor-first 
+        is guaranteed (an earlier sentence cannot have its B inside a window that starts at the anchor's start)."""
         anchor = rec.sentences[anchor_idx]
         eps = 1.0 / rec.pose.fps
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
             if (classify_anchor_visibility(anchor, start_s, end_s) == "complete" and anchor.end_s + eps <= end_s
-                and first_complete_span(rec.sentences, start_s, end_s, eps) is anchor):
+                and first_complete_span(rec.sentences, start_s, end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps) is anchor):
                 return WindowSpec(rec.video_id, start_s, end_s, "mode1", anchor_idx)
         return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
 
 
     def _mode2_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Truncated-anchor window
-        """`right` keeps the start, cuts before the end (B, no terminator); `left` cuts after the start, keeps
-        the end + its terminator frame (no B); `both` is a strictly-interior slice (all I).
+        """`right` keeps the start, cuts before the end (B, no terminator); `left` cuts after the start, keeps the end + its terminator 
+        frame (no B); `both` is a strictly-interior slice (all I).
 
-        The truncation depth — where the window cuts *inside* the anchor — is drawn from Analysis A's measured
-        over-segmentation cut positions (`JitterSampler.sample_cut`), the empirical answer to "where does the
-        segmenter split a sentence". The *surviving* outer edge carries ordinary boundary jitter (Δ_head/Δ_tail),
-        so e.g. a right-truncated window's true start still wobbles like a real Started-Pre/Post-Signing event.
-        Uniform interior cut is used only when no over-seg was measured (§5.0/§5.2; Hard Rule §1.4.5)."""
+        The truncation depth — where the window cuts *inside* the anchor — is drawn from Analysis A's measured over-segmentation cut 
+        positions (`JitterSampler.sample_cut`), the empirical answer to "where does the segmenter split a sentence". The *surviving* 
+        outer edge carries ordinary boundary jitter (Δ_head/Δ_tail), so e.g. a right-truncated window's true start still wobbles like 
+        a real Started-Pre/Post-Signing event. Uniform interior cut is used only when no over-seg was measured."""
         anchor = rec.sentences[anchor_idx]
         subcase = str(self.rng.choice(self._mode2_subcases, p=self._mode2_subcase_probs))
         eps = max(1.0 / rec.pose.fps, 1e-3)
@@ -209,16 +218,19 @@ class WindowSampler:
             subcase = "right"  # degenerate interior slice → fall through to right-trunc
 
         if subcase == "left":
-            # Keep true end, discard the head: window starts at the spurious cut. Tail jitter may only push the end OUTWARD 
-            # (max(dt,eps)) so the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves 
-            # the window and the labels no longer describe a left-truncation (P2: labels follow the window).
+            # Keep true end, discard the head: window starts at the spurious cut. Tail jitter may only push the end OUTWARD (max(dt,eps)) so 
+            # the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves the window and labels no longer 
+            # describe a left-truncation (P2: labels follow the window).
             cut = min(self._cut_time(anchor), anchor.end_s - eps)
-            # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end),
-            # so the terminator is inside; tail jitter only extends it further out.
-            start_s, end_s = self._clip_window(rec, cut, min(rec.pose.duration_s, anchor.end_s + max(dt, eps)))
+            # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end), so the terminator is inside; tail 
+            # jitter only extends it further out — abs(dt), NOT max(dt, eps): with max(), half of a zero-loc jitter draw collapses to a window 
+            # edge EXACTLY on GT terminator, a zero-error corner Analysis A measures at ~3% — the head learns "window edge = sentence edge",
+            # a shortcut that is false at deployment (FSM buffers start at terminator−δ; whole-video chunks on an arbitrary 18s grid) and 
+            # that doubles B-at-frame-0 mass under the measured mix.
+            start_s, end_s = self._clip_window(rec, cut, min(rec.pose.duration_s, anchor.end_s + max(abs(dt), eps)))
         else:  # "right": keep the true start, cut before the end. Head jitter only pulls the start outward.
             cut = max(self._cut_time(anchor), anchor.start_s + eps)
-            start_lo = max(0.0, anchor.start_s + min(dh, 0.0))
+            start_lo = max(0.0, anchor.start_s - abs(dh))  # abs: same zero-error-corner removal as the tail above
             # A COMPLETE earlier sentence inside the right-truncated view is poison for the confidence-bound term: the decoder 
             # — correctly, per the shared first-complete-span rule — would translate the NEIGHBOUR, while y_full is anchored on 
             # the anchor (_full_evidence_spec enforces anchor-first), so the gate would penalize correct behaviour. Clamp the 
@@ -231,10 +243,9 @@ class WindowSampler:
 
 
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
-        """Span the anchor and its successor so ≥2 sentences are fully inside; degrade to Mode 1 if the pair
-        does not yield 2 complete spans. The translation target is later chosen by `first_complete_span`.
-        Edges carry Analysis-A jitter like every other mode — an exact [anchor B, successor end] window would
-        train a boundary distribution (B at frame 0) the streaming buffer never produces."""
+        """Span the anchor and its successor so ≥2 sentences are fully inside; degrade to Mode 1 if the pair does not yield 2 complete spans. 
+        The translation target is later chosen by `first_complete_span`. Edges carry Analysis-A jitter like every other mode — an exact 
+        [anchor B, successor end] window would train a boundary distribution (B at frame 0) the streaming buffer never produces."""
         anchor = rec.sentences[anchor_idx]
         next_idx = min(anchor_idx + 1, len(rec.sentences) - 1)
         end_anchor = rec.sentences[next_idx]
@@ -243,11 +254,13 @@ class WindowSampler:
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, end_anchor.end_s + dt)
-            if count_complete_spans(rec.sentences, start_s, end_s, eps) >= 2:
+            if count_complete_spans(rec.sentences, start_s, end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps) >= 2:
                 return WindowSpec(rec.video_id, start_s, end_s, "mode3", anchor_idx)
 
         start_s, end_s = self._clip_window(rec, anchor.start_s, end_anchor.end_s + eps)
-        if count_complete_spans(rec.sentences, start_s, end_s, eps) < 2: return self._mode1_spec(rec, anchor_idx)
+        if count_complete_spans(
+            rec.sentences, start_s, end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps
+        ) < 2: return self._mode1_spec(rec, anchor_idx)
         return WindowSpec(rec.video_id, start_s, end_s, "mode3", anchor_idx)
 
 
@@ -260,9 +273,8 @@ class WindowSampler:
             prev = max(prev, span.end_s)
 
         if prev < rec.pose.duration_s: gaps.append((prev, rec.pose.duration_s))
-        # Trusted gaps only: long uncaptioned stretches (> TRUSTED_GAP_S, mostly intros/outros)
-        # may contain uncaptioned signing — an "all-gap" window there could be all-signing, the
-        # exact opposite of what Mode 4 trains (stay quiet on non-signing input).
+        # Trusted gaps only: long uncaptioned stretches (> TRUSTED_GAP_S, mostly intros/outros) may contain uncaptioned signing — 
+        # an "all-gap" window there could be all-signing, the exact opposite of what Mode 4 trains (stay quiet on non-signing input).
         gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S]
         if not gaps:
             idx = int(self.rng.integers(0, len(rec.sentences)))
@@ -289,20 +301,16 @@ class WindowSampler:
 
 
     def materialize(self, rec: VideoRecord, spec: WindowSpec, fps_aug: bool = False, augment: bool = False) -> WindowSample:
-        """Realize a `WindowSpec` into tensors: load+normalize the pose window, build per-frame BIO labels from GT boundaries,
-        pick the translation target (Mode 1/3 first-complete-span), and for Mode-2a attach the Mode-1-equivalent
-        `full_evidence_spec` the confidence-bound term decodes under no_grad. `fps_aug=True` resamples the window to a
-        random fps (Moryossef 2026 fps_aug; Hard Rule §1.4.4) and rebuilds the BIO labels from the resampled timestamps."""
+        """Realize a `WindowSpec` into tensors: load+normalize pose window, build per-frame BIO labels from GT boundaries, pick translation 
+        target (Mode 1/3 first-complete-span), and for Mode-2a attach the Mode-1-equivalent `full_evidence_spec` the confidence-bound term 
+        decodes under no_grad. `fps_aug=True` resamples the window to a random fps and rebuilds the BIO labels from resampled timestamps."""
         poses, timestamps = load_pose_window(
-            rec.pose, spec.start_s, spec.end_s, normalize=True,
-            augment=self.pose_augmentor if augment else None
+            rec.pose, spec.start_s, spec.end_s, normalize=True, augment=self.pose_augmentor if augment else None
         )
         if fps_aug and poses.shape[0] > 1: poses, timestamps, _ = apply_fps_aug(
-            poses, source_fps=rec.pose.fps,
-            min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=self.rng,
-            source_timestamps_s=timestamps,
+            poses, source_fps=rec.pose.fps, min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, 
+            rng=self.rng, source_timestamps_s=timestamps,
         )
-
         frame_mask = np.ones((poses.shape[0],), dtype=bool)
         labels = make_bio_labels(
             timestamps, rec.sentences, spec.start_s, spec.end_s, frame_mask,
@@ -316,7 +324,7 @@ class WindowSampler:
         # Relabelling keeps the logged per-mode losses / drift check honest AND closes 2 train/inference expectation gaps; 
         # rejection-resampling instead would distort the measured jitter CDF.
         eps = 1.0 / rec.pose.fps
-        n_complete = count_complete_spans(rec.sentences, spec.start_s, spec.end_s, eps)
+        n_complete = count_complete_spans(rec.sentences, spec.start_s, spec.end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps)
         if spec.mode == "mode1" and n_complete >= 2:
             spec = replace(spec, mode="mode3")  # jitter captured a complete neighbour → ≥2 complete spans
         elif spec.mode == "mode2" and n_complete >= 1:
@@ -333,13 +341,14 @@ class WindowSampler:
             realized = classify_anchor_visibility(rec.sentences[spec.anchor_index], spec.start_s, spec.end_s)
             if realized in {"right", "left", "both"} and realized != spec.subcase: spec = replace(spec, subcase=realized)
 
-        if spec.mode in {"mode1", "mode3"}: target = first_complete_span(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps)
+        if spec.mode in {"mode1", "mode3"}: target = first_complete_span(
+            rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps, min_span_s=self.min_span_frames / rec.pose.fps
+        )
         elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
             target = None
-            # Attach the CB full-evidence view ONLY if the WHOLE anchor fits in a ≤buffer_cap_s window. An over-cap
-            # anchor (the buffer-cap-clip relabel above) can't be seen complete even by the "full-evidence" view, so
-            # its y_full self-target would itself be truncated — keep it BIO-only rather than supervise CB against a
-            # truncated target.
+            # Attach the CB full-evidence view ONLY if the WHOLE anchor fits in a ≤buffer_cap_s window. An over-cap anchor (buffer-cap-clip 
+            # relabel above) can't be seen complete even by the "full-evidence" view, so its y_full self-target would itself be truncated — 
+            # keep it BIO-only rather than supervise CB against a truncated target.
             anchor = rec.sentences[spec.anchor_index]
             if anchor.end_s - anchor.start_s <= self.buffer_cap_s:
                 full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)

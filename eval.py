@@ -415,15 +415,25 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
 @torch.no_grad()
 def _translate_windows(
     model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
-    device: torch.device, inference_cfg: dict, method_cfg: dict,
+    device: torch.device, inference_cfg: dict, method_cfg: dict, batch_size: int | None = None,
 ) -> list[tuple[str, float, bool]]:
-    """Translate a batch of pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)].
+    """Translate pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)]. THE loop-decode
+    entry point: hand it ALL windows and a `batch_size`; it decodes in chunks of that size.
 
-    ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the released model; 
-    ar = AR greedy; dlm = SPD/DCD). It returns REAL per-token confidence (the softmax prob the model assigns its own tokens), so 
-    "confidently wrong" is measured, not a placeholder. Variable-length windows are right-padded and masked via `frame_mask` (LM 
-    enc attends only to real frames; SPD/DCD reads per-row lengths), so each row's result is identical to translating it alone."""
+    ONE path for every method — each is `MisalignedSLTModel.generate_from_poses` (baseline = AR beam search on the released model;
+    ar = AR greedy; dlm = SPD/DCD). It returns REAL per-token confidence (the softmax prob the model assigns its own tokens), so
+    "confidently wrong" is measured, not a placeholder. Variable-length windows are right-padded and masked via `frame_mask` (LM
+    enc attends only to real frames; SPD/DCD reads per-row lengths), so each row's result is identical to translating it alone.
+
+    `batch_size` (None = one padded batch): rows pad to the longest row of their chunk, so corpus-scale
+    mixed-length sets should pass the CLI's --batch-size; None is for small same-scale sets."""
     if not items: return []
+    if batch_size is not None and int(batch_size) < len(items):
+        out: list[tuple[str, float, bool]] = []
+        for i in range(0, len(items), max(1, int(batch_size))): out.extend(_translate_windows(
+            model, tokenizer, method, items[i:i + max(1, int(batch_size))], device, inference_cfg, method_cfg
+        ))
+        return out
     visual_padding = str(method_cfg.get("visual_padding", "none"))
     prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
     max_t = max(int(p.shape[0]) for p, _, _ in prepped)
@@ -452,19 +462,6 @@ def _translate_windows(
     # "the system's policy is to defer/skip here" — conflating them charges the gate's refusal as garbage BLEU.
     skips = [bool(s) for s in gate_skip.tolist()]
     return list(zip(texts, [float(c) for c in confs], skips))
-
-
-@torch.no_grad()
-def _translate_window(
-    model, tokenizer, method: str,
-    poses_np: np.ndarray, timestamps_np: np.ndarray, start_s: float,
-    device: torch.device, inference_cfg: dict, method_cfg: dict,
-) -> tuple[str, float, bool]: # Single-window wrapper over `_translate_windows` (RQ2 pipeline floor + analyze.py).
-    return _translate_windows(
-        model, tokenizer, method, 
-        [(poses_np, timestamps_np, start_s)], 
-        device, inference_cfg, method_cfg
-    )[0]
 
 
 def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
@@ -742,17 +739,18 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     for video_id, spans in tqdm(segments.items(), desc="Processing segments"):
         record = records_by_id.get(video_id)
         if record is None: continue
-        events: list[PredictionEvent] = []
+        items, kept = [], []
         for span in spans:
             poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
             if poses.shape[0] == 0: continue
-            text, _, _ = _translate_window(
-                model=model, tokenizer=tokenizer, method=args.method,
-                poses_np=poses, timestamps_np=timestamps, start_s=span.start_s,
-                device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
-            )
-            events.append(PredictionEvent(video_id=video_id, start_s=float(span.start_s), end_s=float(span.end_s), text=text))
-        predicted[video_id] = events
+            items.append((poses, timestamps, float(span.start_s))); kept.append(span)
+        results = _translate_windows(
+            model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size)
+        )
+        predicted[video_id] = [
+            PredictionEvent(video_id=video_id, start_s=float(s.start_s), end_s=float(s.end_s), text=text)
+            for s, (text, _, _) in zip(kept, results)
+        ]
     return predicted
 
 
@@ -808,7 +806,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         else: tags = bio_logits.argmax(dim=-1)[0].cpu()
         segments = bio_tags_to_segments(tags, timestamps.tolist())
 
-        events: list[PredictionEvent] = []
+        items, bounds = [], []
         for span in segments:
             # The head can leave a span longer than buffer_cap (a continuous I-run merged across chunk boundaries).
             # Translating that in one shot feeds the decoder a window longer than ANY it trained on (windows are
@@ -819,14 +817,15 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
                 sub_end = min(float(span.end_s), sub_start + buffer_cap_s)
                 span_poses, span_ts = load_pose_window(record.pose, sub_start, sub_end, normalize=True)
                 if span_poses.shape[0] > 0:
-                    text, _, _ = _translate_window(
-                        model=model, tokenizer=tokenizer, method=args.method,
-                        poses_np=span_poses, timestamps_np=span_ts, start_s=sub_start,
-                        device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
-                    )
-                    events.append(PredictionEvent(video_id=record.video_id, start_s=sub_start, end_s=sub_end, text=text))
+                    items.append((span_poses, span_ts, sub_start)); bounds.append((sub_start, sub_end))
                 sub_start = sub_end
-        predicted[record.video_id] = events
+        results = _translate_windows(
+            model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size)
+        )
+        predicted[record.video_id] = [
+            PredictionEvent(video_id=record.video_id, start_s=s0, end_s=s1, text=text)
+            for (s0, s1), (text, _, _) in zip(bounds, results)
+        ]
     return predicted
 
 
@@ -838,6 +837,17 @@ def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | 
         indent=2, sort_keys=True
     ) + "\n", encoding="utf-8")
     return out
+
+
+def _format_threshold_table(t: "pd.DataFrame") -> "pd.DataFrame":
+    t = t.copy()
+    avg = t.mean(axis=1)
+    out = {}
+    for idx, row in t.iterrows():
+        vals = [float(v) for v in row]
+        if all(v.is_integer() for v in vals): out[idx] = [f"{int(v):d}" for v in vals] + [f"{avg[idx]:.1f}"]
+        else: out[idx] = [f"{v:.4f}" for v in vals] + [f"{avg[idx]:.4f}"]
+    return pd.DataFrame.from_dict(out, orient="index", columns=[*t.columns, "avg"])
 
 
 def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
@@ -867,13 +877,22 @@ def run_rq2(args: argparse.Namespace) -> dict[str, Any]:
         # rows never collide (external+dlm vs external+baseline, etc.).
         src = Path(args.segments).stem
         _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json")
-    else: predicted = load_event_predictions(args.predictions)
+    else:
+        predicted = load_event_predictions(args.predictions)
+        # Same fail-loud contract as run_pipeline_floor's --segments guard: a wrong-split events file shares no video_ids with the 
+        # split's gold and would silently score near-zero (the scorer itself stays permissive — disjoint ids are a legitimate input 
+        # for its video-local matching semantics; the CLI is where a wrong FILE is the only plausible cause).
+        gold_ids = {r.video_id for r in records}
+        if predicted and not (set(predicted) & gold_ids): raise SystemExit(
+            f"--predictions has {len(predicted)} video_ids, none in the {len(gold_ids)} '{args.split}' records — "
+            f"wrong split or wrong events file (score would be silently near-zero)."
+        )
         
     gold = _gold_events(records)
     summary = evaluate_predicted_events(predicted, gold, thresholds).get("thresholds", [])
     summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
     summary.set_index("tiou_threshold", inplace=True)
-    return summary.T
+    return _format_threshold_table(summary.T)
 
 
 def run_segment_prf(args: argparse.Namespace) -> dict[str, Any]:
@@ -922,11 +941,10 @@ def _load_segmenter(args):
 
 
 def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
-    """Standalone whole-video segmentation eval (Moryossef evaluate.py protocol): frame-F1 + one-to-one tIoU segment
-    P/R/F1 on a split. The §4.6 acceptance check ("F1 within order-of-magnitude of published"), and — because it runs
-    the SAME protocol for either --segmenter-arch — the ONLY apples-to-apples way to compare the Moryossef segmenter
-    against the in-system S1 head: the two training monitors are NOT comparable (chunk windows vs misaligned windows).
-    For `s1` it also scores the pretrained head on its own, without waiting for stage-2 joint fine-tuning.
+    """Standalone whole-video segmentation eval (Moryossef evaluate.py protocol): frame-F1 + one-to-one tIoU segment P/R/F1 on a split. The 
+    acceptance check ("F1 within order-of-magnitude of published"), and — because it runs the SAME protocol for either --segmenter-arch — 
+    the ONLY apples-to-apples way to compare the Moryossef segmenter against the in-system S1 head: 2 training monitors are NOT comparable 
+    (chunk windows vs misaligned windows). For `s1` it also scores the pretrained head on its own, without waiting for stage-2 joint fine-tuning.
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run segmenter eval on test without --allow-test")
     data_cfg = load_yaml(args.data_config)
@@ -947,7 +965,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={'duration' if duration_prior else 'plain'})", flush=True)
     decode = "duration" if duration_prior else "plain"
 
-    # Report at RQ2's tIoU grid so these standalone numbers line up 1:1 with the full-system segmentation block.
+    # Report at RQ2's tIoU grid so THRESHOLDS line up with the full-system segmentation block. The numbers are NOT statistic-identical to RQ2's: 
+    # this eval is a per-video MACRO mean with UNK-masked gold (untrusted-gap predictions excluded), while RQ2's event path is MICRO corpus P/R 
+    # against caption-span gold (gap predictions count as false positives). Compare trends across the shared thresholds, never the raw cells.
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     metrics = evaluate_segmenter_whole_video(
         model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds, duration_prior=duration_prior,
@@ -974,10 +994,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--method", default="dlm", choices=["baseline", "ar", "dlm"])
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument(
-        "--severity-grid-s", default=None,
-        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)"
-    )
+    parser.add_argument("--severity-grid-s", default=None,
+                        help="Comma-separated signed RQ1 grid (fractions of duration in relative mode, else seconds)")
     # Per-axis overrides (fall back to --severity-grid-s / the eval.yaml grid). Truncation-only sweeps —
     # the valid sub-grid on pre-trimmed corpora — need head ≥ 0 with tail ≤ 0, which one shared grid's
     # cross-product cannot express: e.g. --severity-grid-head 0,0.1,0.2,0.3 --severity-grid-tail 0,-0.1,-0.2,-0.3
@@ -985,31 +1003,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="RQ1 head-axis grid override (use --severity-grid-head=-0.3,0 for negative-leading values)")
     parser.add_argument("--severity-grid-tail", default=None,
                         help="RQ1 tail-axis grid override (use --severity-grid-tail=-0.3,0 for negative-leading values)")
-    parser.add_argument("--severity-mode", default="relative", choices=["relative", "absolute"], 
+    parser.add_argument("--severity-mode", default=None, choices=["relative", "absolute"],  # None -> eval.yaml rq1.severity_mode
                         help="RQ1 perturbation: relative (fraction of sentence duration, default) or absolute seconds")
     parser.add_argument("--emit-gold-segments", default=None, 
                         help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
     parser.add_argument("--segmenter-eval", action="store_true",
                         help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
-    parser.add_argument(
-        "--segmenter-decode", default=None, choices=["duration", "plain"],
-        help="whole-video decode; default per arch: s1 -> duration (our semi-Markov re-split), external -> plain (faithful Moryossef argmax)"
-    )
-    parser.add_argument(
-        "--segmenter-arch", default="external", choices=["external", "s1"],
-        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head"
-    )
+    parser.add_argument("--segmenter-decode", default=None, choices=["duration", "plain"],
+                        help="whole-video decode; default: s1 -> duration (semi-Markov re-split), external -> plain (Moryossef argmax)")
+    parser.add_argument("--segmenter-arch", default="external", choices=["external", "s1"],
+                        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head")
     parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--num-sentences", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="windows per translate/forward batch in loop-decode paths (RQ2 rows, analysis-b, tail-benefit, delta-enc)")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
     parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
     parser.add_argument("--stream", action="store_true", help="RQ2 row 6: run the streaming FSM engine to produce events")
-    parser.add_argument(
-        "--offline", action="store_true",
-        help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span"
-    )
+    parser.add_argument("--offline", action="store_true",
+                        help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)

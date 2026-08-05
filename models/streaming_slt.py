@@ -5,30 +5,81 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import numpy as np
 from transformers.modeling_outputs import BaseModelOutput
+
 from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 from models.bio_head import RoPEBIOHead
 from models.front_end import SLTFrontEnd
 from models.membership_gate import build_omega, omega_cross_bias
+
 from infer.commit_gate import open_span_start, select_target_span
 from infer.duration_decode import duration_split_tags
 from data.windowing import BIO
 
 
-def gate_skip_flags(bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0) -> torch.Tensor:
-    """Per-row 'the FSM would SKIP this window' flag (B,) from the BIO head's own argmax.
+def deployed_decode_tags(
+    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None,
+    timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """THE deployed tag decode, shared by every consumer that must agree with the FSM: argmax → UNK→O remap →
+    semi-Markov duration re-split (streaming flags) → χ-boundary onset restoration. (B, T) long tensor, no gradient.
 
-    True when window has NO terminated span AND NO open span — the all-gap / headless-left-truncated states the deployed FSM 
-    never decodes (buffer-start I never opens; no-span Ω is inert by construction). Single-window eval (RQ1) force-decodes those 
-    states against a suppressed memory and scores hallucinations vs full reference; this flag lets it report the deployment-honest
-    split: decoded-only quality + skip rate. Same selection rules as build_gate_omega: UNK→O remap, select_target_span, open_span_start.
-    The duration re-split build_gate_omega may apply does NOT affect this flag: re-splitting only adds interior B's to an EXISTING
-    signing run, so whether a window has any span at all (the skip condition) is invariant — skip and the Ω anchor never disagree.
+    UNK→O: UNK is supervision-free, argmax-UNK is rare, but an unremapped UNK neither opens nor closes a span and selection silently 
+    diverges from the FSM's shared decode rule. Re-split (when `duration_prior` is set): the SAME `duration_split_tags` call as 
+    `infer/stream.py step()` — `mark_onsets=False` (opening keys on O→signing, so onset B's are inert for span selection) and 
+    `split_open_tail="survival"` (right-censored buffer tail). χ restoration (when `commit_mask` marks already-committed frames): 
+    the re-split folds ALL argmax B's before re-splitting, and the DP never opens a segment at the ≤δ committed-leftover seam, so 
+    after a b2b commit the successor sentence's onset would sit in unopenable leading I and the sentence would be structurally
+    dropped (alternate-sentence drop). The commit record certifies a sentence ENDED at the χ seam: the first signing frame at/after 
+    the seam that is mid-run (predecessor signing, or seam at row start) is marked B.
     """
+    device = bio_logits.device
     tags = bio_logits.detach().argmax(dim=-1)
     tags = torch.where(tags == BIO["UNK"], torch.full_like(tags, BIO["O"]), tags)
-    B, T = tags.shape
+    if duration_prior is None: return tags
+    pB = torch.softmax(bio_logits.detach().float(), dim=-1)[..., BIO["B"]].cpu().numpy()
+    tags_np = tags.cpu().numpy()
+    for b in range(tags_np.shape[0]):
+        n = int(lengths[b].item())
+        if n <= 2: continue
+        fps_b = 24.0 # Default fallback if timestamps are missing or degenerate.
+        if timestamps_s is not None and n > 1:
+            dt = timestamps_s[b, 1:n] - timestamps_s[b, : n - 1]
+            # Clamp to a sane fps range: a degenerate (duplicate-timestamp) median of ~0 would otherwise give
+            # fps ~1e6 -> lmax = cap_s*fps blows the LP array and the O(T*lmax) DP up to OOM.
+            if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
+        tags_np[b, :n] = duration_split_tags(
+            tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
+        )
+        if commit_mask is not None:
+            cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)
+            if cm.any() and not cm.all():
+                seam = int(np.argmax(~cm))  # first non-committed frame
+                sig = (tags_np[b, :n] == BIO["I"]) | (tags_np[b, :n] == BIO["B"])
+                cand = np.flatnonzero(sig[seam:])
+                if cand.size:
+                    d = seam + int(cand[0])
+                    if tags_np[b, d] == BIO["I"] and (d == 0 or sig[d - 1]): tags_np[b, d] = BIO["B"]
+    return torch.as_tensor(tags_np, device=device, dtype=tags.dtype)
+
+
+def gate_skip_flags(
+    bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0,
+    duration_prior=None, timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-row 'the FSM would SKIP this window' flag (B,) from the DEPLOYED tag decode.
+
+    True when window has NO terminated span AND NO open span — the all-gap / headless-left-truncated states the deployed FSM
+    never decodes (buffer-start I never opens; no-span Ω is inert by construction). Single-window eval (RQ1) force-decodes those
+    states against a suppressed memory and scores hallucinations vs full reference; this flag lets it report the deployment-honest
+    split: decoded-only quality + skip rate. Uses `deployed_decode_tags` — the SAME decode build_gate_omega selects on — because
+    the duration re-split CAN change span existence, not just span count: on a headless all-I window (unopenable) the re-split's
+    interior B's create a complete selectable span the deployed FSM would decode. Skip and the Ω anchor must never disagree.
+    """
+    B, T = bio_logits.shape[:2]
     lengths = frame_mask.long().sum(dim=1) if frame_mask is not None else torch.full((B,), T)
+    tags = deployed_decode_tags(bio_logits, lengths, duration_prior, timestamps_s, commit_mask)
     skip = torch.zeros(B, dtype=torch.bool)
     for b in range(B):
         n = max(1, int(lengths[b].item()))
@@ -78,9 +129,10 @@ class MisalignedSLTModel(nn.Module):
         if pretrained_path: self.front_end.load_pretrained(pretrained_path)
         if decoder == "dlm": self.dlm_decoder = self.front_end.make_dlm_decoder(block_size)
         elif decoder != "ar": raise ValueError(f"Unsupported decoder type: {decoder}")
-        # Semi-Markov duration prior for GATE's anchor selection (infer/duration_decode.py). None = raw-argmax selection. Set by train/slt.py 
-        # (training), infer/stream.py (streaming), eval.py run_rq1 (single-window) — from the SAME inference.yaml `duration_decode` switch 
-        # that drives the FSM's tag re-split, so the gate and the FSM always see the same tag stream (on-policy symmetry).
+        # Semi-Markov duration prior for GATE's anchor selection (infer/duration_decode.py). None = raw-argmax selection. 
+        # Set by train/slt.py (training), infer/stream.py (streaming), eval.py run_rq1 (single-window) — from the SAME 
+        # inference.yaml `duration_decode` switch that drives the FSM's tag re-split, so the gate and the FSM always see 
+        # the same tag stream (on-policy symmetry).
         self.duration_prior = None
 
     def _pad_or_trim_tokens(self, tokens: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -123,36 +175,14 @@ class MisalignedSLTModel(nn.Module):
         B, T, _ = bio_logits.shape
         device = bio_logits.device
         lengths = frame_mask.to(device).long().sum(dim=1) if frame_mask is not None else torch.full((B,), T, device=device)
-        pred_tags = bio_logits.detach().argmax(dim=-1)  # selection carries no gradient (§0)
-        # UNK closes like O — the SAME remap the FSM applies before its selection (infer/stream.py). Without it the
-        # gate's anchor selection sees UNK as neither O nor B: a span the FSM terminates stays open here, and the
-        # committed span vs the Ω anchor (s, τ, bands, cliff) silently diverge on argmax-UNK frames.
-        pred_tags = torch.where(pred_tags == BIO["UNK"], torch.full_like(pred_tags, BIO["O"]), pred_tags)
+        # THE deployed tag decode (module-level `deployed_decode_tags`): argmax → UNK→O remap → semi-Markov duration re-split (streaming flags) 
+        # → χ-boundary onset restoration. ONE shared implementation with the FSM's skip flag, so anchor selection here, `gate_skip_flags`, and 
+        # the deployed FSM can never disagree on which spans exist. Selection carries no gradient. Without the re-split the gate is off-policy 
+        # the moment the FSM decodes with duration: on a back-to-back window the raw argmax yields ONE merged run, select_target_span anchors Ω 
+        # on it, and the decoder trains against neighbour-sentence features the deployed gate would have masked. `commit_mask` doubles as the 
+        # χ record for the alternate-sentence-drop guard (see the helper).
         duration_prior = getattr(self, "duration_prior", None)  # getattr: test fakes drive this method unbound
-        if duration_prior is not None:
-            # Semi-Markov duration re-split BEFORE anchor selection — the same re-decode the deployed FSM applies to its tag stream 
-            # (infer/stream.py step()), with the SAME flags. Without it the gate is off-policy the moment the FSM decodes with duration:
-            # on a back-to-back window the raw argmax yields ONE merged run, select_target_span anchors Ω on it, and the decoder trains
-            # against neighbour-sentence features the deployed gate would have masked. Flags mirror streaming: onsets are not re-marked
-            # B (opening keys on the O→signing transition, so this is inert for span selection) and the run touching the window end is
-            # decoded under the right-censored "survival" rule — its observed prefix gets interior splits (so a b2b Mode-1/3 window still
-            # separates its complete anchor from the truncated neighbour) while the censored tail segment itself stays open, which is
-            # exactly the Mode-2a right-truncation state the open-anchor branch handles.
-            pB = torch.softmax(bio_logits.detach().float(), dim=-1)[..., BIO["B"]].cpu().numpy()
-            tags_np = pred_tags.cpu().numpy()
-            for b in range(B):
-                n = int(lengths[b].item())
-                if n <= 2: continue
-                fps_b = 24.0
-                if timestamps_s is not None and n > 1:
-                    dt = timestamps_s[b, 1:n] - timestamps_s[b, : n - 1]
-                    # Clamp to a sane fps range: a degenerate (duplicate-timestamp) median of ~0 would otherwise
-                    # give fps ~1e6 -> lmax = cap_s*fps blows the LP array and the O(T*lmax) DP up to OOM.
-                    if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
-                tags_np[b, :n] = duration_split_tags(
-                    tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
-                )
-            pred_tags = torch.as_tensor(tags_np, device=device, dtype=pred_tags.dtype)
+        pred_tags = deployed_decode_tags(bio_logits, lengths, duration_prior, timestamps_s, commit_mask)
 
         starts, terms, has_term = [], [], []
         vetoed, n_gt = 0, 0  # veto rate is over windows that HAVE a GT target (§1.6 diagnostic)
@@ -301,7 +331,10 @@ class MisalignedSLTModel(nn.Module):
                 bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), commit_mask=commit_mask, 
                 delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, timestamps_s=timestamps,
             )
-            gate_skip = gate_skip_flags(bio_logits, mask, min_span_frames=gate_min_span_frames)
+            gate_skip = gate_skip_flags(
+                bio_logits, mask, min_span_frames=gate_min_span_frames,
+                duration_prior=getattr(self, "duration_prior", None), timestamps_s=timestamps, commit_mask=commit_mask,
+            )
         tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
         return bio_logits, tokens, confidence, gate_skip
 

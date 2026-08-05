@@ -6,7 +6,7 @@ tIoU matching a merged run spanning k captions matches at most one. The fix is i
 signing/non-signing runs are reliable, and the information missing from the frames — how long a sentence
 plausibly lasts — is exactly what a two-moment lognormal duration prior carries. MAP decoding under that prior
 (exact segmental Viterbi per signing run, then snapping each split to the segmenter's own P(B) peak) recovers
-the merged boundaries with NO model change, for the in-system head and the external segmenter alike.
+the merged boundaries with NO model change, for the in-system head and the Moryossef segmenter alike.
 
 Why this must be semi-Markov: a linear-chain CRF/HMM encodes duration implicitly through self-transitions, which
 is a GEOMETRIC (monotone-decreasing, memoryless) duration law — with flat `B` evidence its Viterbi path never
@@ -15,7 +15,7 @@ law requires hypothesising segment LENGTHS — the O(T·L_max) segmental DP belo
 
 Consumers (all keyed on ONE inference.yaml `duration_decode` switch, resolved per-language by
 `duration_decode_params`): whole-video eval + Analysis A/B via `moryossef26.infer` (`--segmenter-decode plain`
-keeps the faithful argmax protocol for the external baseline row); the streaming FSM's tag stream
+keeps the faithful argmax protocol for the Moryossef baseline row); the streaming FSM's tag stream
 (`infer.stream.step`) and the membership gate's anchor selection (`build_gate_omega`) — both with the
 streaming flags (`mark_onsets=False, split_open_tail="survival"`), which is what keeps the gate on-policy
 with the deployed decode; and `analyze --stage delta-enc`, which must measure the terminator statistic under

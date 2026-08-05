@@ -350,7 +350,7 @@ def analysis_b(args: argparse.Namespace) -> dict:
     is the SAME machinery as `eval.py --rq 1 --method baseline --split dev` — run that for the curve; this stage assembles realistic gap.
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Analysis B runs on dev; --allow-test only for smoke debugging")
-    if not args.predictions: raise SystemExit("--predictions required: external segmenter's spans (analyze.py --stage segmenter-infer)")
+    if not args.predictions: raise SystemExit("--predictions required: Moryossef segmenter's spans (analyze.py --stage segmenter-infer)")
     data_cfg = load_yaml(args.data_config)
     base_cfg = load_yaml(args.baseline_config, language=args.language)  # re-point ${language} paths like every other load
     inference_cfg = load_yaml(args.inference_config)
@@ -622,17 +622,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument(
-        "--segmenter-arch", default="external", choices=["external", "s1"],
-        help="segmenter-infer backend: external = independent chunk-trained segmenter (default), s1 = in-system head (ablation)"
+        "--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
+        help="segmenter-infer backend: moryossef = the faithful Moryossef analysis segmenter (default), s1 = in-system BIO head (ablation)"
     )
-    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="external segmenter config")
+    parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef analysis-segmenter config")
     parser.add_argument(
         "--segmenter-decode", default=None, choices=["duration", "plain"],
-        help="whole-video decode; default per arch: s1 -> duration (our semi-Markov re-split), external -> plain (faithful Moryossef argmax)"
+        help="whole-video decode; default per arch: s1 -> duration (our semi-Markov re-split), moryossef -> plain (Moryossef argmax)"
     )
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
-    parser.add_argument("--baseline-config", default="configs/baseline.yaml")
+    parser.add_argument("--baseline-config", default="configs/baseline_eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--language", default=None)  # None -> data.yaml active_languages[0] (never a stale hardcode)

@@ -299,7 +299,7 @@ def _parse_grid(value: str | None, fallback: list[float]) -> list[float]:
     return [float(x.strip()) for x in value.split(",") if x.strip()]
 
 METHOD_CONFIGS = { # method -> its default config. Shared by eval + visualize so the map lives in one place.
-    "baseline": "configs/baseline.yaml",
+    "baseline": "configs/baseline_eval.yaml",
     "ar": "configs/ar.yaml",
     "dlm": "configs/dlm.yaml",
 }
@@ -710,8 +710,8 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     """Segment-then-translate pipeline floor: predicted spans (analyze.py --stage segmenter-infer JSON, via --segments)
     are cut from the pose stream and translated offline. Scored by the same tIoU/translation harness as the streaming FSM.
 
-    Pipeline FLOOR = an independent/external segmenter's spans translated by CLEAN baseline, so pass `--method baseline`. Translation uses 
-    `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT ablation (external spans + our DLM, offline) — a legitimate RQ2 row, 
+    Pipeline FLOOR = an independent (Moryossef) segmenter's spans translated by CLEAN baseline, so pass `--method baseline`. Translation uses 
+    `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT ablation (Moryossef spans + our DLM, offline) — a legitimate RQ2 row, 
     but not the floor. The method is encoded in output filename so the two never collide; just pass the right --method for the row you want.
     """
     data_cfg = load_yaml(args.data_config)
@@ -906,10 +906,10 @@ def _load_segmenter(args):
     """Build + load a trained segmenter by --segmenter-arch (shared by eval --segmenter-eval and
     analyze --stage segmenter-infer).
 
-    external (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
+    moryossef (default): the faithful Moryossef segmenter (raw keypoints + UNet; a DIFFERENT input space from the FSM
     head — the non-circular Analysis-A/B / RQ2-cascade instrument, gate-doc §1.4). s1: the in-system BIO head, an
     ablation that swaps the same Uni-Sign head in to isolate system design from segmentation competence.
-    Returns (model, device, velocity, rope_chunk_s, checkpoint) — rope_chunk_s in SECONDS (S1) or None (external).
+    Returns (model, device, velocity, rope_chunk_s, checkpoint) — rope_chunk_s in SECONDS (S1) or None (Moryossef).
     """
     device = pick_device(args.device)
     if args.segmenter_arch == "s1":
@@ -925,9 +925,9 @@ def _load_segmenter(args):
         velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s", buffer_cap_s))
     else:
         from moryossef26.trainer import build_segmenter
-        cfg = load_yaml(args.segmenter_config, language=args.language)
-        model = build_segmenter(args.segmenter_config)
-        ckpt_default = f"checkpoints/segmenter/{args.language}"
+        cfg = load_yaml(args.moryossef_config, language=args.language)
+        model = build_segmenter(args.moryossef_config)
+        ckpt_default = f"checkpoints/moryossef/{args.language}"
         velocity, rope_chunk_s = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
 
     # The config's checkpoint.dir had ${language} expanded from the config file's OWN `language:` key at load
@@ -1010,10 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmenter-eval", action="store_true",
                         help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
     parser.add_argument("--segmenter-decode", default=None, choices=["duration", "plain"],
-                        help="whole-video decode; default: s1 -> duration (semi-Markov re-split), external -> plain (Moryossef argmax)")
-    parser.add_argument("--segmenter-arch", default="external", choices=["external", "s1"],
-                        help="segmenter-eval backend: external = Moryossef analysis segmenter (default), s1 = in-system head")
-    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
+                        help="whole-video decode; default: s1 -> duration (semi-Markov re-split), moryossef -> plain (Moryossef argmax)")
+    parser.add_argument("--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
+                        help="segmenter-eval backend: moryossef = Moryossef analysis segmenter (default), s1 = in-system head")
+    parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8,

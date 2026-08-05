@@ -340,7 +340,7 @@ class MisalignedSLTModel(nn.Module):
 
 
     def forward_loss(
-        self, batch: dict, lambda_trans: float = 1.0, 
+        self, batch: dict, lambda_trans: float = 1.0, lambda_bio: float = 1.0,
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
         oput_rollout_eval_mode: bool = True, oput_eos_supervision: int = 32,
@@ -355,8 +355,8 @@ class MisalignedSLTModel(nn.Module):
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
-        Computes ``L = L_BIO + lambda_trans * L_translation`` where the translation term is routed *per window mode* (the batch carries 
-        `mode_names` from the sampler), enforcing premise P1 — a truncated visual input never receives a partial text label:
+        Computes ``L = lambda_bio * L_BIO + lambda_trans * L_translation`` where the translation term is routed *per window mode* (the batch 
+        carries `mode_names` from the sampler), enforcing premise P1 — a truncated visual input never receives a partial text label:
 
         - **BIO** (all modes): Dice(1.5)+CE on the phrase head over every in-window frame; padding/UNK ignored.
         - **Mode 1 / Mode 3** (complete-anchor / first-complete-span): translation via **OPUT** under fixed full conditioning 
@@ -378,11 +378,10 @@ class MisalignedSLTModel(nn.Module):
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
 
-        # Membership gate (docs/membership_gate.md): build the (B,1,1,M) cross-attention bias Ω from the BIO
-        # posteriors + the on-policy selected span, so the decoder is CONDITIONED on the segmentation belief
-        # (the coupling — gradient from the translation loss reaches the BIO logits through Ω). BOTH arms: the
-        # DLM injects Ω in its manual decode; the AR arm injects the same Ω via HF cross-attn hooks
-        # (front_end.ar_omega_context) — so §9.3 is gated-vs-gated, isolating the decoder family. None → pre-gate.
+        # Membership gate (docs/membership_gate.md): build the (B,1,1,M) cross-attention bias Ω from the BIO posteriors + the on-policy 
+        # selected span, so the decoder is CONDITIONED on the segmentation belief (the coupling — gradient from the translation loss 
+        # reaches the BIO logits through Ω). BOTH arms: the DLM injects Ω in its manual decode; the AR arm injects the same Ω via HF 
+        # cross-attn hooks (front_end.ar_omega_context) — so §9.3 is gated-vs-gated, isolating the decoder family. None → pre-gate.
         omega_bias = None
         if gate_enabled:
             omega_bias, gate_stats = self.build_gate_omega(
@@ -590,10 +589,14 @@ class MisalignedSLTModel(nn.Module):
                 cb_weight = cb_ref_mask.to(dtype=translation_loss.dtype).sum().clamp(min=1)
                 translation_loss = (translation_loss * trans_weight + float(cb_lambda) * cb_weight * cb.loss) \
                     / (trans_weight + cb_weight).clamp(min=1)
-                logs["cb_loss"] = cb.loss.detach()                              # per-mode losses (spec §6.4)
+                logs["cb_loss"] = cb.loss.detach()                              # per-mode losses
                 logs["cb_active_count"] = cb.active_count.detach().to(translation_loss.dtype)
 
-        total = bio_loss + float(lambda_trans) * translation_loss
+        # `lambda_bio=0` = translation-only training: the faithful Uni-Sign SLT recipe (a single label-smoothed CE, no auxiliary losses) 
+        # for the clean-floor arm. It matters METHODOLOGICALLY, not just for faithfulness — L_BIO teaches the shared pose trunk about 
+        # sentence boundaries, i.e. exactly the competence RQ1-A claims existing models LACK. A clean floor trained with it would understate 
+        # the misalignment problem and a reviewer could rightly call the comparison rigged.
+        total = float(lambda_bio) * bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()
         logs["loss"] = total.detach()
         return SLTLossOutput(total, bio_loss, translation_loss, logs)

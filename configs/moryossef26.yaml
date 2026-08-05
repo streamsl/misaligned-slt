@@ -10,7 +10,7 @@
 seed: 42
 language: csl # active dataset; --language overrides
 checkpoint:
-    dir: checkpoints/segmenter/${language}
+    dir: checkpoints/moryossef/${language}
     save_best: true
     # 1-to-1 tIoU-matched segment F1 (metrics.segmentation_prf — the metric RQ2 uses): collapse-resistant
     # (neither all-I nor over-segmentation games it). On clean gap-separated streams a good detector is near-ceiling.

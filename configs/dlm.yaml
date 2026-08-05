@@ -112,10 +112,10 @@ mode_ratios:
     # (duration decode, infer/duration_decode.py) actually produces — the injection path that carries the improved
     # segmentation into joint training. Regenerate per language BEFORE train-slt, with the deployed decode as the
     # instrument (order coupling is back, deliberately):
-    #   python analyze.py --stage segmenter-infer --segmenter-arch external --segmenter-decode duration --language <lang> --split dev
-    #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_external_<lang>_dev.json --language <lang>
+    #   python analyze.py --stage segmenter-infer --segmenter-arch moryossef --segmenter-decode duration --language <lang> --split dev
+    #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_moryossef_<lang>_dev.json --language <lang>
     # Measure on DEV, not train: both segmenters were fit on train, so train-split errors are optimistically biased.
-    # asf (external+duration, 2026-07): mode1 0.034 / mode2 0.473 / mode3 0.409 / mode4 0.085 — clean complete
+    # asf (moryossef+duration, 2026-07): mode1 0.034 / mode2 0.473 / mode3 0.409 / mode4 0.085 — clean complete
     # anchors are RARE at deployment; the designed fallback below now only covers missing/degenerate measurements
     # (the mode1>=0.9 guard still auto-falls-back on too-clean corpora, e.g. pre-trimmed CSL). NB a_mode_ratios_csl
     # in outputs/ predates the duration decode — regenerate before training csl with a measured mix.

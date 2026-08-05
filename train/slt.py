@@ -210,17 +210,14 @@ def evaluate_slt(
     for batch in loader:
         batch = move_to_device(batch, device)
         output: SLTLossOutput = model.forward_loss(
-            batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), dice_weight=dice_weight,
-            bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
-            oput_t_low=float(oput_cfg.get("t_low", 0.3)),
-            oput_t_high=float(oput_cfg.get("t_high", 0.8)),
+            batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), lambda_bio=float(slt_cfg.get("lambda_bio", 1.0)), 
+            dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
+            oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
             oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
-            confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)),
-            confidence_bound_active=cb_on,
-            confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)),
-            cb_lambda=float(confidence_cfg.get("lambda", 0.3)),
+            confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)), confidence_bound_active=cb_on,
+            confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_lambda=float(confidence_cfg.get("lambda", 0.3)),
             verified_full_evidence_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
             cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
             cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", slt_cfg.get("block_size", 8))),
@@ -321,10 +318,9 @@ def train_slt_epochs(
 
     def step_fn(batch, epoch: int):
         output: SLTLossOutput = model.forward_loss(
-            batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), dice_weight=dice_weight,
-            bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
-            oput_t_low=float(oput_cfg.get("t_low", 0.3)),
-            oput_t_high=float(oput_cfg.get("t_high", 0.8)),
+            batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), lambda_bio=float(slt_cfg.get("lambda_bio", 1.0)), 
+            dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
+            oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
             oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),

@@ -22,12 +22,12 @@ from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
 
 
-def build_segmenter_loaders(data_config: str, segmenter_config: str, language: str | None = None) -> tuple[DataLoader, DataLoader, dict]:
+def build_segmenter_loaders(data_config: str, moryossef_config: str, language: str | None = None) -> tuple[DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
-    cfg = load_yaml(segmenter_config)
+    cfg = load_yaml(moryossef_config)
     # CLI --language > config's own language: > active_languages; reload so ${language} in checkpoint.dir re-points.
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
-    if language != cfg.get("language"): cfg = load_yaml(segmenter_config, language=language)
+    if language != cfg.get("language"): cfg = load_yaml(moryossef_config, language=language)
     aug_cfg = cfg.get("augmentation", {}) or {}
     fps_cfg = aug_cfg.get("fps", {})
     trusted_gap = data_cfg.get("subtitles", {}).get("trusted_gap_s", TRUSTED_GAP_S)
@@ -50,8 +50,8 @@ def build_segmenter_loaders(data_config: str, segmenter_config: str, language: s
     return train_loader, dev_loader, cfg
 
 
-def build_segmenter(segmenter_config: str) -> MoryossefSegmenter:
-    cfg = load_yaml(segmenter_config)
+def build_segmenter(moryossef_config: str) -> MoryossefSegmenter:
+    cfg = load_yaml(moryossef_config)
     pose_dim = 6 if bool(cfg.get("velocity", True)) else 3  # +velocity doubles the per-keypoint channel dim
     model = MoryossefSegmenter(
         pose_dims=(int(cfg.get("pose_joints", 69)), pose_dim),

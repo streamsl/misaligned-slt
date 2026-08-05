@@ -16,7 +16,7 @@ from poses import load_pose_window
 from moryossef26.dataset import append_velocity
 # The semi-Markov duration decode is THIS SYSTEM'S contribution, not part of the Moryossef protocol — it lives
 # in infer/duration_decode.py and enters here only through the optional `duration_prior` argument (None = the
-# faithful argmax protocol, the default for `--segmenter-arch external`).
+# faithful argmax protocol, the default for `--segmenter-arch moryossef`).
 from infer.duration_decode import DurationPrior, duration_decode_params, duration_decode_tags, fit_duration_prior
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 

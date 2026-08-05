@@ -1,8 +1,10 @@
 from __future__ import annotations
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
 import re, csv, json
 import numpy as np
-from pathlib import Path
-from dataclasses import dataclass
 from .preprocessing import normalize_keypoints_unisign
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
@@ -203,6 +205,13 @@ def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) ->
     return meta
 
 
+@lru_cache(maxsize=64)
+def _pose_memmap(path_str: str):
+    # ONE read-only memmap handle per pose file, LRU-bounded: re-opening the .npy on every window read dominates
+    # wall-time on network filesystems. Pose files are immutable; each worker process holds its own cache.
+    return np.load(path_str, mmap_mode="r")
+
+
 def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) -> np.ndarray:
     if start_frame < 0 or end_frame < start_frame: raise ValueError(f"Invalid frame range [{start_frame}, {end_frame})")
     end_frame = min(end_frame, pose_index.total_frames)
@@ -215,7 +224,7 @@ def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) ->
     for file_idx in range(start_file, end_file + 1):
         local_start = max(0, start_frame - int(cumulative[file_idx]))
         local_end = min(pose_index.frame_counts[file_idx], end_frame - int(cumulative[file_idx]))
-        arr = np.load(pose_index.paths[file_idx], mmap_mode="r")
+        arr = _pose_memmap(str(pose_index.paths[file_idx]))
         chunks.append(np.asarray(arr[local_start:local_end], dtype=np.float32))
     return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 133, 3), dtype=np.float32)
 

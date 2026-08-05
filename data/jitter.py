@@ -4,6 +4,12 @@ from pathlib import Path
 import numpy as np
 import json
 
+# Minimum measured (Δ_head, Δ_tail) pairs before raw empirical replay is trusted over the Laplace fitted to the
+# same measurement: below this, replay cannot draw offsets beyond the observed extremes (censored tails) and
+# repeats each value many times per epoch, while the 2-parameter fit is already well-estimated. A property of the
+# sample count, not the corpus — the same constant applies to every language.
+RAW_REPLAY_MIN_PAIRS = 1000
+
 
 @dataclass
 class JitterSampler:
@@ -20,6 +26,13 @@ class JitterSampler:
     def from_config(cls, cfg: dict) -> "JitterSampler":
         cut_positions = None
         source = cfg.get("source")
+        if source and not Path(source).exists():
+            # Mirror of the sampler's mode_ratios guard: configured-but-missing measurement must FAIL, not silently
+            # train the designed fallback_laplace while claiming measured jitter. `source: null` = designed, explicitly.
+            raise FileNotFoundError(
+                f"jitter.source is set but missing: {source!r} (cwd={Path.cwd()}). Run Analysis A first, or set "
+                f"jitter.source: null to explicitly use fallback_laplace."
+            )
         if source and Path(source).exists():
             data = json.loads(Path(source).read_text(encoding="utf-8"))
             cuts = np.asarray(data.get("overseg_cut_positions", []), dtype=np.float32).reshape(-1)
@@ -31,7 +44,14 @@ class JitterSampler:
                 if isinstance(x, dict) else x for x in raw
             ], dtype=np.float32)
 
-            if samples.size: return cls(samples=samples.reshape(-1, 2), cut_positions=cut_positions)
+            # Large measurement → raw empirical replay; small → the Laplace fitted to the same offsets, carried
+            # in the same file (see RAW_REPLAY_MIN_PAIRS). Both are measured calibration, never the designed fallback.
+            n_pairs = samples.reshape(-1, 2).shape[0] if samples.size else 0
+            if n_pairs >= RAW_REPLAY_MIN_PAIRS:
+                print(f"[jitter] {source}: RAW empirical replay ({n_pairs} measured pairs)", flush=True)
+                return cls(samples=samples.reshape(-1, 2), cut_positions=cut_positions)
+            print(f"[jitter] {source}: fitted-Laplace draws ({n_pairs} measured pairs < {RAW_REPLAY_MIN_PAIRS}; "
+                  f"raw replay would censor tails and lattice the distribution)", flush=True)
             laplace = data.get("laplace", {})
         else: laplace = cfg.get("fallback_laplace", {})
 

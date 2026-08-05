@@ -232,7 +232,10 @@ def _load_evaluate_metric(name: str):
     try:
         import evaluate
         return evaluate.load(name)
-    except Exception: return None
+    except Exception as e:
+        print(f"[metrics] WARNING: metric backend {name!r} unavailable ({type(e).__name__}: {e}); "
+              f"its column will read 0.0 — do NOT report that cell.", flush=True)
+        return None
 
 
 # Full-width CJK punctuation -> ASCII. mT5 decodes Chinese text but emits ASCII '?'/',' for some marks while the

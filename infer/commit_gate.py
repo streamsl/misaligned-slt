@@ -7,28 +7,23 @@ from data.windowing import BIO
 
 
 def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
-    """A span OPENS on a predicted `B`, or on an O→I transition mid-buffer.
+    """A span OPENS on a predicted `B`, or O→I mid-buffer.
 
-    Mirrors the prediction decode used everywhere else (`metrics.signing_runs_with_b_splits`): the model rarely
-    wins argmax with `B` (one B frame per sentence; 68% of caption boundaries have no visual pause), and the first
-    signing frame after a gap is a sentence start by construction. One deliberate exception: signing at BUFFER START
-    without a `B` (prev_tag is None) does NOT open a span — Mode-2b training labels a left-truncated sentence as `I`
-    without `B` precisely so the model can signal "this sentence started before the buffer; do not translate it". 
-    Opening there would translate fragments whose head was discarded. This is also what makes the post-commit overlap 
-    cut safe: ≤2δ leftover tail of previous sentence shows up as buffer-start `I` and is never selected as a target.
+    Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; 68% of caption boundaries
+    have no visual pause), so the first signing frame after a gap counts as a start. Buffer-start signing without `B`
+    (prev_tag None) does NOT open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before the buffer,
+    don't translate"), which also makes the overlap cut safe — its ≤2δ leftover arrives as buffer-start `I`.
     """
     if tag == BIO["B"]: return True
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
 
 
 def first_terminator_index(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Index of the first frame that TERMINATES an active span: an `O`, or a new `B`.
+    """First frame TERMINATING an active span: an `O`, or a new `B`.
 
-    A sign sentence can start immediately after another (back-to-back, no `O` gap), so the terminator of a span is 
-    the first following `O` **or** `B` — the BIO-standard rule and the whole reason a `B` class exists over binary 
-    I/O tagging (Moryossef 2023/2026). Terminating only on `O` would never close the first sentence of a back-to-back 
-    pair and FSM would bridge them until buffer cap. The training-side target rule (windowing.first_complete_span) 
-    encodes the same semantics on GT timestamps (Same rule at train & inference). Span opening follows `_span_opens`.
+    Back-to-back sentences have no `O` gap, so `B` must terminate too (BIO-standard; why a `B` class 
+    exists over binary I/O — Moryossef 2023/2026). `O`-only would bridge such a pair until buffer cap.
+    `windowing.first_complete_span` encodes the same rule on GT timestamps; keep in sync.
     """
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     active, prev = False, None
@@ -40,8 +35,7 @@ def first_terminator_index(bio_tags: torch.Tensor | list[int]) -> int | None:
 
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
-    # Complete predicted spans as [start_idx, terminator_idx]; opening per `_span_opens`
-    # (B anywhere, or mid-buffer O→I), terminating on O or on the next span's B.
+    # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O or next B.
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
@@ -55,29 +49,36 @@ def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, in
     return spans
 
 
-def select_target_span(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0) -> tuple[int, int] | None:
-    """First complete span at least `min_span_frames` long (Λ_min) — the FSM's translation target.
+def select_target_span(
+    bio_tags: torch.Tensor | list[int], min_span_frames: int = 0, skip_term_before: int = 0,
+) -> tuple[int, int] | None:
+    """First complete span ≥ `min_span_frames` (Λ_min) terminating at/after `skip_term_before` — the FSM's target.
 
-    Λ_min filters phantom micro-spans: a spurious `B` inside the post-commit leftover (or a 1-frame flicker) forms
-    a terminated span that is otherwise commit-eligible — a static spurious span trivially passes the boundary-
-    stability hysteresis. Derive Λ_min from the dev sentence-length distribution (a low percentile, in encoder
-    frames) and keep Λ_min > 2δ so the ≤2δ overlap-cut leftover can never qualify even if mislabelled `B`.
+    `skip_term_before` is the commit frontier χ in frames (= frames committed = index of the first uncommitted frame).
+    A span terminating at or before χ is already emitted — an overlap-cut leftover or a stale re-detection — so skip
+    it. The bound is `term <= χ`, not `<`: the cut geometry (`last_commit_t = event.end_s - δ/fps`) makes equality the
+    common case. This commit-log check is the whole no-re-emission guarantee, replacing the "Λ_min > 2δ" coupling that
+    was infeasible on short-sentence corpora (asf: 2δ > p10 sentence length). Spans STRADDLING χ stay selectable:
+    δ-overlap stops a late terminator estimate eating the successor's onset, and their ≤δ committed prefix is
+    attention-floored by Ω's χ term.
+
+    Λ_min is a duration noise floor: spans shorter than δ are unresolvable from boundary evidence (a 1-frame flicker
+    passes stability hysteresis). See StreamingSLTRunner for how it is derived.
     """
     for start, term in bio_complete_spans(bio_tags):
+        if term <= int(skip_term_before): continue  # term == χ: all content frames (< term) are committed
         if term - start >= int(min_span_frames): return (start, term)
     return None
 
 
 def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Start index of a TERMINATOR-LESS span that runs to the buffer edge (Mode-2a right-truncation, or a
-    buffer-cap forced commit), or None if the buffer ends outside a span.
+    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation, or a buffer-cap forced
+    commit); None if the buffer ends outside a span.
 
-    Same open/terminate rule as `bio_complete_spans` (`_span_opens`: B anywhere or mid-buffer O→I; terminate on
-    O or the next B), but returns the start of the FINAL still-open span instead of the completed ones. This is
-    the anchor the membership gate needs for the forced/open path (docs/membership_gate.md §2.8): anchoring Ω at
-    this s gives γ≡γ_s with no right cliff (Ω≈0 for the all-I interior), whereas anchoring at frame 0 would sweep
-    the opening B and floor the very span the gate is meant to open. A buffer-start I-run (left-truncated leftover)
-    never opens, so it correctly yields None (that span is not translated)."""
+    Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate needs on
+    the forced/open path (docs/membership_gate.md §2.8): Ω anchored here gives γ≡γ_s with no right cliff (Ω≈0 for the
+    all-I interior), while frame 0 would sweep the opening B and floor the span the gate should open. A buffer-start
+    I-run (left-truncated leftover) never opens → None."""
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     start: int | None = None
     prev: int | None = None
@@ -92,10 +93,9 @@ def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
 class BoundaryHistory:
     """Terminator hysteresis for ONE candidate span.
 
-    Entries are (start_idx, terminator_idx). Buffer frame indices are stable between commits (the buffer only
-    grows at the right edge), so `start_idx` identifies the span across strides; when the selected span's start
-    moves by more than `delta_enc_frames` the history is for a DIFFERENT span and is cleared — mixing terminator
-    estimates of different spans would make the stability test meaningless.
+    Entries are (start_idx, terminator_idx). Buffer indices are stable between commits (it only grows at the right
+    edge), so `start_idx` identifies the span across strides; a start moving by more than `delta_enc_frames` is a
+    different span and clears the history — mixing spans makes the stability test meaningless.
     """
     hysteresis_strides: int = 3
     delta_enc_frames: int = 3
@@ -132,30 +132,25 @@ class CommitDecision:
 
 
 class CommitGate:
-    """Two-signal commit gate; both signals must hold to emit.
+    """Two-signal commit gate; both must hold to emit.
 
-    1. **Boundary-stable** — the SELECTED target span's terminator (first `O`, or the `B` opening the next sentence) has moved 
-       ≤ `delta_enc_frames` over last `hysteresis_strides` strides, for the SAME span (identity by start index; `BoundaryHistory` 
-       clears on a target change, so a single stride's vote — or a vote inherited from a different span — never commits).
-    2. **Translation-hardened** — the decode's MEAN per-token confidence ≥ `token_confidence_tau` at the *current* stride
-       (forward-looking, not an edit-distance to previous strides — that would reward the warm-started state the design forbids).
-       Mean, not `all(≥τ)`: a single low-confidence subword (a function word / morpheme legitimately sits at 0.2–0.5) must not
-       veto an otherwise-confident sentence. An `all()` floor is only satisfiable when τ sits below the clean per-token MINIMUM,
-       which for a label-smoothed decoder is near-zero — so `all(≥0.75)` is effectively "never commit" on the AR arm (whose
-       honest teacher-forced confidence means ~0.4), silently zeroing §9.3 AR streaming recall. The DLM arm's DCD-committed
-       tokens sit high, so it was unaffected — the mismatch made the two arms incomparable, which is exactly what §9.3 must not do.
+    1. **Boundary-stable** — terminator moved ≤ `delta_enc_frames` over the last `hysteresis_strides` strides for the
+       SAME span (identity by start index; `BoundaryHistory` clears on a target change, so one stride's vote — or one
+       inherited from another span — never commits).
+    2. **Translation-hardened** — MEAN per-token confidence of the *current* stride's decode ≥ `token_confidence_tau`.
+       Not edit-distance to previous strides: that rewards the warm-started state the design forbids. Mean, not
+       `all(≥τ)`: function words sit at 0.2–0.5, so `all(≥0.75)` never commits on the AR arm (mean ~0.4), zeroing its
+       §9.3 streaming recall while the DLM arm's DCD-committed tokens pass — the arms become incomparable.
 
-    τ must be CALIBRATED to the deployed model's clean-input confidence (like δ_enc / buffer_cap are measured), NOT hand-set;
-    see configs/inference.yaml. The gate is a floor against low-confidence junk — it does NOT catch "confidently wrong"
-    truncated decodes (those keep high confidence); the membership gate Ω is the mechanism for that.
+    τ must be CALIBRATED to the model's clean-input confidence (like δ_enc / buffer_cap), see configs/inference.yaml.
+    It floors low-confidence junk only; "confidently wrong" truncated decodes stay high-confidence and are Ω's job.
     """
     def __init__(self, delta_enc_frames: int = 3, hysteresis_strides: int = 3, token_confidence_tau: float = 0.75):
         self.history = BoundaryHistory(hysteresis_strides=int(hysteresis_strides), delta_enc_frames=int(delta_enc_frames))
         self.token_confidence_tau = float(token_confidence_tau)
 
     def update(self, span: tuple[int, int] | None, token_confidence: torch.Tensor | None = None) -> CommitDecision:
-        # `span` is the target the caller selected (select_target_span) and decoded — the gate scores exactly the
-        # span being emitted, never a recomputed one that could disagree with the decode.
+        # `span` must be the one the caller decoded, never recomputed here — the gate scores exactly what is emitted.
         self.history.push(span)
         if token_confidence is None or token_confidence.numel() == 0: trans_ok = False
         else: trans_ok = bool((token_confidence.float().mean() >= self.token_confidence_tau).item())

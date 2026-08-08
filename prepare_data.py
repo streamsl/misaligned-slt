@@ -1,36 +1,34 @@
 """SignVerse-2M downloader + converter → the repo's YouTube-SL-25 language layout.
 
-Fetches exactly the shards containing the requested languages' videos from HuggingFace SignerX/SignVerse-2M
-(shards are mixed-language; asf+bfi span ~206 of 723 shards, ~80 GB vs ~1.3 TB full corpus), converts each
-wanted video's DWPose-128 npz (either packaging scheme) to the canonical (T,133,3) raw-pixel .npy via
-poses.signverse, writes ONE caption per video, and video_meta.csv (duration from the npz frame count at the
-corpus's unified 24 fps — no yt-dlp needed). After this the language behaves exactly like the repo's own
-extractions: train.py / analyze.py / eval.py run unchanged with --language asf|bfi.
+Fetches only the shards holding the requested languages' videos from HuggingFace SignerX/SignVerse-2M (shards are
+mixed-language; asf+bfi span ~206 of 723 shards, ~80 GB vs ~1.3 TB), converts each wanted video's DWPose-128 npz
+to (T,133,3) .npy via poses.signverse, writes ONE caption per video and video_meta.csv (duration = npz frames /
+the corpus's unified 24 fps — no yt-dlp). The language then behaves like the repo's own extractions: train.py /
+analyze.py / eval.py run unchanged with --language asf|bfi.
 
-    python prepare_data.py --stage plan [--size]              # shard/video counts (+ HEAD size estimate); no download
-    python prepare_data.py --stage all --languages asf bfi    # download + convert + subs gap-fill (resumable)
-    python prepare_data.py --stage subs --languages asf       # gap-fill captions from the subtitles tar only
-    python prepare_data.py --stage convert --delete-tars      # convert already-downloaded shards, free disk
+    python prepare_data.py --stage plan [--size]            # shard/video counts (+ HEAD size estimate); no download
+    python prepare_data.py --stage all --languages asf bfi  # download + convert + subs gap-fill (resumable)
+    python prepare_data.py --stage subs --languages asf     # gap-fill captions from the subtitles tar only
+    python prepare_data.py --stage convert --delete-tars    # convert already-downloaded shards, free disk
 
 ON-DISK LAYOUT (root = data/youtube-sl-25):
-    <root>/SignVerse-2M-metadata_split.csv        # splits (shipped)         ── dataset metadata (siblings)
+    <root>/SignVerse-2M-metadata_split.csv        # splits (shipped)
     <root>/archive_upload_progress.json           # video→shard index (fetched once)
     <root>/signverse_subtitles_with_english.tar   # captions tar (fetched only if gaps)
     <root>/signverse_shards/*.tar                 # shard-tar CACHE ONLY (transient; --delete-tars frees it)
     <root>/{asf,bfi}/poses/<vid>.npy , subs/<vid>.<target>.vtt , video_meta.csv
 
-CAPTIONS — one file per video, `<vid>.<target>.vtt`, from ONE selection rule (data.loader.best_subtitle), both paths:
-  - `--stage convert` harvests the single best shard-bundled track → caption_source=shard (no extra download).
-  - `--stage subs` GAP-FILLS only the videos convert left caption-less, from the curated subtitles tar, choosing the
-    dataset target language (`configs/data.yaml` target_lang): the HUMAN track (original.<target>*.manual, or
-    english.en.native for target=en) over NLLB MACHINE-translated english.en.nllb (target=en only). If convert left
-    no gaps, the 700 MB tar is never fetched. Provenance → video_meta.csv `caption_source` (human|mt|shard|none) so
-    the loader holds the TEST split to human references (`subtitles.human_only_splits`). Language-general.
+CAPTIONS — one `<vid>.<target>.vtt` per video, one selection rule (data.loader.best_subtitle), two paths:
+`--stage convert` harvests the best shard-bundled track (caption_source=shard, no extra download); `--stage subs`
+gap-fills the rest from the curated subtitles tar in the target language (`configs/data.yaml` target_lang),
+HUMAN over NLLB machine-English (see `_pick_caption`). No gaps → the 700 MB tar is never fetched. Provenance →
+video_meta.csv `caption_source` (human|mt|shard|none) so the loader holds the TEST split to human references
+(`subtitles.human_only_splits`). Language-general.
 
-The authoritative video→shard index is runtime_state/archive_upload_progress.json::uploaded_folders (the other
-manifests in the repo are stale snapshots — verified). A handful of asf/bfi videos are not yet uploaded upstream
-(no failure markers; past the upload frontier), and a few are listed in the index but absent from their shard
-(upstream packaging gap) — both are reported and reconciled, not treated as errors.
+The authoritative video→shard index is runtime_state/archive_upload_progress.json::uploaded_folders (the repo's
+other manifests are stale snapshots — verified). Some asf/bfi videos are not yet uploaded upstream (past the
+upload frontier, no failure markers), a few are indexed but absent from their shard (upstream packaging gap):
+both are reported and reconciled, not errors.
 """
 from __future__ import annotations
 import argparse, csv, json, shutil, sys, tarfile, urllib.request
@@ -49,10 +47,9 @@ DEFAULT_SPLIT_CSV = "data/youtube-sl-25/SignVerse-2M-metadata_split.csv"
 DEFAULT_CACHE = "data/youtube-sl-25/signverse_shards"
 DEFAULT_ROOT = "data/youtube-sl-25"
 
-# signverse_subtitles_with_english.tar holds, per video: english.en.native.vtt (HUMAN English — source was already English), 
-# english.en.nllb.vtt (English MACHINE-translated via Meta's NLLB — noisy), and original.<lang>.manual.vtt (the raw HUMAN 
-# upload in video's own language; `manual` = human). The caption we want is in DATASET's target language (data.yaml target_lang), 
-# preferring human over machine-translated — NOT hardcoded to English, so this generalises to future non-English-target corpora.
+# Per video the subtitles tar holds: english.en.native.vtt (HUMAN English — the source was already English),
+# english.en.nllb.vtt (English MACHINE-translated by Meta's NLLB — noisy), original.<lang>.manual.vtt (raw HUMAN
+# upload in the video's own language; `manual` = human).
 _ENGLISH_TRACKS = ("english.en.native.vtt", "english.en.nllb.vtt")  # SignVerse only auto-normalizes to English
 
 def _target_code(target_lang: str) -> str:
@@ -69,11 +66,12 @@ def _is_caption_file(fname: str) -> bool:
 def _pick_caption(files: dict[str, bytes], target_code: str) -> tuple[str, bytes] | None:
     """Best caption in the TARGET language → (provenance 'human'|'mt', vtt bytes), or None.
 
-    Priority: (1) human caption in target language — english.en.native for target=en, else human original.<target>*.manual upload; 
-    (2) NLLB machine-English, but ONLY for target=en (SignVerse produces no MT for other targets). A non-English target with no 
-    human original.<target> caption is genuinely caption-less (the English tracks are the wrong language and are not used)."""
+    Priority: (1) human — english.en.native for target=en, else original.<target>*.manual; (2) NLLB machine-English, 
+    ONLY for target=en (SignVerse produces no MT for other targets), so a non-English target with no human 
+    original.<target> is genuinely caption-less — the English tracks are the wrong language.
+    """
     if target_code == "en" and "english.en.native.vtt" in files: return "human", files["english.en.native.vtt"]
-    for name, content in sorted(files.items()):  # human original upload IN the target language
+    for name, content in sorted(files.items()):
         if name.startswith(f"original.{target_code}") and name.endswith(".manual.vtt"): return "human", content
     if target_code == "en" and "english.en.nllb.vtt" in files: return "mt", files["english.en.nllb.vtt"]
     return None
@@ -88,8 +86,8 @@ def _download(url: str, dest: Path, resume: bool = True) -> Path:
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req) as r:
-            # If we asked to resume but the server ignored Range (200, not 206), it is sending the WHOLE file —
-            # appending it onto the partial would corrupt the tar. Restart from byte 0 in that case.
+            # Server ignored our Range (200, not 206) → it is sending the WHOLE file; 
+            # appending onto the partial would corrupt the tar. Restart from byte 0.
             append = start > 0 and r.status == 206
             with open(tmp, "ab" if append else "wb") as f:
                 shutil.copyfileobj(r, f, length=1 << 20)
@@ -101,8 +99,8 @@ def _download(url: str, dest: Path, resume: bool = True) -> Path:
 
 
 def load_plan(split_csv: Path, root: Path, languages: list[str]) -> dict:
-    # video→shard plan for the requested languages, from the split CSV + the authoritative upload index.
-    # The index is DATASET metadata (like the split CSV), so it lives in root/ — NOT in the shard-tar cache.
+    # video→shard plan from the split CSV + the upload index. The index is DATASET metadata (like the split CSV),
+    # so it lives in root/ — NOT in the shard-tar cache.
     progress = root / "archive_upload_progress.json"
     if not progress.exists():
         print(f"prepare | fetching upload index → {progress}", flush=True)
@@ -131,7 +129,7 @@ def stage_plan(args, plan: dict) -> None:
     print(f"plan | videos: {len(plan['videos'])} ({langs}) | shards: {len(shards)} "
           f"| not yet uploaded upstream: {len(plan['missing'])}")
     print(f"plan | shards already downloaded: {len(done)}/{len(shards)} in {args.cache}")
-    if args.size:  # opt-in HEAD probe (one request/undownloaded shard) — off by default (206 round-trips)
+    if args.size:  # opt-in HEAD probe per undownloaded shard — off by default (206 round-trips)
         total = sum((Path(args.cache) / s).stat().st_size for s in done)
         for s in (x for x in shards if x not in set(done)):
             try:
@@ -161,10 +159,9 @@ def _convert_one(tar: tarfile.TarFile, vid: str, lang_root: Path, tmp_dir: Path,
     tar.extractall(tmp_dir, members=members, filter="data")
     stats = convert_video(tmp_dir / vid / "npz", lang_root / "poses" / f"{vid}.npy")
 
-    # Harvest the SINGLE best shard-bundled caption → one canonical `<vid>.<tcode>.vtt` (same file/name `--stage subs` writes, 
-    # so both paths agree on exactly one caption per video). `best_subtitle` is the loader's selection rule; lang_prefix=tcode 
-    # restricts it to TARGET-language shard tracks (so a non-en target never harvests an English track mislabelled as its own). 
-    # No target-language track → caption_source "none" → `--stage subs` gap-fills the human original.<target> from subtitles tar.
+    # Harvest the SINGLE best shard-bundled caption → the canonical `<vid>.<tcode>.vtt` that `--stage subs` also writes, so both paths agree 
+    # on exactly one caption per video. lang_prefix=tcode restricts `best_subtitle` (the loader's rule) to TARGET-language tracks: a non-en 
+    # target never harvests a mislabelled English track. None → caption_source "none", and `--stage subs` gap-fills it.
     best = best_subtitle(tmp_dir / vid / "captions", vid, subtitle_cfg, lang_prefix=tcode) if (tmp_dir / vid / "captions").exists() else None
     if best is not None:
         subs_dir = lang_root / "subs"
@@ -177,13 +174,15 @@ def _convert_one(tar: tarfile.TarFile, vid: str, lang_root: Path, tmp_dir: Path,
 
 
 def _backfill_meta(vid: str, lang_root: Path, meta: dict[str, dict]) -> None:
-    # A prior run that crashed before save leaves a .npy with no meta row. Recompute duration from the .npy frame
-    # count at the corpus's fixed 24 fps (cheap: mmap header only) so video_meta stays complete across resumes.
+    # A run that crashed before save leaves a .npy with no meta row. Recompute duration from the .npy frame count
+    # at the corpus's fixed 24 fps (cheap: mmap header only) so video_meta stays complete across resumes.
     if vid in meta: return
     npy = lang_root / "poses" / f"{vid}.npy"
     if not npy.exists(): return
     frames = int(np.load(npy, mmap_mode="r").shape[0])
-    meta[vid] = {"video_id": vid, "duration_s": f"{frames / SIGNVERSE_DEFAULT_FPS:.3f}", "width": "", "height": ""}
+    # caption_source "none", not blank: a blank is not in human_only_exclude_sources, so a crash-recovered row
+    # would silently pass as a human caption on the test split. "none" is what `--stage subs` gap-fills.
+    meta[vid] = {"video_id": vid, "duration_s": f"{frames / SIGNVERSE_DEFAULT_FPS:.3f}", "width": "", "height": "", "caption_source": "none"}
 
 
 def stage_convert(args, plan: dict) -> None:
@@ -200,10 +199,9 @@ def stage_convert(args, plan: dict) -> None:
     for shard in sorted(plan["shards"]):
         tar_path = cache / shard
         if not tar_path.exists():
-            # Shard tar not present — a --limit smoke run, an interrupted download, or `--delete-tars` already freed it. 
-            # Videos whose pose IS on disk were converted from that (now-deleted) tar: count them as already present 
-            # (and backfill any meta a crash lost), NOT as "not downloaded" — else reconciliation advises a needless 
-            # re-download for work already done. Only pose-less videos are genuinely not downloaded.
+            # Shard tar absent — a --limit smoke run, an interrupted download, or `--delete-tars` freed it. Videos
+            # whose pose IS on disk were converted from that tar: count them as already present (backfilling meta a
+            # crash lost), NOT "not downloaded", else reconciliation advises a needless re-download.
             touched = set()
             for vid in plan["shards"][shard]:
                 lang = plan["videos"][vid]["language"]
@@ -216,8 +214,8 @@ def stage_convert(args, plan: dict) -> None:
 
         in_shard = plan["shards"][shard]
         wanted = [v for v in in_shard if args.overwrite or not (root / plan["videos"][v]["language"] / "poses" / f"{v}.npy").exists()]
-        # Even for fully-converted shards, backfill any meta rows a prior crash lost, then honor --delete-tars
-        # (the "re-run convert --delete-tars to free disk" flow must delete these too).
+        # Even for fully-converted shards: backfill meta rows a prior crash lost, then honor --delete-tars (the
+        # "re-run convert --delete-tars to free disk" flow must delete these too).
         touched_langs = set()
         for vid in in_shard:
             if vid not in wanted:
@@ -235,8 +233,7 @@ def stage_convert(args, plan: dict) -> None:
                     lang_root = root / lang
                     stats = _convert_one(tar, vid, lang_root, tmp_dir, targets.get(lang, "en"), subtitle_cfg)
                     if stats is None:
-                        # Upstream inconsistency: the upload index lists this video in this shard, but the tar has no npz for it. 
-                        # Nothing to retry — record it so the final tally reconciles.
+                        # Upstream inconsistency, nothing to retry — record it so the final tally reconciles.
                         report["npz_missing"].append(vid)
                         print(f"convert |   {vid}: npz absent from {shard} (upstream index/packaging gap) — skipped", flush=True)
                         continue
@@ -251,15 +248,14 @@ def stage_convert(args, plan: dict) -> None:
                     if stats["frames"] and stats["empty_frames"] / stats["frames"] > 0.5:
                         report["empty_heavy"].append((vid, round(stats["empty_frames"] / stats["frames"], 2)))
 
-        # Persist meta AFTER EACH SHARD so a crash costs at most one shard, not the whole run.
+        # Persist meta AFTER EACH SHARD: a crash then costs one shard, not the whole run.
         for lang in touched_langs: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
         if args.delete_tars: tar_path.unlink()
 
-    shutil.rmtree(cache / "_extract", ignore_errors=True)  # remove the transient extraction scratch dir
+    shutil.rmtree(cache / "_extract", ignore_errors=True)
     for lang, meta in per_lang_meta.items(): print(f"convert | {root / lang / META_FILENAME}: {len(meta)} rows", flush=True)
 
-    # Full reconciliation so the counts add up without cross-referencing: every split video is accounted for as
-    # converted, already-present, not-yet-uploaded-upstream, absent-from-its-shard, or in a not-downloaded shard.
+    # Full reconciliation: every split video lands in exactly one bucket, so the counts add up on their own.
     n_split = len(plan["videos"]) + len(plan["missing"])
     accounted = report["converted"] + report["skipped_existing"] + len(plan["missing"]) + len(report["npz_missing"]) + report["not_downloaded"]
     print(f"convert | reconciliation ({n_split} split videos = {accounted} accounted): converted {report['converted']} + "
@@ -274,22 +270,21 @@ def stage_convert(args, plan: dict) -> None:
 
 
 def stage_subs(args, plan: dict) -> None:
-    """GAP-FILL captions that `--stage convert` could not harvest from shard tracks, using the curated subtitles tar. A video already carrying 
-    a `<vid>.<target>.vtt` in subs/ is left untouched (convert wrote the same canonical name from its shard track, caption_source=shard). 
-    Only GAPS (no subs file) get a `<vid>.<target>.vtt` from the tar, choosing the caption in the dataset's target language (human original
-    preferred; NLLB machine-English only for target=en). If there are no gaps, the 700 MB tar is never fetched. Provenance (human | mt) → 
-    video_meta.csv `caption_source` so the loader can hold the test split to human refs."""
+    """GAP-FILL captions `--stage convert` could not harvest from shard tracks (module docstring: CAPTIONS).
+
+    A video already carrying `<vid>.<target>.vtt` in subs/ is left untouched — convert wrote that same canonical name from its shard track. 
+    Only GAPS get one from the tar. Provenance (human | mt) → video_meta.csv `caption_source`."""
     root = Path(args.root)
     data_cfg = load_yaml(args.data_config)
     lang_target = _lang_targets(data_cfg, {info["language"] for info in plan["videos"].values()})
 
-    # A GAP = a video whose POSE is present (converted) but which has no `<vid>.<target>.vtt` caption. Gating on the .npy avoids writing orphan 
-    # captions for videos not yet downloaded/converted, and makes the "no gaps → skip the 700 MB tar" fast path fire on partial runs too. 
-    # Filesystem-based, so deleting subs/ & re-running correctly re-fills from the tar even when video_meta still records caption_source=shard.
+    # A GAP = a video with a POSE but no `<vid>.<target>.vtt`. Gating on the .npy avoids orphan captions for
+    # unconverted videos and lets the "no gaps → skip the tar" fast path fire on partial runs. Filesystem-based, so
+    # deleting subs/ & re-running re-fills from the tar even when video_meta still says shard.
     gaps: dict[str, str] = {}  # vid -> language
     for vid, info in plan["videos"].items():
         lang = info["language"]
-        if not (root / lang / "poses" / f"{vid}.npy").exists(): continue        # no pose → caption not useful yet
+        if not (root / lang / "poses" / f"{vid}.npy").exists(): continue
         if not (root / lang / "subs" / f"{vid}.{lang_target[lang]}.vtt").exists():
             gaps[vid] = lang
     if not gaps:
@@ -297,7 +292,7 @@ def stage_subs(args, plan: dict) -> None:
               "— no gaps, subtitles tar not needed.", flush=True)
         return
 
-    # Reuse an already-downloaded tar (explicit --subs-tar, else root/) before fetching 700 MB into root/.
+    # Reuse an already-downloaded tar (--subs-tar, else root/) before fetching 700 MB.
     candidates = [Path(args.subs_tar)] if getattr(args, "subs_tar", None) else [root / SUBTITLES_TAR]
     tar_path = next((p for p in candidates if p.exists()), None)
     if tar_path is None:
@@ -312,7 +307,7 @@ def stage_subs(args, plan: dict) -> None:
             if not m.isfile(): continue
             parts = m.name.split("/")
             if len(parts) != 3 or parts[0] != "subtitles" or parts[1] not in gaps: continue
-            if not _is_caption_file(parts[2]): continue  # english tracks + ALL original.<lang>.manual (target picks)
+            if not _is_caption_file(parts[2]): continue  # buffer all originals; _pick_caption chooses by target
             f = tar.extractfile(m)
             if f is not None: buf.setdefault(parts[1], {})[parts[2]] = f.read()
 
@@ -332,9 +327,8 @@ def stage_subs(args, plan: dict) -> None:
     for lang, by_vid in source_by_lang.items():
         meta = load_video_meta(root / lang / META_FILENAME)
         for vid, source in by_vid.items():
-            # Ensure the row carries duration_s (gaps are pose-gated, so the .npy exists): a bare
-            # {video_id, caption_source} row has no duration and load_video_meta drops rows without one — which
-            # would silently erase this video's provenance and let an `mt` caption slip past human_only_splits.
+            # Gaps are pose-gated so the .npy exists: give the row a duration_s, because load_video_meta DROPS rows
+            # without one — erasing provenance and letting an `mt` caption slip past human_only_splits.
             _backfill_meta(vid, root / lang, meta)
             meta.setdefault(vid, {"video_id": vid})["caption_source"] = source
         save_video_meta(root / lang / META_FILENAME, meta)

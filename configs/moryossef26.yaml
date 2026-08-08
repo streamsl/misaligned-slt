@@ -21,7 +21,7 @@ checkpoint:
     # (moryossef26.model.load_moryossef_pretrained). Their model is MediaPipe-Holistic 50-kp 3D + normalize_mean_std;
     # ours is DWPose 69-kp 2D — the temporal convs / RoPE encoder / phrase head transfer; frame_cnn.0.fc transfers its
     # 42 HAND columns index-for-index (identical 21-pt topology) and reinits body+face; the sign head is dropped.
-    # NOT zero-shot — train-segmenter fine-tunes. Comment out to train from random.
+    # NOT zero-shot — train-moryossef fine-tunes. Comment out to train from random.
     from_pretrained: checkpoints/moryossef26.safetensors
 wandb:
     enabled: false

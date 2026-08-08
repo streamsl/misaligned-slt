@@ -1,31 +1,16 @@
-"""Metrics — TWO families, by domain and consumer. They are not interchangeable:
+"""Metrics — frame-domain (BIO-head training monitor) and time-domain (final eval).
 
-There is ONE segment metric DEFINITION — `segmentation_prf` (greedy one-to-one tIoU-matched P/R/F1) — used by
-BOTH the training monitor and the final eval. tIoU is scale-invariant, so feeding the SAME segments in frame
-units (monitor) or seconds (eval) scores identically. This does NOT make the monitor and the RQ2 eval equal:
-they score DIFFERENT inputs — the monitor decodes the BIO head's raw (ungated) argmax over sampler dev WINDOWS
-and averages per-window F1 (macro); RQ2 `--stream` scores commit-GATED FSM events over whole VIDEOS against GT
-sentences as corpus precision/recall (micro). So `val_phrase_tiou_f1` (BIO-head quality) and the streaming seg
-F1 (end-to-end, after the commit gate) legitimately differ. The only other segmentation signal is a per-FRAME
-score (different granularity, not redundant).
+`segmentation_prf` (greedy one-to-one tIoU-matched P/R/F1) is THE segment metric for both; tIoU is scale-invariant,
+so frame units and seconds score identically. Numbers differ only because inputs do: monitor = raw (ungated) BIO
+argmax on sampler dev WINDOWS, macro per window (`val_phrase_tiou_f1`); RQ2 `--stream` = commit-GATED FSM events on
+whole VIDEOS vs GT sentences, corpus-micro.
 
-FRAME-DOMAIN entry points (consume BIO logits/labels; the BIO-head TRAINING monitor):
-  bio_frame_metrics          per-frame B/I-vs-O precision/recall/F1/accuracy.
-  moryossef_segment_metrics  per-item `*_frame_f1` (macro O/B/I frame F1) + `*_tiou_f1`/`*_seg_precision`/
-                             `*_seg_recall` from `segmentation_prf` on frame-unit segments (the collapse-proof
-                             monitor; an all-`I`/all-`O` collapse cannot game one-to-one matching). The looser
-                             overlap seg-F1 and frame-IoU flavors were removed (used for no decision).
-  Used by: train/slt.py + train/bio_pretrain.py (the in-system BIO head) and moryossef26/ (the Moryossef segmenter).
-  ONE decode rule is applied to BOTH prediction and gold (default `signing_runs_with_b_splits`): decoding gold
-  B-required while decoding predictions run-based makes headless gold fragments (left-truncated spans, which
-  make_bio_labels deliberately labels as I-runs with no B) structural false positives even for a PERFECT tagger.
-  Decoders: `bio_labels_to_segments` (B-required) and `signing_runs_with_b_splits` (inference rule) — both
-  parameterizations of one core, `_bio_runs`.
+FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metrics; used by train/slt.py,
+train/bio_pretrain.py, moryossef26/. ONE decode rule for BOTH prediction and gold (default
+`signing_runs_with_b_splits`; why there); decoders parameterize `_bio_runs`.
 
-TIME-DOMAIN entry points (consume Segment(start_s, end_s) spans in seconds; the FINAL DVC evaluation + Analysis A):
-  Segment / temporal_iou / match_segments  greedy one-to-one tIoU matching.
-  segmentation_prf                         the SAME P/R/F1 the monitor uses, on seconds spans.
-  Used by: eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
+TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by
+eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
 
 TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT).
 """
@@ -38,7 +23,7 @@ import torch
 
 
 def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "bio") -> dict[str, float]:
-    # Frame-level BIO precision/recall/F1 over signing frames, ignoring UNK.
+    # Frame-level BIO P/R/F1 over signing frames, ignoring UNK.
     pred = logits.argmax(dim=-1)
     valid = labels != BIO["UNK"]
     gold_pos = valid & ((labels == BIO["B"]) | (labels == BIO["I"]))
@@ -58,17 +43,16 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
 
 
 def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) -> list[dict]:
-    """Unified BIO -> [{start,end}] frame-segment decoder. The three public decoders are parameterizations:
+    """Unified BIO -> [{start,end}] frame-segment decoder. Public decoders parameterize it
+    (split_on_b, open_on_i, close_on_unk):
 
-      bio_labels_to_segments     split_on_b=True,  open_on_i=False, close_on_unk=False  (B-required; full-annotation gold)
-      signing_runs_with_b_splits split_on_b=True,  open_on_i=True,  close_on_unk=True   (inference rule; monitor BOTH sides)
-      (decode="likeliest")       split_on_b=False, open_on_i=True,  close_on_unk=True   (pure run, parity ref)
+      bio_labels_to_segments      T F F   B-required; full-annotation gold
+      signing_runs_with_b_splits  T T T   inference rule; monitor BOTH sides
+      decode="likeliest"          F T T   pure run, parity ref
 
-    split_on_b: an interior B closes the open segment and opens a new one (back-to-back sentences with no O gap);
-    when False, B only opens if nothing is open (B behaves like I). open_on_i: an I with nothing open starts a
-    segment (first signing frame after a gap = a sentence start; also a headless left-truncated fragment — which is
-    why the window monitor decodes GOLD with this rule too, see moryossef_segment_metrics). close_on_unk: UNK
-    closes like O (B-required gold keeps UNK non-closing: full-annotation gold has no interior UNK).
+    split_on_b: interior B closes and reopens (back-to-back sentences, no O gap); else B opens only if nothing open.
+    open_on_i: I with nothing open opens (sentence start after a gap; headless left-truncated fragment).
+    close_on_unk: UNK closes like O; B-required gold keeps it non-closing (full annotation has no interior UNK).
     """
     if isinstance(tags, torch.Tensor): tags = tags.detach().cpu().tolist()
     segments: list[dict] = []
@@ -88,23 +72,20 @@ def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) ->
 
 
 def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
-    # GOLD decode (Moryossef metrics.py): B-required. Turns GT BIO labels into reference segments.
+    # GOLD decode (Moryossef metrics.py): B-required.
     return _bio_runs(bio, split_on_b=True, open_on_i=False, close_on_unk=False)
 
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """PREDICTION/inference decode: contiguous signing runs, split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
+    """PREDICTION/inference decode: signing runs split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
 
-    Moryossef's prediction decode (`likeliest_probs_to_segments`) never requires a predicted `B` — a segment is
-    any contiguous B/I run; requiring `B` to OPEN is fatal here (`B` is ~1% of frames, 68% of caption boundaries
-    have no visual pause), so a model that detects signing but never wins argmax with `B` yields zero segments.
-    Opening on the O→signing transition loses nothing (first signing frame after a gap IS a sentence start);
-    interior `B`s are honoured as splits, feeding the Analysis-A over/under-segmentation taxonomy.
+    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, 68% of caption boundaries have no visual pause): 
+    a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
+    doesn't require one either. Interior `B`s split, feeding the Analysis-A over/under-segmentation taxonomy.
     """
     return _bio_runs(tags, split_on_b=True, open_on_i=True, close_on_unk=True)
 
 def _frame_segments_to_seconds(segs: list[dict]) -> list["Segment"]:
-    # Frame-index segments -> Segment objects (end is exclusive: a 1-frame segment spans [start, start+1)).
-    # tIoU is scale-invariant, so matching in frame units gives the SAME number as matching in seconds.
+    # Frame indices -> Segments; end is exclusive (a 1-frame segment spans [start, start+1)).
     return [Segment(float(s["start"]), float(s["end"]) + 1.0) for s in segs]
 
 
@@ -120,9 +101,8 @@ def _macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], B
 
 
 def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_threshold: float = 0.1) -> dict[str, float]:
-    """One-to-one tIoU-matched precision/recall/F1/matches — THE canonical segment metric (RQ2 + the BIO-head
-    monitor via `moryossef_segment_metrics`). Unit-agnostic: pass seconds Segments (eval) or frame-unit Segments
-    (monitor); tIoU is scale-invariant. Nothing predicted AND nothing gold = perfect (nothing to find, none emitted)."""
+    # One-to-one tIoU-matched precision/recall/F1/matches — THE canonical segment metric (RQ2 + BIO-head monitor).
+    # Unit-agnostic (tIoU is scale-invariant): seconds or frame-unit Segments. Nothing predicted AND nothing gold = perfect.
     if not predicted and not gold: return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "matches": 0.0}
     matches = match_segments(predicted, gold, threshold=tiou_threshold)
     tp = len(matches)
@@ -136,27 +116,17 @@ def moryossef_segment_metrics(
     logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase",
     decode: str = "runs_bsplit", tiou_threshold: float = 0.5,
 ) -> dict[str, float]:
-    """Per-item BIO-head training monitor: a per-FRAME score and the ONE segment score used everywhere.
+    """Per-item BIO-head training monitor: one per-FRAME score, one segment score.
 
-    Returns two complementary granularities, nothing redundant:
-    - `{prefix}_frame_f1`: macro F1 over the O/B/I frame classes (frame classification quality).
-    - `{prefix}_tiou_f1` / `_seg_precision` / `_seg_recall`: one-to-one tIoU-matched segment P/R/F1 via the
-      SAME `segmentation_prf` that scores RQ2 (here on frame-unit segments; tIoU is scale-invariant, so this
-      is identical to the seconds-domain number). This is the collapse-proof early-stopping monitor — neither
-      the all-`I` nor all-`O` collapse can game one-to-one matching. The previous overlap-tolerance `seg_f1`
-      and frame-IoU `seg_iou` flavors were looser, collapse-foolable, and used for no decision; removed.
-
-    `decode` picks the segment rule applied to BOTH prediction and gold (`runs_bsplit` = inference decode, default;
-    `bio` = B-required; `likeliest` = raw run). `tiou_threshold` (default 0.5) is the monitor's match threshold.
+    `{prefix}_frame_f1`: macro F1 over O/B/I frame classes.
+    `{prefix}_tiou_f1`/`_seg_precision`/`_seg_recall`: `segmentation_prf` (the RQ2 metric) on frame-unit segments.
+    Collapse-proof for early stopping — an all-`I`/all-`O` collapse can't game one-to-one matching (the looser
+    overlap `seg_f1` / frame-IoU `seg_iou` flavors could; removed).
+    `decode` applies to BOTH sides (`runs_bsplit` = inference, default; `bio` = B-required; `likeliest` = raw run).
     """
-    # ONE decode rule for BOTH sides. Decoding gold with the B-required rule (Moryossef's own gold decode —
-    # faithful, since HIS gold comes from full annotations where every span onset is visible) is a structural bug
-    # under OUR misaligned windows: make_bio_labels deliberately labels a span truncated at the window's left edge
-    # as a HEADLESS I-run (no B — "buffer-start I never opens"), so B-required gold emits NO segment there while a
-    # PERFECT tagger's run decode emits one → a false positive a perfect head cannot avoid (Mode 2b/2c anchors and
-    # leftover neighbour tails in Mode 1/3 windows all score as FPs; precision caps far below 1). Symmetric decode
-    # restores "perfect tagger → 1.0" on every window mode while leaving fully-visible spans unchanged (gold has a
-    # B at each visible onset, so runs_bsplit(gold) == B-required(gold) there).
+    # B-required gold fits Moryossef's full annotations (every onset visible) but breaks on OUR misaligned windows:
+    # make_bio_labels tags a left-truncated span as a HEADLESS I-run, so gold emits NO segment where a PERFECT
+    # tagger's run decode emits one — an unavoidable FP capping precision far below 1. Symmetric decode fixes it.
     if decode == "likeliest": decode_fn = lambda t: _bio_runs(t, split_on_b=False, open_on_i=True, close_on_unk=True)
     elif decode == "bio": decode_fn = bio_labels_to_segments
     else: decode_fn = signing_runs_with_b_splits
@@ -168,14 +138,13 @@ def moryossef_segment_metrics(
         n_valid = int(valid.sum())
         if n_valid == 0: continue
 
-        # Trim TRAILING padding (collators pad with UNK on the right); keep interior UNK (untrusted gaps) in place.
+        # Trim TRAILING padding (collators pad with UNK on the right); keep interior UNK (untrusted gaps).
         last = int(torch.nonzero(valid).max().item()) + 1
         gold_v = gold[:last]
         pred_tags = logits[i, :last].argmax(dim=-1)
         interior_unk = gold_v == BIO["UNK"]
         if bool(interior_unk.any()):
-            # No reliable label inside untrusted gaps: exclude those frames from BOTH sides so `close_on_unk`
-            # splits runs identically for gold and prediction (predictions inside the gap are neither right nor wrong).
+            # No reliable label in untrusted gaps: mask BOTH sides so `close_on_unk` splits runs identically.
             pred_tags = torch.where(interior_unk, torch.full_like(pred_tags, BIO["UNK"]), pred_tags)
         frame_f1s.append(_macro_frame_f1(pred_tags[~interior_unk], gold_v[~interior_unk]))
 
@@ -238,20 +207,19 @@ def _load_evaluate_metric(name: str):
         return None
 
 
-# Full-width CJK punctuation -> ASCII. mT5 decodes Chinese text but emits ASCII '?'/',' for some marks while the
-# references carry full-width '？'/'，' (and '。' etc.), so an un-normalized char-BLEU penalizes a 1-char punctuation
-# mismatch on nearly every sentence. Uni-Sign's eval (fine_tuning.py:285) does exactly this for '，'/'？' on the refs;
-# we normalize BOTH sides over the common marks so the score reflects content, not punctuation encoding.
+# Full-width CJK punctuation -> ASCII. mT5 emits ASCII '?'/',' where refs carry '？'/'，', so un-normalized 
+# char-BLEU penalizes a 1-char mismatch on nearly every sentence. Uni-Sign (fine_tuning.py:285) normalizes 
+# '，'/'？' on refs only; we cover the common marks on BOTH sides.
 _CJK_PUNCT_TABLE = str.maketrans({
     '￥': '$', '％': '%', '＃': '#', '＠': '@', '，': ',', '。': '.', '？': '?', '！': '!', '、': ',', '；': ';', '：': ':',
     '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
     '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
 })
-def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tokenizing metrics such as CIDEr.
+def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizing metrics such as CIDEr.
     out: list[str] = []
     for ch in text:
         is_cjk = "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
-        if is_cjk: # '一' <= ch <= '鿿' or '㐀' <= ch <= '䶿'
+        if is_cjk:
             if out and out[-1] != " ": out.append(" ")
             out.append(ch)
             out.append(" ")
@@ -260,12 +228,10 @@ def _char_split_cjk(text: str) -> str: # Space CJK characters for whitespace-tok
 
 
 def _rouge_l(hyps: list[str], refs: list[str]) -> float:
-    """ROUGE-L f-score (mean over sentences), via the SAME package Uni-Sign reports with — pltrdy `rouge`
-    (`from rouge import Rouge`, `get_scores(...)['rouge-l']['f']`), whitespace-tokenized over the (already
-    char-split for CJK) strings, matching Uni-Sign SLRT_metrics.translation_performance. HF `evaluate`'s
-    "rouge" is Google's rouge_score, whose ROUGE-L F-measure differs (~1 point on CJK) so it is NOT comparable
-    to their 0.55. Empty hyp/ref scores 0 (pltrdy raises on empty — counting them as misses is the honest
-    accounting); rouge_score is the fallback only if pltrdy is not installed."""
+    """ROUGE-L f-score (mean over sentences) via pltrdy `rouge` — Uni-Sign's package (`['rouge-l']['f']`,
+    whitespace-tokenized over the char-split strings), matching SLRT_metrics.translation_performance. HF
+    `evaluate`'s "rouge" is Google's rouge_score, whose ROUGE-L F differs (~1 pt on CJK) and is NOT comparable to
+    their 0.55 — fallback only. Empty hyp/ref scores 0 (pltrdy raises)."""
     try:
         from rouge import Rouge as _PltRouge
         scorer = _PltRouge()
@@ -284,22 +250,19 @@ def _rouge_l(hyps: list[str], refs: list[str]) -> float:
 def compute_text_metrics(
     predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a",
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation"
-) -> dict[str, float]: # Compute translation metrics with optional backends loaded lazily.
+) -> dict[str, float]:
     scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
     if not predictions: return {f"{prefix}_{key}": value for key, value in scores.items()}
-    # Preprocess EXACTLY like Uni-Sign's eval so the numbers are comparable to the paper (fine_tuning.py:284-288 + 
-    # SLRT_metrics.translation_performance): for CJK refs, char-split EVERY character and normalize ONLY the reference's 
-    # full-width comma/question-mark (`，`/`？` -> `,`/`?`), leaving the prediction's punctuation untouched. A full 
-    # punctuation map on BOTH sides is NOT what Uni-Sign does and measurably DEPRESSES ROUGE-L by ~0.03 (LCS sees a 
-    # different sequence). Non-CJK stays word-level. BLEU = sacrebleu '13a' on these strings (their `sableu`); 
-    # ROUGE-L = pltrdy `rouge` (their package, ~1 pt different from HF's rouge_score). BLEURT scores the RAW text.
+    # Preprocess EXACTLY like Uni-Sign's eval (fine_tuning.py:284-288 + SLRT_metrics.translation_performance) for
+    # paper-comparable numbers. A full punctuation map on BOTH sides DEPRESSES ROUGE-L by ~0.03 (LCS sees a
+    # different sequence). BLEURT scores RAW text.
     is_cjk = any(_char_split_cjk(ref) != ref for ref in references)
 
     def _proc(s: str, is_ref: bool) -> str:
         if not is_cjk: return s                                  # word-level for non-CJK (Uni-Sign level='word')
         s = s.replace(" ", "").replace("\n", "")
         if is_ref: s = s.replace("，", ",").replace("？", "?")    # Uni-Sign's asymmetric ref-only normalization
-        return " ".join(list(s))                                 # char-split every character (level='char')
+        return " ".join(list(s))                                 # char-split (Uni-Sign level='char')
 
     pred_proc = [_proc(p, False) for p in predictions]
     ref_proc = [_proc(r, True) for r in references]
@@ -307,8 +270,7 @@ def compute_text_metrics(
 
     bleu = _load_evaluate_metric("sacrebleu")
     if bleu is not None:
-        # sacrebleu '13a' over the char-split strings = Uni-Sign's `sableu(tokenizer='13a')` 
-        # (char-level BLEU for CJK, standard word BLEU for non-CJK).
+        # '13a' over the char-split strings = Uni-Sign's `sableu`: char-level BLEU for CJK, word BLEU otherwise.
         try: scores["bleu4"] = float(bleu.compute(
                 predictions=pred_proc, references=ref_proc_nested, tokenize=sacrebleu_tokenize
             )["score"])

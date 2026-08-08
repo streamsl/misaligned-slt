@@ -166,13 +166,12 @@ def find_best_subtitle(
         ): continue
         score = _subtitle_score(path, preferred_suffixes, reject_suffixes)
         scored.append(((score[0], -char_count, score[2]), path))
-    return min(scored, default=(None, None))[1] if scored else None
+    return min(scored)[1] if scored else None
 
 
 def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, lang_prefix: str | None = None) -> Path | None:
     """`find_best_subtitle` driven by the `subtitles:` config block — the ONE selection rule, shared by the loader
-    (load time; lang_prefix=None, the canonical `<vid>.<target>.vtt` is the only file) and prepare_data (harvesting
-    a video's single caption from its shard tracks, lang_prefix=target so it only considers target-language ones)."""
+    (lang_prefix=None; only the canonical `<vid>.<target>.vtt` exists) and prepare_data (shard tracks, lang_prefix=target)."""
     return find_best_subtitle(
         subtitle_root, video_id,
         preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
@@ -254,8 +253,8 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         return load_pretrimmed_records(data_cfg, language, split=split)
 
     root = Path(lang_cfg["root"])
-    # Per-video fps from the video_meta.csv sidecar (own-extraction poses vary per video; SignVerse poses are a fixed 24 fps).
-    # config pose_fps is fallback-only; with no sidecar every timestamp drifts ~2x and ~44% of captions get dropped by the duration filter.
+    # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
+    # config pose_fps is fallback-only: without the sidecar timestamps drift ~2x and ~44% of captions get dropped.
     video_meta = load_video_meta(root / META_FILENAME)
     pose_cfg = lang_cfg.get("pose", {}) or {}
     fps_fallback = float(pose_cfg.get("fps", 25.0))
@@ -265,7 +264,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
         video_meta=video_meta,
     )
-    if not pose_index: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud, not silently
+    if not pose_index: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
         f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
         f"For SignVerse-2M languages (asf/bfi) run `python prepare_data.py --stage all --languages {language}` "
         f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
@@ -305,11 +304,10 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
-        # `s < duration`: the sentence ONSET must fall within the extracted poses, or it has no visible signing to
-        # anchor a window on. Real SignVerse streams end before their caption timeline (duration = pose_frames/24
-        # underestimates the true video), so late captions can start past the poses; `e <= duration + 1.0` only
-        # bounds the END (right-truncation slack) and does not catch this. A no-op for stream corpora (poses cover
-        # captions exactly). Without it the window sampler builds start_s > end_s windows → load_pose_frames raises.
+        # `s < duration`: the sentence ONSET must land inside the extracted poses, else no visible signing to anchor
+        # on. SignVerse streams end before their caption timeline (duration = pose_frames/24 underestimates the
+        # video), so late captions start past the poses; `e <= duration + 1.0` bounds only the END. Without it the
+        # sampler builds start_s > end_s windows → load_pose_frames raises. No-op for stream corpora.
         dur = pose_index[video_id].duration_s
         spans = tuple(
             SentenceSpan(video_id=video_id, start_s=s, end_s=e, text=t)
@@ -325,18 +323,14 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
 
 
 class StreamingWindowDataset(Dataset):
-    """On-the-fly Stage 2 window dataset.
-
-    `__getitem__` samples from the training distribution rather than indexing a fixed window table. This mirrors the intended 
-    stochastic window sampler while still satisfying PyTorch/HF Trainer's map-style dataset interface.
-    """
+    """On-the-fly Stage 2 window dataset. `__getitem__` samples from the training distribution rather than indexing
+    a fixed window table, keeping the stochastic sampler inside PyTorch/HF Trainer's map-style interface."""
     def __init__(
         self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any],
         steps_per_epoch: int | None = None, include_full_evidence: bool = True, 
         deterministic: bool = False, pose_augment_cfg: dict | None = None,
     ):
-        # `WindowSampler` is imported lazily inside StreamingWindowDataset.__init__ to break the
-        # data.loader <-> train.sampler import cycle (train.sampler needs VideoRecord, defined below, for type hints).
+        # Lazy import breaks the data.loader <-> train.sampler cycle (train.sampler needs VideoRecord for type hints).
         from train.sampler import WindowSampler
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
@@ -345,9 +339,8 @@ class StreamingWindowDataset(Dataset):
         )
         self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
         self.include_full_evidence = bool(include_full_evidence)
-        # Eval loaders set deterministic=True: window `index` then always yields the SAME anchor
-        # under a per-index rng, so the early-stopping monitor scores a fixed dev set every epoch
-        # instead of a fresh random draw (which makes "best epoch" partly a lottery).
+        # Eval loaders set deterministic=True: an index then always yields the SAME anchor under a per-index rng, so early-stopping 
+        # monitor scores a fixed dev set each epoch instead of a fresh draw (else "best epoch" is partly a lottery).
         self.deterministic = bool(deterministic)
         self.seed = int(slt_cfg.get("seed", 42))
 
@@ -355,7 +348,7 @@ class StreamingWindowDataset(Dataset):
         return self.steps_per_epoch
 
     def _sample_item(self, index: int) -> dict:
-        sample = self.sampler.sample(index)   # anchor = anchors[index % N] (index-driven, worker-invariant)
+        sample = self.sampler.sample(index)   # anchor = anchors[index % N]
         item = self.sampler.to_dict(sample)
         if self.include_full_evidence and sample.full_evidence_spec is not None:
             rec = self.records_by_id[sample.full_evidence_spec.video_id]
@@ -365,11 +358,10 @@ class StreamingWindowDataset(Dataset):
         return item
 
     def __getitem__(self, index: int) -> dict:
-        # Anchor is index-driven in both paths (sampler.sample), so every anchor is realized once per epoch.
         if not self.deterministic: return self._sample_item(index)
-        # Dev monitor: fixed windows across epochs — a per-index rng makes mode/jitter reproducible, and fps_aug
-        # is off (a TRAIN augmentation; Moryossef 2026 gates it on split==TRAIN and evaluates at native fps, so
-        # leaving it on scored the monitor on 15–30fps resampled windows the head never deploys under).
+        # Per-index rng makes mode/jitter reproducible. fps_aug off — a TRAIN augmentation (Moryossef 2026 gates it
+        # on split==TRAIN, evaluates at native fps); leaving it on scored the monitor on 15–30fps resampled windows
+        # the head never deploys under.
         rng = np.random.default_rng(self.seed * 100_003 + int(index))
         saved = (self.sampler.rng, self.sampler.fps_aug_enabled)
         self.sampler.rng = rng
@@ -379,12 +371,11 @@ class StreamingWindowDataset(Dataset):
 
 
 def _streaming_worker_init(worker_id: int) -> None:
-    """Reseed each DataLoader worker's WindowSampler so parallel workers don't replay identical mode/jitter streams.
+    """Reseed each worker's WindowSampler so parallel workers don't replay identical mode/jitter streams.
 
     Forked/spawned workers inherit the sampler's Generator state IDENTICALLY (PyTorch's per-worker seeding never
-    touches a Generator stored on the dataset), so without this W workers draw the same per-window random sequence.
-    `info.seed` is unique per worker (torch base_seed + worker_id). The ANCHOR is index-driven (anchors[index % N]),
-    so coverage is exact regardless of workers — this reseed only decorrelates the mode/jitter/fps/pose-aug draws.
+    touches a Generator stored on the dataset); `info.seed` is unique per worker (base_seed + worker_id). Anchors
+    stay index-driven, so coverage is untouched — only mode/jitter/fps/pose-aug draws are decorrelated.
     """
     info = get_worker_info()
     if info is None: return
@@ -396,17 +387,13 @@ def _streaming_worker_init(worker_id: int) -> None:
 def streaming_loader(dataset: StreamingWindowDataset, batch_size: int, collate_fn, num_workers: int = 0) -> DataLoader:
     """The ONE DataLoader constructor for StreamingWindowDataset (both trainers route through here).
 
-    num_workers is a plain throughput knob, safe at any value. The window ANCHOR is a deterministic function of the
-    global sample index (WindowSampler.sample → anchors[index % N]), so every anchor is realized exactly once per
-    epoch no matter how the DataLoader partitions indices across workers — no duplication, no lost coverage. The only
-    thing forked workers would otherwise share is the per-window random stream (mode/jitter/fps/pose-aug); the
-    `_streaming_worker_init` hook reseeds each worker's rng to decorrelate that. Deterministic (dev) datasets seed
-    their rng from the sample index, so they are reproducible and worker-count-invariant either way.
+    num_workers is a plain throughput knob: the ANCHOR is a deterministic function of the global sample index
+    (WindowSampler.sample → anchors[index % N]), so every anchor is realized exactly once per epoch however indices
+    are partitioned — no duplication, no lost coverage. `_streaming_worker_init` decorrelates the per-window random
+    stream forked workers would otherwise share; dev datasets seed from the index and need neither.
     """
     return DataLoader(
         dataset, batch_size=int(batch_size), shuffle=False, num_workers=int(num_workers),
         persistent_workers=num_workers > 0, collate_fn=collate_fn,
         worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
     )
-
-

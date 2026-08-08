@@ -9,8 +9,8 @@ from .preprocessing import normalize_keypoints_unisign
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
-# caption_source: provenance of this video's English caption — human | mt (NLLB machine-translation) | shard
-# (raw bundled YouTube track) | none. Blank for the own-extraction (ase) path, which does not resolve captions here.
+# caption_source: caption provenance — human | mt (NLLB machine-translation) | shard (raw bundled YouTube track)
+# | none. Blank for the own-extraction (ase) path, which does not resolve captions here.
 META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source")
 # Default --format for the metadata fetch. Must match the yt-dlp --format the videos were 
 # downloaded with, so metadata width/height describe the downloaded stream; override per language via 
@@ -25,7 +25,7 @@ class PoseIndex:
     paths: tuple[Path, ...]
     frame_counts: tuple[int, ...]
     fps: float
-    # Pixel frame size (from data.yaml pose.width/height), used only by the train-time spatial augmentations
+    # Pixel frame size (data.yaml pose.width/height), used only by the train-time spatial augmentations
     # (affine / spatial_mask); Uni-Sign normalization is bbox-relative and resolution-independent.
     width: int | None = None
     height: int | None = None
@@ -51,9 +51,8 @@ def base_video_id(path_or_stem: str | Path) -> str:
 def load_video_meta(path: str | Path) -> dict[str, dict]:
     """Read the video_meta.csv sidecar -> {video_id: {duration_s, width, height, caption_source}}.
 
-    CSV columns: video_id, duration_s, width, height, caption_source. width/height may be blank 
-    (yt-dlp can omit them); caption_source (human|mt|shard|none) may be blank; a blank/zero duration 
-    row is skipped (the loader then falls back to config pose_fps).
+    width/height may be blank (yt-dlp can omit them); caption_source (human|mt|shard|none) may be blank; 
+    a blank/zero-duration row is SKIPPED (loader falls back to config pose_fps).
     """
     path = Path(path)
     if not path.exists(): return {}
@@ -96,16 +95,11 @@ def build_pose_index(
 ) -> dict[str, PoseIndex]:
     """Index pose .npy files; fps is resolved PER VIDEO when `video_meta` covers it.
 
-    Per-video fps = total_pose_frames / real_video_duration. The extraction pipeline kept every
-    2nd frame, so effective pose fps is native/2 and the NATIVE rate varies with the source video
-    (measured on Auslan: 12.0/12.5/~15.0, plus a few full-rate 25.0). A single config constant
-    (kept only as fallback) misplaces frame timestamps: the original 25.0 drifted ~2x (BIO labels
-    on the wrong frames — label-motion correlation 0.10 vs 0.26 corrected — and ~44% of captions
-    dropped by the loader duration filter); even a hand-set 12.5 leaves 37.7% of videos with >5%
-    error (median 26s end-of-video misalignment vs ~3s sentences).
-
-    `width`/`height` come from the explicit args (data.yaml pose.width/height) and are used only by the
-    train-time spatial augmentations; Uni-Sign normalization is resolution-independent.
+    Per-video fps = total_pose_frames / real_video_duration. Extraction kept every 2nd frame, so pose fps is
+    native/2 and the NATIVE rate varies per video (Auslan: 12.0/12.5/~15.0, a few full-rate 25.0). A single config
+    constant (fallback only) misplaces timestamps: 25.0 drifted ~2x (BIO labels on the wrong frames — label-motion
+    correlation 0.10 vs 0.26 corrected — and ~44% of captions dropped by the loader duration filter); a hand-set
+    12.5 still leaves 37.7% of videos with >5% error (median 26s end-of-video misalignment vs ~3s sentences).
     """
     pose_root = Path(pose_root)
     grouped: dict[str, list[Path]] = {}
@@ -135,13 +129,11 @@ def fetch_youtube_meta(
 ) -> dict[str, dict]:
     """yt-dlp METADATA-ONLY fetch -> {video_id: {duration_s, width, height}}. No video download.
 
-    Raw videos are never needed (too heavy to keep for large languages, e.g. ase): duration — the only 
-    input the per-video fps calibration needs — comes from YouTube metadata, in WHOLE SECONDS (<=0.5s 
-    error ~ 0.3% fps drift, far below sentence length). width/height resolve via `ytdlp_format`; pass 
-    the SAME --format selector the videos were downloaded with (`python -m poses <lang_root> --format ...`) 
-    so they describe the downloaded stream — note yt-dlp may resolve fewer formats than a browser shows 
-    (JS-runtime/PO-token limits), so treat them as advisory. Removed/private videos are skipped and fall 
-    back to config pose_fps with a loud loader warning.
+    Raw videos are never needed (too heavy for large languages, e.g. ase): duration — the only fps-calibration
+    input — comes from YouTube metadata in WHOLE SECONDS (<=0.5s error ~ 0.3% fps drift, far below sentence
+    length). width/height resolve via `ytdlp_format`; pass the SAME --format the videos were downloaded with, 
+    and treat them as advisory (yt-dlp may resolve fewer formats than a browser: JS-runtime/PO-token limits).
+    Removed/private videos are skipped → config pose_fps fallback with a loud loader warning.
     """
     import subprocess
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -183,10 +175,8 @@ def fetch_youtube_meta(
 def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) -> dict[str, dict]:
     """Build/refresh <lang_root>/video_meta.csv. CLI: `python -m poses <lang_root> [--format SEL]`.
 
-    Existing sidecar rows are kept; yt-dlp metadata is fetched only for pose ids still missing (no video 
-    download — raw videos are never required). A single constant fps CANNOT replace this: poses are extracted 
-    at native/2 and native fps varies per YouTube video — measured on asf, a constant 12.5 leaves 37.7% of 
-    videos with >5% timestamp error (median 26s end-of-video misalignment vs ~3s sentences).
+    Existing sidecar rows are kept; yt-dlp metadata is fetched only for pose ids still missing (no video
+    download). A single constant fps CANNOT replace this — see `build_pose_index` for the measured drift.
     """
     lang_root = Path(lang_root)
     out_path = lang_root / META_FILENAME
@@ -207,8 +197,8 @@ def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) ->
 
 @lru_cache(maxsize=64)
 def _pose_memmap(path_str: str):
-    # ONE read-only memmap handle per pose file, LRU-bounded: re-opening the .npy on every window read dominates
-    # wall-time on network filesystems. Pose files are immutable; each worker process holds its own cache.
+    # ONE read-only memmap per pose file, LRU-bounded: re-opening the .npy per window read dominates wall-time on
+    # network filesystems. Pose files are immutable; each worker process holds its own cache.
     return np.load(path_str, mmap_mode="r")
 
 
@@ -233,10 +223,9 @@ def load_pose_window(
     pose_index: PoseIndex, start_s: float, end_s: float,
     normalize: bool = True, augment=None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Load a real-timeline pose window and relative timestamps. When `normalize`, raw (T,133,3) DWPose is
-    # converted to the Uni-Sign 69-kp representation (poses.normalize_keypoints_unisign). `augment`, when
-    # given (train only), is a callable (raw_poses, width, height) -> raw_poses applied to the RAW pixel
-    # keypoints BEFORE normalization — spatial, length-preserving, so timestamps/BIO stay aligned.
+    # Load a real-timeline pose window + relative timestamps. `normalize` converts raw (T,133,3) DWPose to Uni-Sign 69-kp 
+    # representation (poses.normalize_keypoints_unisign). `augment` (train only) is a callable (raw_poses, width, height) 
+    # -> raw_poses applied to RAW keypoints BEFORE normalization — spatial & length-preserving, so timestamps/BIO stay aligned.
     start_s = max(0.0, float(start_s))
     end_s = min(float(end_s), pose_index.duration_s)
     start_frame = int(np.floor(start_s * pose_index.fps))

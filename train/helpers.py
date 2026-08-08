@@ -14,7 +14,7 @@ from utils import checkpoint_dir, save_best_enabled
 
 
 def move_to_device(value, device: torch.device):
-    # Recursively move tensors in a (possibly nested) batch container onto `device`.
+    # Recursive tensor move for nested batch containers.
     if isinstance(value, torch.Tensor): return value.to(device)
     if isinstance(value, dict): return {k: move_to_device(v, device) for k, v in value.items()}
     if isinstance(value, list): return [move_to_device(v, device) for v in value]
@@ -24,19 +24,18 @@ def move_to_device(value, device: torch.device):
 def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Optimizer:
     """AdamW from a config, reading the SAME keys for every stage.
 
-    Prefers top-level `learning_rate` / `weight_decay` (the slt/bio convention); falls back to nested
-    `optimizer.lr` / `optimizer.weight_decay` so older configs keep working. One place, one convention.
+    Prefers top-level `learning_rate` / `weight_decay`; falls back to `optimizer.lr` / `optimizer.weight_decay`
+    so older configs keep working.
 
-    `backbone_params`: optional second param set trained at `backbone_lr` (default learning_rate × 0.1) —
-    discriminative fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
+    `backbone_params`: optional second param set at `backbone_lr` (default learning_rate × 0.1) — discriminative
+    fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
     """
     opt = cfg.get("optimizer", {}) or {}
     lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
     weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
 
-    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): the reference recipes do the same split
-    # (Uni-Sign via timm create_optimizer filter_bias_and_bn=True; standard HF practice) — decaying norm gains
-    # regularizes the wrong thing. Accepts a generator or a param list.
+    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): decaying norm gains regularizes the wrong
+    # thing. Same split as Uni-Sign (timm create_optimizer filter_bias_and_bn=True) and standard HF practice.
     def wd_split(ps, group_lr):
         ps = [p for p in ps if p.requires_grad]
         return [g for g in ({"params": [p for p in ps if p.ndim > 1], "weight_decay": weight_decay, "lr": group_lr},
@@ -50,7 +49,7 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
 
 @contextmanager
 def eval_mode(model: torch.nn.Module):
-    # `model.eval()` for the block, restoring the prior train/eval state on exit. Shared by every evaluator.
+    # `model.eval()` for the block, restoring the prior mode on exit.
     was_training = model.training
     model.eval()
     try: yield
@@ -61,10 +60,9 @@ def eval_mode(model: torch.nn.Module):
 class AmpHelper:
     """Mixed-precision wrapper shared by all training loops.
 
-    `mixed_precision:` config values: "auto" (default — bf16 when the GPU supports it, else fp16 with loss scaling), "bf16", 
-    "fp16", or "none". CPU always runs fp32. bf16 needs no GradScaler (same exponent range as fp32); fp16 uses one to prevent 
-    gradient underflow. F.cross_entropy / softmax run in fp32 under autocast (PyTorch autocast promote list), so the 1/t-weighted 
-    BD3LM loss and SPD/DCD confidences keep full precision.
+    `mixed_precision:` "auto" (default — bf16 if supported, else fp16), "bf16", "fp16", "none". CPU always fp32. bf16 needs no 
+    GradScaler (same exponent range as fp32); fp16 uses one against gradient underflow. F.cross_entropy / softmax run fp32 under 
+    autocast (PyTorch promote list), so the 1/t-weighted BD3LM loss and SPD/DCD confidences keep full precision.
     """
     def __init__(self, mode: str = "auto", device: torch.device | str = "cpu"):
         device_type = torch.device(device).type
@@ -90,7 +88,7 @@ class AmpHelper:
         else: loss.backward()
 
     def clip_and_step(self, optimizer: torch.optim.Optimizer, parameters, max_grad_norm: float) -> None:
-        # fp16: gradients must be unscaled before clipping or the norm is measured on scaled values.
+        # fp16: unscale before clipping or the norm is measured on scaled values.
         if self.scaler.is_enabled():
             self.scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
@@ -108,8 +106,8 @@ def _fmt_duration(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 def _fmt_metric(value) -> str:
-    # Fixed-shape number for table columns: 3 decimals in the normal range, 3-sig sci at the extremes (tiny LRs, huge sums). 
-    # Within a column the metric magnitude is stable, so the chosen form is consistent down the column → decimal points line up.
+    # Fixed-shape number for table columns: 3 decimals normally, 3-sig sci at the extremes (tiny LRs, huge sums).
+    # Magnitude is stable within a column, so the form stays consistent → decimal points line up.
     try: v = float(value)
     except (TypeError, ValueError): return str(value)
     if v != v: return "nan"  # NaN
@@ -119,7 +117,7 @@ def _fmt_metric(value) -> str:
     return f"{v:.3f}"
 
 
-class TrainLogger: # Unified console + Weights & Biases logger for the training loops.
+class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def __init__(
         self, stage: str, cfg: dict | None = None, epochs: int = 0, 
         steps_per_epoch: int = 0, monitor: str = "val_loss",
@@ -130,7 +128,7 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         cfg = cfg or {}
         wandb_cfg = dict(cfg.get("wandb", {}) or {})
 
-        self.monitor = str(monitor)  # surfaced first among the val columns of the epoch table
+        self.monitor = str(monitor)  # surfaced first among the val columns
         self._global_step = 0
         self._epoch: int | None = None
         self._epoch_t0 = 0.0
@@ -169,11 +167,11 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         try:
             wandb.init(**init_kwargs)
             self._wandb = wandb
-        except Exception as exc:  # noqa: BLE001 - login declined / unavailable → continue without W&B
+        except Exception as exc:
             print(f"{self.stage} | wandb not active ({type(exc).__name__}: {exc}); console table only", flush=True)
             self._wandb = None
             try: wandb.finish()
-            except Exception: pass  # noqa: BLE001
+            except Exception: pass
 
     @staticmethod
     def _numeric(row: dict) -> dict:
@@ -213,14 +211,12 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
 
 
     def epoch_summary(
-        self, epoch: int, train: dict, val: dict | None = None, 
-        is_best: bool = False, saved_path: str | None = None
+        self, epoch: int, train: dict, val: dict | None = None, is_best: bool = False, saved_path: str | None = None
     ) -> None:
         """Record one epoch and append one comma-separated line.
 
-        ALL train/val metrics become columns; epochs without an eval show `-`. `ckpt` records a save event, and `eta` 
-        estimates remaining training time from the mean completed-epoch duration. The best epoch is available from
-        `best.json`, so it is not duplicated in the console/history rows.
+        ALL train/val metrics become columns; non-eval epochs show `-`. `ckpt` records a save; `eta` estimates
+        remaining time from the mean completed-epoch duration. Best epoch lives in `best.json`, not duplicated here.
         """
         took = (time.monotonic() - self._epoch_t0) if (self._epoch == epoch and self._epoch_t0) else None
         train_num, val_num = self._numeric(train or {}), self._numeric(val or {})
@@ -239,8 +235,8 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         row["ckpt"] = "saved" if saved_path else ""
         self._rows.append(row)
 
-        # Console line = readable `key=value` fields (each value self-labelled), same column order and cell
-        # formatting as history.csv. epoch shows progress `n/total`; an empty `ckpt` (no save) is omitted.
+        # Console line = `key=value` fields, same column order and cell formatting as history.csv. 
+        # epoch shows `n/total`; empty `ckpt` omitted.
         fields = []
         for col in self._order_columns(row.keys()):
             if col == "epoch": fields.append(f"epoch={epoch}/{self.epochs}")
@@ -263,10 +259,9 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
         keys = list(keys)
 
         def group(prefix: str) -> list[str]:
-            # ONE sort per group; the tuple key ranks (bare `{prefix}loss`) < (other `*_loss` columns, A–Z) <
-            # (everything else, A–Z). So val reads val_loss, val_bio_loss, val_translation_loss, … mirroring the
-            # train row, instead of scattering the component losses through the alphabetical metrics. Empty group
-            # (train-only or non-eval epoch, no val_* columns) is naturally [].
+            # Tuple key ranks bare `{prefix}loss` < other `*_loss` (A–Z) < the rest (A–Z), so val reads val_loss,
+            # val_bio_loss, val_translation_loss, … mirroring the train row instead of scattering component losses
+            # through the alphabetical metrics.
             return sorted((k for k in keys if k.startswith(prefix)),
                           key=lambda k: (k != f"{prefix}loss", not k.endswith("_loss"), k))
 
@@ -300,11 +295,11 @@ class TrainLogger: # Unified console + Weights & Biases logger for the training 
     def finish(self) -> None:
         if self._progress is not None:
             try: self._progress.close()
-            except Exception: pass  # noqa: BLE001
+            except Exception: pass
             self._progress = None
         if self._wandb is not None and self._wandb.run is not None:
             try: self._wandb.finish()
-            except Exception: pass # noqa: BLE001
+            except Exception: pass
 
 
 def run_epoch_loop(
@@ -317,14 +312,13 @@ def run_epoch_loop(
 ) -> list[dict[str, float]]:
     """The one training loop every trainer shares (slt / bio_s1).
 
-    Owns the whole skeleton — scheduler, AMP, best-checkpoint selection, early stop, logging, restore —
-    so a stage only supplies what genuinely differs:
-      step_fn(batch, epoch)  -> (loss_tensor, scalar_log_dict). Runs under this loop's amp.autocast; the
-                                loop does zero_grad / backward / grad-clip(model.parameters()) / step.
-      evaluate_fn(epoch)     -> dev metrics dict (called only on control.should_eval epochs), or None.
+    Owns scheduler, AMP, best-checkpoint selection, early stop, logging, restore; a stage supplies only:
+      step_fn(batch, epoch)  -> (loss_tensor, scalar_log_dict), run under this loop's amp.autocast; the loop does
+                                zero_grad / backward / grad-clip(model.parameters()) / step.
+      evaluate_fn(epoch)     -> dev metrics dict (only on control.should_eval epochs), or None.
 
-    Grad clipping is over model.parameters() for all stages: frozen params carry no grad, so clipping a
-    superset that includes them is identical to clipping only the trainable subset.
+    Grad clipping covers model.parameters() everywhere: frozen params carry no grad, so clipping the superset is
+    identical to clipping the trainable subset.
     """
     model.to(device)
     model.train()
@@ -393,19 +387,19 @@ class TrainControl:
     best_state: dict[str, torch.Tensor] | None = None
     bad_epochs: int = 0
     stopped_early: bool = False
-    # Save-on-best: when set, `update()` calls this with the model the moment a new best monitor value is found and writes a 
-    # best.json sidecar — so a crash/preemption (Colab) never loses the best weights. The end-of-training save in train.py 
-    # still runs (after restore_best it rewrites the same state). Wire via `attach_save_best`.
+    # Save-on-best: `update()` calls this the moment a new best monitor value appears and writes a best.json
+    # sidecar, so a crash/preemption (Colab) never loses the best weights. train.py's end-of-training save still
+    # runs (after restore_best it rewrites the same state). Wire via `attach_save_best`.
     name: str = "train"
     save_fn: Callable[[torch.nn.Module], Path | None] | None = None
-    last_saved_path: str | None = None  # Set on the epoch a new best is saved (for the logger to report)
+    last_saved_path: str | None = None  # Set on the epoch a new best is saved (for the logger)
     _warned_missing_monitor: bool = False
 
     @classmethod
     def from_config(cls, cfg: dict, default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min") -> "TrainControl":
-        # Two separated concerns:
-        #   checkpoint: monitor / mode / restore_best  -> best-model SELECTION (always active when a dev set exists)
-        #   early_stopping: enabled / patience / min_delta -> TERMINATION only (opt-in; removing the block disables it)
+        # Separate concerns:
+        #   checkpoint: monitor / mode / restore_best      -> best-model SELECTION (active whenever a dev set exists)
+        #   early_stopping: enabled / patience / min_delta -> TERMINATION only (opt-in; drop the block to disable)
         validation = cfg.get("validation", {})
         ckpt = cfg.get("checkpoint", {})
         early = cfg.get("early_stopping", {})
@@ -430,9 +424,8 @@ class TrainControl:
 
     def update(self, model: torch.nn.Module, metrics: dict[str, float], epoch: int) -> bool:
         if self.monitor not in metrics:
-            # Loudly surface a monitor/metric-key mismatch once. This was previously silent: a wrong
-            # monitor name (e.g. segmenter "val_phrase_f1" when eval emits "val_phrase_tiou_f1") left
-            # best_epoch=0 and never saved a best checkpoint, with no warning.
+            # Surface a monitor/metric-key mismatch once: a wrong monitor name (e.g. "val_phrase_f1" when eval
+            # emits "val_phrase_tiou_f1") silently left best_epoch=0 and never saved a best checkpoint.
             if not self._warned_missing_monitor:
                 self._warned_missing_monitor = True
                 available = ", ".join(sorted(metrics)) or "(no metrics returned)"
@@ -475,14 +468,12 @@ class TrainControl:
 
 
 def attach_save_best(
-    control: TrainControl, cfg: dict, name: str,
-    saver: Callable[[torch.nn.Module, str | Path], Path],
+    control: TrainControl, cfg: dict, name: str, saver: Callable[[torch.nn.Module, str | Path], Path],
 ) -> TrainControl:
-    """Wire save-on-best into a TrainControl from the consolidated `checkpoint:` block.
+    """Wire save-on-best into a TrainControl from the `checkpoint:` block.
 
-    `checkpoint.dir` is where the best checkpoint and `best.json`
-    land; `checkpoint.save_best: false` disables mid-training saves (end-of-training save only).
-    `saver(model, dir)` performs the stage-appropriate write (full model vs visual backbone).
+    `checkpoint.dir`: where the best checkpoint and `best.json` land. `save_best: false` disables mid-training
+    saves. `saver(model, dir)` does the stage-appropriate write (full model vs visual backbone).
     """
     control.name = str(name)
     ckpt_dir = checkpoint_dir(cfg)
@@ -529,9 +520,8 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
 
     if sched_type in {"cosine", "cosine_annealing"}:
         # Optional linear warmup (scheduler.warmup_epochs, fractional ok): every A2D/OPUT reference warms up when
-        # retraining a pretrained model (dllm 0.1 of steps, DMax 0.03) — full LR from step one on a converged
-        # checkpoint knocks it out of its basin before any signal accumulates. Stepped per-STEP so warmup and the
-        # cosine tail are smooth within epochs (a per-epoch step over a short horizon is a staircase).
+        # retraining a pretrained model (dllm 0.1 of steps, DMax 0.03) — full LR from step one knocks a converged
+        # checkpoint out of its basin. Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
         warmup_epochs = float(sched_cfg.get("warmup_epochs", 0.0))
         warmup_steps = int(round(warmup_epochs * max(1, int(steps_per_epoch))))
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(

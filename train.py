@@ -75,9 +75,8 @@ if __name__ == "__main__":
         path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"))
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-moryossef":
-        # The faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade (spec §4.6; independent of the
-        # FSM head — raw keypoints + UNet, a different input space). Trained standalone on whole-video chunks →
-        # checkpoints/moryossef (never the FSM's bio_head_init).
+        # Faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade: raw keypoints + UNet, a different input space 
+        # from the FSM head. Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
         from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
         train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.moryossef_config, language=args.language)
         model = build_segmenter(args.moryossef_config)
@@ -88,7 +87,7 @@ if __name__ == "__main__":
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs
-        # language override (--language) re-points ${language} in checkpoint.dir for both training and the save below.
+        # --language re-points ${language} in checkpoint.dir for training and the save below.
         slt_cfg = load_yaml(args.slt_config, language=args.language)
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         components = build_slt_components(
@@ -96,7 +95,7 @@ if __name__ == "__main__":
             decoder=args.decoder, include_dev=True, language=args.language,
         )
         device = pick_device(args.device)
-        # Skip a frozen backbone; build_optimizer reads learning_rate/weight_decay (same keys every stage)
+        # Skip frozen params; build_optimizer reads learning_rate/weight_decay (same keys every stage)
         optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
         logs = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs,

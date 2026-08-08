@@ -1,10 +1,9 @@
-"""Faithful Moryossef 2026 analysis segmenter (spec §4.6): the INDEPENDENT instrument for Analysis A (§8.1),
-Analysis B's realistic operating point (§8.2), and the RQ2 cascaded baseline (§9.2).
+"""Faithful Moryossef 2026 analysis segmenter: the INDEPENDENT instrument for Analysis A, 
+Analysis B's realistic operating point, and the RQ2 cascaded baseline.
 
-It reads RAW pose keypoints (+ velocity) through a UNet CNN → RoPE Transformer → phrase BIO head — a DIFFERENT
-input space from the in-system head's Uni-Sign features (docs/membership_gate.md §1.4), which is what makes
-Analysis A's calibration non-circular. Trained standalone on whole-video chunks (SegmenterChunkDataset), never the
-FSM head's bio_head_init. Reuses the shared training infra (run_epoch_loop); the whole model trains end-to-end.
+Raw keypoints (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: a different input space from the
+in-system head's Uni-Sign features (docs/membership_gate.md §1.4), which makes Analysis A's calibration
+non-circular. Standalone on whole-video chunks, never the FSM head's bio_head_init.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -25,7 +24,7 @@ from utils import load_yaml
 def build_segmenter_loaders(data_config: str, moryossef_config: str, language: str | None = None) -> tuple[DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(moryossef_config)
-    # CLI --language > config's own language: > active_languages; reload so ${language} in checkpoint.dir re-points.
+    # CLI --language > config language > active_languages; reload so ${language} in checkpoint.dir re-points.
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
     if language != cfg.get("language"): cfg = load_yaml(moryossef_config, language=language)
     aug_cfg = cfg.get("augmentation", {}) or {}

@@ -4,18 +4,17 @@ import torch
 
 
 def frame_mask_for(n_frames: int, visual_padding: str = "none") -> torch.Tensor:
-    """All-True per-frame mask for an unpadded window. Uni-Sign uses raw windows ('none'); padding is added at
-    batch level and masked via this frame_mask (no boundary halos). The single source of the padding contract —
-    shared by collate_windows and eval._prep_window."""
-    if visual_padding in {"none", "zero"}: return torch.ones(int(n_frames), dtype=torch.bool)
+    """All-True per-frame mask for an unpadded window. Uni-Sign uses raw windows ('none') and has no 
+    zero-pad mode at all (datasets.py collate_fn repeats the last frame + masks by true length)."""
+    if visual_padding == "none": return torch.ones(int(n_frames), dtype=torch.bool)
     raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
 
 
 def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
-    """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn),
-    not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero-pad frames would leak into the last
-    real frames' features before the LM attention mask drops the pads — making a row's features depend on its
-    batchmates' lengths. Repeating the last frame keeps the receptive-field edge benign and batch-invariant."""
+    """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn), 
+    not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero pads leak into the last real frames' 
+    features before the LM attention mask drops them, making a row depend on its batchmates' lengths. Repeating keeps 
+    the receptive-field edge batch-invariant."""
     if pad <= 0: return poses
     if poses.shape[0]: return torch.cat([poses, poses[-1:].expand(pad, *poses.shape[1:])])
     return torch.nn.functional.pad(poses, (0,) * (2 * (poses.ndim - 1)) + (0, pad))

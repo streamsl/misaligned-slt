@@ -1,11 +1,12 @@
 '''DMax extension to the BD3LM substrate: OPUT training + SPD/DCD inference + the confidence-bound surrogates.
 
-`OPUTBlockDiffusionDecoder` adds DMax's three mechanisms on top of `block_diffusion.BlockDiffusionDecoder`,
-all over a precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, so the concrete
-mBART / mT5 bindings (models/unisign.py) supply only the backbone decode.
+`OPUTBlockDiffusionDecoder` adds DMax's 3 mechanisms on top of `block_diffusion.BlockDiffusionDecoder`, over a
+precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, so the mBART / mT5 bindings
+(models/unisign.py) supply only the backbone decode.
 
-  - `oput_forward`   — OPUT two-pass training (mask + on-policy argmax corruption), trains self-correction.
-  - `decode_spd_dcd` / `generate_spd_dcd` — SPD (renormalized soft state) + DCD (sliding-window commits).
+  - `oput_forward`   — OPUT two-pass training (mask + on-policy argmax corruption); trains self-correction.
+  - `decode_spd_dcd` / `generate_spd_dcd` — SPD (renormalized soft state across denoising steps) + DCD (sliding
+    window choosing which masked slots to commit vs defer).
   - `remasked_logits` — grad-bearing surrogate for the confidence-bound term.
 
 References: DMax OPUT + SPD/DCD (train_llada2_bd_oput.py); dLLM A2D (arXiv 2602.22661).
@@ -52,23 +53,19 @@ def oput_two_pass_loss(
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
-    `decode_fn` must close over a fixed, complete conditioning tensor. It is called twice: first on masked
-    target tokens (L_mask), then on an on-policy target corruption derived from the rollout pass (L_pred). Both passes
-    supervise recovery of `clean_ids` over all valid positions (DMax §3.1; the OPUT SFT transform leaves the loss
-    un-restricted to masked positions — see the commented `labels[~loss_mask] = -100` in DMax dFactory/.../data_transform.py).
+    `decode_fn` must close over fixed, complete conditioning. Called twice: on masked target tokens (L_mask), then on
+    an on-policy corruption from the rollout pass (L_pred). Both supervise recovery of `clean_ids` over all valid
+    positions (DMax §3.1; the OPUT SFT transform leaves the loss un-restricted to masked positions — see the
+    commented `labels[~loss_mask] = -100` in DMax dFactory/.../data_transform.py).
 
-    On-policy rollout uses argmax by default. DMax's training loop (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`)
-    corrupts with the greedy token, i.e. exactly what SPD commits at temperature 0 — so the model is trained to self-correct
-    the same errors it will make at inference. `sample_rollout=True` keeps the sampled variant available as an ablation.
+    Rollout is argmax by default (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`) — exactly what SPD
+    commits at temperature 0, so the model self-corrects the errors it will actually make. `sample_rollout=True` is
+    the sampled ablation. DMax rolls out under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450-472):
+    dropout OFF, matching inference. Pass `rollout_decode_fn` to re-run the whole conditioning+decode path in eval;
+    without it the rollout reuses the masked-pass logits.
 
-    Rollout fidelity: DMax computes the rollout under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450-472), i.e.
-    with dropout OFF — the corruption is sampled from the same distribution inference will see. For a conditional encoder-decoder,
-    pass `rollout_decode_fn` (a closure that re-runs the whole conditioning+decode path in eval mode); without it the rollout
-    reuses the masked-pass logits.
-
-    Note: unlike DMax (which gates mask-vs-pred per example via a `flag` and runs one grad pass), this sums L_mask + L_pred 
-    each step. In expectation the two are equivalent up to a scale absorbed by the LR; summing trades 2x decoder forward cost 
-    for lower gradient variance, acceptable at this model scale.
+    Unlike DMax (per-example mask-vs-pred `flag`, one grad pass), this sums L_mask + L_pred: equivalent in
+    expectation up to a scale the LR absorbs, trading 2x decoder cost for lower gradient variance.
     """
     valid_mask = valid_mask.bool()
     t = sample_mask_ratio(clean_ids.shape, clean_ids.device, t_low=t_low, t_high=t_high)
@@ -102,22 +99,15 @@ def oput_two_pass_loss(
 class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     '''BD3LM decoder with DMax's OPUT training and SPD+DCD inference, over fixed encoder conditioning.
 
-    Still abstract on `_decode`; the concrete `MBart`/`MT5` bindings supply it. DCD prefix KV-cache is shared here and only its 
-    `_decode_with_decoder_forward` hook is backbone-specific (MBartDecoder vs T5Stack). BOTH backbones implement that hook and 
-    are verified cached == no-cache at a block boundary (Δ<1e-4, `test_prefix_cache_matches_no_cache`): mT5's T5Stack is 
-    cache_position-aware, and mBART uses `MBartScaledWordEmbedding` so the cached path scales token embeddings identically to 
-    `_decode` (an earlier plain embedding made them disagree — the Δ≈0.5 cache bug, now fixed). `cache_type='none'` is the exact 
+    Still abstract on `_decode`; the `MBart`/`MT5` bindings supply it. The DCD prefix KV-cache is shared here; only
+    `_decode_with_decoder_forward` is backbone-specific (MBartDecoder vs T5Stack). Both backbones implement it and
+    are verified cached == no-cache at a block boundary (Δ<1e-4, `test_prefix_cache_matches_no_cache`): mT5's T5Stack
+    is cache_position-aware, and mBART's `MBartScaledWordEmbedding` makes the cached path scale token embeddings
+    identically to `_decode` (a plain embedding caused the Δ≈0.5 cache bug, now fixed). `cache_type='none'` is the
     default everywhere; `cache_type='prefix'` + `window_type='static'` turns the cache on.
 
-    Extend BD3LM substrate (`block_diffusion.BlockDiffusionDecoder`) with 3 DMax/DCD mechanisms:
-    - `oput_forward`: **OPUT** training (`oput_two_pass_loss`): mask the target, and additionally re-decode an on-policy 
-      (argmax) corruption, supervising recovery of the clean target over all positions. Trains self-correction.
-    - `decode_spd_dcd` / `generate_spd_dcd` — **SPD+DCD** inference: SPD carries a renormalized soft mask/token embedding 
-      state across denoising steps; DCD's sliding window selects which masked slots to commit vs defer. Cold-start per
-      call — no state crosses streaming strides.
-    - `remasked_logits`: cheap grad-bearing forward used by the confidence-bound term instead of backprop via full decode.
-
-    `[xt|x0]` BD3LM concatenation and block-diff mask match DMax's own block-diff training loop (`train_llada2_bd_oput.py`).
+    SPD/DCD decoding is cold-start per call — no state crosses streaming strides. `[xt|x0]` concatenation and the
+    block-diff mask match DMax's own training loop (`train_llada2_bd_oput.py`).
     '''
     def oput_forward(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
@@ -129,22 +119,19 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
-        The gradient-bearing L_mask/L_pred passes score `[noisy | x0]` against `enc_hidden`. The on-policy rollout
-        corruption is sampled with dropout OFF (DMax eval-mode rollout): if `rollout_encode_fn` is given the whole
-        conditioning path is re-encoded in eval (full fidelity); otherwise only the decoder is toggled to eval over
-        the same `enc_hidden` (decoder-side fidelity).
+        The rollout corruption is sampled with dropout OFF: `rollout_encode_fn` re-encodes the whole conditioning
+        path in eval; otherwise only the decoder is toggled to eval over the same `enc_hidden`.
 
-        `omega_bias` (membership gate, models.membership_gate) is part of the FIXED conditioning: identical across
-        both OPUT passes AND the rollout (it depends only on the BIO posteriors / encoder features, not the target
-        tokens). OPUT corrupts the *target*; Ω conditions the *input* — so it belongs on every decode here, and its
-        gradient (into the BIO logits) flows through the two grad-bearing passes, not the no-grad rollout.
+        `omega_bias` (models.membership_gate) is FIXED conditioning: identical across both OPUT passes AND the
+        rollout, since it depends on the BIO posteriors / encoder features, not the target tokens. OPUT corrupts the
+        *target*, Ω conditions the *input*, so Ω rides every decode here; its gradient into the BIO logits flows
+        through the grad-bearing passes only.
         '''
         x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids, eos_supervision=eos_supervision)
         rollout_decode_fn = None
         if rollout_encode_fn is not None:
             def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
-                # Eval mode for the decoder too (caller's rollout_encode_fn handles the encoder), so the whole
-                # conditioning+decode path runs dropout-off — DMax's eval-mode rollout.
+                # Decoder in eval too (caller's rollout_encode_fn covers the encoder): whole path dropout-off.
                 was_training = self.training
                 self.eval()
                 try:
@@ -152,17 +139,15 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
                     return self._bd3lm_logits(noisy_ids, x0, r_enc, r_mask, omega_bias=omega_bias)
                 finally: self.train(was_training)
         elif rollout_eval_mode:
-            # DMax OPUT samples the on-policy corruption under model.eval() + no_grad. For this conditional AR port,
-            # that means re-running the conditioning path as well as the decoder with dropout off; the gradient-bearing
-            # L_mask/L_pred passes below still share the same train-mode `enc_hidden`, so their conditioning remains fixed.
+            # Decoder-only eval rollout: L_mask/L_pred below still share the train-mode `enc_hidden`, 
+            # so their conditioning stays fixed.
             def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
                 was_training = self.training
                 self.eval()
                 try: return self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias)
                 finally: self.train(was_training)
 
-        # "conditioning c is held fixed and complete across both forward passes... must be enforced as an assertion 
-        # in code". The closures above share this one enc_hidden; `_version` catches any in-place mutation.
+        # Conditioning c must be fixed and complete across both passes; `_version` catches in-place mutation.
         enc_version = enc_hidden._version
         out = oput_two_pass_loss(
             clean_ids=x0, valid_mask=valid,
@@ -184,12 +169,11 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     ) -> torch.Tensor:
         '''Grad-bearing forward on a committed sequence with the gated slots re-masked (confidence-bound surrogate).
 
-        The on-policy gradient surrogate for confidence-bound term: gated slots (confident-disagreement under the no-grad 
-        truncated decode) are replaced by `[MASK]` while every other committed token stays in context, then 1 block-causal 
-        forward yields each gated slot's live conditional belief — exactly the distribution DCD would read had it deferred 
-        those slots. This is strictly closer to the decode's commit-time distribution than an all-`[MASK]` marginal (which 
-        corresponds to t = 1 corruption that OPUT's t ∈ [t_low, t_high] training never visits), and still costs 1 forward 
-        instead of back-prop through the ~128-step decode. No reference text enters the input, so P1 is preserved.
+        Gated slots (confident-disagreement under the no-grad truncated decode) become `[MASK]`, every other committed
+        token stays in context; one block-causal forward gives each gated slot's live conditional belief — what DCD
+        would read had it deferred them. Closer to commit-time than an all-`[MASK]` marginal (t = 1, outside OPUT's
+        t ∈ [t_low, t_high]), and costs 1 forward, not back-prop through the ~128-step decode. No reference text
+        enters the input, so P1 is preserved.
         '''
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
         remask[:, 0] = False  # BOS fixed
@@ -198,25 +182,22 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
 
     # ── DCD prefix KV-cache (backbone-agnostic; block-boundary exact) ─────────
-    # The cache logic is shared; only `_decode_with_decoder_forward` (the native KV-cache-capable HF decoder.forward)
-    # differs per backbone (MBartDecoder vs T5Stack), so each concrete decoder implements ONLY that hook.
     def _decode_with_decoder_forward(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
         past_key_values=None, use_cache=False, cache_position=None,
     ):
-        '''Backbone hook: run the native HF decoder.forward (KV-cache capable) with a 4D self-attention mask; return
-        (logits, past_key_values). A backbone that does not implement this disables the prefix cache.'''
+        # Backbone hook: run the native HF decoder.forward (KV-cache capable) with a 4D self-attention mask; 
+        # return (logits, past_key_values). A backbone that does not implement this disables the prefix cache.
         raise NotImplementedError(f"{type(self).__name__} has no cache-capable decoder.forward; use cache_type='none'.")
 
     def _decoder_stack(self) -> torch.nn.Module:
-        '''Backbone hook: the bare HF decoder stack (T5Stack / MBartDecoder) whose native forward
-        `_decode_with_decoder_forward` runs — the module the Ω cross-attention injector hooks into.'''
+        # Backbone hook: the HF decoder stack (T5Stack / MBartDecoder) `_decode_with_decoder_forward` runs — 
+        # also the module the Ω cross-attention injector hooks into.
         raise NotImplementedError(f"{type(self).__name__} exposes no decoder stack; the gated prefix cache is unavailable.")
 
     def _omega_injector(self):
-        # Lazy CrossAttnOmegaInjector over the native decoder stack, shared by every gated cached decode. The
-        # pre-hooks are inert (identity) outside `with_omega`, so the custom `_decode` path — which adds Ω itself —
-        # is untouched; the tight with_omega scoping in the cache fn is what prevents double application.
+        # Lazy CrossAttnOmegaInjector, shared by every gated cached decode. Pre-hooks are inert outside `with_omega`,
+        # so the custom `_decode` path (which adds Ω itself) is untouched; tight scoping avoids double application.
         inj = getattr(self, "_omega_injector_obj", None)
         if inj is None:
             from models.membership_gate import CrossAttnOmegaInjector
@@ -226,8 +207,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
 
     def _prefix_static_window_mask(self, batch_size, prefix_len, window_len, dtype, device):
-        # All-attend window mask: a window inside one block (after a block-boundary prefix) sees the full committed
-        # prefix + its own block bidirectionally — exactly the block-causal view at that point.
+        # All-attend mask: inside one block, after a block-boundary prefix, this IS the block-causal view.
         mask = torch.zeros((window_len, prefix_len + window_len), dtype=dtype, device=device)
         return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, window_len, prefix_len + window_len)
 
@@ -243,23 +223,21 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     ):
         '''A DCD `logits_fn(ids, soft_embeds, window)` that caches the committed prefix's K/V and forwards only the
         active window against it. Exact ONLY when (a) the prefix ends on a block boundary, (b) the window lies inside
-        one block, AND (c) the window reaches that block's end (BD3LM is bidirectional within a block, so a prefix or
-        window that stops mid-block lacks K/V the full forward exposes) — all three checked, falling back to the exact
-        full `_decode` otherwise (mirrors DCD window_causal_decode). The final partial block (window ends at the
-        sequence end) is exact too: no keys exist past the sequence in either path.
+        one block, AND (c) the window reaches that block's end — BD3LM is bidirectional within a block, so a prefix or
+        window stopping mid-block lacks K/V the full forward exposes. All three are checked, falling back to the exact
+        full `_decode` otherwise (mirrors DCD window_causal_decode). A final partial block (window at the sequence
+        end) is exact too: no keys exist past the sequence in either path.
 
-        Ω-compatible: `omega_bias` biases cross-attention SCORES only, so cached K/V (projections of enc_hidden and
-        of prefix hiddens) are reusable as-is; the bias rides the native forward via CrossAttnOmegaInjector — the
-        same KV-cache-safe mechanism the AR arm uses. Both the prefix build AND the window pass run under Ω (prefix
-        hidden states depend on Ω through their own cross-attention), matching the gated no-cache `_decode` exactly.'''
+        Ω-compatible: `omega_bias` biases cross-attn SCORES only, so cached K/V are reusable as-is; it rides the native 
+        forward via CrossAttnOmegaInjector, the KV-cache-safe mechanism the AR arm uses. Prefix build AND window pass 
+        both run under Ω (prefix hiddens depend on Ω via their own cross-attention), matching the gated no-cache `_decode`.'''
         state: dict[str, object] = {"prefix_len": None, "prefix_tokens": None, "past": None}
         injector = self._omega_injector() if omega_bias is not None else None
 
         def _native_forward(**kw):
-            # Tight with_omega scope: hooks bias ONLY this native forward. Fallback `_decode` calls below run
-            # outside it and receive omega_bias explicitly (the custom path adds Ω itself — no double application).
+            # Fallback `_decode` calls run outside it and take omega_bias explicitly.
             if injector is None: return self._decode_with_decoder_forward(**kw)
-            with injector.with_omega(omega_bias):
+            with injector.with_omega(omega_bias): # Tight with_omega scope: hooks bias ONLY this native forward. 
                 return self._decode_with_decoder_forward(**kw)
 
         def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None, window: tuple[int, int] | None = None) -> torch.Tensor:
@@ -267,10 +245,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             left, right = int(window[0]), int(window[1])
             if left <= 0: return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
             if left % self.block_size != 0:
-                # BD3LM is bidirectional within each block. If the cached prefix ends inside a block,
-                # those prefix K/V states were computed w/o later same-block tokens that the exact full
-                # forward would expose. Prefix cache is exact only at block boundaries; otherwise fall back.
-                # Ref: DCD window_causal_decode block-local cache split + DMax/dLLM BD3LM block-causal mask.
+                # (a) A prefix ending inside a block has K/V computed without the later same-block tokens the full
+                # forward exposes. Ref: DCD window_causal_decode block-local cache split.
                 return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
 
             prefix_tokens = ids[:, :left].detach()
@@ -294,16 +270,12 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
                 state["past"] = past
 
             if left // self.block_size != (right - 1) // self.block_size:
-                # The all-attend window mask below is only valid when the window lies inside one attention block
-                # (bidirectional within block, full view of the committed prefix). A spanning window would let an
-                # earlier block attend into a later one — fall back to the exact full block-causal forward instead.
+                # (b) A window spanning blocks would let an earlier block attend into a later one.
                 return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
 
             if right % self.block_size != 0 and right != ids.shape[1]:
-                # ...and the window must reach its block's END. BD3LM attends bidirectionally to the WHOLE block, but
-                # the cached window pass exposes keys only up to `right`; a partial window (right < block_end) omits
-                # the [right, block_end) keys the no-cache forward includes, so the two diverge. Exact iff right is a
-                # block boundary OR the sequence end (no keys exist past it in either path). Otherwise fall back.
+                # (c) The cached pass exposes keys only up to `right`, so a window short of its block's end omits the
+                # [right, block_end) keys the no-cache forward includes. Exact iff `right` is a boundary or seq end.
                 return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
 
             window_ids = ids[:, left:right]
@@ -329,24 +301,20 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
         decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
-        top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16,
-        omega_bias: torch.Tensor | None = None,
+        top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16, omega_bias: torch.Tensor | None = None,
     ) -> SPDDecodeResult:
         batch = enc_hidden.shape[0]
-        token_ids = torch.full(
-            (batch, int(max_length)), int(self.mask_token_id),
-            dtype=torch.long, device=enc_hidden.device
-        )
+        token_ids = torch.full((batch, int(max_length)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)
         token_ids[:, 0] = int(self.bos_index)
 
         if cache_type == "prefix" and window_type == "static":
-            # Ω-compatible: the gate bias rides the cached native forward via CrossAttnOmegaInjector (score-time bias;
-            # cached K/V are Ω-independent) — same conditioning as the no-cache `_decode`, verified numerically.
+            # Ω rides the cached native forward via CrossAttnOmegaInjector (score-time bias; cached K/V are
+            # Ω-independent) — same conditioning as the no-cache `_decode`, verified numerically.
             logits_fn = self._make_static_prefix_cache_logits_fn(enc_hidden, enc_mask, omega_bias=omega_bias)
         elif cache_type == "none":
             def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None) -> torch.Tensor:
-                # inputs_embeds=None -> _decode embeds `ids` itself; otherwise it uses the SPD soft-embedding mixture.
-                # omega_bias is fixed conditioning: identical across every denoising step of this single decode.
+                # inputs_embeds=None -> _decode embeds `ids` itself; else it uses the SPD soft-embedding mixture.
+                # omega_bias is fixed conditioning: identical across every denoising step of this decode.
                 return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
         else: raise NotImplementedError(
             "Only cache_type='none' or cache_type='prefix'+window_type='static' are implemented (both verified "
@@ -360,8 +328,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             window_length=window_length or self.block_size, max_window_length=max_window_length,
             window_type=window_type, decode_algo=decode_algo, decode_param=decode_param,
             sample_top_k=sample_top_k, top_p=top_p, cache_type=cache_type, refresh_count=refresh_count,
-            # This decoder is block-causal, so the DCD window must not span attention blocks (see spd_dcd_decode docstring).
-            block_size=self.block_size,
+            block_size=self.block_size # Block-causal decoder: DCD window must not span attention blocks (see spd_dcd_decode).
         )
 
 

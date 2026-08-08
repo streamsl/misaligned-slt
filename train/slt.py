@@ -26,9 +26,8 @@ class SLTComponents:
     dev_loader: DataLoader | None
 
 def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> None:
-    """The membership gate's δ and Λ_min are trained here and DEPLOYED from inference.yaml — they must be the
-    SAME geometry, or the gate the decoder learned differs from the one the FSM runs. The two configs have no
-    inheritance link, so nothing else enforces it; check at load (only when the gate is on)."""
+    """Gate δ/Λ_min train here but deploy from inference.yaml, and nothing links 2 configs — 
+    mismatched geometry silently gives the decoder a different gate than the FSM runs."""
     gate = slt_cfg.get("membership_gate", {})
     if not gate.get("enabled", False): return
     pairs = [
@@ -40,7 +39,7 @@ def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> No
     for s_key, s_val, i_key, i_val in pairs:
         if s_val != i_val: raise ValueError(
             f"Membership-gate geometry mismatch: slt config {s_key}={s_val} but inference.yaml {i_key}={i_val}. "
-            f"The gate trains and deploys under the SAME δ/Λ_min — reconcile the two configs.")
+            f"The gate trains and deploys under the SAME δ/Λ_min — reconcile 2 configs.")
 
 def _optional_int(value) -> int | None:
     return None if value is None else int(value)
@@ -49,25 +48,21 @@ def _optional_float(value) -> float | None:
     return None if value is None else float(value)
 
 def build_slt_components(
-    data_config: str = "configs/data.yaml",
-    slt_config: str = "configs/dlm.yaml",
-    inference_config: str = "configs/inference.yaml",
-    decoder: str | None = None,
-    include_dev: bool = False,
-    language: str | None = None,
+    data_config: str = "configs/data.yaml", slt_config: str = "configs/dlm.yaml", inference_config: str = "configs/inference.yaml",
+    decoder: str | None = None, include_dev: bool = False, language: str | None = None,
 ) -> SLTComponents:
     data_cfg = load_yaml(data_config)
     slt_cfg = load_yaml(slt_config)
-    # Effective language: CLI --language > config's own language: > active_languages. Reload with the override only
-    # when it changes, so ${language} in checkpoint.dir (+ ar/baseline children) re-points to the right dataset dir.
+    # Precedence: --language > config `language:` > active_languages. Reload on override so ${language} 
+    # in checkpoint.dir (+ ar/baseline children) re-points at the right dataset.
     language = str(language or slt_cfg.get("language") or data_cfg.get("active_languages", ["phoenix"])[0])
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(slt_config, language=language)
     inference_cfg = load_yaml(inference_config)
     _assert_gate_inference_consistency(slt_cfg, inference_cfg)
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
-    # Uni-Sign front end; the LANGUAGE MODEL (and its tokenizer) is selected by this config's language_model.name:
-    # mT5 (Path A default) or mBART (the mT5-vs-mBART ablation). Same pose encoder + prompt either way — only the LM differs.
+    # Uni-Sign front end. language_model.name picks the LM + tokenizer: mT5 (Path A default) or mBART
+    # (mT5-vs-mBART ablation); same pose encoder + prompt either way.
     lm_name = language_model_name(slt_cfg)
     prompt_lang = prompt_lang_for_target(target_lang)
     if "mbart" in lm_name.lower():
@@ -79,7 +74,7 @@ def build_slt_components(
         tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
 
-    pose_augment_cfg = slt_cfg.get("augmentation")  # train-only spatial aug; dev dataset below passes None
+    pose_augment_cfg = slt_cfg.get("augmentation")  # train-only spatial aug; dev passes None
     train_records, _ = load_language_records(data_cfg, language, split="train")
     train_dataset = StreamingWindowDataset(
         train_records, slt_cfg=slt_cfg, 
@@ -89,9 +84,8 @@ def build_slt_components(
         tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
         visual_padding=str(slt_cfg.get("visual_padding", "none")),
     )
-    # streaming_loader: num_workers is a plain throughput knob, safe at any value — the window anchor is index-driven
-    # (every anchor realized once per epoch regardless of worker partitioning) and each worker reseeds its rng to
-    # decorrelate the per-window random draws (see data.loader.streaming_loader / WindowSampler.configure_worker).
+    # num_workers is pure throughput: anchors are index-driven (each realized once per epoch regardless of worker
+    # split) and workers reseed their rng (data.loader.streaming_loader / WindowSampler.configure_worker).
     num_workers = int(slt_cfg.get("num_workers", 0))
     train_loader = streaming_loader(train_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
     dev_loader = None
@@ -112,8 +106,8 @@ def build_slt_components(
         front_end=front_end, tokenizer=tokenizer,
         decoder=decoder or str(slt_cfg.get("decoder", "dlm")),
         block_size=int(slt_cfg.get("block_size", 8)),
-        # BIO-head shape MUST match S1 (train/bio_pretrain.py) exactly, or `bio_head_init` fails to strict-load.
-        # Read the SAME keys build_bio_s1 reads (bio_pretrain.yaml `extends` this file, so they share values).
+        # Shape MUST match S1 (train/bio_pretrain.py) or `bio_head_init` fails to strict-load — 
+        # same keys build_bio_s1 reads (bio_pretrain.yaml `extends` this file).
         bio_hidden_dim=int(slt_cfg.get("bio_hidden_dim", 384)),
         bio_depth=int(slt_cfg.get("bio_depth", 4)),
         bio_nhead=int(slt_cfg.get("bio_nhead", 8)),
@@ -131,13 +125,11 @@ def build_slt_components(
             "lambda_bio: 0 skips the head's forward and leaves it untrained/frozen. Either train the head (lambda_bio > 0) "
             "or disable the gate (the clean-floor recipe does both)."
         )
-        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): there is NO BIO branch. Skip the S1 init entirely — both 
-        # the head AND the pose encoder it carries (the Uni-Sign baseline must start from the RELEASED weights only, and the 
-        # S1-carried encoder would silently overwrite them) — and freeze the untouched head so the optimizer never sees its 
-        # parameters. compute_loss also skips its forward, so the branch costs nothing per step instead of being zero-weighted.
+        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip the S1 init entirely, head
+        # AND its pose encoder (the baseline must start from the RELEASED weights only), and freeze the head so
+        # the optimizer never sees it. compute_loss skips its forward, so the branch costs nothing.
         for p in model.bio_head.parameters(): p.requires_grad_(False)
-        # Flag for the inference path: generate_from_poses skips the head's forward too (frozen-random logits
-        # are garbage nobody reads with the gate off — running them at every val decode only burns compute).
+        # generate_from_poses skips the head's forward too: with the gate off nobody reads frozen-random logits.
         model.bio_branch_off = True
         print("slt | lambda_bio=0: BIO branch OFF — head frozen at random init, forward SKIPPED in training and decode; "
               + ("bio_head_init IGNORED (clean-floor recipe trains the released front end only)" \
@@ -147,12 +139,9 @@ def build_slt_components(
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
         head_sd = {k[len("bio_head."):]: v for k, v in sd.items() if k.startswith("bio_head.")}
-        # The S1 head reads pose features at feat_dim; the SLT model's bio_head reads front_end.bio_tap_dim (= the LM's 
-        # d_model: 768 mT5 / 1024 mBART). These MUST match for "S1 features == S2 initial features" and for this strict-load. 
-        # The released Uni-Sign checkpoints (which seed train-bio's encoder) are mT5-768, so mBART ablation needs an mBART-dim 
-        # S1 (bio_pretrain feat_dim=1024) + a 1024 pose encoder — fail loud here rather than with a cryptic size-mismatch, 
-        # since no 1024 release exists to warm-start from. (Whether S1 froze or fine-tuned that encoder, its adapted weights 
-        # are carried into S2 below, so "S1 features == S2 initial features" parity holds either way.)
+        # S1's head reads feat_dim; this bio_head reads front_end.bio_tap_dim (LM d_model: 768 mT5 / 1024 mBART). Must match for 
+        # "S1 features == S2 initial features" and the strict-load. Released Uni-Sign checkpoints (which seed train-bio) are mT5-768, 
+        # so mBART arm needs S1 at bio_pretrain feat_dim=1024 + a 1024 pose encoder; no 1024 release exists to warm-start from.
         s1_dim = head_sd.get("input_proj.weight")
         if s1_dim is not None and int(s1_dim.shape[1]) != int(front_end.bio_tap_dim): raise ValueError(
             f"bio_head_init dim mismatch: S1 head reads {int(s1_dim.shape[1])}-d features but this SLT model's "
@@ -160,11 +149,9 @@ def build_slt_components(
             f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml), or use the mT5 arm (the released checkpoints are mT5-768)."
         )
         model.bio_head.load_state_dict(head_sd, strict=True)
-        # Carry S1's pose encoder into S2 so the head meets the SAME features it was trained on ("S1 features == S2 initial 
-        # features"). When S1 ran freeze_backbone:true its encoder == the released one loaded above, so this is a no-op; 
-        # when S1 ran freeze_backbone:false the head was trained on the ADAPTED encoder, and without carrying it the head 
-        # would meet features it never saw (silent warm-start corruption). Same UniSignPoseEncoder on both sides (dims 
-        # already checked via bio_tap_dim), so strict-load.
+        # Carry S1's pose encoder so the head meets the features it trained on. No-op under S1 freeze_backbone:true 
+        # (== the released weights above); under false the head trained on the ADAPTED encoder and would meet features 
+        # it never saw (silent warm-start corruption).
         pose_sd = {k[len("pose_encoder."):]: v for k, v in sd.items() if k.startswith("pose_encoder.")}
         if pose_sd: model.front_end.pose_encoder.load_state_dict(pose_sd, strict=True)
         enc_note = (f"S1 pose encoder OVERRIDES the released warm-start ({len(pose_sd)} tensors) — deliberate: the head must "
@@ -183,10 +170,9 @@ def build_slt_components(
     print(f"slt | model: {total_params / 1e6:.2f}M parameters ({trainable_params / 1e6:.2f}M trainable, "
           f"{(total_params - trainable_params) / 1e6:.2f}M frozen)", flush=True)
           
-    # Gate-side duration decode (inference.yaml duration_decode, the SAME switch the streaming FSM reads): the
-    # membership gate's anchor selection re-splits merged back-to-back runs inside build_gate_omega, so stage-2
-    # trains under the tag stream deployment actually gates on (§1.3 on-policy symmetry). Prior fit on TRAIN
-    # captions only; no-op when the gate is disabled (build_gate_omega is then never called).
+    # Gate-side duration decode (inference.yaml duration_decode — the switch the streaming FSM reads):
+    # build_gate_omega re-splits merged back-to-back runs, so stage-2 trains on the tag stream deployment gates
+    # on (§1.3 on-policy symmetry). Prior fit on TRAIN captions only; no-op when the gate is off.
     if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)):
         from infer.duration_decode import duration_decode_params, fit_duration_prior
         params = duration_decode_params(inference_cfg, language)
@@ -214,19 +200,23 @@ def evaluate_slt(
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
 
-    # Dev must be scored under the SAME gate AND CB state the current training epoch uses (during warmup the
-    # decoder has never seen Ω / the CB self-target — evaluating with either on reports a conditioning/objective
-    # it wasn't trained under, and runs an expensive CB decode on not-yet-trustworthy full-evidence targets).
-    # cb_active=None (standalone eval, no epoch) reports the full objective.
+    # Score dev under the SAME gate/CB state the epoch trained under: during warmup the decoder has never seen Ω
+    # or the CB self-target, so either one on reports an untrained objective and burns a CB decode on
+    # untrustworthy targets. cb_active=None (standalone eval) = full objective.
     gate_on = bool(gate_cfg.get("enabled", False)) if gate_active is None else bool(gate_active)
     cb_on = True if cb_active is None else bool(cb_active)
+    # Every gate knob training passes — otherwise dev loss is computed under forward_loss's DEFAULTS (iou_veto 0.5,
+    # gt_anchored False) while training used the config, so val_loss is not comparable to train_loss and the
+    # gt_anchored ablation's dev numbers are silently ungated.
     gate_kwargs = dict(
         gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
         gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
+        gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
+        gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)),
     )
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     validation_cfg = slt_cfg.get("validation", {})
-    # <= 0 means evaluate translation on ALL supervised dev windows (default).
+    # <= 0: translate ALL supervised dev windows (default).
     max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0)
 
     pred_texts: list[str] = []
@@ -264,10 +254,9 @@ def evaluate_slt(
             bio_tap, _, timestamps = model.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
             bio_logits = model.bio_head(bio_tap, timestamps_s=timestamps).logits
             row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
-            # Moryossef-style segmentation metrics on the in-model BIO head (frame macro-F1, frame-IoU, overlap segment-F1, 1-to-1 
-            # tIoU-matched segment-F1) under inference decode (runs split at interior Bs), so SLT dev tracks span quality — what RQ2 
-            # streaming depends on — not just per-frame BIO accuracy. lambda_bio=0 (clean-floor recipe): the head is frozen at random 
-            # init and never trained — its "metrics" would be noise rows, so they are omitted rather than logged and ignored.
+            # Moryossef-style span metrics (frame + segment F1/IoU) under inference decode (runs split at interior
+            # Bs), so dev tracks span quality — what RQ2 streaming needs — not just per-frame BIO accuracy.
+            # Skipped at lambda_bio=0: the head is frozen at random init, so its metrics are noise.
             row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
         rows.append(row)
 
@@ -311,9 +300,8 @@ def evaluate_slt(
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
         metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
-        # Hypothesis/reference length ratio (the BLEU brevity-penalty input, char-level for CJK): the direct
-        # early-EOS-truncation diagnostic — a ratio < 1 and FALLING across epochs means the decode is committing
-        # EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr then punish as brevity.
+        # Hyp/ref length ratio (BLEU brevity-penalty input, char-level for CJK): early-EOS diagnostic — < 1 and FALLING across epochs 
+        # means the decode commits EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr punish as brevity.
         total_ref = sum(len(r) for r in ref_texts)
         metrics["val_translation_len_ratio"] = float(sum(len(p) for p in pred_texts)) / max(1, total_ref)
     return metrics
@@ -331,9 +319,8 @@ def train_slt_epochs(
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     decoder_name = getattr(model, "decoder_type", "dlm")
 
-    # OPUT warmup holds the confidence-bound term off until the model's full-evidence decode is trustworthy.
-    # Membership-gate warmup holds Ω off while a fresh BIO head sharpens on Dice (prefer a real S1 pretrain, so
-    # gate.warmup_epochs: 0 when bio_head_init is present). Both are per-epoch flags feeding step AND eval.
+    # OPUT warmup holds the confidence-bound term off until full-evidence decode is trustworthy; gate warmup holds Ω off while a fresh 
+    # BIO head sharpens on Dice (0 when bio_head_init is present — prefer a real S1 pretrain). Per-epoch flags, feeding step AND eval.
     cb_warmup_epochs = int(confidence_cfg.get("warmup_epochs", 1))
     cb_lambda = float(confidence_cfg.get("lambda", 0.3))
     gate_enabled_cfg = bool(gate_cfg.get("enabled", False))
@@ -370,8 +357,7 @@ def train_slt_epochs(
             cb_spd_revision=bool(spd_cfg.get("revision", True)),
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
             gate_enabled=_gate_active(epoch),
-            # δ must match the inference commit gate's delta_enc_frames (configs/inference.yaml) — 
-            # the gate's ramp/band/tolerance is the SAME δ at train and inference.
+            # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml).
             gate_delta=int(gate_cfg.get("delta", 3)),
             gate_eps=float(gate_cfg.get("eps", 1e-4)),
             gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
@@ -380,8 +366,7 @@ def train_slt_epochs(
         )
         return output.loss, {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
 
-    def evaluate_fn(epoch: int):
-        # Dev must be scored under the SAME gate AND CB warmup state the epoch trained under (see evaluate_slt).
+    def evaluate_fn(epoch: int): # Same gate/CB warmup state the epoch trained under (see evaluate_slt).
         return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg,
                             gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
 

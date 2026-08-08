@@ -6,11 +6,6 @@ import torch
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
 def pick_device(preferred: str | None = None):
-    """Single source of truth for device selection: explicit override, else cuda → mps → cpu.
-
-    Every entrypoint (train/eval/analyze/visualize) used to inline this; two train stages skipped the
-    MPS rung and silently fell to CPU on Apple silicon. One helper keeps the fallback consistent.
-    """
     if preferred: return torch.device(preferred)
     if torch.cuda.is_available(): return torch.device("cuda")
     if torch.backends.mps.is_available(): return torch.device("mps")
@@ -18,18 +13,17 @@ def pick_device(preferred: str | None = None):
 
 def cfg_get(cfg: dict, *path: str, default=None):
     cur = cfg
-    for key in path: # Nested lookup: cfg_get(cfg, "checkpoint", "dir"). Returns `default` if any level is missing.
+    for key in path: # Nested lookup: cfg_get(cfg, "checkpoint", "dir"); `default` if any level is missing.
         if not isinstance(cur, dict) or key not in cur or cur[key] is None: return default
         cur = cur[key]
     return cur
 
-# Single source of truth for the consolidated `checkpoint:` / `language_model:` config blocks (§12).
+# Accessors for the consolidated `checkpoint:` / `language_model:` config blocks (§12).
 def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
     return cfg_get(cfg, "checkpoint", "dir", default=default)
 
 def pretrained_checkpoint(cfg: dict, default: str | None = None) -> str | None:
-    # Weights to start from: the released Uni-Sign pose-only checkpoint (the mBART ablation loads the pose
-    # encoder from it; the mBART LM starts from base).
+    # Start weights: released Uni-Sign pose-only checkpoint (mBART ablation uses only its pose encoder; LM starts from base).
     return cfg_get(cfg, "checkpoint", "from_pretrained", default=default)
 
 def save_best_enabled(cfg: dict, default: bool = True) -> bool:
@@ -39,7 +33,7 @@ def language_model_name(cfg: dict) -> str:
     # ONE key for the text model regardless of family: google/mt5-base OR facebook/mbart-large-cc25.
     return str(cfg_get(cfg, "language_model", "name", default="google/mt5-base"))
 
-def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `override` onto `base` (override wins; nested dicts merged).
+def _deep_merge(base: dict, override: dict) -> dict: # `override` wins; nested dicts merged recursively.
     out = dict(base)
     for key, value in override.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict): out[key] = _deep_merge(out[key], value)
@@ -48,13 +42,13 @@ def _deep_merge(base: dict, override: dict) -> dict: # Recursively merge `overri
 
 
 def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: str | None = None) -> str | None:
-    """Uni-Sign warm-start checkpoint for a language — a per-TARGET-LANGUAGE property (like target_lang), so it
-    lives in data.yaml `languages[lang].pretrained_slt`. Chinese-sign CSL and English-sign OpenASL ship DIFFERENT
-    released checkpoints (same arch; the mT5 LM is tuned to emit Chinese vs English, the pose encoder saw CSL vs
-    ASL), so the CSL checkpoint is the wrong warm-start for an English-output language and vice-versa.
+    """Uni-Sign warm-start checkpoint for a language.
 
-    Resolution order: an explicit `checkpoint.from_pretrained` in the model/method config wins (ablation override);
-    else the language's `pretrained_slt`; else `default`."""
+    Per-TARGET-LANGUAGE (like target_lang), hence data.yaml `languages[lang].pretrained_slt`: CSL and OpenASL ship
+    DIFFERENT released checkpoints (same arch, but the mT5 LM emits Chinese vs English and the pose encoder saw
+    CSL vs ASL), so each is the wrong warm-start for the other.
+
+    Order: model/method `checkpoint.from_pretrained` (ablation override) > `pretrained_slt` > `default`."""
     explicit = cfg_get(model_cfg, "checkpoint", "from_pretrained", default=None)
     if explicit: return explicit
     lang_ckpt = ((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("pretrained_slt")
@@ -62,12 +56,11 @@ def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: 
 
 
 def resolve_placeholders(cfg: dict) -> dict:
-    """Substitute `${key}` in string values using the config's own TOP-LEVEL scalar keys.
+    """Substitute `${key}` in string values from the config's own TOP-LEVEL scalar keys.
 
-    Makes configs dataset-agnostic: with `language: phoenix`, every `checkpoints/dlm/${language}`, `bio_s1_${language}`,
-    `outputs/a_mode_ratios_${language}.json` etc. resolves to the phoenix path, and switching to another corpus is a one-line `language:`
-    change (no other dataset to template here — roots/target_lang live per-entry in data.yaml). Unknown placeholders are left untouched
-    (no key, no substitution), so this is a no-op for any config that uses none.
+    Makes configs dataset-agnostic: with `language: phoenix` every `${language}` path resolves to phoenix, so
+    switching corpus is a one-line change (roots/target_lang stay per-entry in data.yaml). Unknown placeholders
+    are left untouched — a no-op for configs that use none.
     """
     scalars = {k: v for k, v in cfg.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
     if not scalars: return cfg
@@ -86,15 +79,12 @@ def resolve_placeholders(cfg: dict) -> dict:
 def load_yaml(path: str | Path, language: str | None = None) -> dict:
     """Load a YAML config, resolving an optional `extends:` key and `${key}` placeholders.
 
-    `extends` may be a path (or list of paths), relative to the child file, to a parent config that is loaded first and deep-merged
-    under the child. This lets e.g. `ar.yaml` inherit the entire `dlm.yaml` recipe (sampler, Analysis-A ratios/jitter,
-    confidence-bound, optimization) and override only the decoder + output dir — so the AR-vs-DLM comparison isolates the decoder alone.
-    `${key}` placeholders are then resolved from the merged config's own top-level scalars (see resolve_placeholders) — chiefly `${language}`.
-    `_load_yaml_raw` already does the `extends` deep-merge (unresolved); this just resolves placeholders on the merged child.
+    `extends` (path or list, relative to the child) is deep-merged under the child by `_load_yaml_raw`: `ar.yaml`
+    inherits the whole `dlm.yaml` recipe and overrides only the decoder + output dir, so the AR-vs-DLM comparison
+    isolates the decoder alone. `${key}` then resolves from the merged config's own top-level scalars.
 
-    `language` overrides the config's own top-level `language:` BEFORE placeholder resolution — so a single
-    `--language asf` re-points BOTH the active dataset AND every `${language}`-templated path (checkpoints/bio_s1/asf,
-    …) without editing the shared configs. This is what makes the runbook language-parameterized.
+    `language` overrides the config's own `language:` BEFORE resolution, so one `--language asf` re-points BOTH
+    the active dataset AND every `${language}`-templated path without editing the shared configs.
     """
     merged = _load_yaml_raw(Path(path))
     if language is not None: merged["language"] = str(language)
@@ -120,9 +110,9 @@ def _load_yaml_raw(path: str | Path) -> dict:
 def update_yaml_scalar(path: str | Path, key_path: tuple[str, ...] | list[str], value) -> bool:
     """Replace one scalar in a YAML file in place, preserving layout and comments.
 
-    Used by Analysis to write the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires the analysis 
-    to persist the frozen constant). Line-targeted: walks the indentation stack to find `key_path` (e.g. ("buffer_cap_s",) or 
-    ("boundary_stability", "delta_enc_frames")) and rewrites only that line's value, keeping any inline comment.
+    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires 
+    freezing the constant). Line-targeted: walks the indentation stack to `key_path`, rewriting only that 
+    value and keeping any inline comment.
     """
     path = Path(path)
     lines = path.read_text(encoding="utf-8").splitlines()

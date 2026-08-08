@@ -1,22 +1,18 @@
 """S1 — in-system BIO head pretrain on FROZEN Uni-Sign pose features (docs/membership_gate.md §1.4 "competence
 before coupling").
 
-This is the DEPLOYED FSM head, pretrained then jointly fine-tuned — NOT the Moryossef analysis segmenter
-(moryossef26/, a separate raw-keypoint instrument for Analysis A/B + the RQ2 cascade). The two are deliberately
-distinct: gate-doc §1.4 keeps the analysis segmenter on raw keypoints (a different input space) so Analysis A's
-calibration is non-circular, while this head reads Uni-Sign features and lives inside the system.
+This is the DEPLOYED FSM head, NOT the Moryossef analysis segmenter (moryossef26/: raw keypoints, for Analysis A/B
++ the RQ2 cascade). Different input space by design (§1.4), so Analysis A's calibration is non-circular.
 
-Two jobs, both about the coupling:
-  1. **membership-gate warm start**: S2 starts from a sharp head, so the gate couples on-policy from step one with
-     `membership_gate.warmup_epochs: 0` (no garbage-conditioning phase).
-  2. **in-system BIO head init**: S2 loads `bio_head.*` from this checkpoint (`checkpoint.bio_head_init` in dlm.yaml),
-     then JOINTLY fine-tunes it under the gate (gate-doc §1.4 S2; the frozen-BIO alternative is an ablation only).
+Two jobs:
+  1. **gate warm start**: S2 starts from a sharp head, so the gate couples on-policy from step one with
+     `membership_gate.warmup_epochs: 0` (no garbage-conditioning warmup).
+  2. **BIO head init**: S2 loads `bio_head.*` (`checkpoint.bio_head_init` in dlm.yaml) and JOINTLY fine-tunes it
+     under the gate (§1.4 S2; frozen-BIO is an ablation only).
 
-Recipe (gate-doc §1.4 S1): the SAME SLT window distribution the head deploys under — StreamingWindowDataset +
-WindowSampler — with Dice(1.5) + plain CE, fps_aug, RoPE relative time, the pose encoder FROZEN (released Uni-Sign
-checkpoint; BatchNorm held in eval so S1 features == S2 initial features). Training on the window distribution (not
-Moryossef chunks) is train-what-inference-sees applied to the head, and gives S1↔S2 parity so S2 trains exactly one
-new thing: the coupling.
+Recipe (§1.4 S1): train on the deployed window distribution (StreamingWindowDataset + WindowSampler), not Moryossef
+chunks — train-what-inference-sees plus S1↔S2 parity, so S2 trains exactly one new thing: the coupling. 
+Dice(1.5) + CE, fps_aug, RoPE time, encoder FROZEN (released Uni-Sign checkpoint, BatchNorm held in eval).
 """
 from __future__ import annotations
 from pathlib import Path
@@ -41,15 +37,13 @@ from utils import load_yaml, pretrained_checkpoint, resolve_pretrained
 class BioS1Model(nn.Module):
     """Uni-Sign pose encoder + trainable RoPE BIO head.
 
-    Attribute name `bio_head` matches `MisalignedSLTModel.bio_head`, so this checkpoint's `bio_head.*` keys
-    load directly as the SLT-model init.
+    `bio_head` matches `MisalignedSLTModel.bio_head`, so this checkpoint's keys load directly as the SLT-model init.
 
-    `freeze_encoder=True` (default, the gate-doc §1.4 recipe): the pose encoder is frozen AND pinned to eval
-    (`train()` override) so its ST-GCN BatchNorm running stats stay exactly the released checkpoint's — S1
-    features == S2 initial features and the head transfers without an input-distribution jump.
-    `freeze_encoder=False` (`freeze_backbone: false`): the encoder trains too, adapting the translation-optimized
-    features to the segmentation objective. NB this does NOT recover back-to-back sentence boundaries on YouTube
-    corpora — that signal is absent from the captions themselves.
+    `freeze_encoder=True` (default, §1.4 recipe): encoder frozen AND pinned to eval (`train()` override) so ST-GCN BatchNorm 
+    running stats stay the released checkpoint's — S1 features == S2 initial features, no input-distribution jump. 
+
+    `freeze_encoder=False` (`freeze_backbone: false`): encoder trains too, adapting translation-optimized features to segmentation. 
+    Does NOT recover back-to-back sentence boundaries on YouTube corpora — that signal is absent from the captions themselves.
     """
     def __init__(
         self, pose_hidden_dim: int = 256, feat_dim: int = 768, bio_hidden_dim: int = 384, bio_depth: int = 4, 
@@ -68,7 +62,7 @@ class BioS1Model(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze_encoder: self.pose_encoder.eval()  # frozen: BN running stats pinned to the released checkpoint
+        if self.freeze_encoder: self.pose_encoder.eval()  # BN running stats pinned to the released checkpoint
         return self
 
     def load_unisign_pose(self, ckpt_path: str | Path) -> int:
@@ -87,16 +81,16 @@ class BioS1Model(nn.Module):
 
 
 def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
-    """Construct BioS1Model from a config and load the FROZEN Uni-Sign pose encoder.
+    """Construct BioS1Model and load the FROZEN Uni-Sign pose encoder.
 
-    SINGLE source of truth for the head shape: both training (build_bio_s1) and inference (analyze.segmenter_infer) go through
-    here, so the S1 checkpoint always strict-loads and SLT model's `bio_head_init` shape parity is guaranteed by construction.
-    `pretrained_path` overrides which released checkpoint the frozen pose encoder loads (per-language warm-start; the
-    caller resolves it). At inference the trained bio_s1 checkpoint later overwrites these weights, so it only bites
-    at train time — but keeping it per-language avoids depending on the CSL file on an English-only machine.
+    SINGLE source of truth for the head shape: training (build_bio_s1) and inference (analyze.segmenter_infer) both
+    route here, so the S1 checkpoint always strict-loads and `bio_head_init` shape parity holds by construction.
+    `pretrained_path` overrides which released checkpoint the frozen encoder loads (per-language warm-start,
+    resolved by the caller). Only bites at train time — the trained bio_s1 checkpoint overwrites these weights at
+    inference — but per-language avoids depending on the CSL file on an English-only machine.
     """
-    # Reuse the inherited dlm.yaml `freeze_backbone` key (same concept: freeze the Uni-Sign pose encoder). dlm's
-    # value is for STAGE 2 (false → joint-train); bio_pretrain.yaml overrides it to true for the frozen-S1 recipe.
+    # Inherited dlm.yaml `freeze_backbone`. dlm's value is for STAGE 2 (false → joint-train); bio_pretrain.yaml
+    # overrides it to true for the frozen-S1 recipe.
     freeze_encoder = bool(cfg.get("freeze_backbone", True))
     model = BioS1Model(
         pose_hidden_dim=int(cfg.get("pose_hidden_dim", 256)), feat_dim=int(cfg.get("feat_dim", 768)),
@@ -118,8 +112,8 @@ def build_bio_s1(
 ) -> tuple[BioS1Model, DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(config)
-    # Effective language: CLI --language > config's own language: > data.yaml active_languages. Reload with the
-    # override only when it changes, so ${language} in checkpoint.dir re-points to the right dataset dir.
+    # Precedence: CLI --language > config `language:` > data.yaml active_languages. Reload only when it changes, 
+    # so ${language} in checkpoint.dir re-points to the right dataset dir.
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
     inference_cfg = load_yaml(inference_config)
@@ -136,13 +130,13 @@ def build_bio_s1(
     )
     collator = WindowCollator(tokenizer=None)  # BIO-only: no text tokenization
     num_workers = int(cfg.get("num_workers", 0))
-    # streaming_loader: num_workers is safe at any value — the anchor is index-driven (exact per-epoch coverage) and
-    # each worker reseeds its rng to decorrelate window draws (see data.loader.streaming_loader).
+    # num_workers is safe at any value: anchors are index-driven (exact per-epoch coverage) and each worker reseeds
+    # its rng (see data.loader.streaming_loader).
     train_loader = streaming_loader(train_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
     dev_loader = streaming_loader(dev_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
 
-    # Frozen pose encoder from the language's released Uni-Sign checkpoint (OpenASL for English asf/bfi, CSL for
-    # Chinese csl) — this MUST match the SLT model's warm-start so S1 features == S2 initial features (§1.4).
+    # Language's released Uni-Sign checkpoint (OpenASL for asf/bfi, CSL for csl) — MUST match the SLT model's
+    # warm-start so S1 features == S2 initial features (§1.4).
     pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg
@@ -164,20 +158,19 @@ def evaluate_bio_s1(
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(out.logits, labels, prefix="phrase"))
-            # Collapse floor: the SAME segment metric on a CONSTANT all-I prediction. Under the symmetric run-decode
-            # any single-span window is near-free for a signing detector, so a monitor sitting within noise of this
-            # floor is measuring the window mix, not the head. Logged every epoch so saturation is visible mid-run.
+            # Collapse floor: same segment metric on a CONSTANT all-I prediction. Under the symmetric run-decode any
+            # single-span window is near-free, so a monitor within noise of this floor measures the window mix, not
+            # the head. Logged every epoch so saturation is visible mid-run.
             alli = torch.zeros_like(out.logits); alli[..., BIO["I"]] = 1.0
             row["alli_tiou_f1"] = moryossef_segment_metrics(alli, labels, prefix="alli")["alli_tiou_f1"]
-            # Per-mode tIoU diagnostic. This is a SEGMENTATION metric (predicted BIO spans vs the GT BIO spans),
-            # well-defined for EVERY mode because the head is supervised on all modes' bio_labels — independent of
-            # translation ("complete-sentence") supervision, which only some modes carry (OPUT on 1/3, CB on 2a,
-            # none on 2b/2c/4). So the split is legitimate for modes 2 and 4; only the INTERPRETATION differs:
+            # Per-mode tIoU: a SEGMENTATION metric (predicted vs GT BIO spans), valid for EVERY mode since the head
+            # is supervised on all modes' bio_labels — independent of translation supervision, which only some modes
+            # carry (OPUT on 1/3, CB on 2a, none on 2b/2c/4). Only the INTERPRETATION differs:
             #   mode1/3 = span boundary quality; mode2 = truncated-fragment localization;
-            #   mode4 (gaps) = PHANTOM-AVOIDANCE — gold has 0 spans (all-O; long all-UNK gaps are skipped), so
-            #                  tiou_f1 is 1.0 iff the head stays silent and 0.0 if it fires. It scores ABSENCE, not overlap.
-            # A capped headline average mixing these is uninterpretable without the split (a low val_phrase_tiou_f1
-            # driven by mode2 fragments is a metric-granularity property of misaligned windows, not head incompetence).
+            #   mode4 (gaps) = PHANTOM-AVOIDANCE — gold has 0 spans (all-O; long all-UNK gaps skipped), so tiou_f1
+            #                  is 1.0 iff the head stays silent, 0.0 if it fires. Scores ABSENCE, not overlap.
+            # The headline average needs this split: a low val_phrase_tiou_f1 driven by mode2 fragments is metric
+            # granularity on misaligned windows, not head incompetence.
             modes = batch.get("mode_names") or []
             for mode in set(modes):
                 idx = [i for i, m in enumerate(modes) if m == mode]
@@ -193,8 +186,8 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
-    # Frozen encoder → optimize the head only. Unfrozen (freeze_backbone: false) → head at learning_rate, the PRETRAINED encoder 
-    # at backbone_lr (default lr×0.1, see build_optimizer): a single head-scale LR on Uni-Sign weights empirically degrades them.
+    # Frozen encoder → head only. Unfrozen → head at learning_rate, the PRETRAINED encoder at backbone_lr
+    # (default lr×0.1, see build_optimizer): a single head-scale LR on Uni-Sign weights empirically degrades them.
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
     else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -204,8 +197,7 @@ def train_bio_s1_epochs(
         return loss, {"bio_loss": float(loss.detach())}
 
     return run_epoch_loop(
-        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer,
-        device=device, epochs=epochs, cfg=cfg, step_fn=step_fn,
-        evaluate_fn=lambda epoch: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
+        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
+        step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
         default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader,
     )

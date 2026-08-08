@@ -1,20 +1,17 @@
-"""The Uni-Sign backbone stack (Path A), arXiv 2501.15187: pose encoder + mT5 (default) / mBART (ablation).
+"""Uni-Sign backbone stack (Path A), arXiv 2501.15187: pose encoder + mT5 (default) / mBART (ablation).
 
-One module owns everything Uni-Sign so it is easy to find:
-  - `MT5BlockDiffusionDecoder` / `MBartBlockDiffusionDecoder` — the per-LM block-diffusion (BD3LM/OPUT/SPD-DCD)
-                                  decoder bindings (each implements only `_decode`).
-  - `UniSignMT5FrontEnd` / `UniSignMBartFrontEnd` — UniSignPoseEncoder + the verbatim task prompt + the LM encoder
-                                  (one front end per LM; the SAME front end serves the AR baseline and the SLT
-                                  AR/DLM model via `MisalignedSLTModel`, so there is no separate per-LM AR wrapper).
-  - `load_unisign_pretrained`   — load a released `*_pose_only_slt.pth` into any model carrying the front end.
+Everything Uni-Sign lives here:
+  - `MT5BlockDiffusionDecoder` / `MBartBlockDiffusionDecoder` — per-LM block-diffusion (BD3LM/OPUT/SPD-DCD)
+    decoder bindings (each implements only `_decode`).
+  - `UniSignMT5FrontEnd` / `UniSignMBartFrontEnd` — pose encoder + task prompt + LM encoder; the SAME front end
+    serves the AR baseline and the AR/DLM SLT model via `MisalignedSLTModel`.
+  - `load_unisign_pretrained` — load a released `*_pose_only_slt.pth` into a model carrying the front end.
 
-mT5 has no absolute positions / no embed scale / no layernorm_embedding, and folds attn mask into attn `position_bias` 
-(T5Attention adds a supplied bias straight to the scores, skipping its own relative-bias + mask compute). BD3LM `[xt|x0]` 
-repeated-position geometry is recreated by computing the relative bias over the EFFECTIVE positions [0..L-1, 0..L-1] 
-(`_self_position_bias`). mT5's WEIGHTS are untied (ckpt has distinct shared / lm_head) but google/mt5-base resolves 
-config.tie_word_embeddings=True, which gates T5's d_model**-0.5 pre-lm_head scaling — so the params are untied manually 
-while the scaling is kept (see UniSignMT5FrontEnd.__init__ and MT5BlockDiffusionDecoder.lm_head_scale). Only the decoder 
-objective changes between the AR and DLM arms (dLLM A2D) — the encoder/prompt is identical.
+mT5: no absolute positions / embed scale / layernorm_embedding, and the attn mask folds into `position_bias`
+(T5Attention adds a supplied bias straight to the scores, skipping its own relative-bias + mask compute), so
+BD3LM `[xt|x0]` geometry is rebuilt over EFFECTIVE positions [0..L-1, 0..L-1] (`_self_position_bias`). mT5's
+weights are untied by hand while config.tie_word_embeddings stays True (UniSignMT5FrontEnd.__init__,
+MT5BlockDiffusionDecoder.lm_head_scale). AR and DLM arms differ only in the decoder objective (dLLM A2D).
 """
 from __future__ import annotations
 from pathlib import Path
@@ -39,7 +36,7 @@ __all__ = [
     "UniSignFrontEndBase", "UniSignMT5FrontEnd", "UniSignMBartFrontEnd",
     "load_unisign_pretrained", "prompt_lang_for_target", "PROMPT_LANG_BY_TARGET",
 ]
-# target_lang (data.yaml) -> the natural-language name Uni-Sign puts in the prompt 
+# target_lang (data.yaml) -> the prompt's language name
 # (Uni_Sign: 'Chinese' if 'CSL' in dataset else 'English'); de_DE = German for PHOENIX.
 PROMPT_LANG_BY_TARGET = {"zh_CN": "Chinese", "en_XX": "English", "de_DE": "German"}
 
@@ -51,10 +48,10 @@ def prompt_lang_for_target(target_lang: str | None) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def resolve_decoder_start_id(tokenizer) -> int | None:
-    """Target-language decoder start for mBART generation.
+    """Target-language decoder start id for mBART; None -> HF model default.
 
-    HF mBART's shift_tokens_right wraps the LAST non-pad label token — the language code — to position 0, so the
-    decoder is trained to start from the language code. Returns that id (else None -> HF uses the model default).
+    shift_tokens_right wraps the LAST non-pad label token — the language code — to position 0, so the pretrained
+    decoder has only ever started from the language code.
     """
     lang = getattr(tokenizer, "tgt_lang", None) or getattr(tokenizer, "src_lang", None)
     if not lang: return None
@@ -66,12 +63,8 @@ def resolve_decoder_start_id(tokenizer) -> int | None:
 
 class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
     '''BD3LM/OPUT decoder on the pretrained mBART decoder (learned absolute positions, layernorm_embedding,
-    sqrt(d_model) token-embedding scale). Includes the DCD prefix-KV-cache decode (block-boundary exact).
-
-    Same constructor shape as `MT5BlockDiffusionDecoder` (model + the three token indices). `decoder_start_id`
-    (the DLM canvas BOS) is mBART's target LANGUAGE CODE, not `<s>`: HF mBART's shift_tokens_right maps labels
-    [toks, eos, lang] -> decoder inputs [lang, toks, eos], so the pretrained decoder has only ever seen
-    sequences starting with the language code.'''
+    sqrt(d_model) embed scale), plus the DCD prefix-KV-cache decode (block-boundary exact). `decoder_start_id` (the DLM 
+    canvas BOS) is mBART's target LANGUAGE CODE, not `<s>` — see `resolve_decoder_start_id`.'''
     def __init__(self, mbart_model, pad_index: int, decoder_start_id: int, eos_id: int, block_size: int = 4, **kw):
         super().__init__()
         self.mbart_decoder = mbart_model.model.decoder  # MBartDecoder layers + norms
@@ -83,14 +76,13 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
             pad_index=pad_index, eos_index=eos_id, bos_index=decoder_start_id, embed_scale=embed_scale,
             block_size=block_size, **kw,
         )
-        # mBART's word embedding scales by sqrt(d_model) INTERNALLY (MBartScaledWordEmbedding). The DLM canvas needs
-        # vocab+1 (the MASK row) AND that internal scale so the manual `_decode` AND the HF `decoder.forward` used by
-        # the prefix KV-cache scale token embeddings identically (a plain embedding + external scale made the two
-        # paths disagree — the cache != no-cache Δ≈0.5 bug). Swap in a scaled embedding and drop the external scale.
+        # The canvas needs vocab+1 (MASK row) AND mBART's INTERNAL sqrt(d_model) scale, so `_decode` and the HF
+        # `decoder.forward` behind the prefix KV-cache embed identically. Plain embedding + external scale made
+        # them disagree (the cache != no-cache Δ≈0.5 bug).
         scaled = MBartScaledWordEmbedding(self.vocab_size + 1, self.d_model, self.pad_index, embed_scale=embed_scale)
         with torch.no_grad(): scaled.weight.copy_(self.embed_tokens.weight)
         self.embed_tokens = scaled
-        self.embed_scale = 1.0  # scale now lives inside embed_tokens; never apply it again
+        self.embed_scale = 1.0  # scale lives inside embed_tokens now; never apply it twice
         self.mbart_decoder.embed_tokens = self.embed_tokens  # avoids a duplicate parameter
         print(
             f"MBartBlockDiffusionDecoder (mBART A2D): d_model={self.d_model}, vocab={self.vocab_size}+1(MASK), "
@@ -117,17 +109,16 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         hidden = self.mbart_decoder.layernorm_embedding(hidden)
         hidden = F.dropout(hidden, p=self.mbart_decoder.dropout, training=self.training)
 
-        # Self-attention mask: BD3LM mask during training or build block-causal mask for inference
+        # Self-attn: BD3LM mask (training) or block-causal (inference)
         if self_attn_mask is None: self_mask = build_block_causal_mask(batch_size, tgt_len, self.block_size, dtype, device)
         else: self_mask = self_attn_mask.to(dtype=dtype, device=device)
         cross_mask = AttentionMaskConverter._expand_mask(enc_mask, dtype, tgt_len=tgt_len) if enc_mask is not None else None
-        # Membership gate: ADD Ω(t) (query-independent, (B,1,1,M)) to the cross-attn key bias; broadcasts over
-        # the tgt_len query axis of the expanded mask. Every layer/head sees it (docs/membership_gate.md §2.9).
+        # Membership gate: add Ω(t) (query-independent, (B,1,1,M)) to the cross-attn key bias; broadcasts over
+        # the query axis, so every layer/head sees it (docs/membership_gate.md §2.9).
         if omega_bias is not None:
             ob = omega_bias.to(dtype=dtype, device=device)
             cross_mask = ob if cross_mask is None else cross_mask + ob
 
-        # Run each decoder layer (self-attn + cross-attn + FFN)
         for layer in self.mbart_decoder.layers:
             hidden = layer(
                 hidden, attention_mask=self_mask, encoder_hidden_states=enc_hidden, encoder_attention_mask=cross_mask
@@ -140,9 +131,9 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
         past_key_values=None, use_cache=False, cache_position=None,
     ):
-        # DCD prefix KV-cache hook (shared cache logic in dmax.OPUTBlockDiffusionDecoder; only this native KV-cache-capable
-        # decoder.forward is backbone-specific). MBartDecoder uses the supplied 4D mask verbatim; token embeddings scale via
-        # the MBartScaledWordEmbedding set in __init__, so the cache matches the no-cache `_decode` (verified ~1e-7).
+        # DCD prefix KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). 
+        # MBartDecoder takes the 4D mask verbatim and embeds via the MBartScaledWordEmbedding, so the cache matches the 
+        # no-cache `_decode` (verified ~1e-7).
         out = self.mbart_decoder(
             input_ids=None if inputs_embeds is not None else decoder_input_ids,
             inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
@@ -169,10 +160,8 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self.n_heads = int(self.config.num_heads)
         self.rel_num_buckets = int(self.config.relative_attention_num_buckets)
         self.rel_max_distance = int(self.config.relative_attention_max_distance)
-        # T5ForConditionalGeneration.forward scales sequence_output by d_model**-0.5 before lm_head IFF config.tie_word_embeddings 
-        # — and google/mt5-base resolves that flag True in current transformers, so the released Uni-Sign weights are calibrated 
-        # WITH the scaling (the front end unties the weight tensors but keeps the flag). The DLM decode must apply the same scaling 
-        # or every logit is off by sqrt(768) relative to the pretrained calibration.
+        # T5 scales by d_model**-0.5 before lm_head IFF config.tie_word_embeddings, True for google/mt5-base — 
+        # so the released weights are calibrated WITH it. Scale here too or every logit is off by sqrt(768).
         self.lm_head_scale = float(self.config.d_model) ** -0.5 if getattr(self.config, "tie_word_embeddings", False) else 1.0
         self._init_block_diffusion(
             d_model=self.config.d_model, vocab_size=self.config.vocab_size, embed_source_weight=self.decoder.embed_tokens.weight, 
@@ -185,8 +174,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         )
 
     def _rel_bias(self, eff_pos: torch.Tensor) -> torch.Tensor:
-        # Relative-position self-attention bias over EFFECTIVE positions (reproduces T5Attention.compute_bias but
-        # with caller-supplied positions, so [xt|x0] = [0..L-1, 0..L-1] gets the correct relative geometry).
+        # T5Attention.compute_bias with caller-supplied positions: [xt|x0] = [0..L-1, 0..L-1] needs that geometry.
         sa = self.decoder.block[0].layer[0].SelfAttention
         rel = eff_pos[None, :] - eff_pos[:, None]
         bucket = sa._relative_position_bucket(
@@ -209,8 +197,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         return (1.0 - m) * torch.finfo(dtype).min
 
     def _run_layers(self, hidden, enc_hidden, self_pos_bias, cross_pos_bias):
-        # Manual T5Block loop (bypasses T5Block.forward, which eagerly needs cache_position). 
-        # Each sub-layer applies its own RMSNorm + residual internally.
+        # Manual T5Block loop: T5Block.forward eagerly needs cache_position. Sub-layers do their own RMSNorm+residual.
         for block in self.decoder.block:
             hidden = block.layer[0](hidden, attention_mask=None, position_bias=self_pos_bias)[0]
             hidden = block.layer[1](hidden, key_value_states=enc_hidden, attention_mask=None, position_bias=cross_pos_bias)[0]
@@ -239,9 +226,9 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
         past_key_values=None, use_cache=False, cache_position=None,
     ):
-        # DCD prefix KV-cache hook (shared cache logic in dmax.OPUTBlockDiffusionDecoder). T5Stack.forward computes its
-        # own relative position bias (standard positions, cache_position-aware) and ADDS the supplied 4D mask to it —
-        # at a block boundary with the all-attend window mask this equals the no-cache `_decode` (verified numerically).
+        # DCD prefix KV-cache hook. T5Stack.forward computes its own relative position bias (standard positions,
+        # cache_position-aware) and ADDS the supplied 4D mask — at a block boundary with the all-attend window
+        # mask this equals the no-cache `_decode` (verified numerically).
         out = self.decoder(
             input_ids=None if inputs_embeds is not None else decoder_input_ids,
             inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
@@ -260,11 +247,10 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
 def released_layout_state(sd: dict) -> dict:
     """Normalize a checkpoint state dict to the RELEASED Uni-Sign layout ({<bare pose keys>, 'mt5_model.*'}).
 
-    Accepts either layout, so ONE artifact serves every consumer and no exported duplicate is needed:
-      - released `*_pose_only_slt.pth` (already bare pose + mt5_model.*)  -> returned as-is;
-      - a trainer `model.pt` (full MisalignedSLTModel: front_end.pose_encoder.*, front_end.mt5.*, bio_head.*, 
-        dlm_decoder.*, ...) -> re-keyed to the released layout; non-front-end keys (bio_head, decoder canvas) 
-        are dropped — they are training-arm state, not the transferable front end.
+    Accepts either layout, so ONE artifact serves every consumer:
+      - released `*_pose_only_slt.pth` -> as-is;
+      - trainer `model.pt` -> re-keyed from front_end.pose_encoder.* / front_end.mt5.*; other keys (bio_head,
+        dlm_decoder) dropped as training-arm state, not the transferable front end.
     """
     if not any(k.startswith("front_end.") for k in sd): return sd
     out = {}
@@ -275,11 +261,11 @@ def released_layout_state(sd: dict) -> dict:
 
 
 class UniSignFrontEndBase(SLTFrontEnd):
-    """Shared Uni-Sign front end: UniSignPoseEncoder -> the verbatim task prompt prepended to the pose tokens -> LM encoder. 
-    Subclasses bind the language model (mT5 / mBART) and supply only LM-specific bits: `_prompt_token_embeds`, `_run_lm_encoder`, 
-    `make_dlm_decoder`, `_load_lm_pretrained`, and `pose_embed_scale` (mBART scales its word embeddings by sqrt(d), so the pose 
-    tokens are scaled to match the prompt-embed magnitude in the encoder; mT5 has no embed scale -> 1.0). Only the LM differs 
-    between the two — same pose encoder, same prompt — which makes the mT5-vs-mBART comparison a clean LM ablation."""
+    """Shared Uni-Sign front end: UniSignPoseEncoder -> verbatim task prompt + pose tokens -> LM encoder.
+
+    Subclasses bind the LM (mT5 / mBART) and supply `_prompt_token_embeds`, `_run_lm_encoder`, `make_dlm_decoder`,
+    `_load_lm_pretrained`, `pose_embed_scale` (mBART scales word embeddings by sqrt(d), so pose tokens match the
+    prompt-embed magnitude; mT5 -> 1.0). Only the LM differs, so mT5-vs-mBART is a clean ablation."""
     prompt_lang: str = "Chinese"
     pose_embed_scale: float = 1.0  # mBART overrides to sqrt(d_model)
 
@@ -300,23 +286,19 @@ class UniSignFrontEndBase(SLTFrontEnd):
         return pose_tokens, frame_mask, timestamps_s
 
     def prompt_length(self) -> int:
-        # Token count of the fixed task prompt (cached): the encoder memory is [prompt | pose], so M = prompt_length() + T. 
-        # Used to align the membership gate's Ω to the pose columns without running an encoder pass just to read a shape.
+        # Cached: memory is [prompt | pose], M = prompt_length() + T. Aligns the gate's Ω to the pose columns
+        # without an encoder pass just to read a shape.
         if getattr(self, "_prompt_len", None) is None:
             ids = self.tokenizer([f"Translate sign language video to {self.prompt_lang}: "], return_tensors="pt")["input_ids"]
             self._prompt_len = int(ids.shape[1])
         return self._prompt_len
 
     def encode_memory(self, bio_tap, bio_mask):
-        # Prepend the LM-embedded task/language prompt to the pose tokens (Uni_Sign forward). Pose tokens are scaled
-        # by `pose_embed_scale` to match the prompt-embed magnitude (1.0 for mT5; sqrt(d) for mBART's scaled embeds).
+        # Prepend the LM-embedded task/language prompt to the pose tokens (Uni_Sign forward).
         device = bio_tap.device
         b = bio_tap.shape[0]
         prefix = self.tokenizer(
-            # No truncation: the prompt is a fixed short constant (never exceeds the model max), so truncation=True
-            # only triggers the "no maximum length is provided" warning while doing nothing.
-            [f"Translate sign language video to {self.prompt_lang}: "] * b,
-            padding="longest", return_tensors="pt",
+            [f"Translate sign language video to {self.prompt_lang}: "] * b, padding="longest", return_tensors="pt"
         ).to(device)
         prefix_embeds = self._prompt_token_embeds(prefix["input_ids"])
         inputs_embeds = torch.cat([prefix_embeds, bio_tap * self.pose_embed_scale], dim=1)
@@ -325,10 +307,9 @@ class UniSignFrontEndBase(SLTFrontEnd):
         return enc_out.last_hidden_state, attention_mask
 
     def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None):
-        # Uni-Sign uses an external label-smoothed CE (models.py:300) rather than the model's internal loss.
-        # Under `omega_bias` the cross-attention is membership-gated via HF forward hooks (CrossAttnOmegaInjector),
-        # so the AR de-risk arm trains under the SAME Ω conditioning as the DLM arm — and the translation loss
-        # backpropagates into the BIO logits through Ω (the coupling), exactly as on the DLM side.
+        # Uni-Sign uses an external label-smoothed CE (models.py:300), not the model's internal loss. `omega_bias`
+        # gates cross-attn via HF hooks (CrossAttnOmegaInjector), so the AR de-risk arm trains under the same Ω as
+        # the DLM arm and translation loss backprops into the BIO logits through Ω.
         with self.ar_omega_context(omega_bias):
             out = self.lm_model(
                 encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
@@ -340,9 +321,8 @@ class UniSignFrontEndBase(SLTFrontEnd):
         )
 
     def freeze_pose_backbone(self, freeze_projection: bool = False) -> int:
-        """Freeze the ST-GCN pose backbone. `freeze_projection=False` (default) keeps the final pose→feature
-        projection (`pose_encoder.pose_proj`) trainable so it can still adapt the frozen GCN features to the LM;
-        `True` freezes that too. Returns the number of parameters actually frozen."""
+        #Freeze the ST-GCN pose backbone; returns the parameter count frozen. `freeze_projection=False` (default)
+        # keeps `pose_encoder.pose_proj` trainable so it can still adapt the frozen GCN features to the LM.
         frozen = 0
         for p in self.pose_encoder.parameters():
             if p.requires_grad:
@@ -352,22 +332,21 @@ class UniSignFrontEndBase(SLTFrontEnd):
             for p in self.pose_encoder.pose_proj.parameters():
                 p.requires_grad_(True)
                 frozen -= p.numel()
-        self._pose_backbone_frozen = True  # `train()` keeps it in eval so its ST-GCN BatchNorm stats don't drift
+        self._pose_backbone_frozen = True  # `train()` keeps it in eval (see below)
         self.pose_encoder.eval()
         return frozen
 
     def train(self, mode: bool = True):
-        # A frozen pose backbone must stay in eval: its BatchNorm2d would otherwise use batch stats and update
-        # running_mean/var during SLT training — so it isn't truly frozen, and S2 features drift away from the
-        # S1 features the BIO head was pretrained on (docs/membership_gate.md §1.4). No-op when not frozen.
+        # A frozen pose backbone must stay in eval: BatchNorm2d would otherwise update running_mean/var during
+        # SLT training, drifting S2 features off the S1 the BIO head was pretrained on (docs/membership_gate.md §1.4).
         super().train(mode)
         if getattr(self, "_pose_backbone_frozen", False): self.pose_encoder.eval()
         return self
 
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
-        """Load a released Uni-Sign `*_pose_only_slt.pth` OR a trainer `model.pt` (auto-normalized by `released_layout_state`): 
-        pose keys -> `pose_encoder` (always); mT5 arm additionally loads `mt5_model.*` -> mT5, mBART arm loads pose only (mBART 
-        LM stays at base init). Call BEFORE building the DLM decoder (it copies the loaded LM into the vocab+1 canvas)."""
+        """Load a released `*_pose_only_slt.pth` or trainer `model.pt` (normalized by `released_layout_state`):
+        pose keys -> `pose_encoder`, mT5 arm also `mt5_model.*` (mBART: pose only). Call BEFORE building the DLM
+        decoder — it copies the loaded LM into the vocab+1 canvas."""
         blob = torch.load(str(ckpt_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
         sd = released_layout_state(sd)
@@ -382,10 +361,8 @@ class UniSignFrontEndBase(SLTFrontEnd):
 
 
 class UniSignMBartFrontEnd(UniSignFrontEndBase):
-    """mBART LM ablation: same Uni-Sign pose encoder + task prompt as the mT5 arm, mBART as the language model.
-    mBART's word embedding scales by sqrt(d) (MBartScaledWordEmbedding), so pose tokens are scaled by sqrt(d) to
-    match the prompt-embed magnitude in the encoder. Init: pose from the released Uni-Sign ckpt (`load_pretrained`),
-    mBART from base (no released Uni-Sign+mBART weights). decoder-start = the mBART target-language code."""
+    # mBART LM ablation: same pose encoder + task prompt as the mT5 arm. Init: pose from the released Uni-Sign
+    # ckpt (`load_pretrained`), mBART from base (no released Uni-Sign+mBART weights); decoder-start = mBART target-language code.
     def __init__(
         self, mbart_name: str = "facebook/mbart-large-cc25", prompt_lang: str = "Chinese",
         target_lang: str = "zh_CN", tokenizer=None, pose_hidden_dim: int = 256, init_mbart_weights: bool = True,
@@ -407,7 +384,7 @@ class UniSignMBartFrontEnd(UniSignFrontEndBase):
         self.decoder_start_id = resolve_decoder_start_id(self.tokenizer)  # mBART lang-code decoder start
 
     def _prompt_token_embeds(self, input_ids):
-        return self.mbart.model.shared(input_ids)  # MBartScaledWordEmbedding -> scaled, matches pose * sqrt(d)
+        return self.mbart.model.shared(input_ids)  # MBartScaledWordEmbedding — matches pose * sqrt(d)
 
     def _run_lm_encoder(self, inputs_embeds, attention_mask):
         return self.mbart.model.encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
@@ -426,20 +403,16 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         self, mt5_name: str = "google/mt5-base", prompt_lang: str = "Chinese", tokenizer=None,
         pose_hidden_dim: int = 256, init_mt5_weights: bool = False,
     ):
-        """`init_mt5_weights`: True downloads pretrained mT5-base; False builds from config only (no 2.3GB download)
-        — correct when a Uni-Sign checkpoint overwrites every mT5 tensor anyway."""
+        # `init_mt5_weights=False` builds from config only — correct when a Uni-Sign checkpoint overwrites every mT5 tensor anyway.
         super().__init__()
         self.prompt_lang = str(prompt_lang)
         self.pose_embed_scale = 1.0  # mT5 does not scale word embeddings
         if init_mt5_weights: self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_name)
         else: self.mt5 = MT5ForConditionalGeneration(MT5Config.from_pretrained(mt5_name))
-        # google/mt5-base resolves config.tie_word_embeddings=True in current transformers, so the PLAIN constructor aliases 
-        # lm_head.weight <-> shared.weight (one storage). mT5 checkpoints are UNTIED — Uni-Sign's ckpt carries DIFFERENT 
-        # shared/lm_head tensors — and load_state_dict onto the aliased module silently writes both keys into one tensor 
-        # (last write wins, 0 missing/0 unexpected): the encoder then embeds tokens with LM-head matrix and decodes garbage 
-        # (found via parity eval — ref from_pretrained path warns "both present with different values, so we WON'T tie" and 
-        # unties). Untie the PARAMETER here; keep config.tie_word_embeddings as resolved (True) because T5's forward gates 
-        # its d_model**-0.5 pre-lm_head scaling on that flag and the released weights were trained with the scaling active.
+        # google/mt5-base resolves tie_word_embeddings=True, so the plain constructor aliases lm_head.weight <-> shared.weight. 
+        # mT5 ckpts are UNTIED: load_state_dict then writes both keys into that one tensor (last write wins, 0 missing/0 unexpected) 
+        # and the encoder embeds with the LM-head matrix -> garbage (caught by parity eval; from_pretrained warns and unties). Untie 
+        # the PARAMETER only — T5 gates its d_model**-0.5 pre-lm_head scaling on the flag and the released weights assume it.
         if self.mt5.lm_head.weight.data_ptr() == self.mt5.shared.weight.data_ptr():
             self.mt5.lm_head = nn.Linear(self.mt5.config.d_model, self.mt5.config.vocab_size, bias=False)
         self.tokenizer = tokenizer if tokenizer is not None else T5Tokenizer.from_pretrained(mt5_name, legacy=False)
@@ -449,7 +422,7 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         self.bio_tap_dim = d_model
         self.pad_token_id = int(self.tokenizer.pad_token_id)
         self.eos_token_id = int(self.tokenizer.eos_token_id)
-        # mT5 conditions via the encoder prompt (no language-code prefix), so the canvas/AR start is mT5's own
+        # mT5 conditions via the encoder prompt (no language-code prefix), so the canvas/AR start is
         # decoder_start_token_id (pad for T5) — what HF teacher-forcing shifts labels onto.
         self.decoder_start_id = int(self.mt5.config.decoder_start_token_id)
 
@@ -472,6 +445,6 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
 
 
 def load_unisign_pretrained(model, ckpt_path: str | Path, strict: bool = True) -> dict[str, int]:
-    """Load a released Uni-Sign `*_pose_only_slt.pth` into anything carrying a `UniSignMT5FrontEnd` at `.front_end`
-    (the baseline `UniSignMT5SLT` or the `MisalignedSLTModel`). Delegates to `UniSignMT5FrontEnd.load_pretrained`."""
+    # Load a released `*_pose_only_slt.pth` into anything carrying a `UniSignMT5FrontEnd` at 
+    # `.front_end` (`UniSignMT5SLT`, `MisalignedSLTModel`).
     return model.front_end.load_pretrained(ckpt_path, strict=strict)

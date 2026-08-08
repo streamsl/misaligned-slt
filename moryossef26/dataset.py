@@ -1,10 +1,9 @@
 """Whole-video-chunk dataset for the faithful Moryossef analysis segmenter (Analysis A/B + RQ2 cascade floor).
 
-Random natural-timeline chunks of whole videos — the segmentation training regime (Moryossef 2026), distinct from
-the SLT window sampler that trains the in-system BIO head. This model reads RAW pose keypoints (+ velocity) through
-a UNet CNN, so the raw-keypoint augmentations Moryossef uses apply here: fps_aug (essential), frame_dropout,
-body_part_dropout, and appended per-keypoint velocity. (The in-system head, by contrast, reads FROZEN Uni-Sign
-features and drops these — see configs/bio_pretrain.yaml. That input-space split is the whole point of §4.6.)
+Random natural-timeline chunks — the Moryossef 2026 segmentation regime, not the SLT window sampler that trains
+the in-system BIO head. This model reads RAW pose keypoints (+ velocity) via a UNet CNN, so the raw-keypoint 
+augmentations Moryossef uses apply here: fps_aug (essential), frame_dropout, body_part_dropout, and appended 
+per-keypoint velocity. The in-system head reads FROZEN Uni-Sign features and drops these.
 """
 from __future__ import annotations
 import numpy as np
@@ -17,7 +16,6 @@ from poses import load_pose_window, apply_fps_aug
 
 
 class SegmenterChunkDataset(Dataset):
-    # Random real-timeline chunks for the standalone Moryossef segmenter (raw keypoints + velocity).
     def __init__(
         self, records: list[VideoRecord],
         num_frames: int = 1024, steps_per_epoch: int | None = None,
@@ -30,8 +28,8 @@ class SegmenterChunkDataset(Dataset):
         self.records = records
         self.num_frames = int(num_frames)
         if steps_per_epoch is None and training:
-            # One epoch = enough random chunks to COVER the corpus once (sum of video frames / num_frames), not
-            # one chunk per video — else epoch-based early stopping kills runs after a handful of steps.
+            # Epoch = enough chunks to COVER the corpus once, not one per video — 
+            # else epoch-based early stopping kills runs after a handful of steps.
             total_frames = sum(int(r.pose.total_frames) for r in records)
             steps_per_epoch = max(len(records), total_frames // max(1, self.num_frames))
         self.steps_per_epoch = int(steps_per_epoch or len(records))
@@ -50,9 +48,8 @@ class SegmenterChunkDataset(Dataset):
         return self.steps_per_epoch
 
     def __getitem__(self, index: int) -> dict:
-        # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from
-        # (seed, index) so the SAME chunks are scored every epoch — a per-epoch-random dev set
-        # makes the early-stopping monitor noise, and the "best epoch" partly a lottery draw.
+        # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from (seed, index) so the 
+        # SAME chunks are scored every epoch — a per-epoch-random dev set makes the early-stopping monitor noise.
         rng = self.rng if self.training else np.random.default_rng(self.seed * 100_003 + int(index))
         rec = self.records[int(rng.integers(0, len(self.records)))]
         chunk_s = self.num_frames / rec.pose.fps
@@ -89,7 +86,7 @@ class SegmenterChunkDataset(Dataset):
 
 
 def collate_segmenter_chunks(batch: list[dict]) -> dict:
-    # Right-pad chunks (poses zero-pad, labels UNK, mask False). Padded frames are masked out of the loss.
+    # Right-pad; labels pad with UNK so padded frames drop out of the loss.
     max_len = max(item["poses"].shape[0] for item in batch)
     pose_shape = batch[0]["poses"].shape[1:]
     poses, timestamps, labels, masks, meta = [], [], [], [], []
@@ -114,18 +111,16 @@ def collate_segmenter_chunks(batch: list[dict]) -> dict:
 def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray, clip: float = 50.0) -> np.ndarray:
     """Append units/second velocity (Moryossef 2026 utils/pose.compute_velocity: diff / dt).
 
-    Two guards theirs does not need (their normalize_mean_std input is bounded; our Uni-Sign-normalized
-    keypoints are zeroed when detection drops): a velocity spanning a missing detection — either
-    endpoint keypoint zeroed — is detection flicker, not motion (a 0↔value flip at 25 fps reads as
-    |Δ|×25), so it is masked to 0; and velocities are clipped to ±clip (real signing peaks at ~20
-    group-units/s; beyond that is detector jitter).
+    Two guards theirs does not need (our Uni-Sign-normalized keypoints are zeroed on dropped detections): 
+    velocity spanning a zeroed endpoint is flicker, not motion (0↔value at 25 fps reads as |Δ|×25) → masked 
+    to 0; and clipped to ±clip (real signing peaks ~20 group-units/s).
     """
     if poses.shape[0] <= 1: velocity = np.zeros_like(poses, dtype=np.float32)
     else:
         dt = np.diff(timestamps_s.astype(np.float32))
         dt = np.maximum(dt, 1e-6)
         inner = np.diff(poses.astype(np.float32), axis=0) / dt[:, None, None]
-        # Mask flicker: per-keypoint validity = any nonzero channel (invalid points are all-zero).
+        # Per-keypoint validity = any nonzero channel (invalid points are all-zero).
         valid = np.any(poses != 0.0, axis=-1)             # (T, K)
         pair_valid = (valid[1:] & valid[:-1])[..., None]  # (T-1, K, 1)
         inner = np.where(pair_valid, inner, 0.0)
@@ -135,7 +130,7 @@ def append_velocity(poses: np.ndarray, timestamps_s: np.ndarray, clip: float = 5
 
 
 def apply_body_part_dropout(poses: np.ndarray, probability: float, rng: np.random.Generator) -> np.ndarray:
-    # Zero left/right hand channels independently, as train-time segmenter aug (Moryossef repo default).
+    # Zero left/right hand channels independently (Moryossef repo default train aug).
     out = poses.copy()
     if rng.random() < float(probability): out[:, 9:30, :] = 0.0
     if rng.random() < float(probability): out[:, 30:51, :] = 0.0
@@ -144,7 +139,7 @@ def apply_body_part_dropout(poses: np.ndarray, probability: float, rng: np.rando
 
 def apply_frame_dropout(
     poses: np.ndarray, timestamps_s: np.ndarray, max_rate: float, rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]: # Drop a random 0..max_rate fraction of middle frames, preserving edges.
+) -> tuple[np.ndarray, np.ndarray]: # Drop 0..max_rate of middle frames; edges preserved.
     if poses.shape[0] <= 2: return poses, timestamps_s
     drop_rate = float(rng.uniform(0.0, max(0.0, float(max_rate))))
 

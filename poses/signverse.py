@@ -1,33 +1,26 @@
 """SignVerse-2M (HuggingFace SignerX/SignVerse-2M) → canonical COCO-WholeBody-133 pose converter.
 
-SignVerse ships DWPose keypoints in the 128-point OpenPose layout (18 body + 68 face + 2×21 hands; NO feet),
-coordinates NORMALIZED to the image (x/W, y/H), one npz per video in one of TWO packaging schemes (both verified
-on real shard bytes):
-  - consolidated: <vid>/npz/poses.npz with header arrays (video_id, fps, total_frames, frame_widths,
-    frame_heights, frame_indices, frame_payloads[object] — one dict per frame)
-  - per-frame:    <vid>/npz/00000001.npz ... (1-based file index = frame index; same keys per file; no fps header
-    — the corpus is extracted at a unified 24 fps per the dataset card)
+DWPose keypoints in the 128-point OpenPose layout (18 body + 68 face + 2×21 hands; NO feet), coords NORMALIZED
+to the image (x/W, y/H), one npz per video in one of TWO packaging schemes (both verified on real shard bytes):
+  - consolidated: <vid>/npz/poses.npz + header arrays (video_id, fps, total_frames, frame_widths, frame_heights,
+    frame_indices, frame_payloads[object] — one dict per frame)
+  - per-frame:    <vid>/npz/00000001.npz ... (1-based file index = frame index; no fps header — the corpus is
+    extracted at a unified 24 fps per the dataset card)
 
-This module converts a video's npz payloads to the repo-canonical (T, 133, 3) float32 COCO-WholeBody array with
-coords kept NORMALIZED [0,1] (x/W, y/H) — the exact input contract of poses.preprocessing.normalize_keypoints_unisign
-and the SAME domain data/pretrimmed.py feeds (the path that reproduces the paper BLEU). Do NOT scale to pixels: the
-released Uni-Sign weights were trained on x/W,y/H coords and crop_scale is aspect-ratio dependent. Every downstream
-stage (build_pose_index, load_pose_window, augmentations, both segmenters, SLT) then runs unchanged on SignVerse data.
+Output (T, 133, 3) float32 keeps coords NORMALIZED [0,1] — the contract of poses.preprocessing.normalize_keypoints_unisign 
+and the domain data/pretrimmed.py feeds (reproduces the paper BLEU). Do NOT scale to pixels: the released Uni-Sign weights 
+were trained on x/W,y/H, and crop_scale uses ONE shared scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent). 
+Downstream (build_pose_index, load_pose_window, augmentations, both segmenters, SLT) runs unchanged.
 
-Cross-checked against SignVerse's own (deleted, pre-release) README: our `person_000` == its "person_0 ... treated
-as the primary signer"; body IS OpenPose-18 (their viz uses --style openpose). BUT that README describes a stale
-schema — nested `person_0: {body: float[18,3]}`, a `caption.json`, and "pixel space" coords — that matches NONE of
-the actual release: flat `person_000_*_keypoints (18,2)` + `_scores`, per-video `.vtt`, coords NORMALIZED to [0,1]
-(verified on real shards, both schemes). `assert_normalized_coords` fails loud if a shard ever ships pixel-space.
+The deleted pre-release README confirms `person_000` = primary signer and OpenPose-18 body (viz: --style openpose), 
+but its schema is stale (nested `person_0: {body: float[18,3]}`, `caption.json`, "pixel space") vs the release: 
+flat `person_000_*_keypoints (18,2)` + `_scores`, per-video `.vtt`, normalized coords.
 
-Verified data quirks handled here (real bytes, shards 000006 + 000270):
-  - body_scores sometimes contain the INDICES 0..17 instead of confidences (~4% of frames): detected per
-    part+frame and replaced by 1.0 for in-frame coords / 0.0 otherwise (a naive conf>thr gate would
-    permanently delete the nose, score 0.0).
-  - frames with num_persons == 0 carry no keypoint arrays → zero frames (the pipeline's missing-detection
-    convention; velocity masking + conf gating already treat all-zero joints as absent).
-  - multiple persons can be present (person_001 seen in the wild) → person_000 (primary signer) only.
-  - sentinel coordinates far outside the frame on off-screen joints → score forced to 0 beyond a tolerance.
+Verified quirks handled here (real bytes, shards 000006 + 000270):
+  - body_scores sometimes hold the INDICES 0..17, not confidences (~4% of frames) → 1.0 in-frame / 0.0 otherwise.
+  - num_persons == 0 → no keypoint arrays → zero frames (velocity masking + conf gating treat all-zero joints as absent).
+  - multiple persons (person_001 in the wild) → person_000 only.
+  - off-frame sentinel coords → score 0 beyond a tolerance.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -59,23 +52,21 @@ def _part_arrays(payload: dict, part: str, count: int) -> tuple[np.ndarray, np.n
     sc = np.asarray(sc, dtype=np.float32).reshape(-1)
     if kp.shape != (count, 2) or sc.shape != (count,): return None
 
-    # Extraction bug (the DOMINANT case on real shards): scores hold the joint INDEX (0..N-1) instead of a confidence, 
-    # MIXED with -1 failed-detection sentinels, e.g. [0,1,2,...,7,-1,-1,10,...]. A real confidence is bounded ~[0,1.1], 
-    # so an entry equal to its own index >= 2 is an impossible confidence — the unambiguous tell. When every non-(-1) 
-    # score equals its index (and at least 1 such index >= 2 confirms the pattern), the frame is a bug frame: replace 
-    # the index-scores with 1.0 (present); the -1 slots stay and are zeroed below as absences. (`allclose(sc, arange)` 
-    # check never matched these hybrid frames, so it deleted the nose — index 0, value 0.0 — in ~100% of body-detected 
-    # frames and leaked raw indices in as confidences.)
+    # Extraction bug (DOMINANT on real shards): scores hold the joint INDEX (0..N-1), not a confidence, MIXED with -1 
+    # failed-detection sentinels, e.g. [0,1,2,...,7,-1,-1,10,...]. Real confidences are ~[0,1.1], so a score = its own 
+    # index >= 2 is impossible — the tell. All non-(-1) scores equal to their index (>= 1 of them >= 2) ⇒ bug frame: 
+    # index-scores → 1.0; -1 slots zeroed below. An `allclose(sc, arange)` check missed these hybrid frames: it deleted 
+    # the nose (index 0, value 0.0) in ~100% of body-detected frames and leaked indices in as confidences.
     idx = np.arange(count, dtype=np.float32)
     is_idx = sc == idx
     if count > 2 and bool((is_idx | (sc == -1.0)).all()) and bool((is_idx & (idx >= 2)).any()):
         sc = np.where(is_idx, 1.0, sc)
-    # Off-screen sentinel coords (far outside the normalized frame) are absences, not detections.
+    # Coords far outside the normalized frame are off-screen sentinels: absences, not detections.
     off = (kp[:, 0] < -_COORD_TOLERANCE) | (kp[:, 0] > 1 + _COORD_TOLERANCE) | \
           (kp[:, 1] < -_COORD_TOLERANCE) | (kp[:, 1] > 1 + _COORD_TOLERANCE)
     sc = np.where(off, 0.0, sc)
-    # Failed detections carry score sentinels (-1 observed in the wild) with garbage coords. Zero BOTH so the
-    # canonical array uses the pipeline's absence convention (all-zero joint) instead of storing junk geometry.
+    # Failed detections carry score sentinels (-1 in the wild) with garbage coords. Zero BOTH: absences must use
+    # the pipeline's all-zero-joint convention, not junk geometry.
     bad = sc <= 0.0
     sc = np.where(bad, 0.0, sc)
     kp = np.where(bad[:, None], 0.0, kp)
@@ -83,9 +74,8 @@ def _part_arrays(payload: dict, part: str, count: int) -> tuple[np.ndarray, np.n
 
 
 def _confident_coord_sample(payload: dict) -> np.ndarray:
-    """RAW detected body coords from one frame — for the normalized-vs-pixel space check. Reads the payload
-    DIRECTLY (not via `_part_arrays`, whose off-screen filter zeroes pixel coords before we could detect them),
-    dropping only failed-detection rows (score <= 0, e.g. the -1 sentinel)."""
+    """RAW detected body coords from one frame, for the pixel-space check. Reads the payload DIRECTLY, not via
+    `_part_arrays` (whose off-screen filter zeroes pixel coords first); drops only failed rows (score <= 0)."""
     if not isinstance(payload, dict): return np.empty(0, dtype=np.float32)
     kp = payload.get("person_000_body_keypoints")
     sc = payload.get("person_000_body_scores")
@@ -97,11 +87,8 @@ def _confident_coord_sample(payload: dict) -> np.ndarray:
 
 
 def assert_normalized_coords(payloads, video_id: str = "") -> None:
-    """The released SignVerse corpus stores coords NORMALIZED to [0,1] (x/W, y/H; verified on real shards, both
-    packaging schemes) — the exact domain the released Uni-Sign weights were trained on, forwarded UNCHANGED into
-    crop_scale. That transform is aspect-ratio dependent, so a pixel-space shard (were one to ship, as the deleted
-    pre-release README's stale schema claimed) would be a different domain → OOD features; `_part_arrays` would also
-    filter its coords as off-screen → a silently-empty video. Fail LOUD instead. Cheap: first populated frames only."""
+    """Fail LOUD if a shard ships PIXEL-space coords: forwarded unchanged into crop_scale they are OOD, and
+    `_part_arrays` filters them as off-screen → a silently-empty video. Cheap: first populated frames only."""
     sample: list[float] = []
     for payload in payloads:
         vals = _confident_coord_sample(payload)
@@ -116,12 +103,8 @@ def assert_normalized_coords(payloads, video_id: str = "") -> None:
 
 
 def payload_to_coco133(payload: dict) -> np.ndarray:
-    # One SignVerse frame payload → (133, 3) COCO-WholeBody (x, y, conf), coords kept NORMALIZED [0,1] exactly as
-    # stored. Uni-Sign's frozen weights were trained on x/W,y/H-normalized coords (crop_scale uses ONE shared
-    # scale=max(bbox_w,bbox_h) for both axes → aspect-ratio DEPENDENT, so it must NOT be un-distorted to pixels);
-    # this matches data/pretrimmed.py, which feeds the same [0,1] domain and reproduces the paper BLEU. Zeros where
-    # absent. person_000 = the primary (largest-bbox) signer; person_001+ ignored. Body is OpenPose-18 (their viz 
-    # uses --style openpose) → OPENPOSE18_TO_COCO17.
+    # One frame payload → (133, 3) COCO-WholeBody (x, y, conf), coords NORMALIZED [0,1] as stored (see module
+    # docstring); zeros where absent. person_000 = primary (largest-bbox) signer; person_001+ ignored.
     out = np.zeros((133, 3), dtype=np.float32)
     if not isinstance(payload, dict) or int(payload.get("num_persons", 0) or 0) < 1: return out
 
@@ -143,9 +126,9 @@ def payload_to_coco133(payload: dict) -> np.ndarray:
 
 def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int]:
     z = np.load(npz_path, allow_pickle=True)
-    # SignVerse is a UNIFORM 24 fps corpus (dataset card; verified on real shards). Pin to SIGNVERSE_DEFAULT_FPS so
-    # convert_video and prepare_data._backfill_meta (which has only the .npy, no fps) agree by construction; warn if
-    # a header ever disagrees rather than silently using a per-video rate the crash-recovery path can't reproduce.
+    # UNIFORM 24 fps corpus (dataset card; verified). Pin to SIGNVERSE_DEFAULT_FPS so convert_video and
+    # prepare_data._backfill_meta (which sees only the .npy) agree by construction; warn on a disagreeing header
+    # rather than using a rate the crash-recovery path can't reproduce.
     header_fps = float(np.asarray(z["fps"]).item()) if "fps" in z.files else SIGNVERSE_DEFAULT_FPS
     if abs(header_fps - SIGNVERSE_DEFAULT_FPS) > 0.5: print(
         f"[signverse] WARNING: {npz_path} header fps={header_fps} != {SIGNVERSE_DEFAULT_FPS}; "
@@ -163,10 +146,10 @@ def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int]:
     poses = np.zeros((n_frames, 133, 3), dtype=np.float32)
     frame_w = frame_h = 0
     for row, frame_no in enumerate(indices):
-        if int(frame_no) < 1: continue  # frame_indices are 1-based; guard against a 0/negative writing poses[-1]
+        if int(frame_no) < 1: continue  # 1-based; guard a 0/negative from writing poses[-1]
         payload = payloads[row]
         if not isinstance(payload, dict): continue
-        poses[int(frame_no) - 1] = payload_to_coco133(payload)  # coords are normalized [0,1] — no W/H scaling
+        poses[int(frame_no) - 1] = payload_to_coco133(payload)  # normalized coords — no W/H scaling
         w = float(widths[row]) if widths is not None else float(payload.get("frame_width", 0) or 0)
         h = float(heights[row]) if heights is not None else float(payload.get("frame_height", 0) or 0)
         if w > 0 and h > 0: frame_w, frame_h = int(w), int(h)  # recorded in video_meta (feeds spatial augs only)
@@ -186,10 +169,10 @@ def _load_per_frame(npz_dir: Path) -> tuple[np.ndarray, float, int, int]:
     frame_w = frame_h = 0
     checked = False
     for frame_no, path in sorted(frames.items()):
-        if frame_no < 1: continue                       # 1-based filenames; guard poses[-1]
-        z = np.load(path)  # per-frame npz hold plain numeric arrays only — no allow_pickle (untrusted HF bytes)
+        if frame_no < 1: continue                       # guard poses[-1]
+        z = np.load(path)  # plain numeric arrays only — no allow_pickle (untrusted HF bytes)
         payload = {k: z[k] for k in z.files}
-        if not checked:  # normalized-vs-pixel guard on the first POPULATED frame (see assert_normalized_coords)
+        if not checked:  # pixel-space guard, first POPULATED frame
             assert_normalized_coords([payload], video_id=npz_dir.parent.name)
             checked = bool(_confident_coord_sample(payload).size)
         w = float(np.asarray(payload.get("frame_width", 0)).item() or 0)
@@ -200,7 +183,7 @@ def _load_per_frame(npz_dir: Path) -> tuple[np.ndarray, float, int, int]:
 
 
 def load_signverse_video(npz_dir: str | Path) -> tuple[np.ndarray, float, int, int]:
-    # One SignVerse video's npz dir (either packaging scheme) → ((T,133,3) NORMALIZED-[0,1] poses, fps, width, height).
+    # One video's npz dir (either scheme) → ((T,133,3) NORMALIZED-[0,1] poses, fps, width, height).
     npz_dir = Path(npz_dir)
     consolidated = npz_dir / "poses.npz"
     if consolidated.exists(): return _load_consolidated(consolidated)
@@ -208,7 +191,7 @@ def load_signverse_video(npz_dir: str | Path) -> tuple[np.ndarray, float, int, i
 
 
 def convert_video(npz_dir: str | Path, out_npy: str | Path) -> dict:
-    # Convert one video and write `<out_npy>` ((T,133,3) float32). Returns summary stats for reporting.
+    # Convert one video → `<out_npy>` ((T,133,3) float32) + summary stats for reporting.
     poses, fps, width, height = load_signverse_video(npz_dir)
     out_npy = Path(out_npy)
     out_npy.parent.mkdir(parents=True, exist_ok=True)

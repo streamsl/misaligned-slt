@@ -1,5 +1,5 @@
-"""Stage-2 composition: the shared pose/text front end plus an AR or DLM decoder, and the per-window-mode training loss 
-(`MisalignedSLTModel.forward_loss`) that keeps truncated visual inputs free of partial text labels (premise P1)."""
+"""Stage-2 composition: shared pose/text front end + an AR or DLM decoder, 
+and the per-window-mode training loss (`MisalignedSLTModel.forward_loss`)."""
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,20 +20,20 @@ from data.windowing import BIO
 
 
 def deployed_decode_tags(
-    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None,
-    timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None,
+    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None, timestamps_s: torch.Tensor | None = None, 
+    commit_mask: torch.Tensor | None = None, seam_is_terminator: bool = True,
 ) -> torch.Tensor:
-    """THE deployed tag decode, shared by every consumer that must agree with the FSM: argmax → UNK→O remap →
-    semi-Markov duration re-split (streaming flags) → χ-boundary onset restoration. (B, T) long tensor, no gradient.
+    """THE deployed tag decode, shared with the FSM: argmax → UNK→O remap → duration re-split → χ-onset restoration.
+    (B, T) long, no gradient.
 
-    UNK→O: UNK is supervision-free, argmax-UNK is rare, but an unremapped UNK neither opens nor closes a span and selection silently 
-    diverges from the FSM's shared decode rule. Re-split (when `duration_prior` is set): the SAME `duration_split_tags` call as 
-    `infer/stream.py step()` — `mark_onsets=False` (opening keys on O→signing, so onset B's are inert for span selection) and 
-    `split_open_tail="survival"` (right-censored buffer tail). χ restoration (when `commit_mask` marks already-committed frames): 
-    the re-split folds ALL argmax B's before re-splitting, and the DP never opens a segment at the ≤δ committed-leftover seam, so 
-    after a b2b commit the successor sentence's onset would sit in unopenable leading I and the sentence would be structurally
-    dropped (alternate-sentence drop). The commit record certifies a sentence ENDED at the χ seam: the first signing frame at/after 
-    the seam that is mid-run (predecessor signing, or seam at row start) is marked B.
+    UNK→O: unremapped UNK neither opens nor closes a span → diverges from the FSM's rule.
+    Re-split: same `duration_split_tags` call as `infer/stream.py step()`; `mark_onsets=False` (opening keys on
+    O→signing, onset B's inert), `split_open_tail="survival"` (right-censored tail).
+    χ restoration: the DP never opens at the ≤δ committed-leftover seam, so a b2b successor's onset lands in unopenable
+    leading I and is dropped (alternate-sentence drop); the commit record proves a sentence ENDED there → mark the first
+    mid-run signing frame at/after the seam B. Only under `seam_is_terminator` (= FSM `_committed_is_terminator`), else
+    B at an open-span buffer-cap cut fabricates a boundary. Default True fits TRAINING (χ = sampler GT commit_mask);
+    streaming's `_stride_omega` passes the runner's live flag.
     """
     device = bio_logits.device
     tags = bio_logits.detach().argmax(dim=-1)
@@ -47,13 +47,12 @@ def deployed_decode_tags(
         fps_b = 24.0 # Default fallback if timestamps are missing or degenerate.
         if timestamps_s is not None and n > 1:
             dt = timestamps_s[b, 1:n] - timestamps_s[b, : n - 1]
-            # Clamp to a sane fps range: a degenerate (duplicate-timestamp) median of ~0 would otherwise give
-            # fps ~1e6 -> lmax = cap_s*fps blows the LP array and the O(T*lmax) DP up to OOM.
+            # Clamp: duplicate-timestamp median ~0 → fps ~1e6, so lmax = cap_s*fps OOMs the LP array / O(T*lmax) DP.
             if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
         tags_np[b, :n] = duration_split_tags(
             tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
         )
-        if commit_mask is not None:
+        if commit_mask is not None and seam_is_terminator:
             cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)
             if cm.any() and not cm.all():
                 seam = int(np.argmax(~cm))  # first non-committed frame
@@ -69,14 +68,13 @@ def gate_skip_flags(
     bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0,
     duration_prior=None, timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-row 'the FSM would SKIP this window' flag (B,) from the DEPLOYED tag decode.
+    """Per-row 'the FSM would SKIP this window' flag (B,) from `deployed_decode_tags`.
 
-    True when window has NO terminated span AND NO open span — the all-gap / headless-left-truncated states the deployed FSM
-    never decodes (buffer-start I never opens; no-span Ω is inert by construction). Single-window eval (RQ1) force-decodes those
-    states against a suppressed memory and scores hallucinations vs full reference; this flag lets it report the deployment-honest
-    split: decoded-only quality + skip rate. Uses `deployed_decode_tags` — the SAME decode build_gate_omega selects on — because
-    the duration re-split CAN change span existence, not just span count: on a headless all-I window (unopenable) the re-split's
-    interior B's create a complete selectable span the deployed FSM would decode. Skip and the Ω anchor must never disagree.
+    True when the window has NO terminated and NO open span — the all-gap / headless-left-truncated states the FSM never
+    decodes (buffer-start I never opens; no-span Ω inert). Single-window eval (RQ1) force-decodes them and reports the
+    honest split: decoded-only quality + skip rate. Must use the decode build_gate_omega selects on — the re-split
+    changes span *existence*, not just count (interior B's make a headless all-I window selectable) → skip and the Ω
+    anchor can never disagree.
     """
     B, T = bio_logits.shape[:2]
     lengths = frame_mask.long().sum(dim=1) if frame_mask is not None else torch.full((B,), T)
@@ -85,7 +83,11 @@ def gate_skip_flags(
     for b in range(B):
         n = max(1, int(lengths[b].item()))
         row = tags[b, :n]
-        if select_target_span(row, min_span_frames) is None and open_span_start(row) is None: skip[b] = True
+        # Same χ-frontier filter as build_gate_omega: else a window whose only complete span is already committed
+        # reads as decodable while the Ω anchor discards it.
+        chi_b = int(commit_mask[b, :n].sum().item()) if commit_mask is not None else 0
+        if select_target_span(row, min_span_frames, skip_term_before=chi_b) is None and open_span_start(row) is None:
+            skip[b] = True
     return skip
 
 
@@ -98,16 +100,15 @@ class SLTLossOutput:
 
 
 class MisalignedSLTModel(nn.Module):
-    """Stage-2 model: a pluggable pose/text front end (`models.front_end.SLTFrontEnd`) + a swappable AR or DLM decoder.
+    """Stage-2 model: pluggable pose/text front end (`models.front_end.SLTFrontEnd`) + swappable AR or DLM decoder.
 
-    The front end (Uni-Sign pose encoder + mT5 default / mBART ablation) produces, from poses:
+    The front end (Uni-Sign pose encoder + mT5 default / mBART ablation) emits from poses:
     - `bio_tap` (per-frame, length T): read DIRECTLY by `bio_head` (RoPEBIOHead) for phrase B/I/O — the streaming
       buffer's variable length never hits the seq2seq encoder's positions.
-    - the encoder memory (`enc_hidden`/`enc_mask`): cross-attended by the translation decoder.
+    - encoder memory (`enc_hidden`/`enc_mask`): cross-attended by the translation decoder.
 
-    `decoder="dlm"` builds the front end's block-diffusion decoder (OPUT training / SPD+DCD inference); `decoder="ar"`
-    uses the front end's AR seq2seq decoder. Only the decoder family differs between the two arms — front end, BIO head,
-    sampler, FSM, and commit gate are identical, which is what makes the AR-vs-DLM comparison a clean test.
+    `decoder="dlm"` → block-diffusion decoder (OPUT training / SPD+DCD inference), `"ar"` → AR seq2seq. Nothing else
+    differs — front end, BIO head, sampler, FSM, commit gate identical — which is what makes AR-vs-DLM a clean test.
     """
     def __init__(
         self, front_end: SLTFrontEnd | None = None, tokenizer=None, decoder: str = "dlm", block_size: int = 8, 
@@ -115,7 +116,7 @@ class MisalignedSLTModel(nn.Module):
         bio_conv_stem_layers: int = 2, pretrained_path: str | None = None,
     ):
         super().__init__()
-        # Front end: caller passes one (UniSignMT5FrontEnd / UniSignMBartFrontEnd — both live in models/unisign.py).
+        # Caller passes UniSignMT5FrontEnd / UniSignMBartFrontEnd (models/unisign.py).
         self.front_end = front_end
         self.tokenizer = self.front_end.tokenizer
         self.decoder_type = decoder
@@ -124,9 +125,8 @@ class MisalignedSLTModel(nn.Module):
             depth=bio_depth, nhead=bio_nhead, dropout=bio_dropout, num_classes=4,  # B/I/O + padding/UNK
             conv_stem_layers=bio_conv_stem_layers,  # local boundary inductive bias the UNet-less head lacks
         )
-        # Load the pretrained front end BEFORE building the DLM decoder: the block-diffusion substrate copies the
-        # current decoder/lm into its vocab+1 [MASK] canvas, so the pretrained weights must already be in place
-        # (loads the Uni-Sign pose_encoder + mT5/mBART; pose weights come from the released ckpt).
+        # Load pretrained BEFORE building the DLM decoder: the substrate copies the current decoder/lm into its
+        # vocab+1 [MASK] canvas, so the weights must already be in place.
         if pretrained_path:
             rep = self.front_end.load_pretrained(pretrained_path)
             print(f"slt | front-end warm-start {Path(pretrained_path).name}: {rep['pose_tensors']} pose + "
@@ -134,10 +134,8 @@ class MisalignedSLTModel(nn.Module):
                   f"unexpected {rep['pose_unexpected']}/{rep['mt5_unexpected']})", flush=True)
         if decoder == "dlm": self.dlm_decoder = self.front_end.make_dlm_decoder(block_size)
         elif decoder != "ar": raise ValueError(f"Unsupported decoder type: {decoder}")
-        # Semi-Markov duration prior for GATE's anchor selection (infer/duration_decode.py). None = raw-argmax selection. 
-        # Set by train/slt.py (training), infer/stream.py (streaming), eval.py run_rq1 (single-window) — from the SAME 
-        # inference.yaml `duration_decode` switch that drives the FSM's tag re-split, so the gate and the FSM always see 
-        # the same tag stream (on-policy symmetry).
+        # Semi-Markov duration prior for gate's anchor selection (infer/duration_decode.py); None = raw argmax. Set by train/slt.py, 
+        # infer/stream.py and eval.py run_rq1 from the SAME inference.yaml `duration_decode` switch that drives the FSM's re-split.
         self.duration_prior = None
 
     def _pad_or_trim_tokens(self, tokens: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -148,7 +146,6 @@ class MisalignedSLTModel(nn.Module):
         return torch.cat([tokens, pad], dim=1)
 
     def encode_visual(self, batch: dict):
-        # -> (bio_tap, bio_mask, enc_hidden, enc_mask, timestamps)
         bio_tap, bio_mask, timestamps, enc_hidden, enc_mask = self.front_end.encode(
             batch["poses"], batch["frame_mask"], batch.get("timestamps_s"),
         )
@@ -156,7 +153,7 @@ class MisalignedSLTModel(nn.Module):
 
     @staticmethod
     def _span_iou(a: tuple[int, int] | None, b: tuple[int, int] | None) -> float:
-        # tIoU of 2 [start, terminator) frame spans; 0 if either is missing.
+        # tIoU of 2 [start, terminator) frame spans.
         if a is None or b is None: return 0.0
         lo = max(a[0], b[0]); hi = min(a[1], b[1])
         inter = max(0, hi - lo)
@@ -165,36 +162,31 @@ class MisalignedSLTModel(nn.Module):
 
     def build_gate_omega(
         self, bio_logits: torch.Tensor, bio_labels: torch.Tensor | None, frame_mask: torch.Tensor, memory_len: int, 
-        commit_mask: torch.Tensor | None = None, delta: int = 3, eps: float = 1e-4, min_span_frames: int = 0,
-        iou_veto: float = 0.5, gt_anchored: bool = False, timestamps_s: torch.Tensor | None = None,
+        commit_mask: torch.Tensor | None = None, delta: int = 3, eps: float = 1e-4, min_span_frames: int = 0, iou_veto: float = 0.5, 
+        gt_anchored: bool = False, timestamps_s: torch.Tensor | None = None, seam_is_terminator: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Build the membership-gate cross-attention bias (B,1,1,M) for a batch (docs/membership_gate.md).
+        """Membership-gate cross-attention bias (B,1,1,M) for a batch (docs/membership_gate.md).
 
-        The per-window selected span (s, τ) is ON-POLICY — from the BIO head's OWN argmax (`select_target_span`, the SAME rule the streaming 
-        FSM uses) — so training and inference see the same imperfect gate. At training, `bio_labels` (true B/I/O, already in window-relative 
-        frames) provides the GT span for the IoU veto (§1.5) — the honest residue of teacher forcing: where the predicted target overlaps GT 
-        at IoU < `iou_veto`, the span is rebuilt from the GT anchor for that window only (train-only rail, rate logged). `gt_anchored=True` 
-        forces the GT span (the always-GT ablation). At INFERENCE `bio_labels=None`: no GT, no veto — the predicted span is used verbatim, 
-        which is exactly the deployed behaviour.
+        The span (s, τ) is ON-POLICY — the BIO head's OWN argmax via `select_target_span`, the rule the FSM uses.
+        Training: `bio_labels` (window-relative B/I/O) gives the GT span for the IoU veto (§1.5); overlap below
+        `iou_veto` rebuilds from the GT anchor (train-only rail, rate logged); `gt_anchored=True` forces GT (ablation).
+        Inference (`bio_labels=None`): no GT, no veto, predicted span verbatim — deployed behaviour.
         """
         B, T, _ = bio_logits.shape
         device = bio_logits.device
         lengths = frame_mask.to(device).long().sum(dim=1) if frame_mask is not None else torch.full((B,), T, device=device)
-        # THE deployed tag decode (module-level `deployed_decode_tags`): argmax → UNK→O remap → semi-Markov duration re-split (streaming flags) 
-        # → χ-boundary onset restoration. ONE shared implementation with the FSM's skip flag, so anchor selection here, `gate_skip_flags`, and 
-        # the deployed FSM can never disagree on which spans exist. Selection carries no gradient. Without the re-split the gate is off-policy 
-        # the moment the FSM decodes with duration: on a back-to-back window the raw argmax yields ONE merged run, select_target_span anchors Ω 
-        # on it, and the decoder trains against neighbour-sentence features the deployed gate would have masked. `commit_mask` doubles as the 
-        # χ record for the alternate-sentence-drop guard (see the helper).
+        # Without the re-split the gate goes off-policy once the FSM decodes with duration: a back-to-back window's
+        # raw argmax is ONE merged run, training the decoder on neighbour-sentence features the deployed gate masks.
         duration_prior = getattr(self, "duration_prior", None)  # getattr: test fakes drive this method unbound
-        pred_tags = deployed_decode_tags(bio_logits, lengths, duration_prior, timestamps_s, commit_mask)
-
+        pred_tags = deployed_decode_tags(
+            bio_logits, lengths, duration_prior, timestamps_s, commit_mask, seam_is_terminator=seam_is_terminator
+        )
         starts, terms, has_term = [], [], []
         vetoed, n_gt = 0, 0  # veto rate is over windows that HAVE a GT target (§1.6 diagnostic)
         for b in range(B):
             n = int(lengths[b].item())
-            # χ-frontier filter, mirroring the FSM's selection (on-policy symmetry): a span whose terminator
-            # precedes the commit frontier is emitted content, never an anchor candidate.
+            # χ-frontier filter mirroring the FSM (χ = in-buffer frame count): a span terminating before the commit
+            # frontier is emitted content, never an anchor candidate.
             chi_b = int(commit_mask[b, :n].sum().item()) if commit_mask is not None else 0
             pred = select_target_span(pred_tags[b, :n], min_span_frames, skip_term_before=chi_b)
             if bio_labels is None: span = pred  # inference: on-policy, no veto, no GT
@@ -202,9 +194,9 @@ class MisalignedSLTModel(nn.Module):
                 gt = select_target_span(bio_labels[b, :n], min_span_frames)
                 if gt is not None: n_gt += 1
                 if gt_anchored:                 # ablation row: "GT-anchored with ±δ jitter" (gate-doc §3 table)
-                    # The ±δ jitter is part of the ablation's definition, not decoration: exact GT anchors would hand the gate boundary 
-                    # information the deployed on-policy head can never supply, conflating "teacher-forced m" with "oracle boundaries". 
-                    # Jitter keeps the anchors GT-DERIVED but δ-imprecise — the same tolerance the gate's ramp/bands are built around.
+                    # Jitter is part of the ablation: exact GT anchors would hand the gate boundary
+                    # info the on-policy head can never supply, conflating "teacher-forced m" with
+                    # "oracle boundaries". δ-imprecision is the tolerance the gate's ramp/bands assume.
                     span = gt
                     if gt is not None:
                         vetoed += 1
@@ -221,13 +213,10 @@ class MisalignedSLTModel(nn.Module):
             if span is not None: 
                 starts.append(int(span[0])); terms.append(int(span[1])); has_term.append(True)
             else:
-                # No TERMINATED span. If an OPEN (terminator-less) span runs to buffer edge — Mode-2a right-truncation or a buffer-cap 
-                # forced commit — anchor Ω at ITS true start s (doc §2.8 forced path: γ≡γ_s, no right cliff → Ω≈0 for all-I interior). 
-                # Anchoring at frame 0 instead would sweep the opening B and floor the entire span the gate is meant to OPEN (attention 
-                # ×0.01). SAME anchoring policy as the terminated branch above: ON-POLICY first — the predicted open start, which is 
-                # what inference uses — with GT only as the logged veto fallback when the prediction is missing or off by more than δ 
-                # (the single-endpoint analog of the IoU veto; within δ the ramp/band geometry is unchanged). GT-first here would train 
-                # the decoder on teacher-forced anchors it never sees deployed, invisibly to the veto-rate diagnostic.
+                # An OPEN span running to buffer edge (Mode-2a right-truncation, buffer-cap forced commit) anchors Ω at ITS true start 
+                # s (doc §2.8 forced path: γ≡γ_s, no right cliff → Ω≈0 for all-I interior); frame 0 would sweep the opening B and floor 
+                # the span the gate must OPEN (attention ×0.01). On-policy first; GT only as the logged veto fallback when the prediction 
+                # is missing or off by >δ (single-endpoint IoU-veto analog), since GT-first trains on anchors never seen deployed.
                 pred_open = open_span_start(pred_tags[b, :n])
                 if bio_labels is None: open_s = pred_open  # inference: on-policy, no veto
                 else:
@@ -239,10 +228,9 @@ class MisalignedSLTModel(nn.Module):
                 if open_s is not None:
                     starts.append(int(open_s)); terms.append(-1); has_term.append(False)
                 else:
-                    # Genuinely no span (all-gap / buffer-start-I leftover). This Ω is INERT — never decoded against: FSM skips these 
-                    # buffers (all-gap → no target; left-truncated fragment → 'skip', and the 'translate_partial' ablation decodes 
-                    # UNgated), and in training no-span rows carry no translation loss. The anchor value is arbitrary; n−1 is just a 
-                    # valid index (NOT neutral — frames < n−1−δ sit behind the left wall — which is fine only as nothing reads it).
+                    # Genuinely no span (all-gap / buffer-start-I leftover). INERT Ω — never decoded against: the FSM skips these buffers 
+                    # ('translate_partial' decodes UNgated) and no-span rows carry no translation loss. n−1 is valid but NOT neutral 
+                    # (frames < n−1−δ sit behind the left wall) — safe only while unread.
                     starts.append(max(0, n - 1)); terms.append(-1); has_term.append(False)
 
         out = build_omega(
@@ -272,19 +260,17 @@ class MisalignedSLTModel(nn.Module):
                 decode_algo=dcd_decode_algo, decode_param=dcd_decode_param, sample_top_k=dcd_sample_top_k, top_p=dcd_top_p, 
                 cache_type=dcd_cache_type, refresh_count=dcd_refresh_count, omega_bias=omega_bias,
             )
-            # Report PRODUCED-token confidence only, matching the AR arm's per-produced-token vector: canvas slot 0 is the synthetic 
-            # BOS (confidence 1.0) and every slot after the first EOS is pad bookkeeping (also 1.0) — averaged over a max_text_tokens 
-            # canvas they pin the mean the commit gate reads near 1 for any short sentence (a ~10-token sentence on a 128 canvas → 
-            # mean ≥ 0.92 regardless of decode quality, i.e. `translation_confident` would always fire).
+            # Slice to PRODUCED tokens (AR-arm parity): slot 0 (synthetic BOS) and everything past the first EOS are
+            # 1.0 pad bookkeeping, so an unsliced mean pins the commit gate near 1 (~10 tokens on a 128 canvas → ≥
+            # 0.92 regardless of quality; `translation_confident` always fires).
             seq, conf = result.sequences[:, 1:], result.confidence[:, 1:]
             if seq.shape[0] == 1:  # every live caller decodes one window/buffer at a time
                 hits = (seq[0] == int(self.dlm_decoder.eos_index)).nonzero(as_tuple=False)
                 if hits.numel(): seq, conf = seq[:, : int(hits[0]) + 1], conf[:, : int(hits[0]) + 1]
             return seq, conf
 
-        # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns REAL per-token confidence 
-        # (softmax prob of each produced token), aligned with `generated`. `num_beams>1` is the clean-baseline beam search; the SLT AR 
-        # arm stays greedy (num_beams=1). Under `omega_bias`, cross-attention is membership-gated per step (same Ω the DLM decode uses).
+        # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns REAL
+        # per-token confidence. `num_beams>1` is the clean baseline's beam search; the SLT AR arm stays greedy.
         return self.front_end.ar_generate(
             enc_hidden, enc_mask, max_new_tokens=max_text_tokens, num_beams=num_beams,
             decoder_start_id=decoder_start_token_id, omega_bias=omega_bias,
@@ -294,18 +280,13 @@ class MisalignedSLTModel(nn.Module):
     def _ar_confidence_bound_logits(
         self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, max_len: int, omega_bias=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return gradient-carrying AR logits on the truncated model path.
+        """Gradient-carrying AR logits on the truncated path.
 
-        `generate_from_bio_tap` is intentionally called under no-grad to choose the AR prefix. The subsequent forward pass
-        replays that prefix and keeps gradients in the logits used by the confidence-bound CE term. When the gate is on,
-        BOTH the prefix generation and the grad-bearing replay run under the same Ω conditioning (the replay's gradient
-        into the BIO logits through Ω is part of the coupling on Mode-2a as well). (AR is not a diffusion decoder, so
-        diffusion_steps/tau_dec don't apply here — the DLM arm's CB path uses them, this one doesn't.)
+        `generate_from_bio_tap` picks the prefix under no-grad; this forward replays it for the gradients the confidence-bound CE needs. 
+        Generation and replay share one Ω — that gradient into the BIO logits is part of the Mode-2a coupling.
         """
         with torch.no_grad():
-            trunc_tokens, _ = self.generate_from_bio_tap(
-                bio_tap, frame_mask, max_text_tokens=max(1, max_len - 1), omega_bias=omega_bias
-            )
+            trunc_tokens, _ = self.generate_from_bio_tap(bio_tap, frame_mask, max_text_tokens=max(1, max_len - 1), omega_bias=omega_bias)
             trunc_tokens = self._pad_or_trim_tokens(trunc_tokens, max_len)
 
         enc_hidden, enc_mask = self.front_end.encode_memory(bio_tap, frame_mask)
@@ -323,20 +304,17 @@ class MisalignedSLTModel(nn.Module):
         gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
         commit_mask: torch.Tensor | None = None, **decode_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Poses → (bio_logits, tokens, confidence, gate_skip). This method owns the BIO tap + the membership gate; every decode knob 
-        (max_text_tokens / diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) passes straight through to 
-        `generate_from_bio_tap` — declared once, there, not re-listed here. `gate_skip` (B, bool) marks windows the deployed FSM would 
-        never decode (no span at all); all-False when the gate is off."""
+        """Poses → (bio_logits, tokens, confidence, gate_skip). Owns the BIO tap + membership gate; decode knobs (max_text_tokens / 
+        diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) pass through to `generate_from_bio_tap`, 
+        declared once there. `gate_skip` (B, bool) marks windows the deployed FSM would never decode; all-False when gate is off."""
         bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
         if getattr(self, "bio_branch_off", False) and not gate_enabled:
-            # Clean-floor recipe (lambda_bio=0): the head is frozen at random init — its logits are meaningless
-            # and, with the gate off, unread. Return zeros in the contract slot instead of running the head.
+            # Clean-floor recipe: head frozen at random init and, gate off, unread — zeros fill the contract slot.
             bio_logits = bio_tap.new_zeros(*bio_tap.shape[:2], 4)
         else:
             bio_logits = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=mask).logits
-        # Membership gate at inference: on-policy span from the head's own argmax (bio_labels=None → no veto),
-        # χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in training (§1.3/§2.8).
-        # Both arms: the DLM injects Ω in its decode; the AR arm via HF cross-attn hooks (front_end.ar_generate).
+        # Inference gate (no veto), χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in
+        # training (§1.3/§2.8); the AR arm injects it via HF cross-attn hooks (front_end.ar_generate).
         omega_bias = None
         gate_skip = torch.zeros(poses.shape[0], dtype=torch.bool)
         if gate_enabled:
@@ -368,24 +346,24 @@ class MisalignedSLTModel(nn.Module):
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
-        Computes ``L = lambda_bio * L_BIO + lambda_trans * L_translation`` where the translation term is routed *per window mode* (the batch 
-        carries `mode_names` from the sampler), enforcing premise P1 — a truncated visual input never receives a partial text label:
+        ``L = lambda_bio * L_BIO + lambda_trans * L_translation``, translation routed per window mode (`mode_names` from
+        the sampler) to enforce premise P1: a truncated visual input never receives a partial text label.
 
-        - **BIO** (all modes): Dice(1.5)+CE on the phrase head over every in-window frame; padding/UNK ignored.
-        - **Mode 1 / Mode 3** (complete-anchor / first-complete-span): translation via **OPUT** under fixed full conditioning 
-          (`dlm_decoder.oput_forward`, or plain CE for the AR arm). A hard check raises if any other mode reaches the OPUT path.
-        - **Mode 2a** (right-truncated): the **confidence-bound** term only — gated CE toward the model's own no-grad full-evidence decode, 
-          at slots where that decode is reference-verified and the truncated decode is confidently disagreeing. Held off during 
-          ``confidence_bound_active=False`` (OPUT warmup) and weighted by ``cb_lambda``. See `dlm_decoder.remasked_logits` for why the CE 
-          gradient uses 1 cheap re-masked forward rather than back-prop through the decode.
-        - **Mode 2b / 2c / Mode 4** (left/both-truncated, all-gap): no translation loss (the model must stay silent / not hallucinate text).
+        - BIO (all modes): Dice(1.5)+CE over in-window frames; padding/UNK ignored.
+        - Mode 1 / Mode 3 (complete-anchor / first-complete-span): OPUT under fixed full conditioning
+          (`dlm_decoder.oput_forward`; plain CE for AR). Raises if any other mode reaches that path.
+        - Mode 2a (right-truncated): confidence-bound term only — gated CE toward the model's own no-grad full-evidence
+          decode, at slots where that decode is reference-verified and the truncated decode confidently disagrees. Off
+          during OPUT warmup (``confidence_bound_active=False``), weighted by ``cb_lambda``; see
+          `dlm_decoder.remasked_logits` for why its gradient uses 1 re-masked forward, not back-prop through the decode.
+        - Mode 2b / 2c / Mode 4 (left/both-truncated, all-gap): no translation loss — the model must stay silent.
 
-        Per-mode losses logged separately. Returns `SLTLossOutput` with the total, the BIO and translation components, and a `logs` dict.
+        Per-mode losses logged separately.
         """
         bio_tap, bio_mask, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
         if float(lambda_bio) == 0.0 and not gate_enabled: # Clean-floor recipe
-            # BIO branch is SKIPPED, not zero-weighted — no head forward, no loss graph, no backward through the head. (The gate is the 
-            # only other consumer of head's logits; with it off nothing downstream needs them — both gate blocks below are `if gate_enabled`.)
+            # BIO branch SKIPPED, not zero-weighted — no head forward, no graph, no backward. 
+            # The gate is its only other logits consumer and is off here.
             bio_out, bio_loss = None, bio_tap.new_zeros(())
         else:
             bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
@@ -396,10 +374,9 @@ class MisalignedSLTModel(nn.Module):
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
 
-        # Membership gate (docs/membership_gate.md): build the (B,1,1,M) cross-attention bias Ω from the BIO posteriors + the on-policy 
-        # selected span, so the decoder is CONDITIONED on the segmentation belief (the coupling — gradient from the translation loss 
-        # reaches the BIO logits through Ω). BOTH arms: the DLM injects Ω in its manual decode; the AR arm injects the same Ω via HF 
-        # cross-attn hooks (front_end.ar_omega_context) — so §9.3 is gated-vs-gated, isolating the decoder family. None → pre-gate.
+        # Membership gate (docs/membership_gate.md): Ω from BIO posteriors + on-policy span conditions the decoder on the segmentation 
+        # belief — the coupling, since translation-loss gradient reaches the BIO logits through Ω. BOTH arms inject same Ω (DLM manual
+        # decode, AR via front_end.ar_omega_context) → §9.3 stays gated-vs-gated. None → pre-gate.
         omega_bias = None
         if gate_enabled:
             omega_bias, gate_stats = self.build_gate_omega(
@@ -500,9 +477,8 @@ class MisalignedSLTModel(nn.Module):
             ref_mask = batch["reference_tokens"]["attention_mask"].to(bio_tap.device)[cb_indices].bool()
             max_len = ref_ids.shape[1]
 
-            # Membership gate for the Mode-2a CB decodes (both arms, so §9.3 stays symmetric): the truncated
-            # decode is gated by Ω from its own posteriors (on-policy); the full-evidence self-target by Ω from
-            # the full view's posteriors. None when the gate is off. Both trunc decodes/forwards share cb_omega_trunc.
+            # Gate for the Mode-2a CB decodes, both arms (§9.3 symmetry): the truncated decode uses Ω from its own
+            # posteriors (on-policy), the full-evidence self-target Ω from the full view's.
             cb_omega_trunc = cb_omega_full = None
             if gate_enabled:
                 prompt_len = self.front_end.prompt_length()
@@ -515,22 +491,19 @@ class MisalignedSLTModel(nn.Module):
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, iou_veto=gate_iou_veto,
                     timestamps_s=timestamps[cb_indices],  # real fps for the duration re-split (else 24fps fallback)
                 )
-                # Real timestamps + mask (previously dropped: RoPE silently fell back to the 50fps-index
-                # assumption on the full-evidence view — a time-scale mismatch vs the trunc view's real seconds).
+                # Real timestamps + mask, else RoPE assumes 50fps indices on full-evidence view — 
+                # a time-scale mismatch vs trunc view's real seconds.
                 full_cb_bio_logits = self.bio_head(full_bio_tap, timestamps_s=full_timestamps, frame_mask=full_mask).logits
                 cb_omega_full, _ = self.build_gate_omega(
                     full_cb_bio_logits, None, full_mask, memory_len=prompt_len + int(full_bio_tap.shape[1]),
-                    # χ on BOTH views (mirroring cb_omega_trunc): the full-evidence rows carry their own commit_mask,
-                    # so a committed predecessor tail straddling the left edge is floored here too — else the two
-                    # views would differ by a left-edge conditioning change, not only the right-truncation.
+                    # χ on BOTH views: a committed predecessor tail at the left edge must be
+                    # floored here too, else the views differ by more than the right-truncation.
                     commit_mask=full_batch.get("commit_mask"),
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
-                    timestamps_s=full_timestamps,  # real fps for the duration re-split (else 24fps fallback)
+                    timestamps_s=full_timestamps,
                 )
 
-            if self.decoder_type == "dlm":
-                # Encode the truncated path ONCE, grad-bearing (the no-grad decode below won't track it; remasked_logits
-                # later does). Encoding belongs to the front end, not the decoder (unified enc_hidden interface).
+            if self.decoder_type == "dlm": # Encode the trunc path ONCE, grad-bearing: the no-grad decode won't track it, remasked_logits will.
                 trunc_enc_hidden, trunc_enc_mask = self.front_end.encode_memory(bio_tap[cb_indices], bio_mask[cb_indices])
                 with torch.no_grad():
                     full_enc_hidden, full_enc_mask = self.front_end.encode_memory(full_bio_tap, full_mask)
@@ -544,7 +517,7 @@ class MisalignedSLTModel(nn.Module):
                     )
                     full_tokens = full_decode.sequences
 
-                    # The gate reads the confidence/argmax the *real* decode produces (what DCD sees at inference), so this stays under no_grad.
+                    # The gate reads the *real* decode's confidence/argmax (what DCD sees at inference) → stays no_grad.
                     trunc_decode = self.dlm_decoder.decode_spd_dcd(
                         enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len,
                         diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
@@ -563,8 +536,8 @@ class MisalignedSLTModel(nn.Module):
                 cb_ref_ids = torch.cat([bos_col, ref_ids[:, :-1]], dim=1)
                 cb_ref_mask = torch.cat([torch.ones_like(ref_mask[:, :1]), ref_mask[:, :-1]], dim=1)
 
-                # Gate first (from the real no-grad decode the inference gate reads), then 1 grad-bearing forward with gated slots re-masked 
-                # in an otherwise committed sequence — the deferral counterfactual DCD would face (see dlm_decoder.remasked_logits).
+                # Gate first, then 1 grad-bearing forward with the gated slots re-masked in an otherwise committed
+                # sequence — the deferral counterfactual DCD would face (dlm_decoder.remasked_logits).
                 cb_active_mask = confidence_bound_gate(
                     full_tokens=full_tokens, trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence,
                     reference_tokens=cb_ref_ids, valid_mask=cb_ref_mask, tau_cb=confidence_bound_tau, 
@@ -575,9 +548,7 @@ class MisalignedSLTModel(nn.Module):
                     remask_positions=cb_active_mask, omega_bias=cb_omega_trunc,
                 )
                 else: trunc_logits = None
-            else:
-                # AR Mode-2a: reuse the shared cb_omega_full / cb_omega_trunc built above the arm split, so the
-                # DLM and AR CB paths are gated symmetrically (§9.3).
+            else: # AR Mode-2a: reuse the cb_omega_* built above the arm split.
                 with torch.no_grad():
                     full_tokens, _ = self.generate_from_bio_tap(
                         full_bio_tap, full_mask, max_text_tokens=max(1, max_len - 1), omega_bias=cb_omega_full
@@ -587,9 +558,9 @@ class MisalignedSLTModel(nn.Module):
                 trunc_logits, _ = self._ar_confidence_bound_logits(
                     bio_tap[cb_indices], bio_mask[cb_indices], max_len=max_len, omega_bias=cb_omega_trunc,
                 )
-                # AR decode layout is [lang, tok1, ..., eos] (decoder start fixed to language code, matching mBART's training-time shift), 
-                # so after dropping the start token, slot j of full_tokens[:, 1:] lines up with reference slot j ([tok1, ..., eos, lang]); 
-                # Loss's min-length slicing trims the dangling lang code. DON'T slice reference too — that shifts verified gate off by 1.
+                # AR layout [lang, tok1, ..., eos] (start = language code, matching mBART's training shift), so dropping
+                # it lines full_tokens[:, 1:] slot j up with reference slot j ([tok1, ..., eos, lang]); the loss's
+                # min-length slicing trims the dangling lang code. DON'T slice the reference too — shifts the gate by 1.
                 full_tokens = full_tokens[:, 1:]
                 trunc_tokens, trunc_confidence = None, None
                 cb_ref_ids, cb_ref_mask, cb_active_mask = ref_ids, ref_mask, None
@@ -601,19 +572,18 @@ class MisalignedSLTModel(nn.Module):
                     tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
                     enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
                 )
-                # Fold CB into the SAME token-weighted pool as the OPUT modes (L_translation per window: L_OPUT for 1/3, L_cb for 2a). 
-                # A flat add would weight the 2a term independently of its batch share — ~9% of windows supplying the majority of the 
-                # translation gradient (the epoch-4 loss shock). λ_cb=1.0 then IS the spec composition; ≠1 is an explicit deviation.
+                # Fold CB into the SAME token-weighted pool as the OPUT modes (L_OPUT for 1/3, L_cb for 2a). A flat add
+                # would weight 2a independently of its batch share — ~9% of windows supplying most of the translation
+                # gradient (the epoch-4 loss shock). λ_cb=1.0 then IS the spec composition; ≠1 is an explicit deviation.
                 cb_weight = cb_ref_mask.to(dtype=translation_loss.dtype).sum().clamp(min=1)
                 translation_loss = (translation_loss * trans_weight + float(cb_lambda) * cb_weight * cb.loss) \
                     / (trans_weight + cb_weight).clamp(min=1)
-                logs["cb_loss"] = cb.loss.detach()                              # per-mode losses
+                logs["cb_loss"] = cb.loss.detach()
                 logs["cb_active_count"] = cb.active_count.detach().to(translation_loss.dtype)
 
-        # `lambda_bio=0` = translation-only training: the faithful Uni-Sign SLT recipe (a single label-smoothed CE, no auxiliary losses) 
-        # for the clean-floor arm. It matters METHODOLOGICALLY, not just for faithfulness — L_BIO teaches the shared pose trunk about 
-        # sentence boundaries, i.e. exactly the competence RQ1-A claims existing models LACK. A clean floor trained with it would understate 
-        # the misalignment problem and a reviewer could rightly call the comparison rigged.
+        # `lambda_bio=0` = translation-only: the faithful Uni-Sign SLT recipe (1 label-smoothed CE) for the clean-floor arm. 
+        # Also methodological — L_BIO teaches the shared pose trunk sentence boundaries, exactly the competence RQ1-A claims 
+        # existing models LACK, so a floor trained with it would understate the misalignment problem.
         total = float(lambda_bio) * bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()
         logs["loss"] = total.detach()

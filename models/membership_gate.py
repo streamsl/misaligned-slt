@@ -1,27 +1,21 @@
-"""The membership gate Ω(t): conditioning the translation decoder on the BIO head's segmentation beliefs.
+"""Membership gate Ω(t): additive, query-independent bias on the decoder's cross-attention logits,
+`score(i,t) = q·k/√d + Ω(t)`, conditioning translation on the BIO head's segmentation beliefs.
 
-Implements `docs/membership_gate.md` §2.9 verbatim — an additive, query-independent bias on the decoder's
-cross-attention logits, `score(i,t) = q·k/√d + Ω(t)`, built as **trust × evidence + fact**:
+`docs/membership_gate.md` §2.9, as trust × evidence + fact:
 
     Ω(t) = γ_t · max(ln ε, −Σ_{k∈K_t} ReLU(−ℓ_k))  +  ln(1 − χ_t + ε)
     ℓ_k  = z_k(I) − logsumexp(z_k(B), z_k(O))                 (three-way log-odds of I)
     γ_t  = sg[ 1 − H̄(band around the nearer of {s, τ}) ]      (per-edge trust, stop-grad)
     K_t  = frames between the selected start s and the attended frame t (δ-wide left ramp)
-    χ_t  = commit flag (already-emitted frames), UNCONDITIONAL floor, outside γ
+    χ_t  = commit flag (already-emitted frames), unconditional floor, outside γ
 
-Ω(t) ≤ 0 always (m_t ≤ 1): the gate can only DOWN-weight attention, never amplify. Frames the head believes
-are inside the target sentence (I wins the majority) get Ω = 0 — the decoder attends them unchanged; frames
-the head believes are outside/next-sentence get a γ-scaled penalty.
+Ω ≤ 0 always: confident-I frames get Ω = 0, outside ones a γ-scaled penalty.
 
-CRITICAL — the offset the design doc glosses. The doc's F is "what the BIO head reads AND what the decoder
-cross-attends". In the real Uni-Sign stack these differ: the BIO head reads the pose-encoder tap (length T);
-the decoder cross-attends `mT5_encoder([prompt | pose_tokens])` (length M = prompt_len + T). Ω is defined over
-the T pose frames, so `omega_cross_bias` LEFT-PADS prompt_len zeros — the task prompt is never gated — and
-aligns Ω to cross-attention columns [prompt_len, prompt_len+T).
+Offset the doc glosses: the BIO head reads the pose tap (T) but the decoder cross-attends
+`mT5_encoder([prompt | pose_tokens])` (M = prompt_len + T) — see `omega_cross_bias`.
 
-Gradient (per the doc): flows only into the softmax logits of contested, above-floor frames in K_t, scaled by
-γ_t; nothing flows into γ_t (stop-grad) or χ_t (constant). The selection of (s, τ) is argmax-level and carries
-no gradient. Verified against the doc's running-example numbers in tests/test_membership_gate.py.
+Gradient reaches only contested, above-floor frames in K_t, scaled by γ_t; γ_t (stop-grad), χ_t and 
+the argmax selection of (s, τ) carry none.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -30,8 +24,8 @@ import torch
 import torch.nn.functional as F
 from data.windowing import BIO
 
-# BIO class indices (data.windowing.BIO = {UNK:0, O:1, B:2, I:3}); UNK is padding-only and excluded from the
-# three-way {B,I,O} log-odds and entropy exactly as the doc specifies (ln 3 normalization, 3 classes).
+# data.windowing.BIO = {UNK:0, O:1, B:2, I:3}. UNK is padding-only: excluded from the {B,I,O} log-odds 
+# and entropy (hence the ln 3 normalization).
 _B, _I, _O = BIO["B"], BIO["I"], BIO["O"]
 LN3 = torch.log(torch.tensor(3.0))
 
@@ -46,11 +40,10 @@ class OmegaOutput:
 
 
 def three_way_log_odds(bio_logits: torch.Tensor) -> torch.Tensor:
-    """ℓ_k = z(I) − logsumexp(z(B), z(O)), the three-way log-odds of I vs {B,O} (doc §2.5, canonical form).
+    """ℓ_k = z(I) − logsumexp(z(B), z(O)), log-odds of I vs {B,O} (doc §2.5). `bio_logits`: (..., C≥4) raw logits.
 
-    Pure logit space — no probabilities materialized — so it is the numerically stable path the doc names.
-    Gradient split (doc §2.5): ∂ℓ/∂z(I)=1, ∂ℓ/∂z(B)=−P(B|¬I), ∂ℓ/∂z(O)=−P(O|¬I) — the push attacks the actual
-    competitor. `bio_logits`: (..., C≥4) raw head logits (UNK ignored).
+    Pure logit space for stability. ∂ℓ/∂z(I)=1, ∂ℓ/∂z(B)=−P(B|¬I), ∂ℓ/∂z(O)=−P(O|¬I) — 
+    the push attacks the actual competitor.
     """
     zI = bio_logits[..., _I]
     zBO = torch.stack([bio_logits[..., _B], bio_logits[..., _O]], dim=-1)
@@ -58,7 +51,7 @@ def three_way_log_odds(bio_logits: torch.Tensor) -> torch.Tensor:
 
 
 def _three_way_entropy(bio_logits: torch.Tensor) -> torch.Tensor:
-    # Normalized entropy H̄ = −Σ_c P(c) ln P(c) / ln 3 over the 3 classes {B,I,O} (UNK excluded, renormalized).
+    # Normalized entropy H̄ = −Σ_c P(c) ln P(c) / ln 3 over {B,I,O}.
     z3 = torch.stack([bio_logits[..., _B], bio_logits[..., _I], bio_logits[..., _O]], dim=-1)
     logp = torch.log_softmax(z3, dim=-1)
     p = logp.exp()
@@ -70,14 +63,11 @@ def membership_logm(
     hinge: torch.Tensor, starts: torch.Tensor, ramp: int, eps: float,
     lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Directional capped-odds accumulation → floored ln(m_t ∨ ε), doc §2.5 + §2.9 legend.
+    """Directional capped-odds accumulation → floored ln(m_t ∨ ε), doc §2.5–§2.6. Differentiable w.r.t. hinge.
 
-    `hinge[b,k] = ReLU(−ℓ_k) ≥ 0`. For t ≥ s: ln m_t = −Σ_{s<k≤t} hinge (start s excluded, m_s = 1). For the
-    δ-wide left ramp s−δ ≤ t < s: ln m_t = −Σ_{t≤k<s} hinge (doc §2.6). For t < s−δ: the wall (floor ln ε).
-    All floored at ln ε (the exact `m_t ∨ ε` form, so the gradient is exactly zero below the doubt cap).
-
-    Fully vectorized via a padded prefix-sum `Cpad[b,j] = Σ_{k<j} hinge[b,k]` (so Cpad[:,1:] == cumsum, and any
-    contiguous inclusive sum a..b = Cpad[b+1] − Cpad[a]). Differentiable w.r.t. hinge (→ BIO logits).
+    `hinge[b,k] = ReLU(−ℓ_k) ≥ 0`. t ≥ s: ln m_t = −Σ_{s<k≤t} hinge (s excluded, m_s = 1); δ-wide left ramp
+    s−δ ≤ t < s: −Σ_{t≤k<s} hinge; t < s−δ: the wall. Floored at ln ε (exact `m_t ∨ ε` → gradient exactly 0
+    below the doubt cap). Prefix sums `Cpad[b,j] = Σ_{k<j} hinge`; inclusive a..b = Cpad[b+1] − Cpad[a].
     """
     B, T = hinge.shape
     device = hinge.device
@@ -87,24 +77,22 @@ def membership_logm(
     Cs1 = Cpad.gather(1, (s + 1).view(B, 1))          # (B,1) = sum_{k<=s} hinge
 
     t = torch.arange(T, device=device).view(1, T).expand(B, T)
-    right = Cs1 - Cpad[:, 1:]                          # sum_{0..s} − sum_{0..t}  = −Σ_{s<k≤t}  (valid t≥s)
-    left = Cpad[:, :T] - Cs                            # sum_{0..t−1} − sum_{0..s−1} = −Σ_{t≤k<s} (valid t<s)
+    right = Cs1 - Cpad[:, 1:]                         # sum_{0..s} − sum_{0..t}  = −Σ_{s<k≤t}  (valid t≥s)
+    left = Cpad[:, :T] - Cs                           # sum_{0..t−1} − sum_{0..s−1} = −Σ_{t≤k<s} (valid t<s)
 
     s_col = s.view(B, 1)
     logm = torch.where(t >= s_col, right, left)
     logm = torch.where(t < s_col - int(ramp), torch.full_like(logm, float("-inf")), logm)  # wall → floor below
     ln_eps = torch.log(torch.tensor(float(eps), device=device, dtype=logm.dtype))
     logm = torch.maximum(logm, ln_eps)                # exact floor m_t ∨ ε
-    if lengths is not None:                            # padded frames never gate real ones; keep them at floor
+    if lengths is not None:                           # padded frames never gate real ones; keep them at floor
         valid = t < lengths.view(B, 1)
         logm = torch.where(valid, logm, ln_eps.expand_as(logm))
     return logm
 
 
-def _band_entropy(
-    entropy: torch.Tensor, center: torch.Tensor, half: int, lengths: torch.Tensor,
-) -> torch.Tensor:
-    # Mean normalized entropy over the ±half band around `center`, clamped to [0, length). (B,)
+def _band_entropy(entropy: torch.Tensor, center: torch.Tensor, half: int, lengths: torch.Tensor) -> torch.Tensor:
+    # Mean H̄ over the ±half band around `center`, clamped to [0, length). (B,)
     B, T = entropy.shape
     device = entropy.device
     t = torch.arange(T, device=device).view(1, T).expand(B, T)
@@ -121,18 +109,17 @@ def build_omega(
     commit_mask: torch.Tensor | None = None, lengths: torch.Tensor | None = None,
     delta: int = 3, eps: float = 1e-4, has_terminator: torch.Tensor | None = None,
 ) -> OmegaOutput:
-    """Assemble Ω(t) over the T pose frames (doc §2.9). Returns (B, T); see `omega_cross_bias` for the
-    prompt-offset expansion to a cross-attention bias.
+    """Assemble Ω(t) over the T pose frames (doc §2.9) → (B, T); `omega_cross_bias` expands it to a cross-attn bias.
 
     Args:
         bio_logits: (B, T, C≥4) raw BIO head logits.
-        starts:      (B,) selected start frame s (argmax-level; no gradient).
-        terminators: (B,) terminator frame τ (first O-or-B after s). Use any value where `has_terminator` is
-                     False — it is ignored there (open/forced-commit path: γ ≡ γ_s, no right cliff).
-        commit_mask: (B, T) bool χ — already-emitted frames get an UNCONDITIONAL ln ε (outside γ). None → zeros.
+        starts:      (B,) start frame s (argmax-level; no gradient).
+        terminators: (B,) terminator τ (first O-or-B after s); ignored where `has_terminator` is False
+                     (open/forced-commit path: γ ≡ γ_s, no right cliff).
+        commit_mask: (B, T) bool χ — emitted frames get an unconditional ln ε (outside γ). None → zeros.
         lengths:     (B,) real frame counts (excludes right-padding). None → all T valid.
         delta:       δ = ramp width, boundary tolerance, and (as 2δ) trust-band half-width. One constant.
-        has_terminator: (B,) bool. None → inferred as (terminators >= 0) & (terminators > starts).
+        has_terminator: (B,) bool. None → (terminators >= 0) & (terminators > starts).
     """
     B, T, _ = bio_logits.shape
     device = bio_logits.device
@@ -163,12 +150,10 @@ def build_omega(
     near_s = near_s | (~has_terminator.view(B, 1))
     gamma = torch.where(near_s, gamma_s.view(B, 1), gamma_tau.view(B, 1))  # (B, T), detached
 
-    # ── right wall (mirror of the left wall at s−δ): frames beyond τ+δ are non-members regardless of evidence ──
-    # The capped-odds membership is EVIDENCE-driven: past τ, m only decays where hinge(−ℓ) > 0, i.e. where frames stop 
-    # being confident-I — which is exactly a GAP. A back-to-back successor sentence is confident-I throughout, so without 
-    # a wall Ω ≈ 0 past τ and the gate cannot mask the neighbour — precisely the contamination the duration re-split 
-    # anchors exist to prevent. A no-op for gap-terminated spans (O frames' own hinge already floors m within δ of τ) and 
-    # inert on the open/forced path (no terminator); the same hard floor as left wall, so gradient below it is exactly 0.
+    # ── right wall (mirrors the left wall at s−δ): frames past τ+δ are non-members ──
+    # Membership only decays where hinge > 0, i.e. at a gap; a back-to-back successor is confident-I throughout,
+    # so without this wall Ω ≈ 0 past τ and the gate cannot mask the neighbour. No-op for gap-terminated spans,
+    # inert on the open/forced path; hard floor → gradient exactly 0 below it.
     right_wall = has_terminator.view(B, 1) & (t > terminators.view(B, 1) + int(delta))
     ln_eps = torch.log(torch.tensor(float(eps), device=device, dtype=logm.dtype))
     logm = torch.where(right_wall, ln_eps.expand_as(logm), logm)
@@ -182,21 +167,17 @@ def build_omega(
 
 
 class CrossAttnOmegaInjector:
-    """Add a fixed, query-independent Ω(t) to a HF encoder-decoder's CROSS-attention via forward pre-hooks —
-    so HF's own AR `forward` / `generate` / beam / KV-cache run UNCHANGED and the AR de-risk arm sees the
-    identical conditioning as the DLM arm (which injects Ω in its manual decode loop). Adapt HF, don't
-    reimplement the decoder. One mechanism, two backbones (verified against transformers 4.57.3 internals):
+    """Add Ω(t) to a HF encoder-decoder's cross-attention via forward pre-hooks, so HF's `forward` / `generate` /
+    beam / KV-cache run unchanged and the AR arm sees what the DLM arm injects in its manual decode loop.
+    Verified against transformers 4.57.3 internals:
 
-      T5 / mT5 : the cross-attn folds its mask into `encoder_decoder_position_bias` at block 0 and REUSES it
-                 across blocks (modeling_t5.py `T5Attention`: `if position_bias is None: ... += causal_mask`),
-                 so adding Ω to each block's cross `attention_mask` kwarg propagates to every layer.
+      T5 / mT5 : cross-attn folds its mask into `encoder_decoder_position_bias` at block 0 and reuses it across
+                 blocks, so adding Ω to each block's cross `attention_mask` kwarg reaches every layer.
       mBART    : each `MBartDecoderLayer` adds `encoder_attention_mask` to the cross-attn scores directly
-                 (`eager_attention_forward`: `attn_weights += attention_mask`; SDPA passes it as `attn_mask`),
-                 so adding Ω to `attention_mask` gates every layer.
+                 (eager `attn_weights += attention_mask`; SDPA `attn_mask`), so Ω gates every layer.
 
-    Ω is (B,1,1,M) additive (≤0); it broadcasts over heads and decoder queries and is re-applied every decode
-    step (fixed conditioning). Beam expands the batch to B·beams — the hook repeats Ω to match. Use via the
-    `with_omega(omega_bias)` context so the hooks are inert (identity) whenever no gate is active.
+    Ω is (B,1,1,M), broadcasts over heads and queries, re-applied every decode step. Beam expands the batch to
+    B·beams — the hook repeats Ω to match. Use via `with_omega(omega_bias)`, inert when no gate is active.
     """
     def __init__(self, lm_model: torch.nn.Module):
         self._omega: torch.Tensor | None = None
@@ -224,8 +205,14 @@ class CrossAttnOmegaInjector:
         mask = kwargs.get("attention_mask", None)
         ref = mask if isinstance(mask, torch.Tensor) else omega
         om = omega.to(dtype=ref.dtype, device=ref.device)
-        if isinstance(mask, torch.Tensor) and mask.shape[0] != om.shape[0] and mask.shape[0] % om.shape[0] == 0:
-            om = om.repeat_interleave(mask.shape[0] // om.shape[0], dim=0)  # beam-expanded batch
+        # Beam search expands the batch to B·beams. Read the target batch from the mask when there is one, else
+        # from the query states: keying expansion off the mask ALONE left Ω un-expanded on any backbone that
+        # cross-attends without a mask, gating beam rows with another row's Ω.
+        hidden = args[0] if args and isinstance(args[0], torch.Tensor) else kwargs.get("hidden_states")
+        tgt = mask.shape[0] if isinstance(mask, torch.Tensor) else (
+            hidden.shape[0] if isinstance(hidden, torch.Tensor) else om.shape[0])
+        if tgt != om.shape[0] and om.shape[0] and tgt % om.shape[0] == 0:
+            om = om.repeat_interleave(tgt // om.shape[0], dim=0)
         kwargs["attention_mask"] = om if not isinstance(mask, torch.Tensor) else mask + om
         return args, kwargs
 
@@ -242,11 +229,10 @@ class CrossAttnOmegaInjector:
 
 
 def omega_cross_bias(omega: torch.Tensor, memory_len: int, dtype: torch.dtype) -> torch.Tensor:
-    """Expand Ω (B, T) over pose frames into a (B, 1, 1, M) additive cross-attention bias.
+    """Expand Ω (B, T) into a (B, 1, 1, M) additive bias for the existing cross-attention mask bias.
 
-    LEFT-PADS `prompt_len = M − T` zeros: the task-prompt columns are NEVER gated (Ω=0 → full attention), and
-    Ω aligns to the pose columns [prompt_len, M). Broadcasts over heads and decoder queries (query-independent —
-    the doc's non-monotonicity guarantee, §2.10). Add this to the existing cross-attention mask bias.
+    Left-pads `prompt_len = M − T` zeros: the prompt is never gated, Ω aligns to pose columns [prompt_len, M)
+    and broadcasts over heads and queries (query-independent — doc §2.10).
     """
     B, T = omega.shape
     prompt_len = int(memory_len) - int(T)
@@ -256,10 +242,10 @@ def omega_cross_bias(omega: torch.Tensor, memory_len: int, dtype: torch.dtype) -
     return full.view(B, 1, 1, int(memory_len))
 
 
-if __name__ == "__main__": # Self-check against docs/membership_gate.md running example (§2.9 table / Appendix C).
+if __name__ == "__main__": # Self-check vs the docs/membership_gate.md running example (§2.9 / Appendix C).
     torch.manual_seed(0)
 
-    def frame(pB, pI, pO):  # probabilities → logits (log; softmax recovers them up to a constant)
+    def frame(pB, pI, pO):  # probabilities → logits (softmax recovers them up to a constant)
         return torch.log(torch.tensor([0.0, pO, pB, pI]).clamp_min(1e-9))  # [UNK,O,B,I]
 
     # S2 = [s=1 .. τ=4]; frame 0 = gap (pre-start), 1-3 interior/pre-boundary, 4 = B opening S3, 5 = S3 interior.

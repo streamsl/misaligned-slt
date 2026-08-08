@@ -19,10 +19,9 @@
 # random subsampling (their memory heuristic; our encoder runs native-rate and deployment never subsamples —
 # introducing it would create a rate mismatch OUR system never sees), and single-GPU batch sizing below.
 #
-# After training: point data.yaml <lang>.pretrained_slt at checkpoints/baseline_train/<lang>/model.pt
-# (written by export_pretrained in the released blob layout) and RERUN the per-language chain from step 2c
-# (train-bio -> delta-enc -> stage 2): bio_s1's frozen encoder and the arms' warm-start must re-root on the
-# same blob to keep S1 features == stage-2 init features (gate-doc §1.4).
+# After training: point data.yaml <lang>.pretrained_slt at checkpoints/baseline_train/<lang>/model.pt and RERUN 
+# the per-language chain from step 2c (train-bio -> delta-enc -> stage 2): bio_s1's frozen encoder and the arms' 
+# warm-start must re-root on the same blob to keep S1 features == stage-2 init features (gate-doc §1.4).
 extends: baseline_eval.yaml
 
 epochs: 50

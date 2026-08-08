@@ -1,5 +1,4 @@
-"""Stage-2 loss functions: the BIO Dice+CE term (Moryossef recipe) and the §6.3
-confidence-bound term for right-truncated windows. OPUT lives in `models.dlm_decoder`."""
+# Stage-2 losses: BIO Dice+CE (Moryossef recipe) and confidence-bound term for right-truncated windows. OPUT lives in `models.dlm_decoder`.
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -21,8 +20,8 @@ def masked_cross_entropy(
     logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None,
     class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # CE over valid positions, optionally per-class weighted. Normalized by valid-frame count
-    # (not by the sum of class weights) so the scale stays comparable to the unweighted loss.
+    # CE over valid positions, optionally per-class weighted. Normalized by valid-frame count 
+    # (not by summed class weights) so the scale stays comparable to the unweighted loss.
     if logits.ndim != targets.ndim + 1: raise ValueError(f"logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}")
     weight = None
     if class_weights is not None: weight = class_weights.to(dtype=logits.dtype, device=logits.device)
@@ -47,11 +46,8 @@ def binary_sign_dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_in
 
 
 def bio_class_weight_tensor(class_weights: dict | list | None) -> torch.Tensor | None:
-    """Build a length-4 BIO class-weight tensor (indexed UNK/O/B/I) from config.
-
-    Accepts a {"O":..,"B":..,"I":..} dict or a 4-element list. UNK is forced to 0 (ignored).
-    Returns None when no weights are given (→ plain unweighted CE, Moryossef's default recipe).
-    """
+    """Length-4 BIO class-weight tensor (indexed UNK/O/B/I) from a {"O","B","I"} dict or a 4-element list.
+    UNK forced to 0 (ignored). None when no weights given → unweighted CE, Moryossef's default recipe."""
     if not class_weights: return None
     if isinstance(class_weights, dict):
         w = [0.0, float(class_weights.get("O", 1.0)), float(class_weights.get("B", 1.0)), float(class_weights.get("I", 1.0))]
@@ -66,13 +62,11 @@ def bio_nll_dice_loss(
     logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = BIO["UNK"],
     dice_weight: float = 1.5, ce_weight: float = 1.0, class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """BIO loss: CE + weighted binary-signing Dice. Padding/UNK is ignored by both terms, never relabelled O.
+    """BIO loss: CE + weighted binary-signing Dice. Padding/UNK ignored by both terms, never relabelled O.
 
-    `class_weights` (length-4 UNK/O/B/I tensor) upweights the rare boundary/gap classes in the CE term. Moryossef 2026 
-    used UNWEIGHTED CE because their joint *sign* head gave dense `B` supervision; we dropped the sign head (YouTube-SL-25 
-    has no sign spans) and measured `B`=1.1% / `O`=11% of frames (corrected per-video-fps timeline), where unweighted CE + 
-    binary Dice (which gives no B-vs-I signal at all) collapses to predicting all-`I`. Upweighting `B`/`O` is the standard 
-    rare-class remedy and a justified, data-driven deviation. None ⇒ Moryossef's exact recipe.
+    `class_weights` (length-4 UNK/O/B/I) upweights the rare boundary/gap classes in CE. Moryossef 2026 used UNWEIGHTED CE — their joint 
+    *sign* head gave dense `B` supervision. Without that head (YouTube-SL-25 has no sign spans), `B`=1.1% / `O`=11% of frames (corrected 
+    per-video-fps timeline) and unweighted CE + binary Dice (no B-vs-I signal) collapses to all-`I`. None ⇒ Moryossef's exact recipe.
     """
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0
@@ -86,9 +80,8 @@ def confidence_bound_gate(
     reference_tokens: torch.Tensor | None = None, valid_mask: torch.Tensor | None = None,
     tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, pad_token_id: int | None = None,
 ) -> torch.Tensor:
-    """§6.3 active-slot gate, decoupled from the CE so the caller can re-mask the
-    gated slots before the grad-bearing forward: (π_i > τ) & (t_i != f_i)
-    [& (f_i == r_i) when the verified gate is on], minus padding/invalid slots."""
+    """Active-slot gate, decoupled from the CE so the caller can re-mask gated slots before the grad-bearing
+    forward: (π_i > τ) & (t_i != f_i) [& (f_i == r_i) with the verified gate on], minus padding/invalid slots."""
     active = trunc_confidence > float(tau_cb)
     active = active & (trunc_tokens != full_tokens)
     if verified_full_evidence_gate:
@@ -99,13 +92,11 @@ def confidence_bound_gate(
     if pad_token_id is not None:
         active = active & (full_tokens != int(pad_token_id))
         if reference_tokens is not None: active = active & (reference_tokens != int(pad_token_id))
-        # TRUNC pads too: the decoder back-fills every slot after a committed EOS with pad @ FABRICATED
-        # confidence 1.0 (infer/decode.py bookkeeping — π_j was never computed there). A right-truncated decode
-        # legitimately ends earlier than the full-evidence one, so without this the whole post-EOS tail passes
-        # (conf 1.0 > τ) & (pad != f) & (f == r) and receives dense CE toward the reference continuation — the
-        # exact partial-target-on-truncated-input supervision P1 forbids ("uncertainty below τ_cb is free"
-        # bypassed by a confidence the model never expressed). The early-EOS slot ITSELF keeps its real commit
-        # confidence and stays eligible — confidently ending where full evidence continues IS a P1 error.
+        # TRUNC pads too: after a committed EOS the decoder back-fills every slot with pad @ FABRICATED confidence 1.0 (infer/decode.py 
+        # bookkeeping — π_j was never computed). A truncated decode legitimately ends earlier than the full-evidence one, so without this 
+        # the post-EOS tail passes the gate and gets dense CE toward the reference continuation — the partial-target-on-truncated-input 
+        # supervision P1 forbids. The early-EOS slot ITSELF keeps its real commit confidence and stays eligible: confidently ending where 
+        # full evidence continues IS a P1 error.
         active = active & (trunc_tokens != int(pad_token_id))
     return active
 
@@ -116,15 +107,9 @@ def confidence_bound_loss(
     tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, enabled: bool = True, pad_token_id: int | None = None,
     active_mask: torch.Tensor | None = None,
 ) -> ConfidenceBoundStats:
-    """Confidence-bound loss for right-truncated Mode 2a windows.
-
-    With `verified_full_evidence_gate=True`, a truncated position is penalized
-    only when the full-evidence decode is itself verified by the reference:
-
-        (f_i == r_i) and (max p_trunc_i > tau_cb) and (argmax p_trunc_i != f_i)
-
-    This preserves P1: the right-truncated visual input never receives a partial text label. 
-    The reference is used only to decide whether the full-evidence self-target is trustworthy at this slot.
+    """Confidence-bound loss for right-truncated Mode 2a windows: CE toward the full-evidence tokens on the slots
+    `confidence_bound_gate` marks active. Preserves P1 — the right-truncated visual input never receives a partial
+    text label; the reference only decides whether the full-evidence self-target is trustworthy at this slot.
     """
     if not enabled:
         zero = trunc_logits.sum() * 0.0
@@ -154,10 +139,9 @@ def confidence_bound_loss(
     if not active.any(): loss = logits.sum() * 0.0
     else:
         token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), full.reshape(-1), reduction="none").reshape_as(full)
-        # Normalize by the VALID reference slots, not the gated slots: spec §6.3 writes L_cb as a position sum in the same form 
-        # as OPUT's (which is per-valid-token). A per-ACTIVE-slot mean is sparsity-invariant — 1 gated slot in the batch would 
-        # carry the same gradient magnitude as a fully-gated batch, giving Mode-2a windows (~9% of the batch) the majority of 
-        # the translation gradient (the epoch-4 loss shock).
+        # Normalize by VALID reference slots, not gated slots: L_cb as a position sum in OPUT's form (per-valid-token). 
+        # A per-ACTIVE-slot mean is sparsity-invariant — 1 gated slot would carry the same gradient magnitude as a 
+        # fully-gated batch, giving Mode-2a windows most of the translation gradient.
         denom = (valid_mask[:, :seq_len].to(device=token_loss.device, dtype=token_loss.dtype).sum()
                  if valid_mask is not None else token_loss.new_tensor(float(active.numel())))
         loss = (token_loss * active.to(token_loss.dtype)).sum() / denom.clamp(min=1)

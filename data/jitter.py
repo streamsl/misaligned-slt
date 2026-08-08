@@ -4,10 +4,9 @@ from pathlib import Path
 import numpy as np
 import json
 
-# Minimum measured (Δ_head, Δ_tail) pairs before raw empirical replay is trusted over the Laplace fitted to the
-# same measurement: below this, replay cannot draw offsets beyond the observed extremes (censored tails) and
-# repeats each value many times per epoch, while the 2-parameter fit is already well-estimated. A property of the
-# sample count, not the corpus — the same constant applies to every language.
+# Minimum measured (Δ_head, Δ_tail) pairs before raw replay beats the Laplace fitted to the same measurement:
+# below this, replay censors the tails (cannot exceed observed extremes) and repeats each value many times per
+# epoch, while the 2-parameter fit is already well-estimated. Depends on sample count, not corpus.
 RAW_REPLAY_MIN_PAIRS = 1000
 
 
@@ -18,8 +17,8 @@ class JitterSampler:
     head_scale_s: float = 0.5
     tail_loc_s: float = 0.0
     tail_scale_s: float = 0.5
-    # Empirical relative cut positions of over-segmentation events (Analysis A). Mode 2 draws its
-    # truncation depth from these; empty → uniform interior fallback. See analyze.py.
+    # Empirical relative cut positions of over-segmentation events (Analysis A, analyze.py). 
+    # Mode 2 draws its truncation depth from these; empty → uniform interior fallback.
     cut_positions: np.ndarray | None = None
 
     @classmethod
@@ -27,8 +26,8 @@ class JitterSampler:
         cut_positions = None
         source = cfg.get("source")
         if source and not Path(source).exists():
-            # Mirror of the sampler's mode_ratios guard: configured-but-missing measurement must FAIL, not silently
-            # train the designed fallback_laplace while claiming measured jitter. `source: null` = designed, explicitly.
+            # Like the sampler's mode_ratios guard: configured-but-missing must FAIL, not silently train
+            # fallback_laplace while claiming measured jitter. `source: null` = designed, explicitly.
             raise FileNotFoundError(
                 f"jitter.source is set but missing: {source!r} (cwd={Path.cwd()}). Run Analysis A first, or set "
                 f"jitter.source: null to explicitly use fallback_laplace."
@@ -44,8 +43,8 @@ class JitterSampler:
                 if isinstance(x, dict) else x for x in raw
             ], dtype=np.float32)
 
-            # Large measurement → raw empirical replay; small → the Laplace fitted to the same offsets, carried
-            # in the same file (see RAW_REPLAY_MIN_PAIRS). Both are measured calibration, never the designed fallback.
+            # Large measurement → raw replay; small → the Laplace fitted to the same offsets in the same file
+            # (RAW_REPLAY_MIN_PAIRS). Both are measured calibration, never the designed fallback.
             n_pairs = samples.reshape(-1, 2).shape[0] if samples.size else 0
             if n_pairs >= RAW_REPLAY_MIN_PAIRS:
                 print(f"[jitter] {source}: RAW empirical replay ({n_pairs} measured pairs)", flush=True)
@@ -53,6 +52,12 @@ class JitterSampler:
             print(f"[jitter] {source}: fitted-Laplace draws ({n_pairs} measured pairs < {RAW_REPLAY_MIN_PAIRS}; "
                   f"raw replay would censor tails and lattice the distribution)", flush=True)
             laplace = data.get("laplace", {})
+            # Same fail-loud rule as the missing-file guard above: without a fit we would silently draw the
+            # hard-coded 0.0/0.5 defaults while claiming measured jitter (the print above would be a lie).
+            if not laplace: raise ValueError(
+                f"jitter.source {source!r} has {n_pairs} pairs (< {RAW_REPLAY_MIN_PAIRS}) and no 'laplace' fit to "
+                f"fall back on. Re-run Analysis A (it writes both), or set jitter.source: null for the designed mix."
+            )
         else: laplace = cfg.get("fallback_laplace", {})
 
         if "head" in laplace or "tail" in laplace:
@@ -84,9 +89,9 @@ class JitterSampler:
     def sample_cut(self, rng: np.random.Generator, lo: float = 0.15, hi: float = 0.85) -> float:
         """Relative position in (0,1) of a Mode-2 spurious internal cut.
 
-        Drawn from Analysis A's measured over-segmentation cut positions when available; otherwise a
-        uniform interior cut in [lo, hi] (avoids degenerate near-empty windows). Uniform is the
-        noninformative prior — over-seg internal-cut positions are not in the matched-pair jitter CDF.
+        From Analysis A's measured over-segmentation cut positions when available; else uniform in [lo, hi]
+        (avoids near-empty windows). Uniform is the noninformative prior — over-seg cut positions are not 
+        in the matched-pair jitter CDF.
         """
         if self.cut_positions is not None and len(self.cut_positions):
             return float(self.cut_positions[int(rng.integers(0, len(self.cut_positions)))])

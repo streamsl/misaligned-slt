@@ -30,6 +30,7 @@ from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
+from models.unisign import released_layout_state
 
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
@@ -73,6 +74,7 @@ class BioS1Model(nn.Module):
     def load_unisign_pose(self, ckpt_path: str | Path) -> int:
         blob = torch.load(str(ckpt_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+        sd = released_layout_state(sd)  # accepts released blobs AND trainer model.pt (baseline_train re-rooting)
         pose_sd = {k: v for k, v in sd.items() if not k.startswith("mt5_model.")}
         self.pose_encoder.load_state_dict(pose_sd, strict=True)
         return len(pose_sd)

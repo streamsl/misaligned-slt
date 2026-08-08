@@ -257,6 +257,23 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
 # Uni-Sign front end — shared pose+prompt base; mT5 (primary) / mBART (ablation) LM variants
 # ════════════════════════════════════════════════════════════════════════════
 
+def released_layout_state(sd: dict) -> dict:
+    """Normalize a checkpoint state dict to the RELEASED Uni-Sign layout ({<bare pose keys>, 'mt5_model.*'}).
+
+    Accepts either layout, so ONE artifact serves every consumer and no exported duplicate is needed:
+      - released `*_pose_only_slt.pth` (already bare pose + mt5_model.*)  -> returned as-is;
+      - a trainer `model.pt` (full MisalignedSLTModel: front_end.pose_encoder.*, front_end.mt5.*, bio_head.*, 
+        dlm_decoder.*, ...) -> re-keyed to the released layout; non-front-end keys (bio_head, decoder canvas) 
+        are dropped — they are training-arm state, not the transferable front end.
+    """
+    if not any(k.startswith("front_end.") for k in sd): return sd
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("front_end.pose_encoder."): out[k[len("front_end.pose_encoder."):]] = v
+        elif k.startswith("front_end.mt5."): out["mt5_model." + k[len("front_end.mt5."):]] = v
+    return out
+
+
 class UniSignFrontEndBase(SLTFrontEnd):
     """Shared Uni-Sign front end: UniSignPoseEncoder -> the verbatim task prompt prepended to the pose tokens -> LM encoder. 
     Subclasses bind the language model (mT5 / mBART) and supply only LM-specific bits: `_prompt_token_embeds`, `_run_lm_encoder`, 
@@ -348,11 +365,12 @@ class UniSignFrontEndBase(SLTFrontEnd):
         return self
 
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
-        """Load a released Uni-Sign `*_pose_only_slt.pth` ({'model': {<pose>.*, mt5_model.*}}): pose keys -> `pose_encoder` 
-        (always); the mT5 arm additionally loads `mt5_model.*` -> mT5, the mBART arm loads pose only (mBART LM stays at 
-        base init). Call BEFORE building the DLM decoder (it copies the loaded LM into the vocab+1 canvas)."""
+        """Load a released Uni-Sign `*_pose_only_slt.pth` OR a trainer `model.pt` (auto-normalized by `released_layout_state`): 
+        pose keys -> `pose_encoder` (always); mT5 arm additionally loads `mt5_model.*` -> mT5, mBART arm loads pose only (mBART 
+        LM stays at base init). Call BEFORE building the DLM decoder (it copies the loaded LM into the vocab+1 canvas)."""
         blob = torch.load(str(ckpt_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+        sd = released_layout_state(sd)
         pose_sd = {k: v for k, v in sd.items() if not k.startswith("mt5_model.")}
         pose_ret = self.pose_encoder.load_state_dict(pose_sd, strict=strict)
         lm_t, lm_m, lm_u = self._load_lm_pretrained(sd, strict)

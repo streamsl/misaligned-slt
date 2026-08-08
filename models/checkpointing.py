@@ -27,20 +27,31 @@ def _load_state(path: str | Path) -> dict:
 def save_model_checkpoint(module: nn.Module, output_dir: str | Path, filename: str = "model.pt") -> Path:
     """torch.save with write-then-rename atomicity + fsync durability.
 
-    A multi-GB `torch.save` straight onto the target is a data-loss hazard in exactly the situations that matter: 
-    an interrupt DURING the write truncates the previous best checkpoint, and on network/FUSE mounts (Colab + Drive)
-    the large write can sit unflushed in the page/FUSE cache while a tiny sibling file (best.json) syncs. Writing to 
-    a temp file in the SAME directory, fsync'ing, then os.replace guarantees the target is always either the old 
-    complete checkpoint or the new complete checkpoint, never a torso.
+    A multi-GB `torch.save` straight onto the target truncates the previous best checkpoint if interrupted, and
+    can sit unflushed in the page cache. Temp file in the SAME directory + fsync + os.replace leaves the target
+    as the old or the new complete checkpoint, never a torso.
     """
     path = Path(output_dir) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        torch.save({"model": module.state_dict()}, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # PID-unique temp name: a shared `model.pt.tmp` lets two writers of the same dir interleave into ONE
+    # published file — exactly the corruption this prevents. Unique names degrade concurrency to
+    # last-writer-wins over WHOLE files.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            torch.save({"model": module.state_dict()}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:  # BaseException, not Exception: KeyboardInterrupt is the motivating case
+        tmp.unlink(missing_ok=True)  # never leave a multi-GB torso behind (Colab disk quota)
+        raise
+    
+    try: # fsync the DIRECTORY so the rename is durable across a crash, not just the file's bytes.
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(dir_fd)
+        finally: os.close(dir_fd)
+    except OSError: pass  # filesystems that reject directory fsync: the rename is still atomic
     return path
 
 

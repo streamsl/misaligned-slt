@@ -10,6 +10,7 @@ from data.loader import load_language_records
 from data.windowing import BIO
 
 from models.checkpointing import save_model_checkpoint
+from train import distributed as dist
 from train.helpers import build_optimizer
 from train.sampler import WindowSampler
 from utils import checkpoint_dir, load_yaml, pick_device
@@ -62,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; without them this is a no-op and everything runs as before.
+    dist_device = dist.init_distributed()
     if args.stage == "smoke-data": result = smoke_data(args)
     elif args.stage == "train-bio":
         from train.bio_pretrain import build_bio_s1, train_bio_s1_epochs
@@ -69,10 +72,10 @@ if __name__ == "__main__":
             data_config=args.data_config, config=args.bio_config,
             inference_config=args.inference_config, language=args.language,
         )
-        device = pick_device(args.device)
+        device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
         logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
-        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"))
+        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-moryossef":
         # Faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade: raw keypoints + UNet, a different input space 
@@ -80,10 +83,10 @@ if __name__ == "__main__":
         from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
         train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.moryossef_config, language=args.language)
         model = build_segmenter(args.moryossef_config)
-        device = pick_device(args.device)
+        device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
         logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
-        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/moryossef"))
+        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/moryossef")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs
@@ -94,19 +97,22 @@ if __name__ == "__main__":
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
             decoder=args.decoder, include_dev=True, language=args.language,
         )
-        device = pick_device(args.device)
+        device = dist_device or pick_device(args.device)
         # Skip frozen params; build_optimizer reads learning_rate/weight_decay (same keys every stage)
         optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
         logs = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs,
             slt_cfg=slt_cfg, dev_loader=components.dev_loader,
         )
-        path = save_model_checkpoint(components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"))
+        path = save_model_checkpoint(components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 
-    text = json.dumps(result, indent=2, sort_keys=True)
-    print(text)
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    if dist.is_main():
+        text = json.dumps(result, indent=2, sort_keys=True)
+        print(text)
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(text + "\n", encoding="utf-8")
+    dist.barrier()   # non-zero ranks must not exit before rank 0 finishes writing
+    dist.cleanup()

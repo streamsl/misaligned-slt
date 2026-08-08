@@ -28,9 +28,10 @@ from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
 
-from metrics import bio_frame_metrics, moryossef_segment_metrics
+from train import distributed as dist
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
+from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml, pretrained_checkpoint, resolve_pretrained
 
 
@@ -132,8 +133,10 @@ def build_bio_s1(
     num_workers = int(cfg.get("num_workers", 0))
     # num_workers is safe at any value: anchors are index-driven (exact per-epoch coverage) and each worker reseeds
     # its rng (see data.loader.streaming_loader).
-    train_loader = streaming_loader(train_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
-    dev_loader = streaming_loader(dev_dataset, int(cfg.get("batch_size", 8)), collator, num_workers=num_workers)
+    train_loader = streaming_loader(
+        train_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers)
+    dev_loader = streaming_loader(
+        dev_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers)
 
     # Language's released Uni-Sign checkpoint (OpenASL for asf/bfi, CSL for csl) — MUST match the SLT model's
     # warm-start so S1 features == S2 initial features (§1.4).

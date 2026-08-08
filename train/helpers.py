@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 from models.checkpointing import save_model_checkpoint
 from utils import checkpoint_dir, save_best_enabled
+from train import distributed as dist
 
 
 def move_to_device(value, device: torch.device):
@@ -119,13 +120,16 @@ def _fmt_metric(value) -> str:
 
 class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def __init__(
-        self, stage: str, cfg: dict | None = None, epochs: int = 0, 
-        steps_per_epoch: int = 0, monitor: str = "val_loss",
+        self, stage: str, cfg: dict | None = None, epochs: int = 0,
+        steps_per_epoch: int = 0, monitor: str = "val_loss", enabled: bool = True,
     ):
+        # `enabled=False` (non-zero ranks under torchrun) makes every method a no-op: no console, no progress bar,
+        # no history.csv, no wandb — one writer per artifact, one readable stream on stdout.
+        self.enabled = bool(enabled)
         self.stage = str(stage)
         self.epochs = int(epochs)
         self.steps_per_epoch = int(steps_per_epoch)
-        cfg = cfg or {}
+        cfg = dict(cfg or {}) if self.enabled else {}
         wandb_cfg = dict(cfg.get("wandb", {}) or {})
 
         self.monitor = str(monitor)  # surfaced first among the val columns
@@ -179,6 +183,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
 
 
     def log_step(self, epoch: int, step: int, row: dict) -> None:
+        if not self.enabled: return
         self._global_step += 1
         numeric = self._numeric(row)
         if self._wandb is not None: self._wandb.log({f"{self.stage}/{k}": v for k, v in numeric.items()}, step=self._global_step)
@@ -213,6 +218,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def epoch_summary(
         self, epoch: int, train: dict, val: dict | None = None, is_best: bool = False, saved_path: str | None = None
     ) -> None:
+        if not self.enabled: return
         """Record one epoch and append one comma-separated line.
 
         ALL train/val metrics become columns; non-eval epochs show `-`. `ckpt` records a save; `eta` estimates
@@ -293,6 +299,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
 
 
     def finish(self) -> None:
+        if not self.enabled: return
         if self._progress is not None:
             try: self._progress.close()
             except Exception: pass
@@ -327,11 +334,22 @@ def run_epoch_loop(
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
-    attach_save_best(control, cfg, name, save_model_checkpoint)
-    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor)
+    # Side effects (checkpoint writes, wandb, history.csv, progress bars) are rank 0's alone: concurrent writers
+    # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
+    # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
+    if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint)
+    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor, enabled=dist.is_main())
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+    if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
+        "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about "
+        "the loss scale (and about skipping a step) and drift apart. Use amp: bf16 (A100/H100) or amp: none."
+    )
 
     for epoch in range(1, int(epochs) + 1):
+        # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler).
+        for ld in (loader, dev_loader):
+            sampler = getattr(ld, "sampler", None) if ld is not None else None
+            if hasattr(sampler, "set_epoch"): sampler.set_epoch(epoch)
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):
             batch = move_to_device(batch, device)
@@ -340,6 +358,9 @@ def run_epoch_loop(
                 loss, step_logs = step_fn(batch, epoch)
 
             amp.backward(loss)
+            # Average gradients BEFORE clipping so every rank clips the same (global) gradient and therefore
+            # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
+            dist.average_gradients(model.parameters())
             amp.clip_and_step(optimizer, model.parameters(), max_grad_norm)
             scheduler.step_batch()
             row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
@@ -347,14 +368,14 @@ def run_epoch_loop(
             logger.log_step(epoch, step, row)
 
         scheduler.step_epoch()
-        train_means = mean_logs(epoch_logs)
+        train_means = dist.reduce_metrics(mean_logs(epoch_logs))
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
-            metrics = evaluate_fn(epoch)
+            metrics = dist.reduce_metrics(evaluate_fn(epoch))
             improved = control.update(model, metrics, epoch)
             logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
             logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
-                print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
+                if dist.is_main(): print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
         else: logger.epoch_summary(epoch, train=train_means)
 

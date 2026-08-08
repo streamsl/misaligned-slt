@@ -12,6 +12,7 @@ from data.loader import StreamingWindowDataset, load_language_records, streaming
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 
+from train import distributed as dist
 from train.losses import bio_class_weight_tensor
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
@@ -87,7 +88,9 @@ def build_slt_components(
     # num_workers is pure throughput: anchors are index-driven (each realized once per epoch regardless of worker
     # split) and workers reseed their rng (data.loader.streaming_loader / WindowSampler.configure_worker).
     num_workers = int(slt_cfg.get("num_workers", 0))
-    train_loader = streaming_loader(train_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
+    train_loader = streaming_loader(
+        train_dataset, dist.per_rank_batch_size(int(slt_cfg.get("batch_size", 4))), collator, num_workers=num_workers
+    )
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
@@ -98,8 +101,9 @@ def build_slt_components(
             dev_records, slt_cfg=slt_cfg, inference_cfg=inference_cfg,
             steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
         )
-        dev_loader = streaming_loader(dev_dataset, int(slt_cfg.get("batch_size", 4)), collator, num_workers=num_workers)
-
+        dev_loader = streaming_loader(
+            dev_dataset, dist.per_rank_batch_size(int(slt_cfg.get("batch_size", 4))), collator, num_workers=num_workers
+        )
     # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
     # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).
     model = MisalignedSLTModel(

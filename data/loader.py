@@ -5,7 +5,9 @@ from typing import Any, Iterable
 from pathlib import Path
 
 import numpy as np
-from torch.utils.data import DataLoader, Dataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
+from train import distributed as dist
+
 from data.windowing import SentenceSpan
 from poses import PoseIndex, build_pose_index
 from poses.pose_io import META_FILENAME, load_video_meta
@@ -392,8 +394,10 @@ def streaming_loader(dataset: StreamingWindowDataset, batch_size: int, collate_f
     are partitioned — no duplication, no lost coverage. `_streaming_worker_init` decorrelates the per-window random
     stream forked workers would otherwise share; dev datasets seed from the index and need neither.
     """
+    sampler = None
+    if dist.is_distributed(): sampler = DistributedSampler(dataset, num_replicas=dist.world_size(), rank=dist.rank(), shuffle=False)
     return DataLoader(
-        dataset, batch_size=int(batch_size), shuffle=False, num_workers=int(num_workers),
+        dataset, batch_size=int(batch_size), shuffle=False, sampler=sampler, num_workers=int(num_workers),
         persistent_workers=num_workers > 0, collate_fn=collate_fn,
         worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
     )

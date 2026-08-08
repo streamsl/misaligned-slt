@@ -9,12 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from data.windowing import TRUSTED_GAP_S
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
+from train import distributed as dist
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from metrics import bio_frame_metrics, moryossef_segment_metrics
@@ -43,9 +44,12 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
     dev_steps = sum(len(r.sentences) for r in dev_records)
     train_ds = SegmenterChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, **common)
     dev_ds = SegmenterChunkDataset(dev_records, steps_per_epoch=max(dev_steps, 1), training=False, **common)
-    bs = int(cfg.get("batch_size", 8))
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, collate_fn=collate_segmenter_chunks)
-    dev_loader = DataLoader(dev_ds, batch_size=bs, collate_fn=collate_segmenter_chunks)
+    bs = dist.per_rank_batch_size(int(cfg.get("batch_size", 8)))
+    def _sampler(ds):
+        return DistributedSampler(ds, num_replicas=dist.world_size(), rank=dist.rank(), shuffle=False) if dist.is_distributed() else None
+        
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, sampler=_sampler(train_ds), collate_fn=collate_segmenter_chunks)
+    dev_loader = DataLoader(dev_ds, batch_size=bs, sampler=_sampler(dev_ds), collate_fn=collate_segmenter_chunks)
     return train_loader, dev_loader, cfg
 
 

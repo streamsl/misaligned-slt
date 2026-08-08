@@ -122,12 +122,28 @@ def build_slt_components(
         # Per-language warm-start (data.yaml pretrained_slt; e.g. OpenASL for asf/bfi English, CSL for csl Chinese).
         pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth"),
     )
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'Model initialized with {total_params / 1e6:.2f}M parameters')
     # S1 BIO init (docs/membership_gate.md §1.4 "competence before coupling"): load the pre-trained head from
     # train-bio so S2 trains exactly one new thing — the coupling — and membership_gate.warmup_epochs can be 0.
     bio_init = slt_cfg.get("checkpoint", {}).get("bio_head_init")
-    if bio_init and Path(bio_init).exists():
+    if float(slt_cfg.get("lambda_bio", 1.0)) == 0.0:
+        if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)): raise SystemExit(
+            "lambda_bio: 0 with membership_gate.enabled: true is incoherent — the gate reads the BIO head's posteriors, but "
+            "lambda_bio: 0 skips the head's forward and leaves it untrained/frozen. Either train the head (lambda_bio > 0) "
+            "or disable the gate (the clean-floor recipe does both)."
+        )
+        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): there is NO BIO branch. Skip the S1 init entirely — both 
+        # the head AND the pose encoder it carries (the Uni-Sign baseline must start from the RELEASED weights only, and the 
+        # S1-carried encoder would silently overwrite them) — and freeze the untouched head so the optimizer never sees its 
+        # parameters. compute_loss also skips its forward, so the branch costs nothing per step instead of being zero-weighted.
+        for p in model.bio_head.parameters(): p.requires_grad_(False)
+        # Flag for the inference path: generate_from_poses skips the head's forward too (frozen-random logits
+        # are garbage nobody reads with the gate off — running them at every val decode only burns compute).
+        model.bio_branch_off = True
+        print("slt | lambda_bio=0: BIO branch OFF — head frozen at random init, forward SKIPPED in training and decode; "
+              + ("bio_head_init IGNORED (clean-floor recipe trains the released front end only)" \
+                if bio_init else "no bio_head_init configured"), flush=True)
+
+    elif bio_init and Path(bio_init).exists():
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
         head_sd = {k[len("bio_head."):]: v for k, v in sd.items() if k.startswith("bio_head.")}
@@ -151,14 +167,22 @@ def build_slt_components(
         # already checked via bio_tap_dim), so strict-load.
         pose_sd = {k[len("pose_encoder."):]: v for k, v in sd.items() if k.startswith("pose_encoder.")}
         if pose_sd: model.front_end.pose_encoder.load_state_dict(pose_sd, strict=True)
-        print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); carried S1 pose encoder "
-              f"{f'({len(pose_sd)} tensors) for S1 features == S2 initial features' if pose_sd else ''}", flush=True)
+        enc_note = (f"S1 pose encoder OVERRIDES the released warm-start ({len(pose_sd)} tensors) — deliberate: the head must "
+                    "meet the features it trained on (S1 features == S2 initial features); identical to the released weights "
+                    "when S1 ran freeze_backbone: true") if pose_sd else "S1 checkpoint carries no pose encoder"
+        print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); {enc_note}", flush=True)
     elif bio_init:
         print(f"slt | WARNING: bio_head_init {bio_init} not found — BIO head starts FRESH; keep "
               f"membership_gate.warmup_epochs > 0 (the gate must not couple to an untrained head)", flush=True)
     if bool(slt_cfg.get("freeze_backbone", False)):
         n = model.front_end.freeze_pose_backbone(freeze_projection=bool(slt_cfg.get("freeze_projection", False)))
         print(f"slt | froze pose backbone ({n / 1e6:.2f}M parameters)", flush=True)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"slt | model: {total_params / 1e6:.2f}M parameters ({trainable_params / 1e6:.2f}M trainable, "
+          f"{(total_params - trainable_params) / 1e6:.2f}M frozen)", flush=True)
+          
     # Gate-side duration decode (inference.yaml duration_decode, the SAME switch the streaming FSM reads): the
     # membership gate's anchor selection re-splits merged back-to-back runs inside build_gate_omega, so stage-2
     # trains under the tag stream deployment actually gates on (§1.3 on-policy symmetry). Prior fit on TRAIN
@@ -236,13 +260,15 @@ def evaluate_slt(
             **gate_kwargs,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
-        bio_tap, _, timestamps = model.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
-        bio_logits = model.bio_head(bio_tap, timestamps_s=timestamps).logits
-        row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
-        # Moryossef-style segmentation metrics on the in-model BIO head (frame macro-F1, frame-IoU, overlap
-        # segment-F1, one-to-one tIoU-matched segment-F1) under the inference decode (runs split at interior Bs),
-        # so SLT dev tracks span quality — what RQ2 streaming depends on — not just per-frame BIO accuracy.
-        row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
+        if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0:
+            bio_tap, _, timestamps = model.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
+            bio_logits = model.bio_head(bio_tap, timestamps_s=timestamps).logits
+            row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
+            # Moryossef-style segmentation metrics on the in-model BIO head (frame macro-F1, frame-IoU, overlap segment-F1, 1-to-1 
+            # tIoU-matched segment-F1) under inference decode (runs split at interior Bs), so SLT dev tracks span quality — what RQ2 
+            # streaming depends on — not just per-frame BIO accuracy. lambda_bio=0 (clean-floor recipe): the head is frozen at random 
+            # init and never trained — its "metrics" would be noise rows, so they are omitted rather than logged and ignored.
+            row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
         rows.append(row)
 
         cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples

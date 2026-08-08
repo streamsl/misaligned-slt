@@ -1,0 +1,61 @@
+# baseline_train — TRAIN the clean-floor translator for corpora with NO released in-domain SLT checkpoint
+# (YouTube-SL-25 asf/bfi: zero-shot OpenASL on Auslan/BSL is floored at BLEU ~1 — BANZSL is not ASL; a floored
+# baseline makes Analysis B, RQ1-A PANEL (b) (the self-anchored continuous-corpus curve — panel (a) is the
+# csl_pretrimmed literature anchor and is unaffected), and the RQ2 cascade rows uninformative on those corpora).
+#
+# Recipe = the faithful Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh):
+# strict warm-start from the released checkpoint (data.yaml pretrained_slt), EVERYTHING trainable, AdamW
+# lr 3e-4 / wd 1e-4 (bias & norm params excluded from decay — train/helpers.build_optimizer applies the same
+# filter as their timm create_optimizer), cosine to 0 with no warmup, 20 epochs, grad-clip 1.0, label smoothing
+# 0.2 (models/unisign.ar_loss default), best checkpoint by dev BLEU-4. Their effective batch is 32 (8 x 4 GPUs).
+#
+# "Pre-trimmed" TRAINING VIEW with zero new data plumbing: mode1-only ratios + near-zero jitter make every
+# sampler window exactly the GT caption span + one terminator frame, deterministically (at 1e-9 scales mode1's
+# jittered-retry acceptance never fires and the clean-clip fallback always wins; anchors are index-driven, so
+# one epoch = exact coverage of every train caption). NB these spans are CAPTION-cut, not studio-trimmed:
+# onset noise and back-to-back bleed are IN the training windows, so this baseline's RQ1-A panel is
+# SELF-ANCHORED at its own (0,0) — like the csl streams panel, NOT literature-anchored like csl_pretrimmed
+# (README "RQ1 design"). Deliberate deviations from Uni-Sign, both documented for the paper: no 256-frame
+# random subsampling (their memory heuristic; our encoder runs native-rate and deployment never subsamples —
+# introducing it would create a rate mismatch OUR system never sees), and single-GPU batch sizing below.
+#
+# After training: point data.yaml <lang>.pretrained_slt at checkpoints/baseline_train/<lang>/model.pt
+# (written by export_pretrained in the released blob layout) and RERUN the per-language chain from step 2c
+# (train-bio -> delta-enc -> stage 2): bio_s1's frozen encoder and the arms' warm-start must re-root on the
+# same blob to keep S1 features == stage-2 init features (gate-doc §1.4).
+extends: baseline_eval.yaml
+
+epochs: 50
+learning_rate: 3.0e-4
+weight_decay: 1.0e-4
+scheduler:
+    type: cosine
+max_grad_norm: 1.0
+batch_size: 32
+freeze_backbone: false  # Uni-Sign transfer recipe: everything trainable, pose encoder included.
+lambda_bio: 0.0         # Uni-Sign SLT loss is a SINGLE label-smoothed CE — no BIO auxiliary. 0 SKIPS the
+                        # BIO branch outright (no forward/backward, S1 init ignored, head frozen), not zero-weights it.
+
+mode_ratios:
+    source: null        # clean-span training view — NOT the measured deployment-error mix (that calibrates stage 2)
+    fallback: {mode1: 1.0, mode2: 0.0, mode3: 0.0, mode4: 0.0}
+jitter:
+    source: null
+    fallback_laplace: {head_loc_s: 0.0, head_scale_s: 1.0e-9, tail_loc_s: 0.0, tail_scale_s: 1.0e-9}
+augmentation: null      # Uni-Sign's SLT fine-tune uses no pose augmentation
+# Captions LONGER than buffer_cap_s (~0.5-1% on asf) get right-truncated by the window clip and relabel to
+# mode2 (no translation target -> BIO supervision only). Deliberate: deployment can never decode >buffer_cap
+# at once either (FSM force-commit), and Uni-Sign's alternative — random 256-frame subsampling — would train
+# at a frame rate the deployed system never produces. Verified: 31/32 smoke windows are exact GT spans.
+
+checkpoint:
+    dir: checkpoints/baseline_train/${language}
+    bio_head_init: null              # explicit: extends deep-merges, so dlm.yaml's S1 path would leak through a
+                                     # partial checkpoint override (it did — caught by the 'loaded S1 BIO head init'
+                                     # log line; lambda_bio: 0 also hard-skips it in code, belt and braces)
+    monitor: val_translation_bleu4   # selection by dev BLEU, as in Uni-Sign (their dev decode is beam-4; the
+    mode: max                        # training monitor here decodes greedy — selection only; final numbers come
+                                     # from eval.py --method baseline --checkpoint ... (beam-4), like every arm.
+
+wandb:
+    name: baseline_train_${language}

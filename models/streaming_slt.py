@@ -2,6 +2,7 @@
 (`MisalignedSLTModel.forward_loss`) that keeps truncated visual inputs free of partial text labels (premise P1)."""
 from __future__ import annotations
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -126,7 +127,11 @@ class MisalignedSLTModel(nn.Module):
         # Load the pretrained front end BEFORE building the DLM decoder: the block-diffusion substrate copies the
         # current decoder/lm into its vocab+1 [MASK] canvas, so the pretrained weights must already be in place
         # (loads the Uni-Sign pose_encoder + mT5/mBART; pose weights come from the released ckpt).
-        if pretrained_path: self.front_end.load_pretrained(pretrained_path)
+        if pretrained_path:
+            rep = self.front_end.load_pretrained(pretrained_path)
+            print(f"slt | front-end warm-start {Path(pretrained_path).name}: {rep['pose_tensors']} pose + "
+                  f"{rep['mt5_tensors']} LM tensors (missing {rep['pose_missing']}/{rep['mt5_missing']}, "
+                  f"unexpected {rep['pose_unexpected']}/{rep['mt5_unexpected']})", flush=True)
         if decoder == "dlm": self.dlm_decoder = self.front_end.make_dlm_decoder(block_size)
         elif decoder != "ar": raise ValueError(f"Unsupported decoder type: {decoder}")
         # Semi-Markov duration prior for GATE's anchor selection (infer/duration_decode.py). None = raw-argmax selection. 
@@ -188,7 +193,10 @@ class MisalignedSLTModel(nn.Module):
         vetoed, n_gt = 0, 0  # veto rate is over windows that HAVE a GT target (§1.6 diagnostic)
         for b in range(B):
             n = int(lengths[b].item())
-            pred = select_target_span(pred_tags[b, :n], min_span_frames)
+            # χ-frontier filter, mirroring the FSM's selection (on-policy symmetry): a span whose terminator
+            # precedes the commit frontier is emitted content, never an anchor candidate.
+            chi_b = int(commit_mask[b, :n].sum().item()) if commit_mask is not None else 0
+            pred = select_target_span(pred_tags[b, :n], min_span_frames, skip_term_before=chi_b)
             if bio_labels is None: span = pred  # inference: on-policy, no veto, no GT
             else:
                 gt = select_target_span(bio_labels[b, :n], min_span_frames)
@@ -320,7 +328,12 @@ class MisalignedSLTModel(nn.Module):
         `generate_from_bio_tap` — declared once, there, not re-listed here. `gate_skip` (B, bool) marks windows the deployed FSM would 
         never decode (no span at all); all-False when the gate is off."""
         bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
-        bio_logits = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=mask).logits
+        if getattr(self, "bio_branch_off", False) and not gate_enabled:
+            # Clean-floor recipe (lambda_bio=0): the head is frozen at random init — its logits are meaningless
+            # and, with the gate off, unread. Return zeros in the contract slot instead of running the head.
+            bio_logits = bio_tap.new_zeros(*bio_tap.shape[:2], 4)
+        else:
+            bio_logits = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=mask).logits
         # Membership gate at inference: on-policy span from the head's own argmax (bio_labels=None → no veto),
         # χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in training (§1.3/§2.8).
         # Both arms: the DLM injects Ω in its decode; the AR arm via HF cross-attn hooks (front_end.ar_generate).
@@ -370,8 +383,13 @@ class MisalignedSLTModel(nn.Module):
         Per-mode losses logged separately. Returns `SLTLossOutput` with the total, the BIO and translation components, and a `logs` dict.
         """
         bio_tap, bio_mask, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
-        bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
-        bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
+        if float(lambda_bio) == 0.0 and not gate_enabled: # Clean-floor recipe
+            # BIO branch is SKIPPED, not zero-weighted — no head forward, no loss graph, no backward through the head. (The gate is the 
+            # only other consumer of head's logits; with it off nothing downstream needs them — both gate blocks below are `if gate_enabled`.)
+            bio_out, bio_loss = None, bio_tap.new_zeros(())
+        else:
+            bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
+            bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
         translation_loss = bio_tap.sum() * 0.0
         trans_weight = translation_loss.detach() * 0.0  # token weight of the OPUT pool (0 when no supervised windows)
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}

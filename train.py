@@ -42,20 +42,18 @@ def smoke_data(args: argparse.Namespace) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT training utilities")
-    parser.add_argument("--stage", default="smoke-data", choices=["smoke-data", "train-slt", "train-bio", "train-segmenter"])
+    parser.add_argument("--stage", default="smoke-data", choices=["smoke-data", "train-slt", "train-bio", "train-moryossef"])
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml")
-    parser.add_argument("--segmenter-config", default="configs/moryossef26.yaml")
-    parser.add_argument(
-        "--language", default=None, 
-        help="Override active language; default falls back to the config's language / data.yaml active_languages"
-    )
+    parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml")
+    parser.add_argument("--language", default=None, 
+                        help="Override active language; default falls back to the config's language / data.yaml active_languages")
     parser.add_argument("--split", default="train", choices=["train", "dev", "test"])
     parser.add_argument("--num-samples", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
-    parser.add_argument("--baseline-config", default="configs/baseline.yaml")
+    parser.add_argument("--baseline-config", default="configs/baseline_eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--device", default=None, help="override device; default cuda -> mps -> cpu")
     parser.add_argument("--output", default=None)
@@ -76,17 +74,17 @@ if __name__ == "__main__":
         logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
         path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"))
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
-    elif args.stage == "train-segmenter":
+    elif args.stage == "train-moryossef":
         # The faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade (spec §4.6; independent of the
         # FSM head — raw keypoints + UNet, a different input space). Trained standalone on whole-video chunks →
-        # checkpoints/segmenter (never the FSM's bio_head_init).
+        # checkpoints/moryossef (never the FSM's bio_head_init).
         from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
-        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.segmenter_config, language=args.language)
-        model = build_segmenter(args.segmenter_config)
+        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.moryossef_config, language=args.language)
+        model = build_segmenter(args.moryossef_config)
         device = pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
         logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
-        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/segmenter"))
+        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/moryossef"))
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs

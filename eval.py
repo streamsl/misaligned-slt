@@ -487,7 +487,6 @@ def run_rq1(args: argparse.Namespace) -> dict[str, Any]:
     windows = controlled_windows(
         records, head_grid, relative=relative, max_sentences=max_sentences, tail_grid=tail_grid, drop_counts=drop_counts
     )
-
     records_by_id = {record.video_id: record for record in records}
     device = pick_device(args.device)
     inference_cfg = load_yaml(args.inference_config)

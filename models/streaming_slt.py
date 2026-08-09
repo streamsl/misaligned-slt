@@ -15,53 +15,8 @@ from models.front_end import SLTFrontEnd
 from models.membership_gate import build_omega, omega_cross_bias
 
 from infer.commit_gate import open_span_start, select_target_span
-from infer.duration_decode import duration_split_tags
+from infer.duration_decode import deployed_decode_tags, duration_split_tags
 from data.windowing import BIO
-
-
-def deployed_decode_tags(
-    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None, timestamps_s: torch.Tensor | None = None, 
-    commit_mask: torch.Tensor | None = None, seam_is_terminator: bool = True,
-) -> torch.Tensor:
-    """THE deployed tag decode, shared with the FSM: argmax → UNK→O remap → duration re-split → χ-onset restoration.
-    (B, T) long, no gradient.
-
-    UNK→O: unremapped UNK neither opens nor closes a span → diverges from the FSM's rule.
-    Re-split: same `duration_split_tags` call as `infer/stream.py step()`; `mark_onsets=False` (opening keys on
-    O→signing, onset B's inert), `split_open_tail="survival"` (right-censored tail).
-    χ restoration: the DP never opens at the ≤δ committed-leftover seam, so a b2b successor's onset lands in unopenable
-    leading I and is dropped (alternate-sentence drop); the commit record proves a sentence ENDED there → mark the first
-    mid-run signing frame at/after the seam B. Only under `seam_is_terminator` (= FSM `_committed_is_terminator`), else
-    B at an open-span buffer-cap cut fabricates a boundary. Default True fits TRAINING (χ = sampler GT commit_mask);
-    streaming's `_stride_omega` passes the runner's live flag.
-    """
-    device = bio_logits.device
-    tags = bio_logits.detach().argmax(dim=-1)
-    tags = torch.where(tags == BIO["UNK"], torch.full_like(tags, BIO["O"]), tags)
-    if duration_prior is None: return tags
-    pB = torch.softmax(bio_logits.detach().float(), dim=-1)[..., BIO["B"]].cpu().numpy()
-    tags_np = tags.cpu().numpy()
-    for b in range(tags_np.shape[0]):
-        n = int(lengths[b].item())
-        if n <= 2: continue
-        fps_b = 24.0 # Default fallback if timestamps are missing or degenerate.
-        if timestamps_s is not None and n > 1:
-            dt = timestamps_s[b, 1:n] - timestamps_s[b, : n - 1]
-            # Clamp: duplicate-timestamp median ~0 → fps ~1e6, so lmax = cap_s*fps OOMs the LP array / O(T*lmax) DP.
-            if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
-        tags_np[b, :n] = duration_split_tags(
-            tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
-        )
-        if commit_mask is not None and seam_is_terminator:
-            cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)
-            if cm.any() and not cm.all():
-                seam = int(np.argmax(~cm))  # first non-committed frame
-                sig = (tags_np[b, :n] == BIO["I"]) | (tags_np[b, :n] == BIO["B"])
-                cand = np.flatnonzero(sig[seam:])
-                if cand.size:
-                    d = seam + int(cand[0])
-                    if tags_np[b, d] == BIO["I"] and (d == 0 or sig[d - 1]): tags_np[b, d] = BIO["B"]
-    return torch.as_tensor(tags_np, device=device, dtype=tags.dtype)
 
 
 def gate_skip_flags(

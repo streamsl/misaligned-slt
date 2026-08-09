@@ -31,6 +31,7 @@ from models.unisign import released_layout_state
 from train import distributed as dist
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
+from infer.duration_decode import deployed_decode_tags, duration_decode_params, fit_duration_prior
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml, pretrained_checkpoint, resolve_pretrained
 
@@ -84,11 +85,9 @@ class BioS1Model(nn.Module):
 def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
     """Construct BioS1Model and load the FROZEN Uni-Sign pose encoder.
 
-    SINGLE source of truth for the head shape: training (build_bio_s1) and inference (analyze.segmenter_infer) both
-    route here, so the S1 checkpoint always strict-loads and `bio_head_init` shape parity holds by construction.
-    `pretrained_path` overrides which released checkpoint the frozen encoder loads (per-language warm-start,
-    resolved by the caller). Only bites at train time — the trained bio_s1 checkpoint overwrites these weights at
-    inference — but per-language avoids depending on the CSL file on an English-only machine.
+    SINGLE source of truth for the head shape: training (build_bio_s1) and inference (analyze.segmenter_infer) both route here, 
+    so the S1 checkpoint always strict-loads and `bio_head_init` shape parity holds by construction. `pretrained_path` overrides 
+    which released checkpoint the frozen encoder loads (per-language warm-start, resolved by the caller).
     """
     # Inherited dlm.yaml `freeze_backbone`. dlm's value is for STAGE 2 (false → joint-train); bio_pretrain.yaml
     # overrides it to true for the frozen-S1 recipe.
@@ -148,8 +147,15 @@ def build_bio_s1(
 @torch.no_grad()
 def evaluate_bio_s1(
     model: BioS1Model, loader: DataLoader, device: torch.device,
-    dice_weight: float, class_weights: torch.Tensor | None,
+    dice_weight: float, class_weights: torch.Tensor | None, duration_prior=None,
 ) -> dict[str, float]:
+    """`duration_prior` (inference.yaml duration_decode): score the DEPLOYED decoder, not raw argmax.
+
+    Without it the monitor measures argmax's split rate — the very quantity the semi-Markov decode REPLACES with the duration 
+    prior at deployment (infer/duration_decode.py). A checkpoint that argmax-splits more then ranks higher while contributing 
+    nothing downstream, which is how a rising monitor coexists with falling whole-video test numbers. Same rule already 
+    applied to `analyze --stage delta-enc`: measure under the decode you deploy.
+    """
     rows = []
     with eval_mode(model):
         for batch in loader:
@@ -158,13 +164,22 @@ def evaluate_bio_s1(
             ts = batch["timestamps_s"].to(device)
             labels = batch["bio_labels"].to(device)
             out = model(poses, mask, timestamps_s=ts)
+            # Loss + FRAME metrics read raw logits (they score the objective and per-frame quality); SEGMENT metrics 
+            # read `seg_logits`, the deployed decode's tags, so the monitor ranks what deployment produces. Segment 
+            # metrics score the DEPLOYED tags (same function the FSM and gate use); loss + frame metrics keep the raw 
+            # logits. One-hot so every metric call is unchanged — they all argmax.
+            seg_logits = out.logits
+            if duration_prior is not None:
+                tags = deployed_decode_tags(out.logits, mask.long().sum(dim=1), duration_prior, ts, batch.get("commit_mask"))
+                seg_logits = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=out.logits.shape[-1]).to(out.logits.dtype)
+
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
-            row.update(moryossef_segment_metrics(out.logits, labels, prefix="phrase"))
+            row.update(moryossef_segment_metrics(seg_logits, labels, prefix="phrase"))
             # Collapse floor: same segment metric on a CONSTANT all-I prediction. Under the symmetric run-decode any
             # single-span window is near-free, so a monitor within noise of this floor measures the window mix, not
             # the head. Logged every epoch so saturation is visible mid-run.
-            alli = torch.zeros_like(out.logits); alli[..., BIO["I"]] = 1.0
+            alli = torch.zeros_like(seg_logits); alli[..., BIO["I"]] = 1.0
             row["alli_tiou_f1"] = moryossef_segment_metrics(alli, labels, prefix="alli")["alli_tiou_f1"]
             # Per-mode tIoU: a SEGMENTATION metric (predicted vs GT BIO spans), valid for EVERY mode since the head
             # is supervised on all modes' bio_labels — independent of translation supervision, which only some modes
@@ -177,8 +192,13 @@ def evaluate_bio_s1(
             modes = batch.get("mode_names") or []
             for mode in set(modes):
                 idx = [i for i, m in enumerate(modes) if m == mode]
-                sub = moryossef_segment_metrics(out.logits[idx], labels[idx], prefix=mode)
+                sub = moryossef_segment_metrics(seg_logits[idx], labels[idx], prefix=mode)
                 row[f"{mode}_tiou_f1"] = sub[f"{mode}_tiou_f1"]
+                # Per-mode floor. The POOLED alli above cannot interpret a per-mode number: the floors differ by a factor of ~4 
+                # across modes because they are set by gold-span COUNT, not by difficulty (an all-I tagger emits ONE span, so 
+                # F1 = 2/(N+1) when that span covers >half the window). The head can sit BELOW a constant on the majority slices 
+                # while looking healthy pooled. Every slice must carry its own floor or none of these numbers is interpretable.
+                row[f"{mode}_alli_tiou_f1"] = moryossef_segment_metrics(alli[idx], labels[idx], prefix=mode)[f"{mode}_tiou_f1"]
             rows.append(row)
     return mean_logs(rows, prefix="val")
 
@@ -191,6 +211,15 @@ def train_bio_s1_epochs(
     if class_weights is not None: class_weights = class_weights.to(device)
     # Frozen encoder → head only. Unfrozen → head at learning_rate, the PRETRAINED encoder at backbone_lr
     # (default lr×0.1, see build_optimizer): a single head-scale LR on Uni-Sign weights empirically degrades them.
+    # Monitor under the DEPLOYED decode (same principle as analyze --stage delta-enc). Prior fitted from this
+    # language's TRAIN captions; None when inference.yaml duration_decode is off for it.
+    duration_prior = None
+    _dd_cfg = load_yaml(str(cfg.get("inference_config", "configs/inference.yaml")))
+    _dd = duration_decode_params(_dd_cfg, cfg.get("language"))
+    if _dd is not None:
+        _recs, _ = load_language_records(load_yaml("configs/data.yaml"), str(cfg.get("language")), split="train")
+        duration_prior = fit_duration_prior(_recs, **_dd)
+        print(f"bio_s1 | monitor decode: duration (deployed); prior from {len(_recs)} train videos", flush=True)
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
     else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -200,7 +229,8 @@ def train_bio_s1_epochs(
         return loss, {"bio_loss": float(loss.detach())}
 
     return run_epoch_loop(
-        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
-        step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader,
+        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, 
+        epochs=epochs, cfg=cfg, step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_s1(
+            model, dev_loader, device, dice_weight, class_weights, duration_prior=duration_prior), 
+        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader
     )

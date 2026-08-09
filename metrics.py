@@ -132,6 +132,7 @@ def moryossef_segment_metrics(
     else: decode_fn = signing_runs_with_b_splits
 
     frame_f1s, tiou_f1s, precisions, recalls = [], [], [], []
+    n_matches = n_pred = n_gold = 0  # raw counts for a caller's micro pooling; the scores below stay per-item macro
     for i in range(labels.shape[0]):
         gold = labels[i]
         valid = gold != BIO["UNK"]
@@ -148,16 +149,17 @@ def moryossef_segment_metrics(
             pred_tags = torch.where(interior_unk, torch.full_like(pred_tags, BIO["UNK"]), pred_tags)
         frame_f1s.append(_macro_frame_f1(pred_tags[~interior_unk], gold_v[~interior_unk]))
 
-        prf = segmentation_prf(
-            _frame_segments_to_seconds(decode_fn(pred_tags)), _frame_segments_to_seconds(decode_fn(gold_v)),
-            tiou_threshold=tiou_threshold,
-        )
+        pred_segs = _frame_segments_to_seconds(decode_fn(pred_tags))
+        gold_segs = _frame_segments_to_seconds(decode_fn(gold_v))
+        prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=tiou_threshold)
         tiou_f1s.append(prf["f1"]); precisions.append(prf["precision"]); recalls.append(prf["recall"])
+        n_matches += int(prf["matches"]); n_pred += len(pred_segs); n_gold += len(gold_segs)
 
     avg = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
     return {
         f"{prefix}_frame_f1": avg(frame_f1s), f"{prefix}_tiou_f1": avg(tiou_f1s),
         f"{prefix}_seg_precision": avg(precisions), f"{prefix}_seg_recall": avg(recalls),
+        f"{prefix}_n_matches": n_matches, f"{prefix}_n_pred": n_pred, f"{prefix}_n_gold": n_gold,
     }
 
     

@@ -26,7 +26,7 @@ from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisig
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
-from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
+from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics, temporal_iou
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
 
@@ -189,90 +189,104 @@ def controlled_windows(
     return windows
 
 
+# densevid_eval pairs each unmatched prediction with a random-string reference so it scores ~0 and still counts. Same effect, reproducible: 
+# an unmatchable sentinel token, repeated to hypothesis's LENGTH. The repetition fixes a flaw in densevid: its random_string() has no spaces, 
+# so every garbage reference is 1 token. That shrinks corpus-BLEU's ref_len, and when system under-generates BP relief outweighs the precision 
+# hit — spurious spans then RAISE BLEU. Length-matched references keep the pair length-neutral, so over-generation costs precision only.
+_UNMATCHED_REF = "\u0000unmatched"
+
+def _unmatched_reference(hypothesis: str) -> str:
+    return " ".join([_UNMATCHED_REF] * max(1, len(hypothesis.split())))
+
+
 def evaluate_predicted_events(
-    predicted: dict[str, list[PredictionEvent]],
-    gold: dict[str, list[PredictionEvent]],
-    thresholds: list[float],
+    predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float]
 ) -> dict[str, Any]:
+    """RQ2 scoring under the ActivityNet dense-captioning protocol (Krishna et al. 2017, `densevid_eval`), translations in place of captions. 
+    Per tIoU threshold: every (prediction, gold) pair with tIoU >= t is a scored pair (many-to-many), an unmatched prediction is paired with 
+    an unmatchable reference so spurious segments cost score, and `compute_text_metrics` scores ONE VIDEO's pairs at a time — densevid calls 
+    its scorers per video (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, so 
+    RQ2 and segmenter-eval report 1 statistic. Missed gold enters `segmentation.recall` only, never the text score (densevid's own convention). 
+    `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
     results = []
     all_video_ids = sorted(set(predicted) | set(gold))
     for threshold in thresholds:
-        total_pred, total_gold = 0, 0
-        pred_texts: list[str] = []
-        ref_texts: list[str] = []
-        latencies: list[float] = []
-        matched_pairs = 0
-
-        matched_tious: list[float] = []
-        # Recall-inclusive: missed gold sentences score as empty hypotheses, so the metric reflects localisation
-        # (matched-only averages the easy subset).
-        matched_gold_text: dict[tuple[str, int], str] = {}
+        per_video: list[dict[str, float]] = []
+        vid_prec, vid_rec, latencies, best_tious = [], [], [], []
+        n_pairs = n_zero_pairs = n_missed_gold = total_pred = total_gold = 0
         for video_id in all_video_ids:
-            pred_events = predicted.get(video_id, [])
-            gold_events = gold.get(video_id, [])
-            pred_by_idx = [event.segment for event in pred_events]
-            gold_by_idx = [event.segment for event in gold_events]
-            total_pred += len(pred_by_idx)
-            total_gold += len(gold_by_idx)
+            pred_events, gold_events = predicted.get(video_id, []), gold.get(video_id, [])
+            if not pred_events and not gold_events: continue
+            total_pred += len(pred_events); total_gold += len(gold_events)
 
-            matches = match_segments(pred_by_idx, gold_by_idx, threshold=float(threshold))
-            matched_pairs += len(matches)
-            for pred_idx, gold_idx, match_tiou in matches:
-                matched_tious.append(float(match_tiou))
-                pred_event = pred_events[pred_idx]
-                gold_text = gold_events[gold_idx].text
-                if pred_event.text is not None and gold_text is not None:
-                    pred_texts.append(pred_event.text)
-                    ref_texts.append(gold_text)
-                    matched_gold_text[(video_id, gold_idx)] = pred_event.text
-                if pred_event.commit_time_s is not None: # Emission latency.
-                    latencies.append(float(pred_event.commit_time_s) - float(gold_events[gold_idx].end_s))
+            # SEGMENTATION: the codebase's one canonical segment metric — greedy ONE-TO-ONE tIoU matching, shared verbatim with segmenter-eval 
+            # and the BIO monitor. densevid's own proposal P/R is coverage-based (many-to-many), which lets duplicate spans all "match" 1 gold 
+            # and keeps precision at 1.0; one-to-one charges the duplicate, so it is the defensible number for a segmentation claim.
+            pred_segs, gold_segs = [ev.segment for ev in pred_events], [gt.segment for gt in gold_events]
+            prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=float(threshold))
+            if pred_events: vid_prec.append(prf["precision"])
+            if gold_events: vid_rec.append(prf["recall"])
+            one_to_one = match_segments(pred_segs, gold_segs, threshold=float(threshold))
 
-        ri_hyps: list[str] = []
-        ri_refs: list[str] = []
-        for video_id in all_video_ids:
-            for gold_idx, gold_event in enumerate(gold.get(video_id, [])):
-                if gold_event.text is None: continue
-                ri_refs.append(gold_event.text)
-                ri_hyps.append(matched_gold_text.get((video_id, gold_idx), ""))  # missed gold -> empty hypothesis
+            # Counts come from SAME one-to-one matching as P/R, so they never contradict it: a merged span covering 2 gold sentences matches 1 
+            # and leaves the other missed — under many-to-many bookkeeping it would read "0 missed" against that same recall.
+            n_missed_gold += len(gold_events) - len(one_to_one)
+            for pi, gi, iou in one_to_one:
+                best_tious.append(float(iou))
+                if pred_events[pi].commit_time_s is not None: # Emission latency.
+                    latencies.append(float(pred_events[pi].commit_time_s) - float(gold_events[gi].end_s))
 
-        precision = matched_pairs / total_pred if total_pred else 0.0
-        recall = matched_pairs / total_gold if total_gold else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        latency_block = {}
+            # TEXT: densevid pairs MANY-TO-MANY — a span overlapping two gold sentences is scored against both,
+            # and a span matching none is paired with an unmatchable reference so it still costs score.
+            hyps, refs = [], []
+            for ev in pred_events:
+                matched = False
+                for gt in gold_events:
+                    if temporal_iou(ev.segment, gt.segment) >= float(threshold):
+                        matched = True
+                        if ev.text is not None and gt.text is not None:
+                            hyps.append(ev.text); refs.append(gt.text)
+                if not matched and ev.text is not None:
+                    hyps.append(ev.text); refs.append(_unmatched_reference(ev.text)); n_zero_pairs += 1
+            n_pairs += len(hyps)
+            if hyps: per_video.append(compute_text_metrics(hyps, refs))
+            elif gold_events: per_video.append(compute_text_metrics([], []))  # gold present, nothing emitted -> 0s
+        
+        text_metrics = {k: float(np.mean([r[k] for r in per_video])) for k in (per_video[0] if per_video else {})}
+        precision = float(np.mean(vid_prec)) if vid_prec else 0.0
+        recall = float(np.mean(vid_rec)) if vid_rec else 0.0
+        latency_block, tiou_block = {}, {}
         if latencies:
             arr = np.sort(np.asarray(latencies, dtype=np.float64))
             latency_block = {
                 "median_latency_s": float(np.median(arr)),
                 "p90_latency_s": float(arr[min(len(arr) - 1, int(round(0.9 * (len(arr) - 1))))]),
-                "n": len(arr),
+                "n": len(arr)
             }
-        tiou_block = {}
-        if matched_tious:
-            tiou_arr = np.asarray(matched_tious, dtype=np.float64)
+        if best_tious:
+            arr = np.asarray(best_tious, dtype=np.float64)
             tiou_block = {
-                "min": float(np.min(tiou_arr)), "p25": float(np.percentile(tiou_arr, 25)),
-                "median": float(np.median(tiou_arr)), "p75": float(np.percentile(tiou_arr, 75)),
-                "max": float(np.max(tiou_arr)),
+                "min": float(np.min(arr)), "p25": float(np.percentile(arr, 25)),
+                "median": float(np.median(arr)), "p75": float(np.percentile(arr, 75)),
+                "max": float(np.max(arr))
             }
         results.append({
             "tiou_threshold": float(threshold),
-            "segmentation": {"precision": precision, "recall": recall, "f1": f1, "matches": float(matched_pairs)},
-            "matched_segments": matched_pairs,
-            "unmatched_predicted": total_pred - matched_pairs,
-            "unmatched_gold": total_gold - matched_pairs,
-            "matched_translation_pairs": len(pred_texts),
-            # ~1.0 = spans localize almost exactly onto gold, so every tIoU threshold keeps the same matches; 
-            # a flat curve is then a property of the predictions, not an eval bug.
-            "mean_matched_tiou": float(sum(matched_tious) / len(matched_tious)) if matched_tious else 0.0,
-            "matched_tiou_distribution": tiou_block,
-            "translation_metrics": compute_text_metrics(pred_texts, ref_texts),
-            # Always ≤ translation_metrics; the gap is the cost of the sentences the FSM never emitted.
-            "translation_metrics_recall_inclusive": compute_text_metrics(ri_hyps, ri_refs),
-            "recall_inclusive_pairs": len(ri_refs),
-            "emission_latency": latency_block,
+            "segmentation": {
+                "precision": precision, "recall": recall,
+                "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+            },
+            "text_metrics": text_metrics,
+            # scored_pairs/zero_pairs describe the TEXT set (many-to-many); missed_gold supports `recall`.
+            "scored_pairs": n_pairs, "zero_pairs": n_zero_pairs, "missed_gold": n_missed_gold,
+            "total_predictions": total_pred, "total_gold": total_gold, 
+            "mean_matched_tiou": float(np.mean(best_tious)) if best_tious else 0.0,
+            "matched_tiou_distribution": tiou_block, "emission_latency": latency_block,
         })
-    return {"thresholds": results}
+    keys = results[0]["text_metrics"] if results else {}
+    summary = {k: float(np.mean([r["text_metrics"][k] for r in results])) for k in keys}
+    summary["segmentation_f1"] = float(np.mean([r["segmentation"]["f1"] for r in results]))
+    return {"thresholds": results, "threshold_average": summary}
 
 
 def _parse_grid(value: str | None, fallback: list[float]) -> list[float]:
@@ -723,7 +737,8 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
 @torch.no_grad()
 def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     """FINAL joint fine-tuned model OFFLINE: its OWN BIO head segments each video, the SAME model translates each
-    span, both at the trained buffer_cap scale. No FSM, no commit/hysteresis, no cross-stride refinement.
+    span under the FSM's DECODE CONDITIONING — the buffer-shaped window (δ-frame lead + trailing context to buffer_cap) 
+    with Ω anchoring the span — never a tight span crop. No FSM, no commit/hysteresis, no cross-stride refinement.
 
     Held against `--stream` at the SAME model to measure what streaming buys; it folds in the cost of causal (vs
     offline-bidirectional) segmentation, so it is a conservative baseline, not a pure-refinement control.
@@ -769,16 +784,17 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         segments = bio_tags_to_segments(tags, timestamps.tolist())
 
         items, bounds = [], []
+        delta_lead_s = float(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3)) / float(record.pose.fps)
         for span in segments:
-            # An I-run merged across chunks can exceed buffer_cap; translating it whole gives the decoder an
-            # OOD-length window. Mirror the FSM: <=buffer_cap sub-windows.
-            sub_start = float(span.start_s)
-            while sub_start < float(span.end_s) - 1e-6:
-                sub_end = min(float(span.end_s), sub_start + buffer_cap_s)
-                span_poses, span_ts = load_pose_window(record.pose, sub_start, sub_end, normalize=True)
-                if span_poses.shape[0] > 0:
-                    items.append((span_poses, span_ts, sub_start)); bounds.append((sub_start, sub_end))
-                sub_start = sub_end
+            # Decode the span inside a buffer-shaped window (δ lead + context to buffer_cap), gated — the FSM's conditioning, 
+            # which is also the training one. A tight crop is stream.py's 'span' mode: untrained, and it force-disables Ω there 
+            # because select_target_span would sub-anchor inside the sentence and mask part of it.
+            w_start = max(0.0, float(span.start_s) - delta_lead_s)
+            w_end = min(float(record.pose.duration_s), w_start + buffer_cap_s)
+            span_poses, span_ts = load_pose_window(record.pose, w_start, w_end, normalize=True)
+            if span_poses.shape[0] == 0: continue
+            items.append((span_poses, span_ts, w_start))
+            bounds.append((float(span.start_s), min(float(span.end_s), w_end)))
         results = _translate_windows(
             model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size)
         )

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
-from data.windowing import TRUSTED_GAP_S
+from data.windowing import BIO, TRUSTED_GAP_S
 from data.loader import load_language_records
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
@@ -82,6 +82,8 @@ def evaluate_segmenter(model, loader, device, dice_weight, class_weights) -> dic
             row = {"bio_loss": float(bio_nll_dice_loss(logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(logits, labels, prefix="phrase"))
+            alli = torch.zeros_like(logits); alli[..., BIO["I"]] = 1.0
+            row["alli_tiou_f1"] = moryossef_segment_metrics(alli, labels, prefix="alli")["alli_tiou_f1"]
             rows.append(row)
     return mean_logs(rows, prefix="val")
 

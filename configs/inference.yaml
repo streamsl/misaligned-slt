@@ -9,8 +9,8 @@ stride_s: 1.0
 # then add a `<lang>: {split_bias, snap_radius_s}` row. (Accepts false/true/{params} for single-corpus configs too.)
 duration_decode:
     default: false                                 # untuned corpora (incl. csl): decode OFF until tune-decode is run
-    asf: {split_bias: 4.0, snap_radius_s: 1.0}     # tune_decode_s1_asf_dev.json (folds .524/.525; both arches peak here)
-buffer_cap_s: 18.0 # analyze.py --stage tail-benefit --write-config writes p99_sentence_duration + tail-elbow here
+    asf: {split_bias: 4.0, snap_radius_s: 1.5}     # tune_decode_s1_asf_dev.json (folds .524/.525; both arches peak here)
+buffer_cap_s: 16.27  # analyze.py --stage tail-benefit --write-config writes p99_sentence_duration + tail-elbow here
 # (NOT the bare elbow: §8.3's elbow is ~1-3s but §7.2 requires the FSM buffer to hold a WHOLE sentence + tail, so
 # the forced-commit cap is p99 sentence duration + the elbow; both raw values are in outputs/tail_benefit_*.json).
 boundary_stability:
@@ -23,7 +23,7 @@ boundary_stability:
     #      the next sentence's B in the buffer (the ≤2δ leftover tail is never selected: buffer-start I does
     #      not open a span, and a mislabelled-B leftover is filtered by span_selection.min_span_frames);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
-    delta_enc_frames: 3
+    delta_enc_frames: 22
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3)
 span_selection:
     # Λ_min: shortest selectable span, in encoder frames. Filters phantom micro-spans (a spurious B in the
@@ -32,8 +32,7 @@ span_selection:
     # exceeding the upper bound would silently drop real sentences). Measured on synthetic-CSL dev (1061
     # cues @30fps): p0 = 31 frames (1.03s), p1 = 37 frames — while the phantom scale is ≤ 2δ = 6 frames.
     # 18 = p1/2 sits an order of magnitude above the noise floor with full margin to the shortest sentence.
-    # Rerun per corpus/fps (PHOENIX @25.5fps differs).
-    min_span_frames: 18
+    min_span_frames: 23
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
 # undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.
@@ -58,7 +57,6 @@ translation:
     # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
     # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
     diffusion_steps: 128
-    block_size: 4
     dcd:
         window_type: sliding
         # DCD commit threshold = 0.9 (decode_algorithm.py / run_all.sh). decode_param is operative; tau_dec is its
@@ -69,4 +67,3 @@ translation:
         decode_algo: threshold # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
         decode_param: 0.9
         cache_type: none # prefix cache is available only with window_type: static.
-        refresh_count: 16

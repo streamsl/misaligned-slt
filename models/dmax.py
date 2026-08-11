@@ -301,7 +301,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
         decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
-        top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16, omega_bias: torch.Tensor | None = None,
+        top_p: float | None = None, cache_type: str = "none", omega_bias: torch.Tensor | None = None,
     ) -> SPDDecodeResult:
         batch = enc_hidden.shape[0]
         token_ids = torch.full((batch, int(max_length)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)
@@ -327,7 +327,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             top_k=top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision,
             window_length=window_length or self.block_size, max_window_length=max_window_length,
             window_type=window_type, decode_algo=decode_algo, decode_param=decode_param,
-            sample_top_k=sample_top_k, top_p=top_p, cache_type=cache_type, refresh_count=refresh_count,
+            sample_top_k=sample_top_k, top_p=top_p, cache_type=cache_type,
             block_size=self.block_size # Block-causal decoder: DCD window must not span attention blocks (see spd_dcd_decode).
         )
 

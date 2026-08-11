@@ -95,9 +95,9 @@ membership_gate:
     enabled: true
     # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
     # MUST match inference.yaml boundary_stability.delta_enc_frames.
-    delta: 3
+    delta: 22
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    min_span_frames: 18 # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (CSL @30fps).
+    min_span_frames: 23  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (CSL @30fps).
     # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
     # Log gate_veto_rate — it should start near 0 and decay.
     iou_veto: 0.5
@@ -232,7 +232,6 @@ dcd:
     decode_algo: threshold # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
     decode_param: 0.9
     cache_type: none # none is exact; prefix is implemented only when window_type: static.
-    refresh_count: 16
     # NOTE: the DCD window is automatically clipped to the BD3LM attention block (DCD decode_algorithm.py::window_causal_decode
     # semantics for block-causal models). DCD's optional Dynamic Block Extension is not enabled here as this mBART-BD3LM substrate
     # is trained with fixed block_size.

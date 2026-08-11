@@ -203,7 +203,7 @@ def spd_dcd_decode(
     temperature: float = 0.0, top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True,
     window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
     decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
-    top_p: float | None = None, cache_type: str = "none", refresh_count: int = 16, block_size: int | None = None, 
+    top_p: float | None = None, cache_type: str = "none", block_size: int | None = None, 
     settle_confidence: float = 0.9, fill_leftover_masks: bool = True,
 ) -> SPDDecodeResult:
     """Cold-start SPD + DCD decode under a fixed-conditioning logits function.
@@ -227,7 +227,6 @@ def spd_dcd_decode(
     SETTLED block b — `_settle` at each block crossing plus a final settle. Per-block settles are bounded by the block 
     size (DMax's `while step < block_length`), the final one by `steps`.
     """
-    del refresh_count
     cache_type = str(cache_type)
     cache_aware = bool(getattr(logits_fn, "supports_dcd_cache", False))
     if cache_type != "none" and not cache_aware:

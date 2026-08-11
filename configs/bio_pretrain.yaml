@@ -41,7 +41,7 @@ wandb:
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
 epochs: 50
 batch_size: 8
-learning_rate: 1.0e-3
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 freeze_backbone: true
 # backbone_lr: 1.0e-4  # optional: encoder LR when freeze_backbone: false (default learning_rate×0.1)

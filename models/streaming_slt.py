@@ -203,8 +203,8 @@ class MisalignedSLTModel(nn.Module):
         tau_dec: float = 0.75, spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none",  dcd_refresh_count: int = 16,
-        decoder_start_token_id: int | None = None, num_beams: int = 1, omega_bias: torch.Tensor | None = None,
+        dcd_top_p: float | None = None, dcd_cache_type: str = "none", decoder_start_token_id: int | None = None, 
+        num_beams: int = 1, omega_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         enc_hidden, enc_mask = self.front_end.encode_memory(bio_tap, frame_mask)
         if self.decoder_type == "dlm":
@@ -213,7 +213,7 @@ class MisalignedSLTModel(nn.Module):
                 tau_dec=tau_dec, top_k=spd_top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision, temperature=temperature,
                 window_length=dcd_window_length, max_window_length=dcd_max_window_length, window_type=dcd_window_type,
                 decode_algo=dcd_decode_algo, decode_param=dcd_decode_param, sample_top_k=dcd_sample_top_k, top_p=dcd_top_p, 
-                cache_type=dcd_cache_type, refresh_count=dcd_refresh_count, omega_bias=omega_bias,
+                cache_type=dcd_cache_type, omega_bias=omega_bias,
             )
             # Slice to PRODUCED tokens (AR-arm parity): slot 0 (synthetic BOS) and everything past the first EOS are
             # 1.0 pad bookkeeping, so an unsliced mean pins the commit gate near 1 (~10 tokens on a 128 canvas → ≥
@@ -294,10 +294,9 @@ class MisalignedSLTModel(nn.Module):
         cb_lambda: float = 0.3, verified_full_evidence_gate: bool = True, cb_decode_steps: int = 64,
         cb_dcd_window_length: int | None = None, cb_dcd_max_window_length: int | None = None, cb_dcd_window_type: str = "sliding",
         cb_dcd_decode_algo: str = "threshold", cb_dcd_decode_param: int | float | None = None, cb_dcd_sample_top_k: int | None = None,
-        cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_dcd_refresh_count: int = 16,
-        cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, cb_spd_revision: bool = True, cb_temperature: float = 0.0,
-        gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
-        gate_iou_veto: float = 0.5, gate_gt_anchored: bool = False,
+        cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, 
+        cb_spd_revision: bool = True, cb_temperature: float = 0.0, gate_enabled: bool = False, gate_delta: int = 3, 
+        gate_eps: float = 1e-4, gate_min_span_frames: int = 0, gate_iou_veto: float = 0.5, gate_gt_anchored: bool = False,
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
@@ -468,7 +467,7 @@ class MisalignedSLTModel(nn.Module):
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count, omega_bias=cb_omega_full,
+                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_full,
                     )
                     full_tokens = full_decode.sequences
 
@@ -479,7 +478,7 @@ class MisalignedSLTModel(nn.Module):
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, refresh_count=cb_dcd_refresh_count, omega_bias=cb_omega_trunc,
+                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_trunc,
                     )
                 trunc_tokens = trunc_decode.sequences
                 trunc_confidence = trunc_decode.confidence

@@ -26,7 +26,7 @@ from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisig
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_model_checkpoint
 from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
-from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics, temporal_iou
+from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
 
@@ -189,69 +189,58 @@ def controlled_windows(
     return windows
 
 
-# densevid_eval pairs each unmatched prediction with a random-string reference so it scores ~0 and still counts. Same effect, reproducible: 
-# an unmatchable sentinel token, repeated to hypothesis's LENGTH. The repetition fixes a flaw in densevid: its random_string() has no spaces, 
-# so every garbage reference is 1 token. That shrinks corpus-BLEU's ref_len, and when system under-generates BP relief outweighs the precision 
-# hit — spurious spans then RAISE BLEU. Length-matched references keep the pair length-neutral, so over-generation costs precision only.
-_UNMATCHED_REF = "\u0000unmatched"
-
-def _unmatched_reference(hypothesis: str) -> str:
-    return " ".join([_UNMATCHED_REF] * max(1, len(hypothesis.split())))
-
-
 def evaluate_predicted_events(
     predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float]
 ) -> dict[str, Any]:
     """RQ2 scoring under the ActivityNet dense-captioning protocol (Krishna et al. 2017, `densevid_eval`), translations in place of captions. 
-    Per tIoU threshold: every (prediction, gold) pair with tIoU >= t is a scored pair (many-to-many), an unmatched prediction is paired with 
-    an unmatchable reference so spurious segments cost score, and `compute_text_metrics` scores ONE VIDEO's pairs at a time — densevid calls 
-    its scorers per video (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, so 
-    RQ2 and segmenter-eval report 1 statistic. Missed gold enters `segmentation.recall` only, never the text score (densevid's own convention). 
-    `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
+    Per tIoU threshold: predictions and gold are matched 1-TO-1 (greedy by tIoU, the codebase's canonical rule), unmatched predictions and 
+    missed gold both dilute the score via SODA's count normalization, and `compute_text_metrics` scores 1 VIDEO's pairs at a time — densevid 
+    calls its scorers per video (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, 
+    so RQ2 and segmenter-eval report 1 statistic. Missed gold therefore enters the TEXT score too, which densevid's matched-only convention 
+    drops. `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
     results = []
     all_video_ids = sorted(set(predicted) | set(gold))
     for threshold in thresholds:
         per_video: list[dict[str, float]] = []
         vid_prec, vid_rec, latencies, best_tious = [], [], [], []
-        n_pairs = n_zero_pairs = n_missed_gold = total_pred = total_gold = 0
+        n_pairs = n_unmatched_pred = n_missed_gold = total_pred = total_gold = 0
         for video_id in all_video_ids:
             pred_events, gold_events = predicted.get(video_id, []), gold.get(video_id, [])
             if not pred_events and not gold_events: continue
             total_pred += len(pred_events); total_gold += len(gold_events)
 
-            # SEGMENTATION: the codebase's one canonical segment metric — greedy ONE-TO-ONE tIoU matching, shared verbatim with segmenter-eval 
-            # and the BIO monitor. densevid's own proposal P/R is coverage-based (many-to-many), which lets duplicate spans all "match" 1 gold 
-            # and keeps precision at 1.0; one-to-one charges the duplicate, so it is the defensible number for a segmentation claim.
+            # SEGMENTATION: the codebase's 1 canonical segment metric — greedy 1-to-1 tIoU matching, shared verbatim with segmenter-eval 
+            # and the BIO monitor. densevid's own proposal P/R is coverage-based (many-to-many), which lets duplicate spans all "match" 
+            # 1 gold and keeps precision at 1.0; 1-to-1 charges the duplicate, so it is the defensible number for a segmentation claim.
             pred_segs, gold_segs = [ev.segment for ev in pred_events], [gt.segment for gt in gold_events]
             prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=float(threshold))
             if pred_events: vid_prec.append(prf["precision"])
             if gold_events: vid_rec.append(prf["recall"])
             one_to_one = match_segments(pred_segs, gold_segs, threshold=float(threshold))
 
-            # Counts come from SAME one-to-one matching as P/R, so they never contradict it: a merged span covering 2 gold sentences matches 1 
-            # and leaves the other missed — under many-to-many bookkeeping it would read "0 missed" against that same recall.
+            # Counts come from SAME 1-to-1 matching as P/R, so they never contradict it: a merged span covering 2 gold sentences matches 
+            # 1 and leaves the other missed — under many-to-many bookkeeping it would read "0 missed" against that same recall.
             n_missed_gold += len(gold_events) - len(one_to_one)
             for pi, gi, iou in one_to_one:
                 best_tious.append(float(iou))
                 if pred_events[pi].commit_time_s is not None: # Emission latency.
                     latencies.append(float(pred_events[pi].commit_time_s) - float(gold_events[gi].end_s))
 
-            # TEXT: densevid pairs MANY-TO-MANY — a span overlapping two gold sentences is scored against both,
-            # and a span matching none is paired with an unmatchable reference so it still costs score.
+            # TEXT reuses SAME 1-to-1 pairing as segmentation, so both views describe 1 assignment. densevid pairs many-to-many, which lets 
+            # a duplicate span score against a gold another span already claimed — the permissiveness SODA was written to fix; COCO AP and 
+            # action localization are 1-to-1 too.
             hyps, refs = [], []
-            for ev in pred_events:
-                matched = False
-                for gt in gold_events:
-                    if temporal_iou(ev.segment, gt.segment) >= float(threshold):
-                        matched = True
-                        if ev.text is not None and gt.text is not None:
-                            hyps.append(ev.text); refs.append(gt.text)
-                if not matched and ev.text is not None:
-                    hyps.append(ev.text); refs.append(_unmatched_reference(ev.text)); n_zero_pairs += 1
+            for pi, gi, _ in one_to_one:
+                if pred_events[pi].text is None or gold_events[gi].text is None: continue
+                hyps.append(pred_events[pi].text); refs.append(gold_events[gi].text)
             n_pairs += len(hyps)
-            if hyps: per_video.append(compute_text_metrics(hyps, refs))
-            elif gold_events: per_video.append(compute_text_metrics([], []))  # gold present, nothing emitted -> 0s
-        
+            n_unmatched_pred += len(pred_events) - len(one_to_one)
+            # MATCHED PAIRS ONLY, so the column means 1 thing in every row: translation quality GIVEN correct localisation. densevid instead 
+            # scores spurious spans against a random reference, which drags the column down for localisation reasons — that makes GT-span rows 
+            # (1-2, f1=1, no spurious spans) incomparable with predicted-span rows (3-6) and contaminates the (5-4) and (6-5) contrasts the 
+            # ladder exists to isolate. Both localisation failures live in `segmentation`: spurious spans in precision, missed gold in recall.
+            per_video.append(compute_text_metrics(hyps, refs))
+
         text_metrics = {k: float(np.mean([r[k] for r in per_video])) for k in (per_video[0] if per_video else {})}
         precision = float(np.mean(vid_prec)) if vid_prec else 0.0
         recall = float(np.mean(vid_rec)) if vid_rec else 0.0
@@ -277,8 +266,8 @@ def evaluate_predicted_events(
                 "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0
             },
             "text_metrics": text_metrics,
-            # scored_pairs/zero_pairs describe the TEXT set (many-to-many); missed_gold supports `recall`.
-            "scored_pairs": n_pairs, "zero_pairs": n_zero_pairs, "missed_gold": n_missed_gold,
+            # scored_pairs feed the text score; unmatched_predictions support `precision`, missed_gold `recall`.
+            "scored_pairs": n_pairs, "unmatched_predictions": n_unmatched_pred, "missed_gold": n_missed_gold,
             "total_predictions": total_pred, "total_gold": total_gold, 
             "mean_matched_tiou": float(np.mean(best_tious)) if best_tious else 0.0,
             "matched_tiou_distribution": tiou_block, "emission_latency": latency_block,
@@ -552,11 +541,12 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             # them against the inert Ω gives near-empty hallucinations whose brevity penalty tanks the cell's
             # corpus BLEU superlinearly. Read WITH gate_skip_rate; text_metrics above is the pessimistic bound.
             "gate_skip_rate": float(sum(values["gate_skips"])) / max(1, len(values["gate_skips"])),
-            "text_metrics_decoded_only": compute_text_metrics(
+        })
+        if any(values["gate_skips"]):  # omitted when nothing is skipped: it would equal text_metrics exactly
+            severity[-1]["text_metrics_decoded_only"] = compute_text_metrics(
                 [p for p, s in zip(values["predictions"], values["gate_skips"]) if not s],
                 [r for r, s in zip(values["references"], values["gate_skips"]) if not s],
-            ),
-        })
+            )
     # Sweeps are expensive and the artifacts feed the paper plots.
     if args.output:
         out = Path(args.output)
@@ -942,9 +932,8 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     payload = {
         "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "decode": decode, "tiou_thresholds": list(thresholds), "metrics": metrics,
-        # The pinned (split_bias, snap_radius_s) was SELECTED on dev, so dev numbers with it are in-selection — quote held-out or test.
+        # Pinned pair is dev-SELECTED, so dev numbers with it are in-selection — quote held-out or test.
         "decode_hparams": ((dd or "module-defaults") if decode == "duration" else None),
-        "decode_pair_tuned_on": ("dev (analyze --stage tune-decode)" if decode == "duration" else None),
     }
     output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)

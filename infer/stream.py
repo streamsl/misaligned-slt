@@ -45,7 +45,7 @@ class StreamingSLTRunner:
         spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none", dcd_refresh_count: int = 16,
+        dcd_top_p: float | None = None, dcd_cache_type: str = "none", 
         decode_conditioning: str = "window", min_span_frames: int | None = None, forced_tail_policy: str = "skip",
         gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4, duration_prior=None,
     ):
@@ -70,10 +70,10 @@ class StreamingSLTRunner:
         self.diffusion_steps = int(diffusion_steps)
         self.tau_dec = float(tau_dec)
 
-        # Λ_min (min_span_frames): shortest selectable span in encoder frames — a duration noise floor; spans below δ are unresolvable from 
-        # boundary evidence. Default δ+1, else max(δ+1, p1-p2 of dev sentence lengths); 0 re-admits 1-frame flicker. Not the re-emission 
-        # guard (select_target_span(skip_term_before=χ) is), and not the old "Λ_min > 2δ" bound: 2δ < Λ_min < shortest real sentence is 
-        # infeasible on short corpora, and the duration re-split only disfavors sub-second seam segments (~4-5 nats).
+        # Λ_min (min_span_frames): shortest selectable span in encoder frames — a duration noise floor; spans below δ are unresolvable 
+        # from boundary evidence. Default δ+1, else max(δ+1, p1-p2 of dev sentence lengths); 0 re-admits 1-frame flicker. Not the 
+        # re-emission guard (select_target_span(skip_term_before=χ) is), and not the old "Λ_min > 2δ" bound: 2δ < Λ_min < shortest real 
+        # sentence is infeasible on short corpora, and the duration re-split only disfavors sub-second seam segments (~4-5 nats).
         self.min_span_frames = int(min_span_frames) if min_span_frames is not None else int(delta_enc_frames) + 1
         if self.min_span_frames < 1: raise ValueError(f"min_span_frames ({self.min_span_frames}) must be >= 1")
         # Optional semi-Markov duration decode (infer.duration_decode, inference.yaml duration_decode): injects interior B
@@ -99,7 +99,6 @@ class StreamingSLTRunner:
         self.dcd_top_p = dcd_top_p
 
         self.dcd_cache_type = dcd_cache_type
-        self.dcd_refresh_count = int(dcd_refresh_count)
         self.commit_gate = CommitGate(
             delta_enc_frames=delta_enc_frames,
             hysteresis_strides=hysteresis_strides,
@@ -134,7 +133,7 @@ class StreamingSLTRunner:
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,
             dcd_decode_algo=self.dcd_decode_algo, dcd_decode_param=self.dcd_decode_param, dcd_sample_top_k=self.dcd_sample_top_k,
-            dcd_top_p=self.dcd_top_p, dcd_cache_type=self.dcd_cache_type, dcd_refresh_count=self.dcd_refresh_count, omega_bias=omega_bias,
+            dcd_top_p=self.dcd_top_p, dcd_cache_type=self.dcd_cache_type, omega_bias=omega_bias,
         )
 
     def _stride_omega(self, bio_logits: torch.Tensor, mask: torch.Tensor, ts_b: torch.Tensor, start_s: float):

@@ -1,9 +1,11 @@
 from __future__ import annotations
-import re, random, csv, html
+from collections import defaultdict
+from itertools import combinations
 from dataclasses import dataclass
 from typing import Any, Iterable
 from pathlib import Path
 
+import re, random, csv, html
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
 from train import distributed as dist
@@ -188,7 +190,8 @@ def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, 
 
 
 def _load_signverse_splits(path: Path) -> dict[str, str]:
-    if not path.exists(): return {}
+    # str(Path("")) is ".", which exists and is a directory — guard before opening.
+    if not path.name or not path.is_file(): return {}
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -210,7 +213,15 @@ def _load_signverse_splits(path: Path) -> dict[str, str]:
 
 
 def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
-    signverse = _load_signverse_splits(Path(split_cfg.get("signverse_csv", "")))
+    csv_path = str(split_cfg.get("signverse_csv", "") or "")
+    signverse = _load_signverse_splits(Path(csv_path))
+    # Fail loud rather than fall through to the random split: signverse_csv is CWD-relative, so an entry point started
+    # from another directory would silently re-partition every video, making a checkpoint trained under one split and
+    # evaluated under the other train-on-test. The fallback below is only for configs that declare no CSV at all.
+    if csv_path and not signverse: raise FileNotFoundError(
+        f"splits.signverse_csv={csv_path!r} is configured but unusable from cwd {Path.cwd()} (missing, empty, or "
+        f"no recognised id/split columns). Refusing the random fallback split."
+    )
     if signverse:
         splits = {"train": [], "dev": [], "test": []}
         unmatched = 0
@@ -237,6 +248,45 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
         "dev": sorted(ids[n_train:n_train + n_dev]),
         "test": sorted(ids[n_train + n_dev:]),
     }
+
+
+def _split_caption_sets(root: Path, video_ids, subtitle_cfg: dict, drop_noise: bool) -> dict[str, set[str]]:
+    # {video_id: {normalised caption}} for overlap testing. Parses subtitles only (no poses).
+    out: dict[str, set[str]] = {}
+    for vid in video_ids:
+        path = best_subtitle(root / "subs", vid, subtitle_cfg)
+        if path is None: continue
+        caps = {
+            " ".join(str(t).lower().split()) 
+            for _, _, t in merge_rolling_captions(parse_vtt(path, drop_noise=drop_noise)) if t
+        }
+        if caps: out[vid] = caps
+    return out
+
+
+def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, str, float]]:
+    """Near-duplicate video pairs — the same talk re-uploaded under a different id.
+
+    A caption identifies content only if it is RARE (document frequency <= df_cap; above that it is series
+    boilerplate such as a scripted contact-info outro, which otherwise chains unrelated videos into one cluster)
+    and LONG enough (>= min_words; single-sign vocabulary clips share a word with everything). A pair is flagged
+    when its shared identifying captions cover more than `cover` of the smaller video's identifying set.
+    Videos below min_captions are skipped: the cover statistic is quantised to 1/n and is meaningless there.
+    """
+    df_cap, min_words = int(cfg.get("df_cap", 20)), int(cfg.get("min_words", 4))
+    min_caps, cover = int(cfg.get("min_captions", 10)), float(cfg.get("cover", 0.5))
+    ident = {v: k for v, cs in caps.items() if len(k := {c for c in cs if len(c.split()) >= min_words}) >= min_caps}
+    inv: dict[str, set[str]] = defaultdict(set)
+    for v, cs in ident.items():
+        for c in cs: inv[c].add(v)
+
+    shared: dict[tuple[str, str], int] = defaultdict(int)
+    for c, vs in inv.items():
+        if 2 <= len(vs) <= df_cap:
+            for a, b in combinations(sorted(vs), 2): shared[(a, b)] += 1
+
+    pairs = [(a, b, n / min(len(ident[a]), len(ident[b]))) for (a, b), n in shared.items()]
+    return sorted([p for p in pairs if p[2] > cover], key=lambda p: -p[2])
 
 
 def load_language_records(data_cfg: dict, language: str, split: str | None = None) -> tuple[list[VideoRecord], dict[str, list[str]]]:
@@ -321,6 +371,24 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         f"[loader] {language}/{split or 'all'}: {dropped_no_caption}/{len(selected_ids)} videos dropped "
         f"(no usable caption in {root / 'subs'}).", flush=True
     )
+    # Cross-split de-duplication. YouTube corpora contain RE-UPLOADS: the same talk under different video ids, so an id-based
+    # split puts it in BOTH train and dev/test and the model scores by memorisation. Removal is TRAIN-side, following the
+    # decontamination convention (keep the benchmark intact, purge the training copy) — deleting the eval twin instead would
+    # shrink an already small eval set and bias what remains toward content unlike training.
+    dedup_cfg = subtitle_cfg.get("dedup", {}) or {}
+    if dedup_cfg.get("enabled") and split == "train" and records:
+        eval_ids = {v for s in ("dev", "test") for v in splits.get(s, [])}
+        caps = _split_caption_sets(root, [r.video_id for r in records] + sorted(eval_ids), subtitle_cfg, drop_noise)
+        pairs = _duplicate_pairs(caps, dedup_cfg)
+        drop: dict[str, str] = {}
+        for a, b, frac in pairs:
+            if (a in eval_ids) != (b in eval_ids):
+                drop.setdefault(b if a in eval_ids else a, f"{frac:.0%} of {b if a in eval_ids else a}")
+                
+        if drop:
+            records = [r for r in records if r.video_id not in drop]
+            print(f"[loader] {language}/train: de-duplicated {len(drop)} video(s) duplicated across splits or within train "
+                  f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); subtitles.dedup.", flush=True)
     return records, splits
 
 

@@ -12,7 +12,7 @@ Faithfulness points that make the released checkpoint load (strict=True) and beh
     (models.get_requires_grad_dict). Our loader mirrors the same way.
   * body part is processed FIRST and its spatial-GCN feature is injected (detached) into the
     hand/face features BEFORE the temporal GCN: left += body[...,-2], right += body[...,-1],
-    face_all += body[...,0]. Order of self.modes is load-bearing.
+    face_all += body[...,0]. Order of self.modes is important.
   * NO temporal downsampling (stride 1) -> T preserved -> frame-aligned, so the RoPE BIO head and
     the streaming FSM read per-frame features exactly as before.
 

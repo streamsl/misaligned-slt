@@ -17,9 +17,43 @@ TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT).
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable
 from data.windowing import BIO
 import torch
+
+
+@dataclass(frozen=True)
+class Segment:
+    start_s: float
+    end_s: float
+
+    @property
+    def duration_s(self) -> float:
+        return max(0.0, float(self.end_s - self.start_s))
+
+
+def temporal_iou(a: Segment, b: Segment) -> float:
+    inter = max(0.0, min(a.end_s, b.end_s) - max(a.start_s, b.start_s))
+    union = a.duration_s + b.duration_s - inter
+    return inter / union if union > 0 else 0.0
+
+
+def match_segments(predicted: list[Segment], gold: list[Segment], threshold: float = 0.1) -> list[tuple[int, int, float]]:
+    scored = [] # Greedy one-to-one tIoU matching.
+    for pi, pred in enumerate(predicted):
+        for gi, gt in enumerate(gold):
+            score = temporal_iou(pred, gt)
+            if score >= threshold: scored.append((score, pi, gi))
+
+    scored.sort(reverse=True)
+    used_pred: set[int] = set()
+    used_gold: set[int] = set()
+    matches: list[tuple[int, int, float]] = []
+    for score, pi, gi in scored:
+        if pi in used_pred or gi in used_gold: continue
+        used_pred.add(pi)
+        used_gold.add(gi)
+        matches.append((pi, gi, score))
+    return matches
 
 
 def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = "bio") -> dict[str, float]:
@@ -161,41 +195,6 @@ def moryossef_segment_metrics(
         f"{prefix}_seg_precision": avg(precisions), f"{prefix}_seg_recall": avg(recalls),
         f"{prefix}_n_matches": n_matches, f"{prefix}_n_pred": n_pred, f"{prefix}_n_gold": n_gold,
     }
-
-    
-@dataclass(frozen=True)
-class Segment:
-    start_s: float
-    end_s: float
-
-    @property
-    def duration_s(self) -> float:
-        return max(0.0, float(self.end_s - self.start_s))
-
-
-def temporal_iou(a: Segment, b: Segment) -> float:
-    inter = max(0.0, min(a.end_s, b.end_s) - max(a.start_s, b.start_s))
-    union = a.duration_s + b.duration_s - inter
-    return inter / union if union > 0 else 0.0
-
-
-def match_segments(predicted: list[Segment], gold: list[Segment], threshold: float = 0.1) -> list[tuple[int, int, float]]:
-    scored = [] # Greedy one-to-one tIoU matching.
-    for pi, pred in enumerate(predicted):
-        for gi, gt in enumerate(gold):
-            score = temporal_iou(pred, gt)
-            if score >= threshold: scored.append((score, pi, gi))
-
-    scored.sort(reverse=True)
-    used_pred: set[int] = set()
-    used_gold: set[int] = set()
-    matches: list[tuple[int, int, float]] = []
-    for score, pi, gi in scored:
-        if pi in used_pred or gi in used_gold: continue
-        used_pred.add(pi)
-        used_gold.add(gi)
-        matches.append((pi, gi, score))
-    return matches
 
 
 @lru_cache(maxsize=8)

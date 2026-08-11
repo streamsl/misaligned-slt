@@ -1,6 +1,6 @@
 # S1 — BIO pretrain on FROZEN Uni-Sign pose features (docs/membership_gate.md §1.4; train/bio_pretrain.py).
 #
-# WHY `extends: dlm.yaml` — deliberate and load-bearing. S1 trains the in-system RoPE BIO head on the EXACT
+# WHY `extends: dlm.yaml` — deliberate and important. S1 trains the in-system RoPE BIO head on the EXACT
 # window distribution the SLT model will couple it under: same `StreamingWindowDataset` + `WindowSampler`, so it
 # must inherit that pipeline's keys — mode_ratios, jitter, mode2_subcase_weights, augmentation (incl. fps_aug),
 # bio_class_weights, dice_loss_weight — and the BIO-head arch (bio_hidden_dim/depth/nhead/dropout/conv_stem).

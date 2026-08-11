@@ -121,6 +121,16 @@ subtitles:
     # video_meta.csv caption_source), so there is no load-time fallback dir — a video with no vtt is genuinely
     # caption-less and dropped. human_only_splits: on these splits, exclude videos whose caption_source is in
     # human_only_exclude_sources (default just `mt` = NLLB machine-translation) so BLEU scores against human refs.
+    dedup:
+        # Cross-split de-duplication (data.loader._duplicate_pairs). YouTube re-uploads put the same talk in train 
+        # and dev/test under different video ids; an id-based split does not separate them. The TRAIN copy is removed, 
+        # so the eval sets stay exactly as the split CSV defines them. Every constant below is part of the detector 
+        # spec and should be reported alongside results: they change which videos are considered duplicates.
+        enabled: true
+        df_cap: 20        # a caption in more videos than this is series boilerplate, not evidence of shared content
+        min_words: 4      # shorter captions are sign-vocabulary labels that match unrelated videos
+        min_captions: 10  # below this the cover fraction is quantized to 1/n and unreliable
+        cover: 0.5        # flag a pair sharing more than this fraction of the smaller video's identifying captions
     human_only_splits: [test]
     human_only_exclude_sources: [mt]
     preferred_suffixes:

@@ -63,20 +63,24 @@ def _load_segments(path: str | Path) -> list[Segment]:
     return [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows]
 
 
-def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path) -> Path:
+def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict | None = None) -> Path:
+    # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the arch/decode
+    # that made it is unrecoverable — Analysis A silently inherits whatever was last written under that filename.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [
         {"video_id": video_id, "segments": [{"start_s": float(s.start_s), "end_s": float(s.end_s)} for s in segments]}
         for video_id, segments in sorted(predictions.items())
     ]
-    path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload = {"provenance": dict(provenance), "predictions": rows} if provenance else rows
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
 def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
     # Predicted-segments JSON: dict {vid: [{start_s,end_s}]} or list-of-rows form.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "predictions" in raw: raw = raw["predictions"]  # stamped form
     if isinstance(raw, dict):
         return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
     predictions: dict[str, list[Segment]] = {}
@@ -348,16 +352,34 @@ def _build_eval_model(
     else:
         tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+    # EVERY head knob from config, exactly as train/slt.py builds it. Passing only bio_hidden_dim left the other
+    # four at code defaults, so any config change silently gives eval a different architecture than training —
+    # and the strict=False load below would absorb the mismatch as "missing keys" without a word.
     model = MisalignedSLTModel(
         front_end=front_end, tokenizer=tokenizer,
         decoder="ar" if method == "ar" else "dlm",
         bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
+        bio_depth=int(method_cfg.get("bio_depth", 4)),
+        bio_nhead=int(method_cfg.get("bio_nhead", 8)),
+        bio_dropout=float(method_cfg.get("bio_dropout", 0.1)),
+        bio_conv_stem_layers=int(method_cfg.get("bio_conv_stem_layers", 2)),
         block_size=int(method_cfg.get("block_size", 8)),
     )
     ckpt = Path(checkpoint or checkpoint_dir(method_cfg, default="") or "")
-    if not ckpt.exists():
-        raise FileNotFoundError(f"Missing checkpoint for {method}: {ckpt}. Train the method first or pass --checkpoint.")
-    load_model_checkpoint(model, ckpt, strict=False)
+    if not ckpt.exists(): raise FileNotFoundError(f"Missing checkpoint for {method}: {ckpt}. Train the method first or pass --checkpoint.")
+
+    # strict=False is deliberate (an ar checkpoint has no dlm decoder and vice versa), but the report must be READ:
+    # a silently half-loaded model evaluates a partly-random network and reports it as a result.
+    missing, unexpected = load_model_checkpoint(model, ckpt, strict=False)
+    core_missing = [k for k in missing if k.startswith(("bio_head.", "front_end.pose_encoder."))]
+    if core_missing: raise RuntimeError(
+        f"{ckpt} did not supply {len(core_missing)} core tensor(s) (e.g. {core_missing[:3]}). The eval model's "
+        f"shape disagrees with the checkpoint — check the bio_* / block_size keys in the method config."
+    )
+    if missing or unexpected: print(
+        f"[eval] {ckpt.name}: {len(missing)} missing, {len(unexpected)} unexpected tensor(s) "
+        f"(expected across decoder arms; core pose/BIO tensors verified present).", flush=True
+    )
     model.to(device); model.eval()
     _attach_duration_prior(model, language, data_cfg, inference_cfg)
     return model, tokenizer
@@ -379,7 +401,10 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         return {"max_text_tokens": max_tokens, "num_beams": num_beams}
 
     trans_cfg = inference_cfg.get("translation", {})
-    dcd_cfg = trans_cfg.get("dcd", method_cfg.get("dcd", {}))
+    # PER-KEY merge, not whole-block fallback: method config supplies the trained defaults, inference.yaml
+    # overrides per key at deployment. Block-level fallback shadowed dlm.yaml's entire dcd block the moment
+    # inference.yaml defined one — setting dcd.temperature in dlm.yaml then silently did nothing at eval.
+    dcd_cfg = {**method_cfg.get("dcd", {}), **trans_cfg.get("dcd", {})}
     spd_cfg = method_cfg.get("spd", {})
     return {
         "max_text_tokens": max_tokens, "num_beams": 1,
@@ -397,7 +422,6 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "dcd_sample_top_k": None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
         "dcd_top_p": None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
         "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
-        "dcd_refresh_count": int(dcd_cfg.get("refresh_count", 16)),
         # Membership gate at RQ1: same Ω the decoder trained with (on-policy span, no GT/χ). BOTH arms gated — 
         # DLM injects Ω in its manual decode, AR via HF cross-attention hooks (front_end.ar_generate).
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
@@ -564,7 +588,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
 def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, duration_prior=None):
     from infer.stream import StreamingSLTRunner
     trans = inference_cfg.get("translation", {})
-    dcd = trans.get("dcd", {})
+    dcd = {**method_cfg.get("dcd", {}), **trans.get("dcd", {})}  # same per-key merge as _generation_kwargs
     spd = method_cfg.get("spd", {})
     boundary = inference_cfg.get("boundary_stability", {})
 
@@ -598,7 +622,10 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         dcd_decode_algo=str(dcd.get("decode_algo", "threshold")),
         dcd_decode_param=dcd.get("decode_param", trans.get("commit_confidence_tau", 0.75)),
         dcd_cache_type=str(dcd.get("cache_type", "none")),
-        dcd_refresh_count=int(dcd.get("refresh_count", 16)),
+        # Same two sampling knobs the RQ1 path reads (_generation_kwargs); omitting them here left the FSM at
+        # None while single-window RQ1 honoured the config — the two rows would decode under different policies.
+        dcd_sample_top_k=None if dcd.get("top_k") is None else int(dcd.get("top_k")),
+        dcd_top_p=None if dcd.get("top_p") is None else float(dcd.get("top_p")),
         decode_conditioning=str(trans.get("decode_conditioning", "window")),
         duration_prior=duration_prior,
     )
@@ -909,10 +936,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     data_cfg = load_yaml(args.data_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
-    # Per-arch decode DEFAULT, inference.yaml's per-language switch the ONE source of truth: `s1` -> duration re-split iff enabled, 
-    # else `plain` argmax. --segmenter-decode overrides (`duration` on an OFF/untuned language uses module defaults).
+    
     dd = duration_decode_params(load_yaml(args.inference_config), args.language)
-    decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
+    decode = args.segmenter_decode or ("duration" if dd is not None else "plain")
     duration_prior = None
     if decode == "duration":
         train_records, _ = load_language_records(data_cfg, args.language, split="train")

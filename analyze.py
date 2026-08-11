@@ -214,7 +214,11 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
         model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, duration_prior=duration_prior,
     )
     output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
-    save_prediction_file(predictions, output)
+    save_prediction_file(predictions, output, provenance={
+        "segmenter_arch": args.segmenter_arch, "decode": "duration" if duration_prior else "plain",
+        "decode_hparams": dd if duration_prior else None, "checkpoint": checkpoint,
+        "language": args.language, "split": args.split,
+    })
     return {
         "language": args.language, "split": args.split, "videos": len(records),
         "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
@@ -296,6 +300,15 @@ def tune_decode(args: argparse.Namespace) -> dict:
         "pin_as": {"duration_decode": {"split_bias": selected["split_bias"], "snap_radius_s": selected["snap_radius_s"]}},
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if args.write_config: # Written as a YAML flow mapping under duration_decode.<language>.
+        flow = f"{{split_bias: {selected['split_bias']}, snap_radius_s: {selected['snap_radius_s']}}}"
+        if update_yaml_scalar(args.inference_config, ("duration_decode", str(args.language)), flow):
+            payload["config_updated"] = args.inference_config
+            print(f"[tune-decode] wrote duration_decode.{args.language}: {flow} to {args.inference_config}", flush=True)
+        else:
+            print(f"[tune-decode] could not find duration_decode.{args.language} in {args.inference_config}; "
+                  f"add the row manually: {args.language}: {flow}", flush=True)
     print(f"[tune-decode] selected split_bias={selected['split_bias']} snap_radius_s={selected['snap_radius_s']} "
           f"(in-selection F1@0.5 {selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}; HELD-OUT estimate {heldout_f1} — "
           f"quote the held-out number); pin the pair in inference.yaml duration_decode", flush=True)
@@ -426,6 +439,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
 
     durations = [span.duration_s for rec in records for span in rec.sentences]
     p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
+    fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
     sentences = [(rec, span) for rec in records for span in rec.sentences]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
 
@@ -469,11 +483,18 @@ def tail_benefit(args: argparse.Namespace) -> dict:
             elbow = prev["delta_tail_s"]
             break
 
-    buffer_cap_s = round(p99_duration + elbow, 2)
+    # CAPACITY, not the elbow: the buffer must hold the longest realistic sentence (p99), plus one stride for its
+    # terminator to appear, plus the delta commit tolerance. The elbow cannot size it — the curve's SIGN depends on
+    # what the scoring model trained on (span-trained baseline_train: context hurts, elbow pins to 0; buffer-trained
+    # arms: context helps), so it measures context appetite, not buffer requirement. The curve stays as a diagnostic.
+    stride_s = float(inference_cfg.get("stride_s", 1.0))
+    delta_s = float((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 0)) / max(fps_hint, 1.0)
+    buffer_cap_s = round(p99_duration + stride_s + delta_s, 2)
     payload = {
         "language": args.language, "split": args.split, "sentences": len(sentences),
         "latency_quality_coeff_bleu_per_s": coeff, "curve": curve,
         "elbow_tail_s": elbow, "p99_sentence_duration_s": p99_duration, "buffer_cap_s": buffer_cap_s,
+        "cap_terms": {"p99_s": p99_duration, "stride_s": stride_s, "delta_enc_s": round(delta_s, 3)},
     }
     output = Path(args.output or f"outputs/tail_benefit_{args.language}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -525,6 +546,7 @@ def delta_enc(args: argparse.Namespace) -> dict:
     print(f"[delta-enc] terminator decode: {'duration (deployed)' if duration_prior else 'plain argmax'}; "
           f"Lambda_min={min_span} frames", flush=True)
 
+    fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
     sentences = [(rec, span) for rec in records for span in rec.sentences]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
     rng = np.random.default_rng(int(args.seed))
@@ -601,8 +623,24 @@ def delta_enc(args: argparse.Namespace) -> dict:
     output = Path(args.output or f"outputs/delta_enc_{args.language}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if args.write_config and update_yaml_scalar(args.inference_config, ("boundary_stability", "delta_enc_frames"), delta):
-        payload["config_updated"] = args.inference_config
+    # delta is not a standalone constant. On commit the buffer is cut at terminator-delta, so the next buffer opens
+    # with a delta-frame leftover of the sentence just emitted; Lambda_min must exceed delta or that leftover is
+    # selectable as a span (infer/stream.py's own rule and default). dlm.yaml's gate must equal both. Written
+    # together so the four values cannot drift — a stale pair is exactly what leaves the FSM in an invalid geometry.
+    lam = delta + 1
+    p10_frames = int(np.percentile([s.duration_s for r in records for s in r.sentences], 10) * fps_hint) if records else 0
+    if p10_frames and lam > p10_frames: print(
+        f"[delta-enc] WARNING: Lambda_min={lam} exceeds the p10 sentence ({p10_frames} frames) — >10% of real "
+        f"sentences become unselectable. delta is inflated by snap_radius_s; re-tune the decode before accepting.", flush=True
+    )
+    payload["min_span_frames"] = lam
+    if args.write_config:
+        written = [update_yaml_scalar(args.inference_config, ("boundary_stability", "delta_enc_frames"), delta),
+                   update_yaml_scalar(args.inference_config, ("span_selection", "min_span_frames"), lam),
+                   update_yaml_scalar(args.slt_config, ("membership_gate", "delta"), delta),
+                   update_yaml_scalar(args.slt_config, ("membership_gate", "min_span_frames"), lam)]
+        payload["config_updated"] = [c for c, ok in zip([args.inference_config] * 2 + [args.slt_config] * 2, written) if ok]
+        print(f"[delta-enc] wrote delta_enc_frames={delta}, min_span_frames={lam} to {args.inference_config} + {args.slt_config}", flush=True)
     payload["output"] = str(output)
     return payload
 
@@ -642,7 +680,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--write-config", action="store_true", help="Persist the measured constant into configs/inference.yaml")
+    parser.add_argument("--write-config", action="store_true",
+                        help="Persist measured constants: tail-benefit -> buffer_cap_s; delta-enc -> delta_enc_frames + "
+                             "min_span_frames (both configs); tune-decode -> duration_decode.<language>")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")
     return parser

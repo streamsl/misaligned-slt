@@ -212,9 +212,16 @@ def evaluate_slt(
     # Every gate knob training passes — otherwise dev loss is computed under forward_loss's DEFAULTS (iou_veto 0.5,
     # gt_anchored False) while training used the config, so val_loss is not comparable to train_loss and the
     # gt_anchored ablation's dev numbers are silently ungated.
+    # Split by what the knob NEEDS, not by convenience. `iou_veto` and `gt_anchored` both read bio_labels, so they
+    # exist only where GT exists — the loss. Inference selects the anchor on-policy from the head's own argmax
+    # (bio_labels=None, no veto), so passing them to a generate path is meaningless and lands them in
+    # **decode_kwargs -> generate_from_bio_tap -> TypeError.
     gate_kwargs = dict(
         gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
         gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
+    )
+    gate_loss_kwargs = dict(
+        gate_kwargs,
         gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
         gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)),
     )
@@ -246,12 +253,11 @@ def evaluate_slt(
             cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
             cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
             cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
-            cb_dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
             cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
             cb_spd_revision=bool(spd_cfg.get("revision", True)),
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
-            **gate_kwargs,
+            **gate_loss_kwargs,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
         if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0:
@@ -291,7 +297,6 @@ def evaluate_slt(
                         dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
                         dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
                         dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
-                        dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
                         **gate_kwargs,
                     )
                     pred_texts.extend(model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True))
@@ -355,7 +360,6 @@ def train_slt_epochs(
             cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
             cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
             cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
-            cb_dcd_refresh_count=int(dcd_cfg.get("refresh_count", 16)),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
             cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
             cb_spd_revision=bool(spd_cfg.get("revision", True)),

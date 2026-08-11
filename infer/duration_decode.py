@@ -220,8 +220,12 @@ def deployed_decode_tags(
         )
         if commit_mask is not None and seam_is_terminator:
             cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)
-            if cm.any() and not cm.all():
-                seam = int(np.argmax(~cm))  # first non-committed frame
+            # Guard matches the FSM's (stream.py step): `seam_is_terminator` is only ever True after a terminator
+            # commit, so the seam is live even when the delta-frame overlap rounds to ZERO committed frames in this
+            # buffer (cm all-False -> seam = frame 0). Requiring cm.any() here made the gate skip the mint on
+            # exactly those strides while the FSM applied it — the successor sentence then had no Omega anchor.
+            if not cm.all():
+                seam = int(np.argmax(~cm))  # first non-committed frame (0 when the overlap is empty)
                 sig = (tags_np[b, :n] == BIO["I"]) | (tags_np[b, :n] == BIO["B"])
                 cand = np.flatnonzero(sig[seam:])
                 if cand.size:

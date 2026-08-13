@@ -3,11 +3,8 @@
 # baseline makes Analysis B, RQ1-A PANEL (b) (the self-anchored continuous-corpus curve — panel (a) is the
 # csl_pretrimmed literature anchor and is unaffected), and the RQ2 cascade rows uninformative on those corpora).
 #
-# Recipe = the faithful Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh):
-# strict warm-start from the released checkpoint (data.yaml pretrained_slt), EVERYTHING trainable, AdamW
-# lr 3e-4 / wd 1e-4 (bias & norm params excluded from decay — train/helpers.build_optimizer applies the same
-# filter as their timm create_optimizer), cosine to 0 with no warmup, 20 epochs, grad-clip 1.0, label smoothing
-# 0.2 (models/unisign.ar_loss default), best checkpoint by dev BLEU-4. Their effective batch is 32 (8 x 4 GPUs).
+# Recipe = Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh), strict 
+# warm-start from the released checkpoint (data.yaml pretrained_slt).
 #
 # "Pre-trimmed" TRAINING VIEW with zero new data plumbing: mode1-only ratios + near-zero jitter make every
 # sampler window exactly the GT caption span + one terminator frame, deterministically (at 1e-9 scales mode1's

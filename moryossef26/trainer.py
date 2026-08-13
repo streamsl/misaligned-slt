@@ -88,7 +88,7 @@ def evaluate_segmenter(model, loader, device, dice_weight, class_weights) -> dic
     return mean_logs(rows, prefix="val")
 
 
-def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg) -> list[dict]:
+def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg, resume: bool = False) -> list[dict]:
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
@@ -103,5 +103,5 @@ def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg)
         name="segmenter", model=model, loader=train_loader, optimizer=optimizer, 
         device=device, epochs=epochs, cfg=cfg, step_fn=step_fn,
         evaluate_fn=lambda epoch: evaluate_segmenter(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader,
+        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
     )

@@ -9,9 +9,8 @@ Everything Uni-Sign lives here:
 
 mT5: no absolute positions / embed scale / layernorm_embedding, and the attn mask folds into `position_bias`
 (T5Attention adds a supplied bias straight to the scores, skipping its own relative-bias + mask compute), so
-BD3LM `[xt|x0]` geometry is rebuilt over EFFECTIVE positions [0..L-1, 0..L-1] (`_self_position_bias`). mT5's
-weights are untied by hand while config.tie_word_embeddings stays True (UniSignMT5FrontEnd.__init__,
-MT5BlockDiffusionDecoder.lm_head_scale). AR and DLM arms differ only in the decoder objective (dLLM A2D).
+BD3LM `[xt|x0]` geometry is rebuilt over EFFECTIVE positions [0..L-1, 0..L-1] (`_self_position_bias`). AR and 
+DLM arms differ only in the decoder objective (dLLM A2D).
 """
 from __future__ import annotations
 from pathlib import Path
@@ -160,8 +159,8 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self.n_heads = int(self.config.num_heads)
         self.rel_num_buckets = int(self.config.relative_attention_num_buckets)
         self.rel_max_distance = int(self.config.relative_attention_max_distance)
-        # T5 scales by d_model**-0.5 before lm_head IFF config.tie_word_embeddings, True for google/mt5-base — 
-        # so the released weights are calibrated WITH it. Scale here too or every logit is off by sqrt(768).
+        # T5 scales by d_model**-0.5 before lm_head IFF config.tie_word_embeddings — mirror HF's gate exactly.
+        # google/mt5-base ships the flag FALSE, so this resolves to 1.0 there; the gate exists for tied checkpoints.
         self.lm_head_scale = float(self.config.d_model) ** -0.5 if getattr(self.config, "tie_word_embeddings", False) else 1.0
         self._init_block_diffusion(
             d_model=self.config.d_model, vocab_size=self.config.vocab_size, embed_source_weight=self.decoder.embed_tokens.weight, 
@@ -409,10 +408,11 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         self.pose_embed_scale = 1.0  # mT5 does not scale word embeddings
         if init_mt5_weights: self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_name)
         else: self.mt5 = MT5ForConditionalGeneration(MT5Config.from_pretrained(mt5_name))
-        # google/mt5-base resolves tie_word_embeddings=True, so the plain constructor aliases lm_head.weight <-> shared.weight. 
-        # mT5 ckpts are UNTIED: load_state_dict then writes both keys into that one tensor (last write wins, 0 missing/0 unexpected) 
-        # and the encoder embeds with the LM-head matrix -> garbage (caught by parity eval; from_pretrained warns and unties). Untie 
-        # the PARAMETER only — T5 gates its d_model**-0.5 pre-lm_head scaling on the flag and the released weights assume it.
+        # Defensive untie for TIED configs: if tie_word_embeddings resolved True, the plain constructor aliases
+        # lm_head.weight <-> shared.weight, and loading an untied checkpoint would write both keys into one tensor
+        # (last write wins) — the encoder would then embed with the LM-head matrix. google/mt5-base ships the flag
+        # FALSE, so this guard does not fire there; it protects any tied checkpoint swapped in later. Untie the
+        # PARAMETER only — the d_model**-0.5 pre-lm_head scale stays gated on the same flag (lm_head_scale above).
         if self.mt5.lm_head.weight.data_ptr() == self.mt5.shared.weight.data_ptr():
             self.mt5.lm_head = nn.Linear(self.mt5.config.d_model, self.mt5.config.vocab_size, bias=False)
         self.tokenizer = tokenizer if tokenizer is not None else T5Tokenizer.from_pretrained(mt5_name, legacy=False)

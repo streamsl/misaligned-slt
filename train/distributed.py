@@ -1,8 +1,8 @@
 """Multi-GPU data-parallel training (torchrun). One module; every trainer inherits it through `run_epoch_loop`.
 
 WHY NOT `DistributedDataParallel`. DDP synchronises gradients from hooks it installs around `Module.forward`,
-but no trainer here calls `forward`: each stage's `step_fn` calls `model.compute_loss(...)` (SLT) or the head's
-own signature. Wrapping in DDP and calling `.module.compute_loss(...)` runs a completely UNSYNCHRONISED training
+but no trainer here calls `forward`: each stage's `step_fn` calls `model.forward_loss(...)` (SLT) or the head's
+own signature. Wrapping in DDP and calling `.module.forward_loss(...)` runs a completely UNSYNCHRONISED training
 job that looks fine — every rank silently optimises its own shard. A wrapper module whose `forward` is the loss
 would fix that, but this stack's loss graph is CONDITIONAL (the translation term is routed per window mode, the
 gate/CB terms fire only for the modes that carry them), so ranks disagree about which parameters received
@@ -102,9 +102,15 @@ def reduce_metrics(metrics: dict[str, float]) -> dict[str, float]:
     stop — the ranks would diverge mid-run. Keys are sorted so the reduced vector is order-identical everywhere.
     """
     if not is_distributed() or not metrics: return metrics
-    keys = sorted(metrics)
-    t = torch.tensor([float(metrics[k]) for k in keys], dtype=torch.float64,
-                     device=torch.device(f"cuda:{local_rank()}") if torch.cuda.is_available() else torch.device("cpu"))
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    t.div_(world_size())
-    return {k: float(v) for k, v in zip(keys, t.tolist())}
+    # Key sets are NOT identical across ranks: cb_*/oput_mode*/val_translation_* only exist on ranks whose batches contained 
+    # that mode. Reducing per-rank sorted vectors would silently pair different keys (or hang on length mismatch), so gather 
+    # the union first and mean each key over the ranks that produced it.
+    gathered: list[list[str]] = [None] * world_size()  # type: ignore[list-item]
+    dist.all_gather_object(gathered, sorted(metrics))
+    keys = sorted(set().union(*gathered))
+    device = torch.device(f"cuda:{local_rank()}") if torch.cuda.is_available() else torch.device("cpu")
+    vals = torch.tensor([float(metrics.get(k, 0.0)) for k in keys], dtype=torch.float64, device=device)
+    counts = torch.tensor([float(k in metrics) for k in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+    dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    return {k: float(v / c) for k, v, c in zip(keys, vals.tolist(), counts.tolist()) if c > 0}

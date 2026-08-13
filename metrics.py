@@ -1,13 +1,15 @@
 """Metrics — frame-domain (BIO-head training monitor) and time-domain (final eval).
 
 `segmentation_prf` (greedy one-to-one tIoU-matched P/R/F1) is THE segment metric for both; tIoU is scale-invariant,
-so frame units and seconds score identically. Numbers differ only because inputs do: monitor = raw (ungated) BIO
-argmax on sampler dev WINDOWS, macro per window (`val_phrase_tiou_f1`); RQ2 `--stream` = commit-GATED FSM events on
-whole VIDEOS vs GT sentences, corpus-micro.
+so frame units and seconds score identically. Numbers differ only because inputs do: the stage-2 monitor
+(train/slt.py) = raw (ungated) BIO argmax on sampler dev WINDOWS, macro per window (`val_phrase_tiou_f1`); the S1
+monitor (train/bio_pretrain.py) scores the DEPLOYED duration-decoded tags whenever inference.yaml `duration_decode`
+is on for the language, so the two `val_phrase_tiou_f1` series are NOT comparable; RQ2 `--stream` = commit-GATED FSM
+events on whole VIDEOS vs GT sentences, corpus-micro.
 
-FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metrics; used by train/slt.py,
-train/bio_pretrain.py, moryossef26/. ONE decode rule for BOTH prediction and gold (default
-`signing_runs_with_b_splits`; why there); decoders parameterize `_bio_runs`.
+FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metrics; used by train/slt.py, 
+train/bio_pretrain.py, moryossef26/, eval.py (FSM-internal BIO diagnostic), analyze.py (tune-decode). ONE decode 
+rule for BOTH prediction and gold (default `signing_runs_with_b_splits`; why there); decoders parameterize `_bio_runs`.
 
 TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by
 eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
@@ -112,7 +114,7 @@ def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
     """PREDICTION/inference decode: signing runs split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
 
-    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, 68% of caption boundaries have no visual pause): 
+    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap): 
     a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
     doesn't require one either. Interior `B`s split, feeding the Analysis-A over/under-segmentation taxonomy.
     """

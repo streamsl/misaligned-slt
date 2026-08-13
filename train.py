@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="train", choices=["train", "dev", "test"])
     parser.add_argument("--num-samples", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="continue from <checkpoint.dir>/latest.pt (full optimizer/scheduler state, epoch granularity)")
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
@@ -74,7 +76,7 @@ if __name__ == "__main__":
         )
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
-        logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
+        logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
         path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-moryossef":
@@ -85,7 +87,7 @@ if __name__ == "__main__":
         model = build_segmenter(args.moryossef_config)
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
-        logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg)
+        logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
         path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/moryossef")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
@@ -102,7 +104,7 @@ if __name__ == "__main__":
         optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
         logs = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs,
-            slt_cfg=slt_cfg, dev_loader=components.dev_loader,
+            slt_cfg=slt_cfg, dev_loader=components.dev_loader, resume=args.resume,
         )
         path = save_model_checkpoint(components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt")) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}

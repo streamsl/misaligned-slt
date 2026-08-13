@@ -21,10 +21,8 @@ import numpy as np
 
 
 def apply_fps_aug(
-    poses: np.ndarray, source_fps: float,
-    min_fps: float = 25.0, max_fps: float = 50.0,
-    rng: np.random.Generator | None = None,
-    source_timestamps_s: np.ndarray | None = None,
+    poses: np.ndarray, source_fps: float, min_fps: float = 15.0, max_fps: float = 30.0,
+    rng: np.random.Generator | None = None, source_timestamps_s: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Moryossef-style fps augmentation (frame-density resampling, no speed change).
 

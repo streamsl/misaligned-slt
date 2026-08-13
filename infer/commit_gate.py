@@ -9,10 +9,10 @@ from data.windowing import BIO
 def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
     """A span OPENS on a predicted `B`, or O→I mid-buffer.
 
-    Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; 68% of caption boundaries
-    have no visual pause), so the first signing frame after a gap counts as a start. Buffer-start signing without `B`
-    (prev_tag None) does NOT open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before the buffer,
-    don't translate"), which also makes the overlap cut safe — its ≤2δ leftover arrives as buffer-start `I`.
+    Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; most adjacent captions 
+    chain with no gap have no visual pause), so 1st signing frame after a gap counts as a start. Buffer-start signing 
+    without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before 
+    the buffer, don't translate"), which also makes the overlap cut safe — its ≤2δ leftover arrives as buffer-start `I`.
     """
     if tag == BIO["B"]: return True
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
@@ -145,7 +145,7 @@ class CommitGate:
     τ must be CALIBRATED to the model's clean-input confidence (like δ_enc / buffer_cap), see configs/inference.yaml.
     It floors low-confidence junk only; "confidently wrong" truncated decodes stay high-confidence and are Ω's job.
     """
-    def __init__(self, delta_enc_frames: int = 3, hysteresis_strides: int = 3, token_confidence_tau: float = 0.75):
+    def __init__(self, delta_enc_frames: int = 3, hysteresis_strides: int = 3, token_confidence_tau: float = 0.3):
         self.history = BoundaryHistory(hysteresis_strides=int(hysteresis_strides), delta_enc_frames=int(delta_enc_frames))
         self.token_confidence_tau = float(token_confidence_tau)
 

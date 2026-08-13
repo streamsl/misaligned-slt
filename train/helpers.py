@@ -1,6 +1,6 @@
 from __future__ import annotations
-from typing import Any, Callable, Iterable, Literal
-from dataclasses import dataclass, field
+from typing import Callable, Literal
+from dataclasses import dataclass
 
 import copy, csv, json, sys, time
 from pathlib import Path
@@ -9,7 +9,7 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 from torch.utils.data import DataLoader
-from models.checkpointing import save_model_checkpoint
+from models.checkpointing import load_train_state, save_train_state, save_model_checkpoint
 from utils import checkpoint_dir, save_best_enabled
 from train import distributed as dist
 
@@ -45,7 +45,8 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
     groups = wd_split(params, lr)
     if backbone_params is not None:
         groups += wd_split(backbone_params, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.1))))
-    return torch.optim.AdamW(groups, lr=lr)
+    # fused=True on CUDA: one multi-tensor kernel per step instead of a Python loop over ~800M trainable params.
+    return torch.optim.AdamW(groups, lr=lr, fused=torch.cuda.is_available())
 
 
 @contextmanager
@@ -312,10 +313,10 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
 def run_epoch_loop(
     *, name: str, model: torch.nn.Module, loader: DataLoader, 
     optimizer: torch.optim.Optimizer, device: torch.device, epochs: int, cfg: dict, 
-    step_fn: Callable[[dict, int], tuple[torch.Tensor, dict[str, float]]], 
+    step_fn: Callable[[dict, int], tuple[torch.Tensor, dict[str, float]]],
     evaluate_fn: Callable[[int], dict[str, float]] | None = None,
     default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min",
-    dev_loader: DataLoader | None = None,
+    dev_loader: DataLoader | None = None, resume: bool = False,
 ) -> list[dict[str, float]]:
     """The one training loop every trainer shares (slt / bio_s1).
 
@@ -344,8 +345,31 @@ def run_epoch_loop(
         "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about "
         "the loss scale (and about skipping a step) and drift apart. Use amp: bf16 (A100/H100) or amp: none."
     )
+    # Preemption safety (Colab): latest.pt = full resumable state, rewritten every epoch; loses at most one epoch.
+    ckpt_dir = checkpoint_dir(cfg)
+    latest_path = Path(ckpt_dir) / "latest.pt" if ckpt_dir else None
+    start_epoch = 1
+    if resume:
+        if latest_path is None or not latest_path.exists():
+            raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
+        
+        state = load_train_state(latest_path, model, optimizer)
+        saved_epochs = int(state.get("epochs", epochs))
+        if saved_epochs != int(epochs) and scheduler.scheduler is not None: raise SystemExit(
+            f"--resume: run was launched with epochs={saved_epochs} but this invocation says {epochs}; the LR schedule horizon is baked "
+            f"into the scheduler state, so resume with the SAME --epochs (extend a finished run by warm-starting from model.pt instead)."
+        )
+        if scheduler.scheduler is not None and state.get("scheduler") is not None: scheduler.scheduler.load_state_dict(state["scheduler"])
+        if amp.scaler.is_enabled() and state.get("scaler") is not None: amp.scaler.load_state_dict(state["scaler"])
 
-    for epoch in range(1, int(epochs) + 1):
+        control.load_state_dict(state.get("control") or {})
+        control.best_checkpoint_path = str(Path(ckpt_dir) / "model.pt") if ckpt_dir else None
+        start_epoch = int(state["epoch"]) + 1
+        if start_epoch > int(epochs): raise SystemExit(f"--resume: {latest_path} already at epoch {state['epoch']} of {epochs}")
+        if dist.is_main(): print(f"{name} | resumed {latest_path} -> starting epoch {start_epoch}/{epochs} "
+                                 f"(best {control.monitor}={control.best_value} @ epoch {control.best_epoch})", flush=True)
+
+    for epoch in range(start_epoch, int(epochs) + 1):
         # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler).
         for ld in (loader, dev_loader):
             sampler = getattr(ld, "sampler", None) if ld is not None else None
@@ -361,7 +385,8 @@ def run_epoch_loop(
             # Average gradients BEFORE clipping so every rank clips the same (global) gradient and therefore
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
             dist.average_gradients(model.parameters())
-            amp.clip_and_step(optimizer, model.parameters(), max_grad_norm)
+            # Clip only trainable params: iterating all ~1B (frozen included) per step is pure overhead.
+            amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
             scheduler.step_batch()
             row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
             epoch_logs.append(row); logs.append(row)
@@ -370,7 +395,9 @@ def run_epoch_loop(
         scheduler.step_epoch()
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
-            metrics = dist.reduce_metrics(evaluate_fn(epoch))
+            with amp.autocast():  # dev eval in the same precision as training steps; fp32 eval was ~2x slower
+                eval_metrics = evaluate_fn(epoch)
+            metrics = dist.reduce_metrics(eval_metrics)
             improved = control.update(model, metrics, epoch)
             logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
             logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
@@ -378,7 +405,12 @@ def run_epoch_loop(
                 if dist.is_main(): print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
         else: logger.epoch_summary(epoch, train=train_means)
-
+        if dist.is_main() and latest_path is not None: save_train_state(
+            latest_path, model=model, optimizer=optimizer,
+            scheduler_state=scheduler.scheduler.state_dict() if scheduler.scheduler is not None else None,
+            scaler_state=amp.scaler.state_dict() if amp.scaler.is_enabled() else None,
+            control_state=control.state_dict(), epoch=epoch, epochs=int(epochs),
+        )
     control.restore(model)
     logger.finish()
     return logs
@@ -414,6 +446,7 @@ class TrainControl:
     name: str = "train"
     save_fn: Callable[[torch.nn.Module], Path | None] | None = None
     last_saved_path: str | None = None  # Set on the epoch a new best is saved (for the logger)
+    best_checkpoint_path: str | None = None  # Disk fallback for restore() after a resume (best_state is in-memory only)
     _warned_missing_monitor: bool = False
 
     @classmethod
@@ -478,8 +511,21 @@ class TrainControl:
         return False
 
     def restore(self, model: torch.nn.Module) -> None:
-        if self.restore_best and self.best_state is not None:
-            model.load_state_dict(copy.deepcopy(self.best_state))
+        if not self.restore_best: return
+        if self.best_state is not None: model.load_state_dict(copy.deepcopy(self.best_state))
+        elif self.best_checkpoint_path and Path(self.best_checkpoint_path).exists() and self.best_epoch > 0:
+            # Resumed run whose best epoch predates the resume: the in-memory copy died with the old process,
+            # but the save-on-best file survived — restore from disk.
+            state = torch.load(self.best_checkpoint_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state["model"] if "model" in state else state)
+
+    def state_dict(self) -> dict:
+        return {"best_value": self.best_value, "best_epoch": self.best_epoch, "bad_epochs": self.bad_epochs}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.best_value = state.get("best_value")
+        self.best_epoch = int(state.get("best_epoch", 0))
+        self.bad_epochs = int(state.get("bad_epochs", 0))
 
     def summary(self) -> dict[str, float | int | bool | None | str]:
         return {

@@ -37,7 +37,7 @@ class WindowSampler:
         self, records: list[VideoRecord], jitter: JitterSampler,
         mode_ratios: dict[str, float], buffer_cap_s: float,
         seed: int = 42, mode2_subcase_weights: dict[str, float] | None = None,
-        fps_aug_enabled: bool = True, fps_aug_min: float = 25.0, fps_aug_max: float = 50.0,
+        fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
         pose_augment_cfg: dict | None = None, min_span_frames: int = 0,
     ):
         self.records = records
@@ -59,6 +59,9 @@ class WindowSampler:
         self.fps_aug_max = float(fps_aug_max)
         self.rng = np.random.default_rng(seed)
         weights = dict(mode2_subcase_weights or self.DEFAULT_MODE2_SUBCASE_WEIGHTS)
+        # _mode2_spec dispatches by string compare with a bare else -> a typo'd key would silently sample as 'right'.
+        unknown = set(weights) - {"right", "left", "both"}
+        if unknown: raise ValueError(f"mode2_subcase_weights has unknown keys {sorted(unknown)}; valid: right/left/both")
         self._mode2_subcases = list(weights.keys())
 
         probs = np.asarray([float(weights[k]) for k in self._mode2_subcases], dtype=np.float64)
@@ -120,15 +123,20 @@ class WindowSampler:
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
-        fps_cfg = (slt_cfg.get("augmentation", {}) or {}).get("fps", {})
+        aug_cfg = slt_cfg.get("augmentation", {})
+        fps_cfg = (aug_cfg or {}).get("fps", {})
         return cls(
             records=records, jitter=JitterSampler.from_config(jitter_cfg),
             mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
-            min_span_frames=int((inference_cfg.get("span_selection", {}) or {}).get("min_span_frames", 0)),
+            min_span_frames=int((inference_cfg.get("span_selection", {}) or {}).get("min_span_frames",
+                # Same missing-key derivation as the FSM (infer/stream.py) and the consistency assert: delta+1.
+                # A 0 default trained Lambda_min=0 targets against a delta+1 deployment when the key was absent.
+                int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1,
+            )),
             seed=int(slt_cfg.get("seed", 42)), mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"),
-            fps_aug_enabled=bool(fps_cfg.get("enabled", True)),
-            fps_aug_min=float(fps_cfg.get("min_fps", 25.0)),
-            fps_aug_max=float(fps_cfg.get("max_fps", 50.0)),
+            fps_aug_enabled=bool((aug_cfg or {}).get("enabled", aug_cfg is not None) and fps_cfg.get("enabled", aug_cfg is not None)),
+            fps_aug_min=float(fps_cfg.get("min_fps", 15.0)),
+            fps_aug_max=float(fps_cfg.get("max_fps", 30.0)),
             pose_augment_cfg=pose_augment_cfg,
         )
 
@@ -218,8 +226,8 @@ class WindowSampler:
             subcase = "right"  # degenerate interior slice → fall through to right-trunc
 
         if subcase == "left":
-            # Keep true end, discard the head: window starts at the spurious cut. Tail jitter may only push the end OUTWARD (max(dt,eps)) so 
-            # the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves the window and labels no longer 
+            # Keep true end, discard the head: window starts at the spurious cut. Tail jitter may only push the end OUTWARD (abs(dt), see below) 
+            # so the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves the window and labels no longer 
             # describe a left-truncation (P2: labels follow the window).
             cut = min(self._cut_time(anchor), anchor.end_s - eps)
             # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end), so the terminator is inside; tail 

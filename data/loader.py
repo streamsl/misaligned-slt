@@ -7,6 +7,7 @@ from pathlib import Path
 
 import re, random, csv, html
 import numpy as np
+import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
 from train import distributed as dist
 
@@ -229,13 +230,17 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
             split = signverse.get(video_id)
             if split in splits: splits[split].append(video_id)
             else: unmatched += 1
-
-        if any(splits.values()):
-            if unmatched: print(
-                f"[loader] {unmatched}/{len(video_ids)} pose videos absent from the split CSV (dropped from all splits). "
-                f"Add them to {split_cfg.get('signverse_csv', '')} to include them.", flush=True
-            )
-            return {k: sorted(v) for k, v in splits.items()}
+        # A CSV that parses but shares no ids with the pose index (wrong language, stale export, ids vs stems) is the
+        # same train-on-test hazard as a missing one — without this the loop falls through to the rng below.
+        if not any(splits.values()): raise ValueError(
+            f"splits.signverse_csv={csv_path!r} parsed {len(signverse)} rows but matched NONE of the {len(video_ids)} "
+            f"pose videos (e.g. {sorted(video_ids)[:3]} vs {sorted(signverse)[:3]}). Refusing the random fallback split."
+        )
+        if unmatched: print(
+            f"[loader] {unmatched}/{len(video_ids)} pose videos absent from the split CSV (dropped from all splits). "
+            f"Add them to {csv_path} to include them.", flush=True
+        )
+        return {k: sorted(v) for k, v in splits.items()}
 
     rng = random.Random(int(split_cfg.get("fallback_seed", 42)))
     ids = sorted(video_ids)
@@ -384,10 +389,9 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         for a, b, frac in pairs:
             if (a in eval_ids) != (b in eval_ids):
                 drop.setdefault(b if a in eval_ids else a, f"{frac:.0%} of {b if a in eval_ids else a}")
-                
         if drop:
             records = [r for r in records if r.video_id not in drop]
-            print(f"[loader] {language}/train: de-duplicated {len(drop)} video(s) duplicated across splits or within train "
+            print(f"[loader] {language}/train: de-duplicated {len(drop)} train video(s) whose content also appears in dev/test "
                   f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); subtitles.dedup.", flush=True)
     return records, splits
 
@@ -468,4 +472,5 @@ def streaming_loader(dataset: StreamingWindowDataset, batch_size: int, collate_f
         dataset, batch_size=int(batch_size), shuffle=False, sampler=sampler, num_workers=int(num_workers),
         persistent_workers=num_workers > 0, collate_fn=collate_fn,
         worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
+        pin_memory=torch.cuda.is_available(), prefetch_factor=4 if num_workers > 0 else None,
     )

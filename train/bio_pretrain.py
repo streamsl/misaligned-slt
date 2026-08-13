@@ -117,6 +117,9 @@ def build_bio_s1(
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
     inference_cfg = load_yaml(inference_config)
+    # train_bio_s1_epochs re-reads these for the monitor's duration prior; record the CLI paths so a run with
+    # non-default configs monitors under the same decode/data as the sampler it just built.
+    cfg["inference_config"], cfg["data_config"] = str(inference_config), str(data_config)
 
     train_records, _ = load_language_records(data_cfg, language, split="train")
     train_dataset = StreamingWindowDataset(
@@ -204,7 +207,8 @@ def evaluate_bio_s1(
 
 
 def train_bio_s1_epochs(
-    model: BioS1Model, train_loader: DataLoader, dev_loader: DataLoader, device: torch.device, epochs: int, cfg: dict
+    model: BioS1Model, train_loader: DataLoader, dev_loader: DataLoader, 
+    device: torch.device, epochs: int, cfg: dict, resume: bool = False,
 ) -> list[dict[str, float]]:
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
@@ -217,7 +221,9 @@ def train_bio_s1_epochs(
     _dd_cfg = load_yaml(str(cfg.get("inference_config", "configs/inference.yaml")))
     _dd = duration_decode_params(_dd_cfg, cfg.get("language"))
     if _dd is not None:
-        _recs, _ = load_language_records(load_yaml("configs/data.yaml"), str(cfg.get("language")), split="train")
+        _recs, _ = load_language_records(
+            load_yaml(str(cfg.get("data_config", "configs/data.yaml"))), str(cfg.get("language")), split="train"
+        )
         duration_prior = fit_duration_prior(_recs, **_dd)
         print(f"bio_s1 | monitor decode: duration (deployed); prior from {len(_recs)} train videos", flush=True)
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
@@ -232,5 +238,5 @@ def train_bio_s1_epochs(
         name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, 
         epochs=epochs, cfg=cfg, step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_s1(
             model, dev_loader, device, dice_weight, class_weights, duration_prior=duration_prior), 
-        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader
+        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
     )

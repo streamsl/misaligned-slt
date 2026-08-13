@@ -12,7 +12,8 @@ Mode2Subcase = Literal["right", "left", "both"]
 
 # Uncaptioned stretches longer than this carry no trustworthy non-signing evidence (see make_bio_labels). 
 
-TRUSTED_GAP_S = 8.0 # Override via data.yaml subtitles.trusted_gap_s
+TRUSTED_GAP_S = 8.0 # Module-level default. Only moryossef26/trainer.py reads an override (data.yaml
+# subtitles.trusted_gap_s, absent by default); every other call site takes this constant.
 
 @dataclass(frozen=True)
 class SentenceSpan:

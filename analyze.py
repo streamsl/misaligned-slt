@@ -422,7 +422,7 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     tail_benefit.latency_quality_coeff_bleu_per_s — not hand-picked, not %-of-clean.
 
     The spec calls the elbow the buffer cap, but the FSM buffer holds the WHOLE sentence plus trailing context, 
-    so a 1–3 s elbow cannot be it: buffer_cap_s = p99 sentence duration + elbow (both raw in the JSON).
+    so a 1–3 s elbow cannot be it: buffer_cap_s = p99 sentence duration + stride_s + delta/fps (raw terms in the JSON).
     """
     if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
@@ -640,7 +640,11 @@ def delta_enc(args: argparse.Namespace) -> dict:
                    update_yaml_scalar(args.slt_config, ("membership_gate", "delta"), delta),
                    update_yaml_scalar(args.slt_config, ("membership_gate", "min_span_frames"), lam)]
         payload["config_updated"] = [c for c, ok in zip([args.inference_config] * 2 + [args.slt_config] * 2, written) if ok]
-        print(f"[delta-enc] wrote delta_enc_frames={delta}, min_span_frames={lam} to {args.inference_config} + {args.slt_config}", flush=True)
+        # Report what update_yaml_scalar actually changed — an unconditional "wrote" here would mask a failed write.
+        if payload["config_updated"]: print(f"[delta-enc] wrote delta_enc_frames={delta}, min_span_frames={lam} to "
+                                            f"{', '.join(sorted(set(payload['config_updated'])))}", flush=True)
+        else: print(f"[delta-enc] WARNING: --write-config changed nothing (keys missing or files unwritable): "
+                    f"{args.inference_config}, {args.slt_config}", flush=True)
     payload["output"] = str(output)
     return payload
 

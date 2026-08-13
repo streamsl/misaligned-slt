@@ -20,7 +20,8 @@ Why this is its own loader rather than a config of the YouTube one:
   - one canonical .vtt per stream, so no find_best_subtitle suffix scoring / flattened-transcript guard.
 
 Per-dataset differences (German PHOENIX vs Chinese CSL-Daily vs English How2Sign) live entirely in the
-config entry's `target_lang` (drives the mBART trim) — the schema and this code are language-agnostic.
+config entry's `target_lang` (sets the mBART tokenizer language codes / mT5 prompt language) — 
+the schema and this code are language-agnostic.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -37,8 +38,9 @@ def _stream_frame_size(root: Path, lang_cfg: dict) -> tuple[int | None, int | No
     # (affine / spatial_mask). Authoritative source is the builder's manifest src_meta (PHOENIX:
     # src_w=210, src_h=260); config keys width/height override. Uni-Sign normalization is bbox-relative
     # and resolution-independent, so it ignores these.
-    width = lang_cfg.get("width")
-    height = lang_cfg.get("height")
+    pose_cfg = lang_cfg.get("pose", {}) or {}
+    width = pose_cfg.get("width")
+    height = pose_cfg.get("height")
     if width and height: return int(width), int(height)
     manifest = root / "manifest.json"
     if manifest.exists():
@@ -56,7 +58,10 @@ def _stream_target_fps(root: Path, lang_cfg: dict) -> float:
         try:
             fps = json.loads(manifest.read_text(encoding="utf-8")).get("target_fps")
             if fps: return float(fps)
-        except (OSError, ValueError, json.JSONDecodeError): pass
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            # A corrupt manifest with a silent fps fallback mis-scales every timestamp in the corpus.
+            print(f"[synth] WARNING: {manifest} exists but is unreadable ({type(e).__name__}) - "
+                  f"falling back to config pose.fps", flush=True)
     return float((lang_cfg.get("pose", {}) or {}).get("fps", 12.5))
 
 

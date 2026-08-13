@@ -6,6 +6,9 @@ import torch
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
 def pick_device(preferred: str | None = None):
+    # TF32 matmuls for the fp32 residue outside AMP autocast (Ampere+; no-op elsewhere). 
+    # Set once, at the one chokepoint every entry point already routes through.
+    torch.set_float32_matmul_precision("high")
     if preferred: return torch.device(preferred)
     if torch.cuda.is_available(): return torch.device("cuda")
     if torch.backends.mps.is_available(): return torch.device("mps")

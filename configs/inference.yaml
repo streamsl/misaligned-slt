@@ -1,5 +1,3 @@
-seed: 42
-language: csl
 stride_s: 1.0
 # Semi-Markov duration decode (infer/duration_decode.py). ONE switch for every consumer: the streaming FSM's tag
 # stream, the membership gate's anchor selection (training + inference — build_gate_omega), and segmenter-eval/-infer.
@@ -9,10 +7,12 @@ stride_s: 1.0
 # then add a `<lang>: {split_bias, snap_radius_s}` row. (Accepts false/true/{params} for single-corpus configs too.)
 duration_decode:
     default: false                                 # untuned corpora (incl. csl): decode OFF until tune-decode is run
-    asf: {split_bias: 4.0, snap_radius_s: 1.5}     # tune_decode_s1_asf_dev.json (folds .524/.525; both arches peak here)
-buffer_cap_s: 16.27  # analyze.py --stage tail-benefit --write-config writes p99_sentence_duration + tail-elbow here
-# (NOT the bare elbow: §8.3's elbow is ~1-3s but §7.2 requires the FSM buffer to hold a WHOLE sentence + tail, so
-# the forced-commit cap is p99 sentence duration + the elbow; both raw values are in outputs/tail_benefit_*.json).
+    asf: {split_bias: 4.0, snap_radius_s: 1.5}     # tune_decode_moryossef_asf_dev.json
+# STALE: analyze.py --stage tail-benefit --write-config now writes p99_sentence_duration + stride_s + δ/fps
+# (a capacity bound: the buffer must hold a whole sentence plus the stride that detects its end plus the overlap
+# the commit leaves behind). On asf dev that is 18.19; the 16.27 below predates the stride+δ terms. Re-run
+# delta-enc FIRST (the formula reads delta_enc_frames), then tail-benefit. Raw terms: outputs/tail_benefit_*.json.
+buffer_cap_s: 16.27
 boundary_stability:
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
@@ -26,12 +26,12 @@ boundary_stability:
     delta_enc_frames: 22
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3)
 span_selection:
-    # Λ_min: shortest selectable span, in encoder frames. Filters phantom micro-spans (a spurious B in the
-    # overlap leftover forms a terminated span that would otherwise pass the stability gate unchallenged).
-    # Constraint: 2*delta_enc_frames < Λ_min < shortest real dev sentence (runner asserts the lower bound;
-    # exceeding the upper bound would silently drop real sentences). Measured on synthetic-CSL dev (1061
-    # cues @30fps): p0 = 31 frames (1.03s), p1 = 37 frames — while the phantom scale is ≤ 2δ = 6 frames.
-    # 18 = p1/2 sits an order of magnitude above the noise floor with full margin to the shortest sentence.
+    # Λ_min: shortest selectable span, in encoder frames — a pure DURATION NOISE FLOOR (spans shorter than the
+    # terminator noise floor δ are unresolvable from boundary evidence). Λ_min = δ+1, written together with
+    # delta_enc_frames by `analyze.py --stage delta-enc --write-config`; keep them in step.
+    # It is NOT the re-emission guard: that is the commit-frontier filter select_target_span(skip_term_before=χ),
+    # which uses the commit log instead of a worst-case length bound. The older "Λ_min > 2δ" coupling is
+    # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
     min_span_frames: 23
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is

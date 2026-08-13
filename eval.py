@@ -196,12 +196,12 @@ def controlled_windows(
 def evaluate_predicted_events(
     predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float]
 ) -> dict[str, Any]:
-    """RQ2 scoring under the ActivityNet dense-captioning protocol (Krishna et al. 2017, `densevid_eval`), translations in place of captions. 
-    Per tIoU threshold: predictions and gold are matched 1-TO-1 (greedy by tIoU, the codebase's canonical rule), unmatched predictions and 
-    missed gold both dilute the score via SODA's count normalization, and `compute_text_metrics` scores 1 VIDEO's pairs at a time — densevid 
-    calls its scorers per video (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, 
-    so RQ2 and segmenter-eval report 1 statistic. Missed gold therefore enters the TEXT score too, which densevid's matched-only convention 
-    drops. `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
+    """RQ2 scoring under ActivityNet DVC protocol (Krishna et al. 2017, `densevid_eval`), translations in place of captions. Per tIoU threshold: 
+    predictions and gold are matched 1-TO-1 (greedy by tIoU, the codebase's canonical rule), unmatched predictions and missed gold both dilute 
+    the score via SODA's count normalization, and `compute_text_metrics` scores 1 VIDEO's pairs at a time — densevid calls its scorers per video 
+    (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, so RQ2 and segmenter-eval 
+    report 1 statistic. TEXT is scored over matched pairs only (densevid's convention); unmatched predictions and missed gold move SEGMENTATION 
+    score, not this one. `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
     results = []
     all_video_ids = sorted(set(predicted) | set(gold))
     for threshold in thresholds:
@@ -409,7 +409,7 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
     return {
         "max_text_tokens": max_tokens, "num_beams": 1,
         "diffusion_steps": int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-        "tau_dec": float(dcd_cfg.get("tau_dec", trans_cfg.get("commit_confidence_tau", 0.75))),
+        "tau_dec": float(dcd_cfg.get("tau_dec", 0.9)),  # DCD default; commit_confidence_tau is FSM gate's knob, not a decode threshold
         "spd_top_k": int(spd_cfg.get("top_k", 1)),
         "spd_renormalize": bool(spd_cfg.get("renormalize", True)),
         "spd_revision": bool(spd_cfg.get("revision", True)),
@@ -418,17 +418,21 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "dcd_max_window_length": int(dcd_cfg.get("max_window_length", 64)),
         "dcd_window_type": str(dcd_cfg.get("window_type", "sliding")),
         "dcd_decode_algo": str(dcd_cfg.get("decode_algo", "threshold")),
-        "dcd_decode_param": dcd_cfg.get("decode_param", trans_cfg.get("commit_confidence_tau", 0.75)),
+        "dcd_decode_param": dcd_cfg.get("decode_param", 0.9),
         "dcd_sample_top_k": None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
         "dcd_top_p": None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
         "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
         # Membership gate at RQ1: same Ω the decoder trained with (on-policy span, no GT/χ). BOTH arms gated — 
         # DLM injects Ω in its manual decode, AR via HF cross-attention hooks (front_end.ar_generate).
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
-        "gate_delta": int(method_cfg.get("membership_gate", {}).get("delta", 3)),
+        # Fallbacks mirror the RQ2 runner: delta from the measured noise floor, Lambda_min from it (delta+1),
+        # never 0 — a 0 floor re-admits 1-frame flicker spans in exactly one of the two eval paths.
+        "gate_delta": int(method_cfg.get("membership_gate", {}).get("delta",
+                          inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))),
         "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
         "gate_min_span_frames": int(method_cfg.get("membership_gate", {}).get("min_span_frames",
-                                    inference_cfg.get("span_selection", {}).get("min_span_frames", 0))),
+                                    inference_cfg.get("span_selection", {}).get("min_span_frames",
+                                    int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3)) + 1))),
     }
 
 
@@ -458,18 +462,22 @@ def _translate_windows(
     timestamps = torch.stack([torch.nn.functional.pad(ts, (0, max_t - int(ts.shape[0]))) for _, ts, _ in prepped]).to(device)
     frame_mask = torch.stack([torch.nn.functional.pad(m, (0, max_t - int(m.shape[0]))) for _, _, m in prepped]).to(device)
 
-    max_tokens = int(method_cfg.get("max_text_tokens", inference_cfg.get("translation", {}).get("max_text_tokens", 128)))
+    # inference.yaml overrides the method default — the same per-key precedence as the dcd block and the RQ2 runner.
+    max_tokens = int(inference_cfg.get("translation", {}).get("max_text_tokens", method_cfg.get("max_text_tokens", 128)))
     gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
     _, tokens, confidence, gate_skip = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
     tok = tokens.detach().cpu()
     conf = confidence.detach().float().cpu()
     texts = [t.strip() for t in tokenizer.batch_decode(tok, skip_special_tokens=True)]
 
-    # Mean prob over REAL tokens: drop decoder-start slot (placeholder conf 1.0) and post-EOS pads, else "confidently wrong" signal is diluted.
+    # Mean prob over REAL tokens: both arms now return produced tokens only (synthetic start slots stripped at the decode boundary), so mask 
+    # pads and everything past 1st EOS — batched DLM rows have no per-row trim, and post-EOS filler dilutes the "confidently wrong" signal.
     n = min(tok.shape[1], conf.shape[1])
     tok, conf = tok[:, :n], conf[:, :n]
     valid = tok != int(tokenizer.pad_token_id)
-    if n: valid[:, 0] = False
+    if tokenizer.eos_token_id is not None:
+        cum = (tok == int(tokenizer.eos_token_id)).cumsum(dim=1)
+        valid &= (cum == 0) | ((cum == 1) & (tok == int(tokenizer.eos_token_id)))  # keep the EOS slot itself
     confs = ((conf * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)).tolist()
     # gate_skip: the deployed FSM would never decode this window (no span — all-gap or headless fragment). Text is still reported, but RQ1 
     # must split "translation failed" from "policy is to skip", else the gate's refusal scores as garbage BLEU.
@@ -598,7 +606,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
         delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
         hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
-        token_confidence_tau=float(trans.get("commit_confidence_tau", 0.75)),
+        token_confidence_tau=float(trans.get("commit_confidence_tau", 0.3)),
         # None (missing key) → runner derives Λ_min = δ+1; a 0-fallback would re-admit 1-frame flicker spans
         # (Λ_min is a duration noise floor, NOT the re-emission guard — that is select_target_span's χ filter).
         min_span_frames=inference_cfg.get("span_selection", {}).get("min_span_frames"),
@@ -609,7 +617,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         gate_eps=float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
         max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 128))),
         diffusion_steps=int(trans.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-        tau_dec=float(dcd.get("tau_dec", trans.get("commit_confidence_tau", 0.75))),
+        tau_dec=float(dcd.get("tau_dec", 0.9)),
         spd_top_k=int(spd.get("top_k", 1)),
         spd_renormalize=bool(spd.get("renormalize", True)),
         spd_revision=bool(spd.get("revision", True)),
@@ -620,7 +628,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         dcd_max_window_length=int(dcd.get("max_window_length", 64)),
         dcd_window_type=str(dcd.get("window_type", "sliding")),
         dcd_decode_algo=str(dcd.get("decode_algo", "threshold")),
-        dcd_decode_param=dcd.get("decode_param", trans.get("commit_confidence_tau", 0.75)),
+        dcd_decode_param=dcd.get("decode_param", 0.9),
         dcd_cache_type=str(dcd.get("cache_type", "none")),
         # Same two sampling knobs the RQ1 path reads (_generation_kwargs); omitting them here left the FSM at
         # None while single-window RQ1 honoured the config — the two rows would decode under different policies.
@@ -937,8 +945,10 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
     
+    # Per-arch default, same rule as analyze.py segmenter-infer: moryossef stays on its published argmax decode unless
+    # --segmenter-decode duration is explicit — the config switch alone must not silently re-split the external baseline.
     dd = duration_decode_params(load_yaml(args.inference_config), args.language)
-    decode = args.segmenter_decode or ("duration" if dd is not None else "plain")
+    decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
     duration_prior = None
     if decode == "duration":
         train_records, _ = load_language_records(data_cfg, args.language, split="train")

@@ -64,9 +64,9 @@ languages:
             width: 512 # manifest src_meta
             height: 512
     # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
-    # `python prepare_data.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical raw-pixel 133-kpt),
-    # <root>/subs/*.vtt (per-video captions bundled in the shards) and <root>/video_meta.csv (duration from
-    # frame_count/24, so per-video fps calibration recovers exactly 24.0). pose.fps stays the fallback only.
+    # `python prepare_data.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
+    # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in the shards) and <root>/video_meta.csv (duration 
+    # from frame_count/24, so per-video fps calibration recovers exactly 24.0). pose.fps stays the fallback only.
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
     # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
     # init on both axes. The CSL checkpoint's mT5 emits Chinese and would be relearned. OpenASL is a first-class

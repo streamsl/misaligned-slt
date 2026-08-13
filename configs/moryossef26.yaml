@@ -54,7 +54,7 @@ steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames 
 batch_size: 8
 augmentation:
     # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip below the
-    # source rate to do anything: CSL streams are 30 fps (data.yaml) → [15, 30]. For 25.5 fps PHOENIX use [12.75, 25.5].
+    # source rate to do anything: CSL streams are 30 fps (data.yaml) → [15, 30].
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
     frame_dropout: 0.15 # Moryossef repo default: drop 0-15% middle frames during train.
     body_part_dropout: 0.1 # Moryossef repo default: zero each hand independently during train.

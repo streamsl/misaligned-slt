@@ -19,11 +19,9 @@ checkpoint:
     dir: checkpoints/bio_s1/${language}
     save_best: true
     # val_mode3_tiou_f1, NOT the val_phrase_tiou_f1 headline: the headline is a per-window macro over a mix whose
-    # single-span windows (mode1+mode2, ~58% under the measured asf mix) are near-saturated by ANY signing detector
-    # under the symmetric run-decode, and within a run the headline ANTI-correlates with 2 slices that carry boundary
-    # information (asf: corr(headline, mode3)=-0.54, corr(headline, mode4)=-0.69, corr(headline, bio_recall)=+0.95 —
-    # it is a recall detector). mode3 (>=2 complete spans -> interior-B quality) is the one slice whose geometry matches
-    # whole-video deployment; its all-I floor is 0.219 vs the trained head's 0.27-0.38 — real separation.
+    # single-span windows are near-saturated by ANY signing detector under the symmetric run-decode, and within a
+    # run the headline ANTI-correlates with 2 slices that carry boundary information. mode3 (>=2 complete spans ->
+    # interior-B quality) is the one slice whose geometry matches whole-video deployment.
     monitor: val_mode3_tiou_f1
     mode: max
     restore_best: true
@@ -34,9 +32,9 @@ wandb:
 # NOT this head — so S1 inherits dlm.yaml's mode_ratios / jitter and trains on the SAME misalignment distribution
 # the SLT model uses (S1↔SLT window-distribution parity). dlm.yaml now points those sources at the MEASURED
 # outputs/a_*_${language}.json (from Analysis A run with the deployed duration decode), so S1 must be (re)trained
-# AFTER analysis-a for this language — regenerate both if the segmenter/decode changes. Clean corpora (CSL,
-# measured mode1>=0.9) auto-fall-back to the DESIGNED mix via the sampler's degenerate guard. There is no loop:
-# the analysis segmenter is not in the FSM, so S1 is never trained on its own errors.
+# AFTER analysis-a for this language — regenerate both if the segmenter/decode changes. The mode1>=0.9 degenerate
+# guard only fires once a measurement EXISTS; with the source file absent the sampler raises (run analysis-a first).
+# There is no loop: the analysis segmenter is not in the FSM, so S1 is never trained on its own errors.
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
 epochs: 50
@@ -50,10 +48,10 @@ freeze_backbone: true
 # segmenter-infer / eval.py --segmenter-eval), in SECONDS. MUST match the head's trained context, not exceed it
 # (Moryossef's core lesson: train/inference context mismatch is his largest negative ablation): training windows
 # are clamped to buffer_cap_s (sampler.py), so eval chunks at buffer_cap_s too. DATASET-GENERAL — the inference
-# wrapper converts to frames at each stream's own fps (30fps CSL→540, 25fps PHOENIX→450, per-video YouTube fps).
-# DEFAULTS to inference.yaml's buffer_cap_s when unset (the value the FSM also deploys under, so eval matches deploy).
-# CAVEAT for multi-dataset work: buffer_cap_s is one scalar in the shared inference.yaml that tail-benefit rewrites
-# per corpus. A head trains under whatever buffer_cap_s was set THEN; if we later overwrite inference.yaml for another
-# corpus and eval this head, train/deploy context diverge (whole-system, not just eval). Keep one head ↔ one
-# buffer_cap_s (per-dataset configs, or pin it here):
+# wrapper converts to frames at each stream's own fps. DEFAULTS to inference.yaml's buffer_cap_s when unset
+# (the value the FSM also deploys under, so eval matches deploy). CAVEAT for multi-dataset work: buffer_cap_s
+# is one scalar in the shared inference.yaml that tail-benefit rewrites per corpus. A head trains under
+# whatever buffer_cap_s was set THEN; if we later overwrite inference.yaml for another corpus and eval
+# this head, train/deploy context diverge (whole-system, not just eval). Keep one head ↔ one buffer_cap_s
+# (per-dataset configs, or pin it here):
 # rope_eval_chunk_s: 18.0   # explicit override in SECONDS; unused by stage-1 training

@@ -133,7 +133,8 @@ def spd_hybrid_embeddings(
 
     probs = F.softmax(logits.float(), dim=-1)
     k = min(int(top_k), probs.shape[-1])
-    topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
+    if k == 1: topk_probs, topk_indices = probs.max(dim=-1, keepdim=True) # max() is cheaper than topk(k=1) for same result
+    else: topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
     residual = torch.clamp(1.0 - topk_probs.sum(dim=-1, keepdim=True), min=0.0)
 
     topk_embeds = embedding_layer(topk_indices)

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from transformers.cache_utils import EncoderDecoderCache
 from models.block_diffusion import BlockDiffusionDecoder, build_block_causal_mask
 from infer.decode import SPDDecodeResult, spd_dcd_decode
@@ -33,6 +34,10 @@ class OPUTOutput:
     pred_loss: torch.Tensor
     masked_positions: torch.Tensor
     rollout_tokens: torch.Tensor
+    # Detached per-row (summed token loss, valid-token count). Lets one merged OPUT call report the per-mode
+    # breakdown the split-by-mode call used to give, without paying for a second decoder pass per mode group.
+    row_loss_sum: torch.Tensor | None = None
+    row_valid_count: torch.Tensor | None = None
 
 
 def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float = 0.0, t_high: float = 1.0) -> torch.Tensor:
@@ -86,9 +91,15 @@ def oput_two_pass_loss(
     loss_mask = valid_mask if loss_over_all_positions else masked
     mask_loss = masked_cross_entropy(mask_logits, clean_ids, loss_mask)
     pred_loss = masked_cross_entropy(pred_logits, clean_ids, loss_mask)
+    with torch.no_grad():
+        m = loss_mask.to(dtype=mask_logits.dtype)
+        rows = sum(
+            F.cross_entropy(lg.reshape(-1, lg.shape[-1]), clean_ids.reshape(-1), reduction="none").reshape_as(clean_ids) * m
+            for lg in (mask_logits, pred_logits)
+        ).sum(dim=1)
     return OPUTOutput(
-        loss=mask_loss + pred_loss, mask_loss=mask_loss, pred_loss=pred_loss,
-        masked_positions=masked, rollout_tokens=pred_ids.detach(),
+        loss=mask_loss + pred_loss, mask_loss=mask_loss, pred_loss=pred_loss, masked_positions=masked, 
+        rollout_tokens=pred_ids.detach(), row_loss_sum=rows, row_valid_count=m.sum(dim=1),
     )
 
 
@@ -160,6 +171,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         return {
             "translation_loss": out.loss, "oput_mask_loss": out.mask_loss.detach(),
             "oput_pred_loss": out.pred_loss.detach(), "oput_masked_fraction": out.masked_positions.float().mean().detach(),
+            "row_loss_sum": out.row_loss_sum, "row_valid_count": out.row_valid_count,
         }
 
 

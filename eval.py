@@ -24,7 +24,7 @@ from data.batch import frame_mask_for, repeat_last_frame
 from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
-from models.checkpointing import load_model_checkpoint
+from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
 from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
@@ -243,9 +243,13 @@ def evaluate_predicted_events(
             # scores spurious spans against a random reference, which drags the column down for localisation reasons — that makes GT-span rows 
             # (1-2, f1=1, no spurious spans) incomparable with predicted-span rows (3-6) and contaminates the (5-4) and (6-5) contrasts the 
             # ladder exists to isolate. Both localisation failures live in `segmentation`: spurious spans in precision, missed gold in recall.
-            per_video.append(compute_text_metrics(hyps, refs))
+            # Only videos with at least 1 matched pair: a zero-pair video has no translation quality to report, and appending its all-zero row 
+            # would let a LOCALISATION failure move this column — the thing the paragraph above says it must not do.
+            if hyps: per_video.append(compute_text_metrics(hyps, refs))
 
-        text_metrics = {k: float(np.mean([r[k] for r in per_video])) for k in (per_video[0] if per_video else {})}
+        # Mean over videos that HAVE matched pairs only (see above). If no video has any, the row is degenerate and
+        # `scored_pairs` == 0 says so — emit the zero-filled schema so downstream keys stay stable.
+        text_metrics = ({k: float(np.mean([r[k] for r in per_video])) for k in per_video[0]} if per_video else compute_text_metrics([], []))
         precision = float(np.mean(vid_prec)) if vid_prec else 0.0
         recall = float(np.mean(vid_rec)) if vid_rec else 0.0
         latency_block, tiou_block = {}, {}
@@ -918,7 +922,7 @@ def _load_segmenter(args):
         # Chunked RoPE at the head's TRAINED context, in SECONDS: training windows clamp to buffer_cap_s (sampler.py), so eval chunks there 
         # too (wrapper converts to frames per stream fps). Larger chunks would attend over untrained context.
         buffer_cap_s = float(load_yaml(args.inference_config).get("buffer_cap_s", 18.0))
-        velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s", buffer_cap_s))
+        velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s") or buffer_cap_s)
     else:
         from moryossef26.trainer import build_segmenter
         cfg = load_yaml(args.moryossef_config, language=args.language)
@@ -932,6 +936,18 @@ def _load_segmenter(args):
     if args.language and str(cfg.get("language", args.language)) != str(args.language): ckpt_dir = ckpt_default
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
     load_model_checkpoint(model, checkpoint, strict=True)
+    # S1's RoPE chunk is the buffer cap the head TRAINED under, which the checkpoint records. It wins over both the
+    # config pin and the live buffer_cap_s, because `analyze --stage tail-benefit --write-config` rewrites that cap
+    # after training and following it re-chunks a trained head over context it never saw (measured: dev
+    # tIoU-F1@0.5 fold B 0.5014 -> 0.4763 under an unchanged tuned decode). Checkpoints predating the meta field
+    # fall through to the config pin.
+    if args.segmenter_arch == "s1":
+        trained_chunk = load_checkpoint_meta(checkpoint).get("rope_eval_chunk_s")
+        if trained_chunk:
+            if abs(float(trained_chunk) - float(rope_chunk_s)) > 1e-6: print(
+                f"segmenter | rope_eval_chunk_s {float(trained_chunk):.2f}s from the checkpoint (config/buffer_cap_s "
+                f"says {float(rope_chunk_s):.2f}s); using the trained value.", flush=True)
+            rope_chunk_s = float(trained_chunk)
     return model, device, velocity, rope_chunk_s, checkpoint
 
 
@@ -947,7 +963,7 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     
     # Per-arch default, same rule as analyze.py segmenter-infer: moryossef stays on its published argmax decode unless
     # --segmenter-decode duration is explicit — the config switch alone must not silently re-split the external baseline.
-    dd = duration_decode_params(load_yaml(args.inference_config), args.language)
+    dd = duration_decode_params(load_yaml(args.inference_config), args.language, arch=args.segmenter_arch)
     decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
     duration_prior = None
     if decode == "duration":

@@ -24,8 +24,6 @@ class SPDDecodeResult:
     sequences: torch.Tensor
     confidence: torch.Tensor
     steps: int
-    last_logits: torch.Tensor | None = None
-    commit_logits: torch.Tensor | None = None
 
 
 def sample_tokens(
@@ -274,7 +272,6 @@ def spd_dcd_decode(
     confidence_out = torch.zeros_like(token_ids, dtype=torch.float32)
     confidence_out[token_ids != int(mask_token_id)] = 1.0
     soft_embeds, used_steps = None, 0
-    last_logits, commit_logits = None, None
     window_left = prompt_length
     window_right = min(full_length, prompt_length + win_len)
     eos_pos = torch.full((batch,), full_length, dtype=torch.long, device=device)
@@ -296,7 +293,7 @@ def spd_dcd_decode(
         clear settle_confidence=0.9, or nothing changes). Only committed (non-mask, pre-EOS) tokens in [lo, hi) are
         revisable — DMax never re-enters a FINISHED block (`decode_uniform` writes only `x[:, block_start:block_end]`): 
         later blocks were committed against it."""
-        nonlocal token_ids, commit_logits, eos_pos, last_logits, used_steps
+        nonlocal token_ids, eos_pos, used_steps
         if not spd_revision: return
         for _ in range(max(1, int(budget))):
             revisable = (token_ids != int(mask_token_id)) & generated_region
@@ -305,14 +302,11 @@ def spd_dcd_decode(
             if pad_id is not None: revisable &= token_ids != int(pad_id)
             if not revisable.any(): return
             full_logits = _suppress_mask(_full_forward(token_ids, soft))
-            last_logits = full_logits
             conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
             changed = revisable & (pred != token_ids)
             token_ids = torch.where(revisable, pred, token_ids)
             confidence_out[revisable] = conf[revisable]
             if changed.any():
-                if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
-                commit_logits = torch.where(changed.unsqueeze(-1), full_logits, commit_logits)
                 eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
                 if soft is not None:
                     # `inputs_embeds` REPLACES ids, so hard-refresh revised positions (DMax parallel_strategy
@@ -355,7 +349,6 @@ def spd_dcd_decode(
         else: full_logits = logits_fn(token_ids, soft_embeds)
         full_logits = _suppress_mask(full_logits)
 
-        last_logits = full_logits
         logits = full_logits[:, window_left:window_right]
         candidate = token_ids[:, window_left:window_right] == int(mask_token_id)
         if not candidate.any():
@@ -376,8 +369,6 @@ def spd_dcd_decode(
         selected_global = torch.zeros_like(token_ids, dtype=torch.bool)
         selected_global[:, window_left:window_right] = newly_selected
 
-        if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
-        commit_logits = torch.where(selected_global.unsqueeze(-1), full_logits, commit_logits)
         token_ids[:, window_left:window_right] = decoded.token_ids
         confidence_window = confidence_out[:, window_left:window_right]
         confidence_window[newly_selected] = decoded.confidence[newly_selected]
@@ -398,7 +389,6 @@ def spd_dcd_decode(
                 confidence_window[revisable] = decoded.confidence[revisable]
                 rev_global = torch.zeros_like(token_ids, dtype=torch.bool)
                 rev_global[:, window_left:window_right] = revisable
-                commit_logits = torch.where(rev_global.unsqueeze(-1), full_logits, commit_logits)
                 # Revised positions join the EOS scan: a revision into EOS truncates like a fresh EOS commit.
                 changed_global = torch.zeros_like(token_ids, dtype=torch.bool)
                 changed_global[:, window_left:window_right] = revised_changed
@@ -455,13 +445,10 @@ def spd_dcd_decode(
         print(f"[decode] WARNING: commit loop hit its safety cap with {int(leftover.sum())} masked slots left; "
               f"force-filling in one pass (premature termination — investigate confidence/threshold settings)", flush=True)
         full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
-        last_logits = full_logits
         conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
         token_ids = torch.where(leftover, pred, token_ids)
         confidence_out[leftover] = conf[leftover]
 
-        if commit_logits is None: commit_logits = torch.zeros_like(full_logits)
-        commit_logits = torch.where(leftover.unsqueeze(-1), full_logits, commit_logits)
         eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, leftover, eos_token_id, pad_id)
         used_steps += 1
 
@@ -470,7 +457,4 @@ def spd_dcd_decode(
     if not ((token_ids == int(mask_token_id)) & generated_region).any():
         _settle(max(1, int(steps)), soft_embeds, settled_block_start, full_length)
 
-    return SPDDecodeResult(
-        sequences=token_ids, confidence=confidence_out, steps=used_steps, 
-        last_logits=last_logits, commit_logits=commit_logits,
-    )
+    return SPDDecodeResult(sequences=token_ids, confidence=confidence_out, steps=used_steps)

@@ -72,7 +72,9 @@ class AmpHelper:
         if device_type != "cuda" or mode in {"none", "off", "fp32", "float32"}: self.dtype = None
         elif mode in {"bf16", "bfloat16"}: self.dtype = torch.bfloat16
         elif mode in {"fp16", "float16"}: self.dtype = torch.float16
-        elif mode == "auto": self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # including_emulation=False: torch's default reports bf16 "supported" on Turing (Colab's T4) via EMULATION —
+        # no tensor cores, and the fp16 GradScaler path stays disabled, so "auto" picks the slowest option there.
+        elif mode == "auto": self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
         else: raise ValueError(f"Unknown mixed_precision mode: {mode}")
         self.device_type = device_type
         self.scaler = torch.amp.GradScaler(device_type, enabled=self.dtype == torch.float16)
@@ -291,12 +293,19 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def _save_history_files(self) -> None:
         if not self._rows or self._history_csv is None: return
         self._history_csv.parent.mkdir(parents=True, exist_ok=True)
-        columns = self._order_columns({key for row in self._rows for key in row})
+        # A resumed run starts with an empty _rows, so rewriting would drop epochs 1..k of the curve — the only
+        # record of them when wandb is off. Carry forward any rows on disk this process did not produce.
+        rows = self._rows
+        if self._history_csv.exists():
+            with self._history_csv.open("r", encoding="utf-8", newline="") as f:
+                prior = [r for r in csv.DictReader(f) if r.get("epoch") not in {str(r2.get("epoch")) for r2 in rows}]
+            rows = prior + rows
+        columns = self._order_columns({key for row in rows for key in row})
 
         with self._history_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(columns)
-            for row in self._rows: writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
+            for row in rows: writer.writerow([self._format_cell(row.get(col, "-"), col) for col in columns])
 
 
     def finish(self) -> None:
@@ -316,7 +325,7 @@ def run_epoch_loop(
     step_fn: Callable[[dict, int], tuple[torch.Tensor, dict[str, float]]],
     evaluate_fn: Callable[[int], dict[str, float]] | None = None,
     default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min",
-    dev_loader: DataLoader | None = None, resume: bool = False,
+    dev_loader: DataLoader | None = None, resume: bool = False, checkpoint_meta: dict | None = None,
 ) -> list[dict[str, float]]:
     """The one training loop every trainer shares (slt / bio_s1).
 
@@ -338,7 +347,7 @@ def run_epoch_loop(
     # Side effects (checkpoint writes, wandb, history.csv, progress bars) are rank 0's alone: concurrent writers
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
     # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
-    if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint)
+    if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint, meta=checkpoint_meta)
     logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor, enabled=dist.is_main())
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
@@ -349,6 +358,12 @@ def run_epoch_loop(
     ckpt_dir = checkpoint_dir(cfg)
     latest_path = Path(ckpt_dir) / "latest.pt" if ckpt_dir else None
     start_epoch = 1
+    # Re-running the same command without --resume (the Colab reflex after a session dies) would overwrite latest.pt
+    # AND the best model.pt at the end of epoch 1, discarding the whole prior run. Refuse instead.
+    if not resume and latest_path is not None and latest_path.exists(): raise SystemExit(
+        f"{latest_path} exists: a previous run is resumable. Pass --resume to continue it, or move/delete that file "
+        f"to start over (this would otherwise overwrite it and the best model.pt after one epoch)."
+    )
     if resume:
         if latest_path is None or not latest_path.exists():
             raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
@@ -424,7 +439,24 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
             if key in {"epoch", "step", "lr"}: continue
             sums[key] = sums.get(key, 0.0) + float(value)
             counts[key] = counts.get(key, 0) + 1
-    return {f"{prefix}_{key}": sums[key] / counts[key] for key in sums if counts.get(key, 0) > 0}
+    out = {f"{prefix}_{key}": sums[key] / counts[key] for key in sums if counts.get(key, 0) > 0}
+    # Two silent-failure alarms the logged numbers already contained but nobody compared:
+    #   B-class collapse — signing-vs-not P/R/F1 stay high while B never fires, so only its own rate shows it.
+    #   all-I control — a segmenter that cannot beat "call every frame signing and chop by the duration prior"
+    #   has learned nothing a reviewer will credit; both quantities were being computed already.
+    b_rate = next((v for k, v in out.items() if k.endswith("_pred_b_rate")), None)
+    gold_rate = next((v for k, v in out.items() if k.endswith("_gold_b_rate")), None)
+    if b_rate is not None and gold_rate and b_rate < 0.1 * gold_rate: print(
+        f"[{prefix}] WARNING: B-class collapse — predicted B rate {b_rate:.5f} vs gold {gold_rate:.5f}. "
+        f"Check bio_class_weights (train/losses.py documents this failure).", flush=True
+    )
+    tiou = next((v for k, v in out.items() if k.endswith("phrase_tiou_f1")), None)
+    alli = next((v for k, v in out.items() if k.endswith("alli_tiou_f1")), None)
+    if tiou is not None and alli is not None and tiou <= alli: print(
+        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} — the head is "
+        f"contributing nothing over chopping by the duration prior.", flush=True
+    )
+    return out
 
 
 @dataclass
@@ -535,7 +567,7 @@ class TrainControl:
 
 
 def attach_save_best(
-    control: TrainControl, cfg: dict, name: str, saver: Callable[[torch.nn.Module, str | Path], Path],
+    control: TrainControl, cfg: dict, name: str, saver: Callable[[torch.nn.Module, str | Path], Path], meta: dict | None = None,
 ) -> TrainControl:
     """Wire save-on-best into a TrainControl from the `checkpoint:` block.
 
@@ -544,7 +576,7 @@ def attach_save_best(
     """
     control.name = str(name)
     ckpt_dir = checkpoint_dir(cfg)
-    if save_best_enabled(cfg) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir)
+    if save_best_enabled(cfg) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir, meta=meta)
     return control
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
-from data.windowing import BIO
+import math
 import torch
+import torch.nn.functional as F
+from data.windowing import BIO
 
 
 def frame_mask_for(n_frames: int, visual_padding: str = "none") -> torch.Tensor:
@@ -61,23 +63,42 @@ def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str
 
 class WindowCollator:# Collate windows and optionally tokenize complete-anchor references.
     def __init__(
-        self, tokenizer=None, max_text_tokens: int = 128,
-        pad_to_max_length: bool = True, visual_padding: str = "none",
+        self, tokenizer=None, max_text_tokens: int = 128, pad_to_max_length: bool = True, 
+        visual_padding: str = "none", block_size: int = 1, eos_supervision_tokens: int = 0,
     ):
         self.tokenizer = tokenizer
         self.max_text_tokens = int(max_text_tokens)
         self.pad_to_max_length = bool(pad_to_max_length)
         self.visual_padding = str(visual_padding)
+        # Dynamic padding (pad_to_max_length=False) needs the DLM's canvas geometry to stay equivalent to a
+        # full-width canvas: see _tokenize_texts.
+        self.block_size = max(1, int(block_size))
+        self.eos_supervision_tokens = max(0, int(eos_supervision_tokens))
 
     def _tokenize_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
-        padding = "max_length" if self.pad_to_max_length else True
+        # Every decoder forward runs over the full canvas, so padding to max_text_tokens costs compute on padding:
+        # captions are ~15 tokens against a 128 canvas. Dynamic padding sizes it to the batch instead, with two
+        # slots of headroom that the DLM path requires and batch-max alone would not leave:
+        #   1. supervise_trailing_eos needs eos_supervision_tokens PAD slots after the longest row's sentence;
+        #   2. the confidence-bound reference shift (models/streaming_slt.py) drops the last column, which must be
+        #      PAD or the longest row loses its real final token from the gate.
+        # Block alignment matters too — BD3LM attends bidirectionally WITHIN a block, so a canvas ending mid-block
+        # would change the last positions' logits. With headroom + alignment the result matches the full canvas.
         encoded = self.tokenizer(
-            texts, padding=padding, truncation=True,
-            max_length=self.max_text_tokens, return_tensors="pt",
+            texts, padding="max_length" if self.pad_to_max_length else True,
+            truncation=True, max_length=self.max_text_tokens, return_tensors="pt",
         )
         input_ids = encoded["input_ids"]
         attention_mask = encoded["attention_mask"]
+        if not self.pad_to_max_length:
+            need = input_ids.shape[1] + 1 + self.eos_supervision_tokens
+            width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
+            if width > input_ids.shape[1]:
+                pad_id = int(self.tokenizer.pad_token_id)
+                grow = width - input_ids.shape[1]
+                input_ids = F.pad(input_ids, (0, grow), value=pad_id)
+                attention_mask = F.pad(attention_mask, (0, grow), value=0)
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}

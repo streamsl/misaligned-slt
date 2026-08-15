@@ -30,7 +30,7 @@ from models.unisign import released_layout_state
 
 from train import distributed as dist
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
-from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
+from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
 from infer.duration_decode import deployed_decode_tags, duration_decode_params, fit_duration_prior
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml, pretrained_checkpoint, resolve_pretrained
@@ -98,7 +98,7 @@ def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Mo
         bio_nhead=int(cfg.get("bio_nhead", 8)), bio_dropout=float(cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(cfg.get("bio_conv_stem_layers", 2)), freeze_encoder=freeze_encoder,
     )
-    pose_ckpt = pretrained_path or pretrained_checkpoint(cfg, default="checkpoints/csl_daily_pose_only_slt.pth")
+    pose_ckpt = pretrained_path or pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth")
     n = model.load_unisign_pose(pose_ckpt)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     print(f"bio_s1 | pose encoder from {pose_ckpt} ({n} tensors); encoder {'FROZEN' if freeze_encoder else 'TRAINABLE'}; "
@@ -122,6 +122,7 @@ def build_bio_s1(
     cfg["inference_config"], cfg["data_config"] = str(inference_config), str(data_config)
 
     train_records, _ = load_language_records(data_cfg, language, split="train")
+    resolve_bio_class_weights(cfg, train_records)
     train_dataset = StreamingWindowDataset(
         train_records, slt_cfg=cfg, inference_cfg=inference_cfg, pose_augment_cfg=cfg.get("augmentation"),
     )
@@ -142,7 +143,7 @@ def build_bio_s1(
 
     # Language's released Uni-Sign checkpoint (OpenASL for asf/bfi, CSL for csl) — MUST match the SLT model's
     # warm-start so S1 features == S2 initial features (§1.4).
-    pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth")
+    pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg
 
@@ -215,8 +216,10 @@ def train_bio_s1_epochs(
     if class_weights is not None: class_weights = class_weights.to(device)
     # Frozen encoder → head only. Unfrozen → head at learning_rate, the PRETRAINED encoder at backbone_lr
     # (default lr×0.1, see build_optimizer): a single head-scale LR on Uni-Sign weights empirically degrades them.
-    # Monitor under the DEPLOYED decode (same principle as analyze --stage delta-enc). Prior fitted from this
-    # language's TRAIN captions; None when inference.yaml duration_decode is off for it.
+    # Monitor under the DEPLOYED decode (duration_decode_s1, same principle as analyze --stage delta-enc): the closest available 
+    # estimate of how this head will be read. Untuned corpus -> off -> plain argmax, which is the right fallback. The triple only 
+    # RANKS epochs and is fixed for the run. Compare checkpoints ACROSS runs with --segmenter-eval, never by monitor value. Prior 
+    # fitted from this language's TRAIN captions.
     duration_prior = None
     _dd_cfg = load_yaml(str(cfg.get("inference_config", "configs/inference.yaml")))
     _dd = duration_decode_params(_dd_cfg, cfg.get("language"))
@@ -234,9 +237,15 @@ def train_bio_s1_epochs(
         loss = bio_nll_dice_loss(out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=class_weights)
         return loss, {"bio_loss": float(loss.detach())}
 
+    # The head's RoPE context is set by the windows it trains on, which the sampler clamps to buffer_cap_s. Later stages re-measure 
+    # and rewrite that cap, so eval must read the cap from HERE, not from the live config. monitor_decode: the triple best-epoch 
+    # selection ran under. On a corpus's FIRST pass duration_decode_s1.<lang> is still unpinned (tune-decode needs this checkpoint), 
+    # so selection happens with the decode off and deployed decode differs — recorded here so the gap is visible instead of inferred.
+    meta = {"rope_eval_chunk_s": float(cfg.get("rope_eval_chunk_s") or _dd_cfg.get("buffer_cap_s", 18.0)), 
+            "buffer_cap_s": float(_dd_cfg.get("buffer_cap_s", 18.0)), "monitor_decode": _dd,
+            "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language")}
     return run_epoch_loop(
-        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, 
-        epochs=epochs, cfg=cfg, step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_s1(
-            model, dev_loader, device, dice_weight, class_weights, duration_prior=duration_prior), 
-        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
+        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, step_fn=step_fn, 
+        evaluate_fn=lambda e: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights, duration_prior=duration_prior), 
+        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta
     )

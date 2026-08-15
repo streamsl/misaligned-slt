@@ -1,10 +1,12 @@
-# Stage-2 losses: BIO Dice+CE (Moryossef recipe) and confidence-bound term for right-truncated windows. OPUT lives in `models.dlm_decoder`.
+# Stage-2 losses: BIO Dice+CE (Moryossef recipe) and confidence-bound term for right-truncated windows. 
+# OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
 from __future__ import annotations
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from data.windowing import BIO
+from data.windowing import BIO, make_bio_labels
 
 
 @dataclass
@@ -17,8 +19,7 @@ class ConfidenceBoundStats:
 
 
 def masked_cross_entropy(
-    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None,
-    class_weights: torch.Tensor | None = None,
+    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None, class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # CE over valid positions, optionally per-class weighted. Normalized by valid-frame count 
     # (not by summed class weights) so the scale stays comparable to the unweighted loss.
@@ -45,11 +46,66 @@ def binary_sign_dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_in
     return 1.0 - numerator / denominator
 
 
-def bio_class_weight_tensor(class_weights: dict | list | None) -> torch.Tensor | None:
-    """Length-4 BIO class-weight tensor (indexed UNK/O/B/I) from a {"O","B","I"} dict or a 4-element list.
+def bio_label_counts(records, trusted_gap_s: float | None = None) -> list[int]:
+    """Corpus BIO label histogram (UNK/O/B/I) over each record's full timeline, for `balanced` class weights.
+
+    Calls the real labeller on a uniform per-video timeline rather than re-deriving prevalence, so UNK/trusted-gap
+    handling can never drift from training. No poses are read.
+    """
+    counts = np.zeros(4, dtype=np.int64)
+    for rec in records:
+        fps = float(rec.pose.fps); duration = float(rec.pose.duration_s)
+        n = max(1, int(round(duration * fps)))
+        kw = {} if trusted_gap_s is None else {"trusted_gap_s": trusted_gap_s}
+        labels = make_bio_labels(np.arange(n) / fps, rec.sentences, 0.0, duration, video_duration_s=duration, **kw)
+        counts += np.bincount(np.asarray(labels), minlength=4)[:4]
+    return [int(c) for c in counts]
+
+
+def resolve_bio_class_weights(cfg: dict, records, trusted_gap_s: float | None = None) -> None:
+    """Replace a `bio_class_weights: balanced` config entry with the concrete 4-list measured on `records`.
+
+    Resolved once at setup, in place, so every consumer sees the same numbers and the run's saved config records
+    the exact weights used — a corpus-derived weight vector is not reproducible from the string alone.
+    """
+    if str(cfg.get("bio_class_weights") or "").lower() != "balanced": return
+    counts = bio_label_counts(records, trusted_gap_s=trusted_gap_s)
+    cfg["bio_class_weights"] = balanced_bio_class_weights(counts)
+    print(f"[bio] balanced class weights from {len(records)} train videos: UNK/O/B/I counts {counts} -> "
+          f"{[round(w, 4) for w in cfg['bio_class_weights']]}", flush=True)
+
+
+def balanced_bio_class_weights(label_counts) -> list[float]:
+    """Inverse-sqrt-frequency BIO weights from MEASURED label counts, normalised to mean weight 1 over valid frames.
+
+    Derived per corpus rather than pinned to one dataset's numbers: `B` is 1 frame per sentence, so its share is set by that corpus's 
+    sentence rate and cannot be a constant. Inverse-sqrt, not inverse-frequency: at a sub-1% `B` share the latter asks for a ~100x weight, 
+    which over-segments (Moryossef's CNN ablations) — sqrt is the standard dense-segmentation compromise. Mean-1 normalisation keeps the 
+    CE scale unweighted-comparable so `lambda_bio` carries over.
+    """
+    counts = np.asarray(label_counts, dtype=np.float64)
+    if counts.shape != (4,): raise ValueError(f"label_counts must have 4 entries (UNK,O,B,I); got {counts.tolist()}")
+    valid = counts.copy(); valid[BIO["UNK"]] = 0.0
+    total = valid.sum()
+    if total <= 0 or (valid > 0).sum() < 2: raise ValueError(f"degenerate BIO label counts {counts.tolist()}")
+    w = np.zeros(4)
+    present = valid > 0
+    w[present] = 1.0 / np.sqrt(valid[present] / total)
+    w *= total / float((w * valid).sum())  # mean weight 1 per valid frame
+    w[BIO["UNK"]] = 0.0
+    return [float(x) for x in w]
+
+
+def bio_class_weight_tensor(class_weights: dict | list | str | None, label_counts=None) -> torch.Tensor | None:
+    """Length-4 BIO class-weight tensor (indexed UNK/O/B/I) from a {"O","B","I"} dict, a 4-element list, or
+    "balanced" (derived from `label_counts` — see `balanced_bio_class_weights`; portable across corpora).
     UNK forced to 0 (ignored). None when no weights given → unweighted CE, Moryossef's default recipe."""
     if not class_weights: return None
-    if isinstance(class_weights, dict):
+    if isinstance(class_weights, str):
+        if class_weights.lower() != "balanced": raise ValueError(f"Unknown bio_class_weights: {class_weights!r}")
+        if label_counts is None: raise ValueError("bio_class_weights: balanced needs label_counts from the train split")
+        w = balanced_bio_class_weights(label_counts)
+    elif isinstance(class_weights, dict):
         w = [0.0, float(class_weights.get("O", 1.0)), float(class_weights.get("B", 1.0)), float(class_weights.get("I", 1.0))]
     else:
         w = [float(x) for x in class_weights]
@@ -107,9 +163,11 @@ def confidence_bound_loss(
     tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, enabled: bool = True, pad_token_id: int | None = None,
     active_mask: torch.Tensor | None = None,
 ) -> ConfidenceBoundStats:
-    """Confidence-bound loss for right-truncated Mode 2a windows: CE toward the full-evidence tokens on the slots
-    `confidence_bound_gate` marks active. Preserves P1 — the right-truncated visual input never receives a partial
-    text label; the reference only decides whether the full-evidence self-target is trustworthy at this slot.
+    """Confidence-bound loss for right-truncated Mode 2a windows: CE toward the full-evidence tokens on the slots `confidence_bound_gate` 
+    marks active. With the verified gate on, the active-slot target ALGEBRAICALLY equals the reference token (gate requires f==r), so this 
+    is verified error-triggered reference CE — a direct signal. What the self-decode teacher adds is the MASK (the slot is achievable from 
+    full evidence at current capacity, and the truncated view is confidently wrong there) and the on-policy decoded context; neither can 
+    inject a wrong label — teacher failure yields silence (no active slots), never corruption. Monitor cb_active_count for a dead gate.
     """
     if not enabled:
         zero = trunc_logits.sum() * 0.0
@@ -123,12 +181,13 @@ def confidence_bound_loss(
     full = full_tokens[:, :seq_len].to(device=logits.device)
     ref = reference_tokens[:, :seq_len].to(device=logits.device) if reference_tokens is not None else None
 
-    probs = logits.softmax(dim=-1)
-    logits_conf, logits_pred = probs.max(dim=-1)
-    if trunc_tokens is not None: trunc_pred = trunc_tokens[:, :seq_len].to(device=logits.device)
-    else: trunc_pred = logits_pred
-    if trunc_confidence is not None: trunc_conf = trunc_confidence[:, :seq_len].to(device=logits.device)
-    else: trunc_conf = logits_conf
+    # Only the AR arm needs pi/argmax from the grad-bearing logits; the DLM arm supplies both from its decode.
+    # Computing them unconditionally put a full-vocab (B,L,V) softmax inside the autograd region every step.
+    if trunc_tokens is None or trunc_confidence is None:
+        probs = logits.softmax(dim=-1)
+        logits_conf, logits_pred = probs.max(dim=-1)
+    trunc_pred = trunc_tokens[:, :seq_len].to(device=logits.device) if trunc_tokens is not None else logits_pred
+    trunc_conf = trunc_confidence[:, :seq_len].to(device=logits.device) if trunc_confidence is not None else logits_conf
 
     if active_mask is not None: active = active_mask[:, :seq_len].to(device=logits.device, dtype=torch.bool)
     else: active = confidence_bound_gate(

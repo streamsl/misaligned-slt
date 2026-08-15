@@ -102,10 +102,27 @@ def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.
     return state
 
 
-def save_model_checkpoint(module: nn.Module, output_dir: str | Path, filename: str = "model.pt") -> Path:
-    return _atomic_torch_save({"model": module.state_dict()}, Path(output_dir) / filename)
+def save_model_checkpoint(
+    module: nn.Module, output_dir: str | Path, filename: str = "model.pt", meta: dict | None = None,
+) -> Path:
+    """Weights, plus optional `meta` describing the CONTEXT the weights were trained under.
+
+    Anything eval must reproduce but cannot re-derive belongs here rather than in a config: a config is a live
+    file that later stages rewrite, so a value read from it at eval time is whatever the last stage wrote, not
+    what this checkpoint trained under. Travelling with the weights is the only binding that cannot drift.
+    """
+    payload = {"model": module.state_dict()}
+    if meta: payload["meta"] = dict(meta)
+    return _atomic_torch_save(payload, Path(output_dir) / filename)
+
 
 def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: bool = False) -> tuple[list[str], list[str]]:
     raw = _load_state(checkpoint)
     missing, unexpected = module.load_state_dict(raw, strict=strict)
     return list(missing), list(unexpected)
+
+
+def load_checkpoint_meta(checkpoint: str | Path) -> dict:
+    # `meta` written by save_model_checkpoint; {} for checkpoints saved before it existed.
+    raw = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    return dict(raw.get("meta") or {}) if isinstance(raw, dict) else {}

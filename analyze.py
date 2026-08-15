@@ -12,9 +12,10 @@ from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 
 from models.checkpointing import load_model_checkpoint
-from infer.duration_decode import duration_split_tags
+from infer.duration_decode import DEPLOYED_SEGMENTER_ARCH, decode_config_key, duration_split_tags
 from infer.commit_gate import bio_complete_spans, select_target_span
 from moryossef26.infer import _phrase_logits, _set_rope_chunk, duration_decode_params, fit_duration_prior, predict_phrase_segments
+
 from eval import _build_eval_model, _load_segmenter, _translate_windows, load_prediction_file, save_prediction_file
 from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics
 from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, resolve_pretrained
@@ -201,7 +202,8 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
     # Decode defaults per arch, as in eval --segmenter-eval: s1 -> our semi-Markov re-split, moryossef -> faithful Moryossef argmax. 
     # `--segmenter-decode duration` on external measures the deployed decode's errors, not the baseline's.
-    dd = duration_decode_params(load_yaml(args.inference_config), args.language)  # per-language switch = source of truth
+    # arch-aware: each segmenter reads its own duration_decode_<arch> block, never the other's.
+    dd = duration_decode_params(load_yaml(args.inference_config), args.language, arch=args.segmenter_arch)
     decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
     duration_prior = None
     if decode == "duration":
@@ -229,10 +231,11 @@ def segmenter_infer(args: argparse.Namespace) -> dict:
 def tune_decode(args: argparse.Namespace) -> dict:
     """Two-fold dev tuning of the semi-Markov decode pair (split_bias, snap_radius_s) — infer/duration_decode.py.
 
-    F1(split_bias) is a knife edge (segment-count Lagrange multiplier against a near-constant per-segment cost, so
-    the split count steps) and the knobs interact, so marginal sweeps mislead: joint FINE grid, one forward/video,
-    decode-only re-sweep, per-fold macro F1@0.5, max(min(foldA, foldB)). Pin by hand in inference.yaml
-    `duration_decode: {split_bias, snap_radius_s}`; never auto-applied, keeping eval tuning-free.
+    F1(split_bias) is a knife edge (segment-count Lagrange multiplier against a near-constant per-segment cost, so the split count steps) 
+    and the knobs interact, so marginal sweeps mislead: joint FINE grid, one forward/video, decode-only re-sweep, per-fold macro F1@0.5, 
+    max(min(foldA, foldB)). Run ONCE PER SEGMENTER: each arch's posteriors are calibrated differently, so `--segmenter-arch <arch>` pins 
+    inference.yaml `duration_decode_<arch>.<lang>` — s1's block is the DEPLOYED one (FSM, membership gate, RQ1/RQ2), moryossef's is read 
+    only by the baseline's own analysis. Never auto-applied without --write-config, keeping eval tuning-free.
     """
     if args.split == "test": raise SystemExit("tune-decode is dev-only: tuning on test is test contamination")
     data_cfg = load_yaml(args.data_config)
@@ -260,26 +263,33 @@ def tune_decode(args: argparse.Namespace) -> dict:
     cached.sort(key=lambda c: c[0])
     folds = (cached[::2], cached[1::2])
 
-    def fold_f1(fold, bias, radius):
+    def fold_f1(fold, bias, radius, w_b):
         f1s = []
         for _, tags, pB, gold, fps in fold:
-            t = duration_split_tags(tags, pB, fps, prior, split_bias=bias, snap_radius_s=radius)
+            t = duration_split_tags(tags, pB, fps, prior, split_bias=bias, snap_radius_s=radius, boundary_logit_weight=w_b)
             oh = torch.nn.functional.one_hot(torch.as_tensor(t).long(), num_classes=4).float().unsqueeze(0)
             f1s.append(moryossef_segment_metrics(oh, gold.unsqueeze(0), prefix="p", tiou_threshold=0.5)["p_tiou_f1"])
         return float(np.mean(f1s)) if f1s else 0.0
 
-    grid_bias = [round(float(b), 2) for b in np.arange(2.5, 6.01, 0.25)]
+    # Emission weight shifts the count-optimal bias (its logits are negative off-boundary), so the joint
+    # grid must cover higher bias than the w=0 sweep needed.
+    grid_bias = [round(float(b), 2) for b in np.arange(2.5, 8.01, 0.25)]
     grid_radius = [0.0, 0.5, 1.0, 1.5]
+    grid_weight = [0.0, 0.25, 0.5, 0.75, 1.0]
     rows, best = [], None
-    for bias in grid_bias:
-        for radius in grid_radius:
-            a, b = fold_f1(folds[0], bias, radius), fold_f1(folds[1], bias, radius)
-            rows.append({"split_bias": bias, "snap_radius_s": radius, "foldA_f1@0.5": round(a, 4), "foldB_f1@0.5": round(b, 4)})
-            key = (min(a, b), (a + b) / 2)  # fold-consistent first, mean as tie-break
-            if best is None or key > best[0]: best = (key, rows[-1])
-        print(f"[tune-decode] bias={bias:4.2f}: " + " ".join(
-            f"r={r['snap_radius_s']:.1f}:{r['foldA_f1@0.5']:.3f}/{r['foldB_f1@0.5']:.3f}" for r in rows[-len(grid_radius):]
-        ), flush=True)
+    for w_b in grid_weight:
+        for bias in grid_bias:
+            for radius in grid_radius:
+                a, b = fold_f1(folds[0], bias, radius, w_b), fold_f1(folds[1], bias, radius, w_b)
+                rows.append({
+                    "split_bias": bias, "snap_radius_s": radius, "boundary_logit_weight": w_b, 
+                    "foldA_f1@0.5": round(a, 4), "foldB_f1@0.5": round(b, 4)
+                })
+                key = (min(a, b), (a + b) / 2)  # fold-consistent first, mean as tie-break
+                if best is None or key > best[0]: best = (key, rows[-1])
+            print(f"[tune-decode] w={w_b:.2f} bias={bias:4.2f}: " + " ".join(
+                f"r={r['snap_radius_s']:.1f}:{r['foldA_f1@0.5']:.3f}/{r['foldB_f1@0.5']:.3f}" for r in rows[-len(grid_radius):]
+            ), flush=True)
 
     selected = dict(best[1])
     # Held-out estimate, the number to QUOTE: re-select per fold, evaluate on the other, average. 
@@ -293,28 +303,57 @@ def tune_decode(args: argparse.Namespace) -> dict:
     heldout_f1 = round(sum(heldout) / 2, 4)
     output = Path(args.output or f"outputs/tune_decode_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
+    block = decode_config_key(args.segmenter_arch)
     payload = {
         "language": args.language, "split": args.split, "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "videos": len(cached), "prior": {"mu_log_s": prior.mu_log_s, "sd_log_s": prior.sd_log_s, "cap_s": prior.cap_s},
         "selected": selected, "heldout_f1@0.5": heldout_f1, "heldout_per_fold": [round(h, 4) for h in heldout], "grid": rows,
-        "pin_as": {"duration_decode": {"split_bias": selected["split_bias"], "snap_radius_s": selected["snap_radius_s"]}},
+        "pin_as": {block: {str(args.language): {
+            "split_bias": selected["split_bias"], "snap_radius_s": selected["snap_radius_s"],
+            "boundary_logit_weight": selected["boundary_logit_weight"]
+        }}},
+        "rope_eval_chunk_s": rope_chunk_s,  # s1 only; the trained context this tuning is valid at
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    if args.write_config: # Written as a YAML flow mapping under duration_decode.<language>.
-        flow = f"{{split_bias: {selected['split_bias']}, snap_radius_s: {selected['snap_radius_s']}}}"
-        if update_yaml_scalar(args.inference_config, ("duration_decode", str(args.language)), flow):
+    if args.write_config: # Written as a YAML flow mapping under <block>.<language>.
+        # The baseline's triple lives in its own block: one shared entry would decode the baseline with the
+        # triple tuned for our head (see duration_decode_params).
+        flow = (f"{{split_bias: {selected['split_bias']}, snap_radius_s: {selected['snap_radius_s']}, "
+                f"boundary_logit_weight: {selected['boundary_logit_weight']}}}")
+        if update_yaml_scalar(args.inference_config, (block, str(args.language)), flow):
             payload["config_updated"] = args.inference_config
-            print(f"[tune-decode] wrote duration_decode.{args.language}: {flow} to {args.inference_config}", flush=True)
+            print(f"[tune-decode] wrote {block}.{args.language}: {flow} to {args.inference_config}", flush=True)
         else:
-            print(f"[tune-decode] could not find duration_decode.{args.language} in {args.inference_config}; "
-                  f"add the row manually: {args.language}: {flow}", flush=True)
+            print(f"[tune-decode] could not find {block}.{args.language} in {args.inference_config}; "
+                  f"add the row manually under {block}: {args.language}: {flow}", flush=True)
     print(f"[tune-decode] selected split_bias={selected['split_bias']} snap_radius_s={selected['snap_radius_s']} "
-          f"(in-selection F1@0.5 {selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}; HELD-OUT estimate {heldout_f1} — "
-          f"quote the held-out number); pin the pair in inference.yaml duration_decode", flush=True)
+          f"boundary_logit_weight={selected['boundary_logit_weight']} (in-selection F1@0.5 "
+          f"{selected['foldA_f1@0.5']}/{selected['foldB_f1@0.5']}; HELD-OUT estimate {heldout_f1} — "
+          f"quote the held-out number); pin the triple in inference.yaml {block}.{args.language}", flush=True)
     payload_out = dict(payload); payload_out["output"] = str(output)
     payload_out.pop("grid")  # grid lives in the JSON; keep stdout short
     return payload_out
+
+
+def _assert_predictions_match_pinned_decode(args: argparse.Namespace) -> None:
+    """Refuse spans decoded with a triple that is no longer pinned.
+
+    Analysis A sets stage-2's window-error distribution, so re-tuning the upstream segmenter silently invalidates
+    it — and S1, which trains on that distribution. The predictions file stamps the triple it used; compare.
+    """
+    stamped = json.loads(Path(args.predictions).read_text(encoding="utf-8"))
+    if not isinstance(stamped, dict) or "provenance" not in stamped: return  # unstamped legacy file
+    prov = stamped["provenance"]
+    arch = str(prov.get("segmenter_arch") or DEPLOYED_SEGMENTER_ARCH)
+    used = prov.get("decode_hparams") if prov.get("decode") == "duration" else None
+    pinned = duration_decode_params(load_yaml(args.inference_config), args.language, arch=arch)
+    if used == pinned: return
+    raise SystemExit(
+        f"{args.predictions} was decoded with {used}, but {decode_config_key(arch)}.{args.language} now pins "
+        f"{pinned}. Analysis A calibrates stage-2 training, so it must reflect the decode you report — re-run "
+        f"`analyze.py --stage segmenter-infer --segmenter-arch {arch} --segmenter-decode duration`, then retrain S1."
+    )
 
 
 def analysis_a(args: argparse.Namespace) -> dict:
@@ -322,6 +361,7 @@ def analysis_a(args: argparse.Namespace) -> dict:
     cfg = load_yaml(args.data_config)
     records, _ = load_language_records(cfg, args.language, split=args.split)
     predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
+    _assert_predictions_match_pinned_decode(args)
     gold_segments = {record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences] for record in records}
     durations = {record.video_id: float(record.pose.duration_s) for record in records}
     analysis = analyze_segmenter_errors(
@@ -684,9 +724,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--write-config", action="store_true",
-                        help="Persist measured constants: tail-benefit -> buffer_cap_s; delta-enc -> delta_enc_frames + "
-                             "min_span_frames (both configs); tune-decode -> duration_decode.<language>")
+    parser.add_argument(
+        "--write-config", action="store_true",
+        help="Persist measured constants: tail-benefit -> buffer_cap_s; delta-enc -> delta_enc_frames + "
+        "min_span_frames (both configs); tune-decode -> duration_decode_<arch>.<language>"
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")
     return parser

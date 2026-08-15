@@ -16,7 +16,7 @@ from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
 from train import distributed as dist
-from train.losses import bio_class_weight_tensor, bio_nll_dice_loss
+from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml
@@ -40,6 +40,7 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
         seed=int(cfg.get("seed", 42)), trusted_gap_s=None if trusted_gap is None else float(trusted_gap),
     )
     train_records, _ = load_language_records(data_cfg, language, split="train")
+    resolve_bio_class_weights(cfg, train_records)
     dev_records, _ = load_language_records(data_cfg, language, split="dev")
     dev_steps = sum(len(r.sentences) for r in dev_records)
     train_ds = SegmenterChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, **common)

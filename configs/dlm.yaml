@@ -6,9 +6,10 @@ language_model:
     name: google/mt5-base
 checkpoint:
     dir: checkpoints/dlm/${language} # best model.pt + best.json saved here
-    # S1 BIO-head init (train.py --stage train-bio): pre-trained on frozen Uni-Sign features with the same
-    # window sampler. With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent
-    # head from step one (docs/membership_gate.md §1.4). Missing file → warning + fresh head (keep warmup > 0).
+    # S1 BIO-head init (train.py --stage train-bio): pre-trained on frozen Uni-Sign features with same window sampler. 
+    # With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent head from step one 
+    # (docs/membership_gate.md §1.4). Missing file with the gate ENABLED → hard FileNotFoundError (train/slt.py); 
+    # warning + fresh head only with the gate off, or set bio_head_init: null AND membership_gate.warmup_epochs >= 2.
     bio_head_init: checkpoints/bio_s1/${language}/model.pt
     # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint. Resolved PER LANGUAGE from
     # data.yaml `languages[lang].pretrained_slt` (CSL→Chinese mT5, OpenASL→English mT5; utils.resolve_pretrained),
@@ -42,8 +43,8 @@ oput:
     # at temperature 0). false = argmax (faithful default); true = sampled-rollout ablation.
     sample_rollout: false
     # DMax computes the rollout under model.eval() + no_grad (train_llada2_bd_oput.py) so corruption is drawn dropout-free —
-    # the distribution inference sees. true = faithful (1 extra no-grad decoder forward on Mode 1/3 batches); false = reuse the
-    # dropout-noised L_mask logits (cheaper approximation).
+    # the distribution inference sees. true = faithful (1 extra no-grad decoder forward PLUS 1 full LM-encoder forward
+    # per mode group on Mode 1/3 batches); false = reuse the dropout-noised L_mask logits (cheaper approximation).
     rollout_eval_mode: true
     # Supervise the first K canvas slots after [.., eos, lang] with EOS targets. Without this the post-sentence canvas is never
     # trained and decodes to confident garbage before EOS commits (hallucinated tails; corrupted commit-gate confidence).
@@ -79,8 +80,9 @@ confidence_bound:
     # The membership gate rides the cache too: Ω biases cross-attention SCORES (cached K/V are Ω-independent), so
     # the gated cached decode is numerically identical to the gated no-cache decode (CrossAttnOmegaInjector on the
     # native forward — the same KV-cache-safe mechanism the AR arm uses; test_block_diffusion asserts equality).
-    # decode_steps bounds only the settle phase (commit always runs to completion). Set cache_type: none + window_type:
-    # sliding to make CB decode exactly like inference at the cost of speed.
+    # decode_steps bounds only the FINAL settle pass; the per-block settles (bounded by block_size) dominate the
+    # settle cost, so lowering this trims little — `revision: false` is the knob that removes the settle phase.
+    # Set cache_type: none + window_type: sliding to make CB decode exactly like inference at the cost of speed.
     decode_steps: 16
     cache_type: prefix
     window_type: static
@@ -95,17 +97,18 @@ membership_gate:
     enabled: true
     # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
     # MUST match inference.yaml boundary_stability.delta_enc_frames.
-    delta: 22
+    delta: 20
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    min_span_frames: 23  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (CSL @30fps).
+    min_span_frames: 21  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
     # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
     # Log gate_veto_rate — it should start near 0 and decay.
     iou_veto: 0.5
     gt_anchored: false # always-GT ablation row (§3). Leave false for the on-policy method.
     # Gate warmup — hold the gate off for the first `warmup_epochs` so it never couples to an untrained head
     # (garbage conditioning, §1.2). Canonical flow: run `train.py --stage train-bio` FIRST → checkpoint.bio_head_init
-    # loads a sharp head → set warmup_epochs: 0 (the coupling trains from step one, §1.4). Default 2 is the
-    # safe value that also works if S1 was skipped (bio_head_init missing → fresh head → it needs the warmup).
+    # loads a sharp head → set warmup_epochs: 0 (the coupling trains from step one, §1.4). There is no safe
+    # default: the code default is 0, and train-slt REFUSES gate+warmup 0 without a bio_head_init — training
+    # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
 mode_ratios:
     # MEASURED calibration (Analysis A): stage-2 trains under the window-error distribution the DEPLOYED segmenter
@@ -115,10 +118,11 @@ mode_ratios:
     #   python analyze.py --stage segmenter-infer --segmenter-arch moryossef --segmenter-decode duration --language <lang> --split dev
     #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_moryossef_<lang>_dev.json --language <lang>
     # Measure on DEV, not train: both segmenters were fit on train, so train-split errors are optimistically biased.
-    # asf (moryossef+duration, 2026-07): mode1 0.034 / mode2 0.473 / mode3 0.409 / mode4 0.085 — clean complete
-    # anchors are RARE at deployment; the designed fallback below now only covers missing/degenerate measurements
-    # (the mode1>=0.9 guard still auto-falls-back on too-clean corpora, e.g. pre-trimmed CSL). NB a_mode_ratios_csl
-    # in outputs/ predates the duration decode — regenerate before training csl with a measured mix.
+    # asf (moryossef+duration): mode1 0.032 / mode2 0.467 / mode3 0.414 / mode4 0.088 — clean complete anchors are
+    # RARE at deployment; the designed fallback below only covers an explicitly-null source or degenerate
+    # measurements — a configured-but-MISSING source file raises (run analysis-a first; train/sampler.py) — (the
+    # mode1>=0.9 guard still auto-falls-back on too-clean corpora, e.g. pre-trimmed CSL). Values track the artifact
+    # on the `source:` line — re-read it rather than this comment after regenerating Analysis A.
     source: outputs/a_mode_ratios_${language}.json
     degenerate_mode1_threshold: 0.9
     fallback:
@@ -145,17 +149,14 @@ augmentation:
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-# BIO loss = Dice(1.5) + PLAIN cross-entropy (Moryossef recipe). Hard Rule: Dice carries the imbalance; no
-# class-weighted NLL. bio_class_weights stays null.
-#   REAL-DATA FINDING (docs/implementation_notes.md): on YouTube-SL-25 (asf/bfi) back-to-back sentence boundaries
-#   (~57% of Auslan boundaries; 47% of adjacent caption cues chain at gap=0.000s) are NOT recoverable from the pose
-#   stream — the frame `B` collapses to all-`I` under every per-frame loss (plain/focal/macro-Dice/class-weights)
-#   AND under a separate soft-boundary-regression head, whether the encoder is frozen or unfrozen, all plateauing at
-#   val_phrase_tiou_f1 ≈ 0.55. This is a DATA limit (kinematically invisible boundaries + sub-second caption noise),
-#   not a loss/head/encoder deficiency; boundary placement for these is left to the integrated streaming model
-#   (DLM terminator + commit gate + membership gate), which decides splits with LINGUISTIC evidence the pose lacks.
-#   On clean gap-separated corpora (csl) `B` is not needed to split (the O gap does), so this recipe is fine there.
-bio_class_weights: null
+# BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries the O/I
+# imbalance but gives NO B-vs-I signal; with B at 0.8% of frames, unweighted CE collapsed the class outright
+# (measured: zero B predictions on dev, max P(B) 0.20, mean P(B) 0.015 AT gold boundaries) — the failure
+# train/losses.py predicts in its docstring. Inverse frequency is far too hot on B and over-segments; `balanced`
+# uses the inverse-sqrt compromise, MEASURED on the corpus being trained (train.losses.resolve_bio_class_weights)
+# instead of pinning one dataset's constants — B's share is set by that corpus's sentence rate, so no fixed
+# vector ports. The resolved 4-list is logged and saved with the run; an explicit {O,B,I} dict overrides it.
+bio_class_weights: balanced
 dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
 # In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
 # SLT training and S1 BOTH read these keys and MUST build the identical shape, or checkpoint.bio_head_init fails to
@@ -170,8 +171,9 @@ bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
     # Measured boundary-offset distribution (same Analysis-A run as mode_ratios.source; Laplace loc/scale fitted
-    # from matched-pair offsets — empirically the right family: the deployed decode's placement errors are heavily
-    # leptokurtic, excess kurtosis ~+3.9, Laplace beats Gaussian in held-out log-lik on both head and tail).
+    # from matched-pair offsets — empirically the right family: the deployed decode's placement errors are
+    # leptokurtic, and much more so at the head than the tail (asf: excess kurtosis +10.9 head, +1.3 tail).
+    # Laplace beats Gaussian in held-out log-lik on both.
     source: outputs/a_jitter_${language}.json
     fallback_laplace:
         head_loc_s: 0.0
@@ -191,8 +193,6 @@ num_workers:
 # signature (train_trans 1.02→0.36 in 3 epochs while val_trans rose): the model is pushed out of its basin at full LR.
 learning_rate: 5.0e-5
 weight_decay: 1.0e-4
-# T_max horizon must be the horizon you actually run: at epochs:100 the per-epoch cosine sat at ≥93% of peak LR
-# through epoch 17 (never annealed before early stopping could fire). ~20-30 matches Uni-Sign's stage-3 budget.
 epochs: 50
 eval_every_epochs: 1
 early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
@@ -202,11 +202,17 @@ early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `che
 scheduler:
     type: cosine
     eta_min: 1.0e-6
-    # Linear warmup (in epochs; fractional ok). All three A2D/OPUT references warm up when retraining a pretrained
-    # model (dllm 10% of steps, DMax 3%); 1/30 epochs ≈ 3%. Cosine now steps per-STEP over the epochs horizon.
     warmup_epochs: 0
 max_grad_norm: 1.0
+# Text canvas ceiling. Measured caption lengths: asf max 62, bfi max 96 tokens (mean ~15), so 128 truncates
+# nothing and 96 is the lossless floor. The canvas width drives EVERY decoder forward, so most of the compute
+# under a fixed 128 is spent on padding — see pad_text_to_max_length.
 max_text_tokens: 128
+# false = size the text canvas to the batch (block-aligned, with the EOS-supervision tail preserved). Equivalent
+# supervision at ~1/3 the canvas width; tests/test_collator_dynamic_padding.py pins the equivalence. false is the
+# DEPLOYED setting; true restores the fixed 128-wide canvas for an equivalence check (cb_active_count / cb_loss
+# should match over the first epoch).
+pad_text_to_max_length: false
 validation:
     max_translation_samples: 0 # 0 = score translation on ALL dev windows
     # No separate validation diffusion_steps: dev decoding uses the single top-level `diffusion_steps`

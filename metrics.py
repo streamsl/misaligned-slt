@@ -69,12 +69,19 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
     recall = tp / gold_pos.sum().clamp(min=1)
     f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
     acc = ((pred == labels) & valid).sum().float() / valid.sum().clamp(min=1)
+    # Predicted-B rate: B is <1% of frames, so an unweighted loss can drive the class to never fire while
+    # precision/recall/accuracy all stay high (they score signing-vs-not, which B and I share). That collapse
+    # shipped undetected once. Gold rate alongside it, so a near-zero value is readable without another run.
+    pred_b = (valid & (pred == BIO["B"])).sum().float() / valid.sum().clamp(min=1)
+    gold_b = (valid & (labels == BIO["B"])).sum().float() / valid.sum().clamp(min=1)
     return {
         f"{prefix}_precision": float(precision.detach().cpu().item()),
         f"{prefix}_recall": float(recall.detach().cpu().item()),
         f"{prefix}_f1": float(f1.detach().cpu().item()),
         f"{prefix}_frame_acc": float(acc.detach().cpu().item()),
         f"{prefix}_valid_frames": float(valid.sum().detach().cpu().item()),
+        f"{prefix}_pred_b_rate": float(pred_b.detach().cpu().item()),
+        f"{prefix}_gold_b_rate": float(gold_b.detach().cpu().item()),
     }
 
 

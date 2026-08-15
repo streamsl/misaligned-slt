@@ -1,18 +1,18 @@
 stride_s: 1.0
-# Semi-Markov duration decode (infer/duration_decode.py). ONE switch for every consumer: the streaming FSM's tag
-# stream, the membership gate's anchor selection (training + inference — build_gate_omega), and segmenter-eval/-infer.
-# PER-LANGUAGE, because split_bias is a Lagrange multiplier pinned to each corpus's duration-prior normalisation
-# scale (F1(split_bias) is a knife edge) — a global value would be wrong on the next corpus. `default` covers
-# untuned languages; leave it OFF until `analyze.py --stage tune-decode --language <lang>` pins that corpus's pair,
-# then add a `<lang>: {split_bias, snap_radius_s}` row. (Accepts false/true/{params} for single-corpus configs too.)
-duration_decode:
-    default: false                                 # untuned corpora (incl. csl): decode OFF until tune-decode is run
-    asf: {split_bias: 4.0, snap_radius_s: 1.5}     # tune_decode_moryossef_asf_dev.json
-# STALE: analyze.py --stage tail-benefit --write-config now writes p99_sentence_duration + stride_s + δ/fps
-# (a capacity bound: the buffer must hold a whole sentence plus the stride that detects its end plus the overlap
-# the commit leaves behind). On asf dev that is 18.19; the 16.27 below predates the stride+δ terms. Re-run
-# delta-enc FIRST (the formula reads delta_enc_frames), then tail-benefit. Raw terms: outputs/tail_benefit_*.json.
-buffer_cap_s: 16.27
+# Semi-Markov duration decode (infer/duration_decode.py). ONE BLOCK PER SEGMENTER, named for its
+# `--segmenter-arch` value, so the block a run reads is derivable from its command line:
+#   duration_decode_s1        -> the in-system BIO head. THE DEPLOYED ONE: streaming FSM, membership gate
+#                                (training + inference), RQ1/RQ2, delta-enc, and S1's own segmenter-eval.
+#   duration_decode_moryossef -> the external baseline segmenter. Analysis A/B, its segmenter-eval, the RQ2
+#                                cascade's upstream segmenter. Nothing deployed reads it.
+duration_decode_s1:
+    default: false
+    asf: {split_bias: 4.75, snap_radius_s: 0.0, boundary_logit_weight: 0.25} # outputs/diagnosis/tune_decode_s1_asf_dev.json
+    # Valid at the checkpoint's pinned rope_eval_chunk_s — re-tune if S1 is retrained.
+duration_decode_moryossef:
+    default: false
+    asf: {split_bias: 4.5, snap_radius_s: 0.5, boundary_logit_weight: 0.25} # outputs/diagnosis/tune_decode_moryossef_asf_dev.json
+buffer_cap_s: 17.94
 boundary_stability:
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
@@ -23,7 +23,7 @@ boundary_stability:
     #      the next sentence's B in the buffer (the ≤2δ leftover tail is never selected: buffer-start I does
     #      not open a span, and a mislabelled-B leftover is filtered by span_selection.min_span_frames);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
-    delta_enc_frames: 22
+    delta_enc_frames: 20
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3)
 span_selection:
     # Λ_min: shortest selectable span, in encoder frames — a pure DURATION NOISE FLOOR (spans shorter than the
@@ -32,7 +32,7 @@ span_selection:
     # It is NOT the re-emission guard: that is the commit-frontier filter select_target_span(skip_term_before=χ),
     # which uses the commit log instead of a worst-case length bound. The older "Λ_min > 2δ" coupling is
     # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
-    min_span_frames: 23
+    min_span_frames: 21
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
 # undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.

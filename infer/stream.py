@@ -41,7 +41,7 @@ class StreamingSLTRunner:
     """
     def __init__(
         self, model, stride_s: float = 1.0, buffer_cap_s: float = 18.0, delta_enc_frames: int = 3, hysteresis_strides: int = 3,
-        token_confidence_tau: float = 0.75, max_text_tokens: int = 128, diffusion_steps: int = 64, tau_dec: float = 0.75,
+        token_confidence_tau: float = 0.3, max_text_tokens: int = 128, diffusion_steps: int = 64, tau_dec: float = 0.75,
         spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
@@ -56,7 +56,9 @@ class StreamingSLTRunner:
 
         # forced_tail_policy — continuation of a sentence cut by a FORCED (cap) commit:
         #   "skip" (default): never selected; Mode-2b gives no supervision on that left-truncated conditioning, so the
-        #     decode is undefined behaviour.
+        #     decode is undefined behaviour. (Supervision covers the states the FSM decodes with one known exception:
+        #     anchors longer than buffer_cap_s train without a CB view — a full-evidence self-target would itself be
+        #     truncated — yet the cap-forced commit decodes exactly that state, flagged PARTIAL. ~0.7% of asf steps.)
         #   "translate_partial": decode it flagged PARTIAL at its terminator — best-effort OOD recovery. Ablation.
         if forced_tail_policy not in {"skip", "translate_partial"}: 
             raise ValueError(f"Unknown forced_tail_policy: {forced_tail_policy}")
@@ -128,13 +130,17 @@ class StreamingSLTRunner:
 
     def _decode_span(self, bio_tap: torch.Tensor, mask: torch.Tensor, span_slice: slice, omega_bias: torch.Tensor | None = None):
         if self.decode_conditioning == "span": bio_tap, mask = bio_tap[:, span_slice], mask[:, span_slice]
-        return self.model.generate_from_bio_tap(
+        tokens, confidence = self.model.generate_from_bio_tap(
             bio_tap, mask, max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,
             dcd_decode_algo=self.dcd_decode_algo, dcd_decode_param=self.dcd_decode_param, dcd_sample_top_k=self.dcd_sample_top_k,
             dcd_top_p=self.dcd_top_p, dcd_cache_type=self.dcd_cache_type, omega_bias=omega_bias,
         )
+        # DLM strips its synthetic BOS internally; the AR arm returns it raw (the training replay needs the start slot) — 
+        # drop it here so the commit gate's confidence mean covers only produced tokens, like the DLM arm.
+        if getattr(self.model, "decoder_type", "dlm") == "ar": tokens, confidence = tokens[:, 1:], confidence[:, 1:]
+        return tokens, confidence
 
     def _stride_omega(self, bio_logits: torch.Tensor, mask: torch.Tensor, ts_b: torch.Tensor, start_s: float):
         # None when the gate is off or the model has no gate builder (test fakes / AR-only models).
@@ -146,6 +152,9 @@ class StreamingSLTRunner:
             # ONE seam rule with the FSM: the gate's χ-onset restoration fires only on a certified-terminator last commit,
             # else Ω anchors on a mid-sentence fragment the FSM's skip policy never decodes.
             seam_is_terminator=self._committed_is_terminator,
+            # Same rule for the other mint: step() treats a leading I on the FIRST buffer as a real onset, so the gate
+            # must too — otherwise it anchors Ω on "no span" and floors the frames the FSM is about to decode.
+            stream_start=(start_s <= 0.0 and self._committed_until_s <= 0.0),
         )
         return omega_bias
 
@@ -168,7 +177,7 @@ class StreamingSLTRunner:
         mask_b = torch.ones(poses_b.shape[:2], dtype=torch.bool, device=poses.device)
 
         bio_tap, mask, ts = self.model.front_end.extract_bio_tap(poses_b, mask_b, ts_b)
-        bio_logits = self.model.bio_head(bio_tap, timestamps_s=ts).logits
+        bio_logits = self.model.bio_head(bio_tap, timestamps_s=ts, frame_mask=mask).logits
         bio_tags = bio_logits.argmax(dim=-1)[0]
         # UNK closes like O (shared decode rule, close_on_unk=True). UNK is supervision-free (ignore_index) so argmax-UNK is
         # rare, but one UNK frame in a gap would leave a span terminator-less (commit deferred to the cap → spurious PARTIAL)

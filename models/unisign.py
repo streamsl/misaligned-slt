@@ -91,7 +91,7 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
 
     def _decode(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask=None, 
-        position_ids=None, inputs_embeds=None, omega_bias=None
+        position_ids=None, inputs_embeds=None, omega_bias=None, logits_len=None,
     ):
         batch_size, tgt_len = decoder_input_ids.shape
         device = decoder_input_ids.device
@@ -123,6 +123,7 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
                 hidden, attention_mask=self_mask, encoder_hidden_states=enc_hidden, encoder_attention_mask=cross_mask
             )[0]
         if getattr(self.mbart_decoder, "layer_norm", None) is not None: hidden = self.mbart_decoder.layer_norm(hidden)
+        if logits_len is not None: hidden = hidden[:, :logits_len]
         return self.lm_head(hidden)
 
 
@@ -195,7 +196,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         m = enc_mask[:, None, None, :].to(dtype)
         return (1.0 - m) * torch.finfo(dtype).min
 
-    def _run_layers(self, hidden, enc_hidden, self_pos_bias, cross_pos_bias):
+    def _run_layers(self, hidden, enc_hidden, self_pos_bias, cross_pos_bias, logits_len=None):
         # Manual T5Block loop: T5Block.forward eagerly needs cache_position. Sub-layers do their own RMSNorm+residual.
         for block in self.decoder.block:
             hidden = block.layer[0](hidden, attention_mask=None, position_bias=self_pos_bias)[0]
@@ -203,11 +204,13 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
             hidden = block.layer[2](hidden)
         hidden = self.decoder.final_layer_norm(hidden)
         hidden = self.decoder.dropout(hidden)
+        # Slice AFTER dropout: the draw covers the full canvas either way, so the kept half is bit-identical.
+        if logits_len is not None: hidden = hidden[:, :logits_len]
         return self.lm_head(hidden * self.lm_head_scale)  # T5 tie-flag scaling (see __init__)
 
     def _decode(
-        self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask=None, 
-        position_ids=None, inputs_embeds=None, omega_bias=None
+        self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask=None,
+        position_ids=None, inputs_embeds=None, omega_bias=None, logits_len=None,
     ):
         batch_size, tgt_len = decoder_input_ids.shape
         dtype = enc_hidden.dtype
@@ -219,7 +222,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         # Membership gate: ADD Ω(t) to the cross-attention key bias (query-independent → every layer and head,
         # every decoder query). Ω already carries the prompt-offset zeros, so it aligns to enc_hidden columns.
         if omega_bias is not None: cross_pos_bias = cross_pos_bias + omega_bias.to(dtype=dtype, device=device)
-        return self._run_layers(hidden, enc_hidden, self_pos_bias, cross_pos_bias)
+        return self._run_layers(hidden, enc_hidden, self_pos_bias, cross_pos_bias, logits_len)
 
     def _decode_with_decoder_forward(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
@@ -305,7 +308,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
         enc_out = self._run_lm_encoder(inputs_embeds, attention_mask)
         return enc_out.last_hidden_state, attention_mask
 
-    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None):
+    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
         # Uni-Sign uses an external label-smoothed CE (models.py:300), not the model's internal loss. `omega_bias`
         # gates cross-attn via HF hooks (CrossAttnOmegaInjector), so the AR de-risk arm trains under the same Ω as
         # the DLM arm and translation loss backprops into the BIO logits through Ω.
@@ -314,10 +317,15 @@ class UniSignFrontEndBase(SLTFrontEnd):
                 encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
                 attention_mask=enc_mask, labels=labels, return_dict=True,
             )
-        return F.cross_entropy(
+        flat = F.cross_entropy(
             out.logits.reshape(-1, out.logits.shape[-1]), labels.reshape(-1).to(out.logits.device),
-            ignore_index=-100, label_smoothing=float(label_smoothing),
-        )
+            ignore_index=-100, label_smoothing=float(label_smoothing), reduction="none",
+        ).reshape_as(labels)
+        keep = (labels != -100).to(dtype=flat.dtype)
+        loss = (flat * keep).sum() / keep.sum().clamp(min=1)  # == the old flat-CE mean over non-ignored tokens
+        if not row_stats: return loss
+        # Detached per-row (summed loss, valid count) so one merged call can report a per-mode breakdown.
+        return loss, (flat * keep).detach().sum(dim=1), keep.detach().sum(dim=1)
 
     def freeze_pose_backbone(self, freeze_projection: bool = False) -> int:
         #Freeze the ST-GCN pose backbone; returns the parameter count frozen. `freeze_projection=False` (default)

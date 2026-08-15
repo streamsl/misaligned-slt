@@ -1,18 +1,17 @@
-"""Semi-Markov (HSMM) duration decode — this system's contribution, not part of the Moryossef protocol.
+"""Semi-Markov segment decode — this system's contribution, not part of the Moryossef protocol.
 
 Argmax BIO under-segments caption-supervised corpora: adjacent captions are back-to-back (no `O` gap), argmax
-never wins `B` there, and a merged run of k captions matches at most one under 1-to-1 tIoU. Fix at inference,
-not learning — runs are reliable, only sentence LENGTH is missing; a lognormal duration prior supplies it
+rarely wins `B` there, and a merged run of k captions matches at most one under 1-to-1 tIoU. Fixed at decode
+time — runs are reliable, only the split POSITIONS and COUNT are missing; the duration prior supplies the
+length model and `boundary_logit_weight` lets the head's own boundary evidence set the count
 (`duration_split_tags`), no model change.
 
-Must be semi-Markov: a linear-chain CRF/HMM implies a GEOMETRIC duration law (memoryless, monotone-decreasing)
-whose Viterbi never splits under flat `B` evidence; an interior-mode law needs segment LENGTHS as hypotheses —
-the O(T·L_max) DP below.
-
-Consumers, all keyed on the one `inference.yaml duration_decode` switch (`duration_decode_params`): whole-video
-eval + Analysis A/B (`moryossef26.infer`); `infer.stream.step` and the gate's anchor selection
-(`build_gate_omega`) with streaming flags — this keeps the gate on-policy; `analyze --stage delta-enc`, which
-must use the deployed decode or it reports argmax instability.
+One tuned block PER SEGMENTER in inference.yaml (`duration_decode_<arch>`, resolved by `duration_decode_params`):
+two heads have differently calibrated posteriors, so one shared triple would decode the baseline with our head's
+tuning. `duration_decode_s1` is the DEPLOYED one and drives `infer.stream.step`, the gate's anchor selection
+(`build_gate_omega`, keeping the gate on-policy), whole-video eval, and `analyze --stage delta-enc` — which must
+use the deployed decode or it reports argmax instability. `duration_decode_moryossef` drives Analysis A/B and the
+baseline's own segmenter-eval.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -29,9 +28,16 @@ from metrics import _bio_runs
 # oversplits, so it can't be auto-derived. F1(bias) is a sharp peak pinned to the corpus's duration prior:
 # re-tune per corpus with `analyze --stage tune-decode` and pin the pair in inference.yaml.
 DURATION_SPLIT_BIAS = 4.0
-# Snap radius for a split -> the model's P(B) peak: duration decides HOW MANY, P(B) only WHERE. Weak evidence
-# perturbs positions, never counts (folding P(B) into the DP objective tunes to zero weight).
+# Snap radius for a split -> the model's P(B) peak. With a collapsed B head (the pre-class-weighting state) the
+# emission weight below tunes to zero and snap is P(B)'s only entry point; with a live head the emission term
+# subsumes it (tune-decode selects snap 0.0) — kept for the w=0 operating point.
 SNAP_RADIUS_S = 1.0
+# Weight on the boundary-emission term: the DP split reward becomes split_bias + w*logit(P(B)) at the candidate
+# frame — a log-linear interpolation of the duration model and the head's boundary posterior (the ASR
+# acoustic/LM-weight pattern). w=0 recovers the duration-only DP; w=1 is the fully Bayesian combination, which
+# over-trusts an imperfectly calibrated head — tune per corpus and per segmenter.
+BOUNDARY_LOGIT_WEIGHT = 0.0
+DEPLOYED_SEGMENTER_ARCH = "s1"  # the in-system BIO head: what the FSM, the membership gate and RQ1/RQ2 run on
 
 
 @dataclass(frozen=True)
@@ -43,25 +49,49 @@ class DurationPrior:
     cap_s: float
     split_bias: float = DURATION_SPLIT_BIAS
     snap_radius_s: float = SNAP_RADIUS_S
+    boundary_logit_weight: float = BOUNDARY_LOGIT_WEIGHT
 
 
 def _coerce_decode_entry(v) -> dict | None:
-    # one entry -> None (off) | {} (module defaults) | {split_bias?, snap_radius_s?} (tuned).
-    if isinstance(v, dict): return {k: float(v[k]) for k in ("split_bias", "snap_radius_s") if v.get(k) is not None}
+    # one entry -> None (off) | {} (module defaults) | {split_bias?, snap_radius_s?, boundary_logit_weight?} (tuned).
+    if isinstance(v, dict):
+        return {k: float(v[k]) for k in ("split_bias", "snap_radius_s", "boundary_logit_weight") if v.get(k) is not None}
     return {} if bool(v) else None
 
 
-def duration_decode_params(inference_cfg: dict, language: str | None = None) -> dict | None:
-    """Resolve `duration_decode` for a language -> None (off) | {} (on, defaults) | {split_bias, snap_radius_s}.
+def decode_config_key(arch: str | None = None) -> str:
+    """Config block holding the tuned decode for a segmenter: `duration_decode_<arch>`.
+
+    The suffix is the `--segmenter-arch` value verbatim, so the block a run reads is derivable from its command
+    line. Each segmenter needs its OWN triple: the decode is fit to that head's posterior calibration, so
+    decoding the baseline with the triple tuned for ours would tune the baseline on our method's behalf — the
+    unfair-baseline objection. Defaults to the deployed head.
+    """
+    return f"duration_decode_{arch or DEPLOYED_SEGMENTER_ARCH}"
+
+
+def duration_decode_params(inference_cfg: dict, language: str | None = None, arch: str | None = None) -> dict | None:
+    """Resolve a segmenter's tuned decode for a language -> None (off) | {} (on, defaults) | {tuned triple}.
+
+    Reads `duration_decode_<arch>` (default arch: the deployed head). Falls back to a bare `duration_decode` block
+    when the arch-specific one is absent, so a single-segmenter or not-yet-tuned corpus still runs.
+    """
+    cfg = inference_cfg or {}
+    key = decode_config_key(arch)
+    return _duration_decode_entry(cfg, key if key in cfg else "duration_decode", language)
+
+
+def _duration_decode_entry(inference_cfg: dict, key: str, language: str | None = None) -> dict | None:
+    """Resolve one decode block for a language.
 
     split_bias is corpus-specific, so one global value is wrong. Shapes:
       false / true                             -> off / on-with-defaults
-      {split_bias: .., snap_radius_s: ..}      -> one tuned pair
+      {split_bias: .., snap_radius_s: .., boundary_logit_weight: ..} -> one tuned triple (any subset allowed)
       {default: <entry>, <lang>: <entry>, ...} -> per-language (any other key); untuned languages fall to
-                                                  `default` — keep it false until tune-decode pins a pair.
+                                                  `default` — keep it false until tune-decode pins a triple.
     """
-    v = (inference_cfg or {}).get("duration_decode", False)
-    if isinstance(v, dict) and not ({"split_bias", "snap_radius_s"} & set(v)):
+    v = (inference_cfg or {}).get(key, False)
+    if isinstance(v, dict) and not ({"split_bias", "snap_radius_s", "boundary_logit_weight"} & set(v)):
         entry = v.get(str(language), v.get("default", False)) if language is not None else v.get("default", False)
         return _coerce_decode_entry(entry)
     return _coerce_decode_entry(v)
@@ -69,6 +99,7 @@ def duration_decode_params(inference_cfg: dict, language: str | None = None) -> 
 
 def fit_duration_prior(
     records: list[VideoRecord], split_bias: float | None = None, snap_radius_s: float | None = None,
+    boundary_logit_weight: float | None = None,
 ) -> DurationPrior | None:
     # Fit the lognormal on a TRAIN split's caption durations (filter mirrors data.yaml bounds). `split_bias` /
     # `snap_radius_s`: per-language overrides from `duration_decode_params`; None -> module defaults.
@@ -79,12 +110,13 @@ def fit_duration_prior(
         float(logd.mean()), float(max(logd.std(), 1e-3)), float(min(np.quantile(durs, 0.999), 45.0)),
         split_bias=DURATION_SPLIT_BIAS if split_bias is None else float(split_bias),
         snap_radius_s=SNAP_RADIUS_S if snap_radius_s is None else float(snap_radius_s),
+        boundary_logit_weight=BOUNDARY_LOGIT_WEIGHT if boundary_logit_weight is None else float(boundary_logit_weight),
     )
 
 
 def duration_split_tags(
     tags: np.ndarray, boundary_prob: np.ndarray, fps: float, prior: DurationPrior,
-    split_bias: float | None = None, snap_radius_s: float | None = None,
+    split_bias: float | None = None, snap_radius_s: float | None = None, boundary_logit_weight: float | None = None,
     mark_onsets: bool = True, split_open_tail: bool | str = True,
 ) -> np.ndarray:
     """Re-decode argmax `tags`: keep the signing/non-signing runs, re-place interior boundaries by segmental
@@ -103,6 +135,14 @@ def duration_split_tags(
     fps = float(fps)
     split_bias = float(prior.split_bias if split_bias is None else split_bias)
     snap_radius_s = float(prior.snap_radius_s if snap_radius_s is None else snap_radius_s)
+    w_b = float(prior.boundary_logit_weight if boundary_logit_weight is None else boundary_logit_weight)
+    # Boundary emission per frame: w*logit(P(B)). The full semi-Markov emission over a partition is
+    # sum log P(B at splits) + sum log(1-P(B) elsewhere); the second sum is partition-independent, so it reduces
+    # to this per-split logit. Clipped: P(B)=0 exactly (padding) must disfavour, not poison, the argmax.
+    lb = None
+    if w_b != 0.0:
+        bp = np.clip(np.asarray(boundary_prob, dtype=float), 1e-6, 1.0 - 1e-6)
+        lb = w_b * (np.log(bp) - np.log1p(-bp))
     # Capping at len(tags) bounds the DP to O(T) even if a degenerate timestamp stream inflates fps.
     lmax = max(2, min(round(prior.cap_s * fps), len(tags)))
     # Density over integer FRAME lengths: seconds-lognormal at L/fps plus the -log(fps) Jacobian, for a correct
@@ -121,6 +161,11 @@ def duration_split_tags(
         LS = np.concatenate([[0.0], np.log(np.maximum(surv, 1e-300))])  # LS[L_frames]; LS[0] unused
 
     out = np.array(tags, copy=True)
+    # Drop the head's HARD B decisions and re-derive every interior split below. Only the argmax is discarded,
+    # not the evidence: P(B) re-enters as the DP's emission term. Deliberate — at B's frame prevalence the argmax
+    # is a poor estimator (it collapses outright under an unweighted loss) while the posterior still ranks
+    # boundaries usefully, so scoring the soft value beats trusting the hard one. Run boundaries (O/UNK) are the
+    # head's to keep; only splits WITHIN a signing run are re-decided.
     out[out == BIO["B"]] = BIO["I"]
     snap_r = max(0, round(snap_radius_s * fps))
     splits: list[int] = []
@@ -137,17 +182,23 @@ def duration_split_tags(
             continue
         D = np.full(L + 1, -1e18); D[0] = 0.0
         arg = np.zeros(L + 1, np.int32)
+        # Slices, not arange+fancy-index: same numbers, no per-j temporaries. This DP runs per row per step
+        # through the membership gate, so the constant factor is not free.
+        # Split reward at local frame i (global a+i): split_bias plus the head's boundary evidence when tuned
+        # (bias[0]=0: i=0 opens the run, it is not a split).
+        bias = np.full(L + 1, float(split_bias))
+        if lb is not None: bias[:L] += lb[a:a + L]
+        bias[0] = 0.0
         for j in range(1, L + 1):
             i0 = max(0, j - lmax)
-            rng = np.arange(i0, j)
-            cand = D[rng] + LP[j - rng] + (rng > 0) * split_bias
+            cand = D[i0:j] + LP[j - i0:0:-1] + bias[i0:j]
             k = int(np.argmax(cand)); D[j] = cand[k]; arg[j] = i0 + k
 
         if censored:
             # Censored segment start = best fully-segmented prefix + survival of the open tail. i*=0 (whole run
             # one open sentence) is reachable only while L <= lmax, so over-long runs must split.
             i_rng = np.arange(max(0, L - lmax), L)
-            cand = D[i_rng] + (i_rng > 0) * split_bias + LS[L - i_rng]
+            cand = D[i_rng] + bias[i_rng] + LS[L - i_rng]
             j = int(i_rng[int(np.argmax(cand))])
             tail_start = j  # backtrace covers the prefix [0, j); j itself is the censored segment's opening split
         else: j = L; tail_start = 0
@@ -183,8 +234,8 @@ def duration_decode_tags(logits: torch.Tensor, fps: float, prior: DurationPrior)
 
 
 def deployed_decode_tags(
-    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None, timestamps_s: torch.Tensor | None = None, 
-    commit_mask: torch.Tensor | None = None, seam_is_terminator: bool = True,
+    bio_logits: torch.Tensor, lengths: torch.Tensor, duration_prior=None, timestamps_s: torch.Tensor | None = None,
+    commit_mask: torch.Tensor | None = None, seam_is_terminator: bool = True, stream_start: bool = False,
 ) -> torch.Tensor:
     """THE deployed tag decode, shared with the FSM: argmax → UNK→O remap → duration re-split → χ-onset restoration.
     (B, T) long, no gradient.
@@ -218,6 +269,13 @@ def deployed_decode_tags(
         tags_np[b, :n] = duration_split_tags(
             tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
         )
+        # Stream-start onset, mirroring the FSM (stream.py step — same position, after the re-split and before the χ
+        # mint): on the FIRST buffer of a stream a leading I IS a real onset, else a mid-signing stream never opens a
+        # span. Without it the gate saw a headless I-run where the FSM sees a span, and anchored Ω on "no span",
+        # flooring the very frames the FSM was decoding. Flag, not a timestamp test: window timestamps are
+        # window-relative (train/sampler.py), so "starts at 0" is true of every training window. Training passes False —
+        # a sampled window simulates a buffer at an arbitrary stream position, and a left-truncated one is Mode 2b.
+        if stream_start and tags_np[b, 0] == BIO["I"]: tags_np[b, 0] = BIO["B"]
         if commit_mask is not None and seam_is_terminator:
             cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)
             # Guard matches the FSM's (stream.py step): `seam_is_terminator` is only ever True after a terminator

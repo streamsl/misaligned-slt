@@ -46,7 +46,11 @@ attn_dropout: 0.1
 #   FALLBACK: if THIS UNet-CNN actually collapses to all-I on dev (val_bio_recall=1.0, zero predicted segments),
 #   try {O:1, B:2, I:1} and compare val_phrase_tiou_f1 — an EXPLICIT ablation, not the default.
 dice_loss_weight: 1.5
-bio_class_weights: null
+# The FALLBACK above has FIRED: on YouTube-SL-25 this CNN never predicts B. The unweighted evidence cited above
+# was measured WITH the joint sign head, which this corpus cannot supply, so it does not transfer. `balanced`
+# (corpus-measured, same rule S1 uses) keeps the baseline matched to the method instead of comparing against a
+# collapsed head; `null` reproduces the faithful-but-collapsed variant.
+bio_class_weights: balanced
 
 # Whole-video chunk training (Moryossef-style; distinct from the SLT window sampler).
 num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked inference
@@ -59,7 +63,7 @@ augmentation:
     frame_dropout: 0.15 # Moryossef repo default: drop 0-15% middle frames during train.
     body_part_dropout: 0.1 # Moryossef repo default: zero each hand independently during train.
 
-learning_rate: 1.0e-3
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 epochs: 50
 eval_every_epochs: 1

@@ -13,7 +13,7 @@ from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 
 from train import distributed as dist
-from train.losses import bio_class_weight_tensor
+from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
 from utils import load_yaml, language_model_name, resolve_pretrained
@@ -31,11 +31,14 @@ def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> No
     mismatched geometry silently gives the decoder a different gate than the FSM runs."""
     gate = slt_cfg.get("membership_gate", {})
     if not gate.get("enabled", False): return
+    if "delta" not in gate or "min_span_frames" not in gate: 
+        raise ValueError(f"membership_gate is enabled but missing delta/min_span_frames: {sorted(gate)}")
+    delta_i = int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))
+    lam_i = inference_cfg.get("span_selection", {}).get("min_span_frames")
+    lam_i = delta_i + 1 if lam_i is None else int(lam_i)  # infer/stream.py's derivation
     pairs = [
-        ("membership_gate.delta", int(gate.get("delta", 3)),
-         "boundary_stability.delta_enc_frames", int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))),
-        ("membership_gate.min_span_frames", int(gate.get("min_span_frames", 0)),
-         "span_selection.min_span_frames", int(inference_cfg.get("span_selection", {}).get("min_span_frames", 0))),
+        ("membership_gate.delta", int(gate["delta"]), "boundary_stability.delta_enc_frames", delta_i),
+        ("membership_gate.min_span_frames", int(gate["min_span_frames"]), "span_selection.min_span_frames", lam_i),
     ]
     for s_key, s_val, i_key, i_val in pairs:
         if s_val != i_val: raise ValueError(
@@ -77,13 +80,20 @@ def build_slt_components(
 
     pose_augment_cfg = slt_cfg.get("augmentation")  # train-only spatial aug; dev passes None
     train_records, _ = load_language_records(data_cfg, language, split="train")
+    resolve_bio_class_weights(slt_cfg, train_records)
     train_dataset = StreamingWindowDataset(
         train_records, slt_cfg=slt_cfg, 
         inference_cfg=inference_cfg, pose_augment_cfg=pose_augment_cfg
     )
     collator = WindowCollator(
-        tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
-        visual_padding=str(slt_cfg.get("visual_padding", "none")),
+        tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)), visual_padding=str(slt_cfg.get("visual_padding", "none")),
+        # `pad_text_to_max_length: false` sizes the text canvas to the batch instead of max_text_tokens. Captions
+        # are ~15 tokens against a 128 canvas and every decoder forward runs the whole width, so this is the
+        # largest single throughput lever; the collator keeps the EOS-supervision tail and block alignment intact.
+        pad_to_max_length=bool(slt_cfg.get("pad_text_to_max_length", True)), block_size=int(slt_cfg.get("block_size", 8)),
+        # Default must MATCH the loss path's (block_size, see forward_loss kwargs below): the collator reserves the canvas tail 
+        # the EOS supervision writes into — a 0 default here with block_size there starves that tail under dynamic padding.
+        eos_supervision_tokens=int((slt_cfg.get("oput", {}) or {}).get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
     )
     # num_workers is pure throughput: anchors are index-driven (each realized once per epoch regardless of worker
     # split) and workers reseed their rng (data.loader.streaming_loader / WindowSampler.configure_worker).
@@ -131,7 +141,7 @@ def build_slt_components(
         )
         # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip the S1 init entirely, head
         # AND its pose encoder (the baseline must start from the RELEASED weights only), and freeze the head so
-        # the optimizer never sees it. compute_loss skips its forward, so the branch costs nothing.
+        # the optimizer never sees it. forward_loss skips its forward, so the branch costs nothing.
         for p in model.bio_head.parameters(): p.requires_grad_(False)
         # generate_from_poses skips the head's forward too: with the gate off nobody reads frozen-random logits.
         model.bio_branch_off = True
@@ -163,8 +173,13 @@ def build_slt_components(
                     "when S1 ran freeze_backbone: true") if pose_sd else "S1 checkpoint carries no pose encoder"
         print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); {enc_note}", flush=True)
     elif bio_init:
-        print(f"slt | WARNING: bio_head_init {bio_init} not found — BIO head starts FRESH; keep "
-              f"membership_gate.warmup_epochs > 0 (the gate must not couple to an untrained head)", flush=True)
+        # Fail loud, mirroring the mode_ratios.source guard: bio_head_init is cwd-relative, so a wrong-cwd launch
+        # (Colab default dir) would otherwise silently train the gate against a random-init head.
+        if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)): raise FileNotFoundError(
+            f"bio_head_init {bio_init} not found while membership_gate.enabled: true — the gate must not couple to an untrained head. "
+            f"Fix path/cwd, or set bio_head_init: null AND membership_gate.warmup_epochs >= 2 to train from a fresh head deliberately."
+        )
+        print(f"slt | WARNING: bio_head_init {bio_init} not found — BIO head starts FRESH", flush=True)
     if bool(slt_cfg.get("freeze_backbone", False)):
         n = model.front_end.freeze_pose_backbone(freeze_projection=bool(slt_cfg.get("freeze_projection", False)))
         print(f"slt | froze pose backbone ({n / 1e6:.2f}M parameters)", flush=True)
@@ -250,19 +265,18 @@ def evaluate_slt(
             cb_dcd_window_type=str(confidence_cfg.get("window_type", dcd_cfg.get("window_type", "sliding"))),
             cb_dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
             cb_dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
-            cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
-            cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
+            cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")), cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
             cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
-            cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
-            cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-            cb_spd_revision=bool(spd_cfg.get("revision", True)),
+            cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
+            cb_spd_revision=bool(confidence_cfg.get("revision", spd_cfg.get("revision", True))),
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
             **gate_loss_kwargs,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
-        if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0:
-            bio_tap, _, timestamps = model.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
-            bio_logits = model.bio_head(bio_tap, timestamps_s=timestamps).logits
+        if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0 and output.bio_logits is not None:
+            # Reuse forward_loss's own head forward (identical inputs, eval mode, no_grad) — a 2nd extract_bio_tap + bio_head pass here 
+            # was pure recompute. forward_loss already passes frame_mask, so padded frames never enter conv stem / RoPE as real frames.
+            bio_logits = output.bio_logits
             row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
             # Moryossef-style span metrics (frame + segment F1/IoU) under inference decode (runs split at interior
             # Bs), so dev tracks span quality — what RQ2 streaming needs — not just per-frame BIO accuracy.
@@ -284,7 +298,7 @@ def evaluate_slt(
                         timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
                         max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
                         diffusion_steps=int(validation_cfg.get("diffusion_steps", slt_cfg.get("diffusion_steps", 64))),
-                        tau_dec=float(dcd_cfg.get("tau_dec", confidence_cfg.get("tau_cb", 0.75))),
+                        tau_dec=float(dcd_cfg.get("tau_dec", 0.9)),  # same fallback as eval.py
                         spd_top_k=int(spd_cfg.get("top_k", 1)),
                         spd_renormalize=bool(spd_cfg.get("renormalize", True)),
                         spd_revision=bool(spd_cfg.get("revision", True)),
@@ -317,8 +331,8 @@ def evaluate_slt(
 
 
 def train_slt_epochs(
-    model: MisalignedSLTModel, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, epochs: int,
-    slt_cfg: dict, dev_loader: DataLoader | None = None,
+    model: MisalignedSLTModel, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, 
+    epochs: int, slt_cfg: dict, dev_loader: DataLoader | None = None, resume: bool = False,
 ) -> list[dict[str, float]]:
     confidence_cfg = slt_cfg.get("confidence_bound", {})
     dcd_cfg = slt_cfg.get("dcd", {})
@@ -334,6 +348,11 @@ def train_slt_epochs(
     cb_lambda = float(confidence_cfg.get("lambda", 0.3))
     gate_enabled_cfg = bool(gate_cfg.get("enabled", False))
     gate_warmup_epochs = int(gate_cfg.get("warmup_epochs", 0))
+    # There is no safe default: warmup 0 is only correct when a trained S1 head was loaded.
+    if gate_enabled_cfg and gate_warmup_epochs == 0 and not slt_cfg.get("checkpoint", {}).get("bio_head_init"): raise ValueError(
+        "membership_gate.enabled with warmup_epochs: 0 and no bio_head_init couples the gate to an untrained head "
+        "from epoch 1 — set warmup_epochs >= 2 or provide checkpoint.bio_head_init."
+    )
 
     def _gate_active(epoch: int) -> bool:
         return gate_enabled_cfg and epoch > gate_warmup_epochs
@@ -362,7 +381,7 @@ def train_slt_epochs(
             cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
             cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-            cb_spd_revision=bool(spd_cfg.get("revision", True)),
+            cb_spd_revision=bool(confidence_cfg.get("revision", spd_cfg.get("revision", True))),
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
             gate_enabled=_gate_active(epoch),
             # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml).
@@ -381,5 +400,5 @@ def train_slt_epochs(
     return run_epoch_loop(
         name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device,
         epochs=epochs, cfg=slt_cfg, step_fn=step_fn, evaluate_fn=evaluate_fn,
-        default_monitor="val_loss", default_mode="min", dev_loader=dev_loader,
+        default_monitor="val_loss", default_mode="min", dev_loader=dev_loader, resume=resume,
     )

@@ -54,4 +54,9 @@ freeze_backbone: true
 # whatever buffer_cap_s was set THEN; if we later overwrite inference.yaml for another corpus and eval
 # this head, train/deploy context diverge (whole-system, not just eval). Keep one head ↔ one buffer_cap_s
 # (per-dataset configs, or pin it here):
-# rope_eval_chunk_s: 18.0   # explicit override in SECONDS; unused by stage-1 training
+# PINNED, not defaulted — the hazard above already fired once. This head trained while buffer_cap_s was 16.27;
+# tail-benefit then raised the cap to 17.94 (it now adds stride + δ), and because the default tracks the LIVE cap
+# the head silently started chunking over 1.7s of context it never trained on. Measured cost: dev tIoU-F1@0.5 fold
+# B 0.5014 -> 0.4763 under the same tuned decode. The trained context is a property of the CHECKPOINT, so it must
+# not follow later re-measurements of a deployment quantity. Re-pin only when S1 is retrained under a new cap.
+rope_eval_chunk_s: 16.27

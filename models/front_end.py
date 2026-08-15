@@ -43,7 +43,7 @@ class SLTFrontEnd(nn.Module):
     def encode_memory(self, bio_tap, bio_mask):
         raise NotImplementedError
 
-    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None) -> torch.Tensor:
+    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
         raise NotImplementedError
 
     def make_dlm_decoder(self, block_size: int) -> OPUTBlockDiffusionDecoder:

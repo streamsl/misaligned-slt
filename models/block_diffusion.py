@@ -203,6 +203,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         self, decoder_input_ids: torch.Tensor, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
         self_attn_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None, omega_bias: torch.Tensor | None = None,
+        logits_len: int | None = None,
     ) -> torch.Tensor:
         '''Run the AR decoder backbone with a custom (block-causal / BD3LM) self-attention mask.
 
@@ -218,6 +219,9 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
                 (the SPD soft-embedding mixture). None -> the decoder embeds decoder_input_ids itself.
             omega_bias: optional (B, 1, 1, M) membership-gate bias ADDED to the cross-attention logits, every
                 layer and head (models.membership_gate; docs/membership_gate.md §2.9). None -> no gate.
+            logits_len: optional prefix length to project through the vocab head; the rest of the canvas runs the
+                backbone but skips the |V|-way matmul. Sliced after the final dropout, so the kept positions are
+                bit-identical. None -> project every position.
         '''
         raise NotImplementedError
 
@@ -278,11 +282,12 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         # BD3LM forward: [xt | x0] with the 3-component mask + SHARED positional embeddings; xt-half logits only.
         # omega_bias (over the M encoder frames) is query-independent, so the same (B,1,1,M) bias applies to all
         # 2L target queries — the [xt|x0] concatenation on the TARGET axis does not touch the cross-attn key axis.
-        logits = self._decode(
+        # logits_len=length: the x0 half conditions the xt half through self-attention but its own logits are
+        # never read, so the |V|-way head runs on the xt half only. Halves OPUT's largest matmul, bit-identical.
+        return self._decode(
             torch.cat([noisy_ids, clean_ids], dim=1), enc_hidden, enc_mask,
-            self_attn_mask=bd3lm_mask, position_ids=position_ids, omega_bias=omega_bias,
-        )  # (B, 2L, V+1)
-        return logits[:, :length]  # (B, L, V+1), take only first L logits (xt half)
+            self_attn_mask=bd3lm_mask, position_ids=position_ids, omega_bias=omega_bias, logits_len=length,
+        )  # (B, L, V+1) — xt half
 
 
     # ── BD3LM training forward (MDLM loglinear loss on the xt half) ────────────

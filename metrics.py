@@ -14,7 +14,7 @@ rule for BOTH prediction and gold (default `signing_runs_with_b_splits`; why the
 TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by
 eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
 
-TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT).
+TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/BLEURT).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -226,10 +226,13 @@ _CJK_PUNCT_TABLE = str.maketrans({
     '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
     '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
 })
-_TEXT_KEYS = ("bleu4", "bleurt", "rougeL", "meteor")  # per-pair-able; CIDEr (corpus-df) is corpus-mode only
+# One metric set for BOTH modes so RQ1 and RQ2 tables share columns. CIDEr is excluded: it needs a corpus
+# document frequency, so it has no per-pair form for the RQ2 fusion, and reporting it in one table only
+# would make the two incomparable.
+_TEXT_KEYS = ("bleu4", "bleurt", "rougeL", "meteor")
 
 
-def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizing metrics such as CIDEr.
+def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizing metrics.
     out: list[str] = []
     for ch in text:
         is_cjk = "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
@@ -297,7 +300,7 @@ def _sentence_text_scores(
     hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20",
 ) -> list[dict[str, float]]:
     """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. BLEU
-    here is smoothed sentence-BLEU (corpus BLEU/CIDEr pool across pairs and can't be split; CIDEr is corpus-only)."""
+    here is smoothed sentence-BLEU: corpus BLEU pools across pairs and cannot be split per pair."""
     if not hyps: return []
     pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs)
     bleu = [float(sentence_bleu(h, [r], tokenize=sacrebleu_tokenize).score) for h, r in zip(pred_proc, ref_proc)]
@@ -317,14 +320,14 @@ def compute_text_metrics(
 ) -> dict[str, float]:
     """Translation-quality metrics, in two modes.
 
-    localization_aware=False (default — RQ1, GT-span rows, analysis-b): CORPUS BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT
+    localization_aware=False (default — RQ1, GT-span rows, analysis-b): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT
     over the whole set. Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence
-    means; BLEU-4 and CIDEr pool across the set, so they are computed corpus-level.
+    means; BLEU-4 pools across the set, so it is computed corpus-level.
 
     localization_aware=True (RQ2 dense/streaming): SODA F1 (Fujita et al. 2020) over the MATCHED (pred, gold) pairs.
     Per-pair sentence scores are summed, then precision = Σ/n_pred, recall = Σ/n_gold, F1 = 2PR/(P+R) — charging
     spurious predictions AND missed gold, so a spammy or under-generating method cannot inflate the score by scoring
-    only the subset it localizes. Sentence-BLEU (corpus BLEU/CIDEr don't split per pair). Needs n_pred/n_gold;
+    only the subset it localizes. Sentence-BLEU (corpus BLEU does not split per pair). Needs n_pred/n_gold;
     `memo` caches per-pair scores across tIoU thresholds (BLEURT is a model forward).
     """
     if localization_aware:
@@ -350,8 +353,7 @@ def compute_text_metrics(
             out[f"{prefix}_{k}"] = 2 * p_ * r_ / (p_ + r_) if (p_ + r_) > 0 else 0.0
         return out
 
-    keys = (*_TEXT_KEYS, "cider")
-    if not predictions: return {f"{prefix}_{k}": 0.0 for k in keys}
+    if not predictions: return {f"{prefix}_{k}": 0.0 for k in _TEXT_KEYS}
     # BLEURT scores RAW text; the rest use the Uni-Sign preprocessing (paper-comparable) — the ref-only punctuation
     # map avoids depressing ROUGE-L, whose LCS would otherwise see a different sequence.
     pred_proc, ref_proc, _ = _uni_sign_preprocess(predictions, references)
@@ -362,6 +364,5 @@ def compute_text_metrics(
         "bleurt": float(sum(bleurt) / len(bleurt)) if bleurt else 0.0,
         "rougeL": _rouge_l(pred_proc, ref_proc),
         "meteor": _corpus_metric("meteor", pred_proc, ref_proc, key="meteor"),
-        # "cider": _corpus_metric("sunhill/cider", pred_proc, ref_nested, key="cider_score"),
     }
-    return {f"{prefix}_{k}": float(out[k]) for k in keys}
+    return {f"{prefix}_{k}": float(out[k]) for k in _TEXT_KEYS}

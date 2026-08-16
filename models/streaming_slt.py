@@ -17,20 +17,24 @@ from infer.duration_decode import deployed_decode_tags
 
 
 def gate_skip_flags(
-    bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0,
-    duration_prior=None, timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None,
+    bio_logits: torch.Tensor, frame_mask: torch.Tensor | None, min_span_frames: int = 0, 
+    duration_prior=None, timestamps_s: torch.Tensor | None = None, commit_mask: torch.Tensor | None = None, 
+    stream_start: bool = False, seam_is_terminator: bool = True,
 ) -> torch.Tensor:
     """Per-row 'the FSM would SKIP this window' flag (B,) from `deployed_decode_tags`.
 
-    True when the window has NO terminated and NO open span — the all-gap / headless-left-truncated states the FSM never
-    decodes (buffer-start I never opens; no-span Ω inert). Single-window eval (RQ1) force-decodes them and reports the
-    honest split: decoded-only quality + skip rate. Must use the decode build_gate_omega selects on — the re-split
-    changes span *existence*, not just count (interior B's make a headless all-I window selectable) → skip and the Ω
-    anchor can never disagree.
+    True when the window has NO terminated and NO open span — the all-gap / headless-left-truncated states the FSM never decodes 
+    (buffer-start I never opens; no-span Ω inert). Single-window eval (RQ1) force-decodes them and reports the honest split: decoded-only 
+    quality + skip rate. Must use the decode build_gate_omega selects on — the re-split changes span *existence*, not just count (interior 
+    B's make a headless all-I window selectable) → skip and the Ω anchor can never disagree.
     """
     B, T = bio_logits.shape[:2]
     lengths = frame_mask.long().sum(dim=1) if frame_mask is not None else torch.full((B,), T)
-    tags = deployed_decode_tags(bio_logits, lengths, duration_prior, timestamps_s, commit_mask)
+    # EVERY tag-affecting argument must reach this call: build_gate_omega takes them all, so any defaulted here lets the skip flag and the 
+    # Ω anchor disagree — the contradiction this docstring forbids, and the defect that made `stream_start` floor a third of RQ1's windows.
+    tags = deployed_decode_tags(
+        bio_logits, lengths, duration_prior, timestamps_s, commit_mask, stream_start=stream_start, seam_is_terminator=seam_is_terminator
+    )
     skip = torch.zeros(B, dtype=torch.bool)
     for b in range(B):
         n = max(1, int(lengths[b].item()))
@@ -38,8 +42,7 @@ def gate_skip_flags(
         # Same χ-frontier filter as build_gate_omega: else a window whose only complete span is already committed
         # reads as decodable while the Ω anchor discards it.
         chi_b = int(commit_mask[b, :n].sum().item()) if commit_mask is not None else 0
-        if select_target_span(row, min_span_frames, skip_term_before=chi_b) is None and open_span_start(row) is None:
-            skip[b] = True
+        if select_target_span(row, min_span_frames, skip_term_before=chi_b) is None and open_span_start(row) is None: skip[b] = True
     return skip
 
 
@@ -268,7 +271,7 @@ class MisalignedSLTModel(nn.Module):
     def generate_from_poses(
         self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
         gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
-        commit_mask: torch.Tensor | None = None, **decode_kwargs,
+        commit_mask: torch.Tensor | None = None, gate_stream_start: bool = False, **decode_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Poses → (bio_logits, tokens, confidence, gate_skip). Owns the BIO tap + membership gate; decode knobs (max_text_tokens / 
         diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) pass through to `generate_from_bio_tap`, 
@@ -284,13 +287,16 @@ class MisalignedSLTModel(nn.Module):
         omega_bias = None
         gate_skip = torch.zeros(poses.shape[0], dtype=torch.bool)
         if gate_enabled:
+            # gate_stream_start: this window is the 1st buffer of its stream, so a signing frame 0 IS a genuine onset. Without it a 
+            # window that opens mid-signing can never open a span (buffer-start I does not open), Ω falls to its no-span branch and 
+            # floors the whole window — on GT-span RQ1 windows, which begin exactly at sentence onset, that fires on a 3rd of them.
             omega_bias, _ = self.build_gate_omega(
-                bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), commit_mask=commit_mask, 
-                delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, timestamps_s=timestamps,
+                bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), commit_mask=commit_mask,
+                delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, timestamps_s=timestamps, stream_start=gate_stream_start,
             )
             gate_skip = gate_skip_flags(
-                bio_logits, mask, min_span_frames=gate_min_span_frames,
-                duration_prior=getattr(self, "duration_prior", None), timestamps_s=timestamps, commit_mask=commit_mask,
+                bio_logits, mask, min_span_frames=gate_min_span_frames, duration_prior=getattr(self, "duration_prior", None), 
+                timestamps_s=timestamps, commit_mask=commit_mask, stream_start=gate_stream_start,
             )
         tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
         # DLM already strips its synthetic BOS in generate_from_bio_tap; the AR arm returns it raw (the Mode-2a

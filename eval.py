@@ -445,8 +445,8 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
 
 @torch.no_grad()
 def _translate_windows(
-    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]],
-    device: torch.device, inference_cfg: dict, method_cfg: dict, batch_size: int | None = None,
+    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]], device: torch.device, 
+    inference_cfg: dict, method_cfg: dict, batch_size: int | None = None, stream_start: bool = False,
 ) -> list[tuple[str, float, bool]]:
     """Pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)]. The loop-decode entry point:
     ONE `generate_from_poses` path for every method.
@@ -458,7 +458,8 @@ def _translate_windows(
     if batch_size is not None and int(batch_size) < len(items):
         out: list[tuple[str, float, bool]] = []
         for i in range(0, len(items), max(1, int(batch_size))): out.extend(_translate_windows(
-            model, tokenizer, method, items[i:i + max(1, int(batch_size))], device, inference_cfg, method_cfg
+            model, tokenizer, method, items[i:i + max(1, int(batch_size))], 
+            device, inference_cfg, method_cfg, stream_start=stream_start,
         ))
         return out
     visual_padding = str(method_cfg.get("visual_padding", "none"))
@@ -472,6 +473,10 @@ def _translate_windows(
     # inference.yaml overrides the method default — the same per-key precedence as the dcd block and the RQ2 runner.
     max_tokens = int(inference_cfg.get("translation", {}).get("max_text_tokens", method_cfg.get("max_text_tokens", 128)))
     gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
+    # Whether frame 0 is a genuine sentence ONSET is a property of how the caller cut this window, not a constant:
+    # a window that starts BEFORE the sentence opens inside the predecessor, and minting a B there would anchor Ω
+    # on the predecessor's tail and floor the sentence being scored. Baseline is ungated, so the flag is inert.
+    if gen_kwargs.get("gate_enabled"): gen_kwargs["gate_stream_start"] = bool(stream_start)
     _, tokens, confidence, gate_skip = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
     tok = tokens.detach().cpu()
     conf = confidence.detach().float().cpu()
@@ -500,6 +505,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     # --num-beams: decode-budget override. RQ2 delta arithmetic ((2-1)/(4-3)) needs BEAM PARITY with the greedy
     # arms (pass 1); the literature floor keeps the config's beam-4.
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
+    if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     rq_cfg = eval_cfg.get("rq1", {})
@@ -536,10 +542,13 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     rows = []
     for start in tqdm(range(0, len(materialized), batch_size), desc="Translating windows"):
         chunk = materialized[start : start + batch_size]
+        # The severity grid includes NEGATIVE head offsets (configs/eval.yaml severity_grid_rel), whose windows start before the sentence — 
+        # frame 0 lies in the predecessor, so it is not an onset. Chunks are grouped by grid cell, so the whole chunk shares one offset.
+        heads = {round(float(w.delta_head_s), 6) for (w, _, _) in chunk}
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
-            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk],
-            device=device, inference_cfg=inference_cfg, method_cfg=method_cfg,
+            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device, 
+            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=all(h >= 0.0 for h in heads),
         )
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
@@ -657,6 +666,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
+    if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
@@ -728,6 +738,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
+    if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
@@ -756,8 +767,9 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
             poses, timestamps = load_pose_window(record.pose, span.start_s, span.end_s, normalize=True)
             if poses.shape[0] == 0: continue
             items.append((poses, timestamps, float(span.start_s))); kept.append(span)
-        results = _translate_windows(
-            model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size)
+        results = _translate_windows( # Cascade windows are cut exactly at the predicted span start, so frame 0 is that span's onset.
+            model, tokenizer, args.method, items, device, inference_cfg, method_cfg,
+            batch_size=int(args.batch_size), stream_start=True,
         )
         predicted[video_id] = [
             PredictionEvent(video_id=video_id, start_s=float(s.start_s), end_s=float(s.end_s), text=text)
@@ -783,6 +795,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
+    if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     inference_cfg = load_yaml(args.inference_config)
     device = pick_device(args.device)
 
@@ -827,8 +840,9 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             if span_poses.shape[0] == 0: continue
             items.append((span_poses, span_ts, w_start))
             bounds.append((float(span.start_s), min(float(span.end_s), w_end)))
-        results = _translate_windows(
-            model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size)
+        results = _translate_windows( # Offline windows are extended by delta_lead_s before the span, so frame 0 precedes the sentence.
+            model, tokenizer, args.method, items, device, inference_cfg, method_cfg,
+            batch_size=int(args.batch_size), stream_start=False,
         )
         predicted[record.video_id] = [
             PredictionEvent(video_id=record.video_id, start_s=s0, end_s=s1, text=text)
@@ -876,8 +890,8 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     prov = {
         "method": args.method, 
         "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4))) if args.method == "baseline" else 1, 
-        "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None), 
-        "segments": getattr(args, "segments", None)
+        "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None),
+        "segments": getattr(args, "segments", None), "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
     }
     # Loud, because it silently invalidates every row difference: the cascade rows use --method baseline, whose
     # config default is beam-4, while the dlm/ar arms decode greedy. README prescribes --num-beams 1 for parity.
@@ -1039,6 +1053,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
     parser.add_argument("--num-beams", type=int, default=None,
                         help="decode-budget override for THIS run (baseline defaults to beam-4 from config; pass 1 for beam-parity delta rows)")
+    parser.add_argument("--gate", default=None, choices=["on", "off"],
+                        help="membership-gate override for THIS run (default: method config). RQ1 measures translation under controlled boundary "
+                             "severity, so gate-on vs gate-off is the ablation separating translation quality from gate's conditioning effect")
     parser.add_argument("--segmenter-decode", default=None, choices=["duration", "plain"],
                         help="whole-video decode; default: s1 -> duration (semi-Markov re-split), moryossef -> plain (Moryossef argmax)")
     parser.add_argument("--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],

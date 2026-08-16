@@ -22,6 +22,20 @@ TIMESTAMP_RE = re.compile(
 TAG_RE = re.compile(r"<[^>]+>")
 WORD_TIMING_RE = re.compile(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>")
 SPEAKER_PREFIX_RE = re.compile(r"^[A-Z][A-Z\s_-]{1,30}:\s*")
+# Non-verbal annotations / stylistic markers: (laughter), [music], *flush*. 
+# Newline-free and length-bounded so an unclosed bracket cannot swallow the rest of the cue.
+#
+# Square brackets and asterisks are subtitle annotation conventions and are stripped outright. ROUND parentheses are NOT: in ordinary prose 
+# they carry lexical content, and captions here are the translation targets, so deleting them corrupts the reference and penalises a correct 
+# translation. Measured on asf, blanket removal cost drug brand names ("Comirnaty (Pfizer)") and destroyed whole sentences ("(e.g., fever, 
+# cough, sore throat)." -> "."). Parentheses are therefore removed only when their content is purely non-verbal (`is_noise_caption`).
+BRACKET_ANNOTATION_RE = re.compile(r"\[[^\[\]\n]{0,80}\]|\*[^*\n]{0,80}\*")
+PAREN_GROUP_RE = re.compile(r"\([^()\n]{0,80}\)")
+LEADING_SYMBOL_RE = re.compile(r"^[\s♪♫•·\-–—>»]+")
+TRAILING_SYMBOL_RE = re.compile(r"[\s♪♫•·]+$")  # a cue often closes with the note it opened with
+# Speaker identifier: ONE word (optionally two, e.g. "MRS SMITH:") then a colon, at the cue start. Bounded to a single token so a genuine 
+# clause like "One thing: ..." keeps its text — that costs recall on rare speaker labels but never deletes signed content.
+SPEAKER_ID_RE = re.compile(r"^[A-Za-z][\w'\-]{0,20}(?:\s+[A-Z][\w'\-]{0,20})?:\s+")
 NOISE_WORD_RE = re.compile(r"[a-z]+")
 NOISE_CAPTION_WORDS = {
     "applause", "background", "foreign", "gentle", "inaudible", "laugh", "laughs",
@@ -45,12 +59,25 @@ def timestamp_to_seconds(value: str) -> float:
 
 
 def clean_caption_text(lines: Iterable[str]) -> str:
+    """Normalise one cue's text. Stage order follows Lost-in-Translation (arXiv 2512.08040) §A.7.
+
+    Entities are decoded BEFORE tags are stripped: an entity-encoded tag (`&lt;font&gt;`) is invisible to the tag
+    regex until it is decoded, so the reverse order leaks markup into the reference text.
+    """
     raw = " ".join(line.strip() for line in lines if line.strip())
-    raw = WORD_TIMING_RE.sub(" ", raw)
-    raw = TAG_RE.sub(" ", raw)
-    raw = html.unescape(raw)
+    raw = WORD_TIMING_RE.sub(" ", raw)          # <00:00:01.234> karaoke timings
+    raw = html.unescape(raw)                    # &amp; -> &, &lt;font&gt; -> <font>
+    raw = TAG_RE.sub(" ", raw)                  # ...then any real or decoded markup
+    raw = BRACKET_ANNOTATION_RE.sub(" ", raw)   # [music] / *flush* — annotation-only conventions
+    # (laughter) yes; (Pfizer) no — see PAREN_GROUP_RE. `is_noise_caption` is the single definition of
+    # "purely non-verbal", so the inline test and the whole-cue test can never disagree.
+    raw = PAREN_GROUP_RE.sub(lambda m: " " if is_noise_caption(m.group(0)) else m.group(0), raw)
+    raw = LEADING_SYMBOL_RE.sub("", raw.strip())  # leading music notes, bullets, speaker dashes
+    raw = TRAILING_SYMBOL_RE.sub("", raw)
+    raw = SPEAKER_ID_RE.sub("", raw)            # "John:" / "NARRATOR:" at the start of a cue
+    raw = re.sub(r"\s+([,.!?;:])", r"\1", raw)  # no space before punctuation
     raw = re.sub(r"\s+", " ", raw).strip()
-    return raw
+    return raw.strip("\"'“”‘’ ").strip()
 
 
 def is_noise_caption(text: str) -> bool:

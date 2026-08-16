@@ -98,12 +98,12 @@ if __name__ == "__main__":
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs
         # --language re-points ${language} in checkpoint.dir for training and the save below.
-        slt_cfg = load_yaml(args.slt_config, language=args.language)
-        epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
             decoder=args.decoder, include_dev=True, language=args.language,
         )
+        slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
+        epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         device = dist_device or pick_device(args.device)
         # Skip frozen params; build_optimizer reads learning_rate/weight_decay (same keys every stage)
         optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])

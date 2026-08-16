@@ -25,6 +25,7 @@ class SLTComponents:
     tokenizer: Any
     train_loader: DataLoader
     dev_loader: DataLoader | None
+    slt_cfg: dict
 
 def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> None:
     """Gate δ/Λ_min train here but deploy from inference.yaml, and nothing links 2 configs — 
@@ -201,7 +202,7 @@ def build_slt_components(
                 p = model.duration_prior
                 print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s "
                       f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g}", flush=True)
-    return SLTComponents(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader)
+    return SLTComponents(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg)
 
 
 @torch.no_grad()

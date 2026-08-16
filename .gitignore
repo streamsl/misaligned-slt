@@ -22,3 +22,4 @@ pytest.ini
 *.pt
 *.bin
 *.ckpt
+AGENTS.md

@@ -97,9 +97,9 @@ membership_gate:
     enabled: true
     # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
     # MUST match inference.yaml boundary_stability.delta_enc_frames.
-    delta: 20
+    delta: 13
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    min_span_frames: 21  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
+    min_span_frames: 14  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
     # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
     # Log gate_veto_rate — it should start near 0 and decay.
     iou_veto: 0.5
@@ -118,11 +118,11 @@ mode_ratios:
     #   python analyze.py --stage segmenter-infer --segmenter-arch moryossef --segmenter-decode duration --language <lang> --split dev
     #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_moryossef_<lang>_dev.json --language <lang>
     # Measure on DEV, not train: both segmenters were fit on train, so train-split errors are optimistically biased.
-    # asf (moryossef+duration): mode1 0.032 / mode2 0.467 / mode3 0.414 / mode4 0.088 — clean complete anchors are
-    # RARE at deployment; the designed fallback below only covers an explicitly-null source or degenerate
-    # measurements — a configured-but-MISSING source file raises (run analysis-a first; train/sampler.py) — (the
-    # mode1>=0.9 guard still auto-falls-back on too-clean corpora, e.g. pre-trimmed CSL). Values track the artifact
-    # on the `source:` line — re-read it rather than this comment after regenerating Analysis A.
+    # On these corpora clean complete anchors are rare at deployment (most windows truncate or hold multiple
+    # sentences) — the premise the method rests on. The designed fallback below covers only an explicitly-null
+    # source or a degenerate measurement; a configured-but-MISSING source file raises (run analysis-a first,
+    # train/sampler.py), and the mode1>=0.9 guard auto-falls-back on too-clean corpora (e.g. pre-trimmed CSL).
+    # Read the live ratios from the `source:` artifact, not from here.
     source: outputs/a_mode_ratios_${language}.json
     degenerate_mode1_threshold: 0.9
     fallback:
@@ -181,7 +181,7 @@ jitter:
         tail_loc_s: 0.0
         tail_scale_s: 0.8
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 16
+batch_size: 32
 num_workers:
     4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any value:
     # exact per-epoch coverage comes from the INDEX-driven anchor (sampler.sample(index) -> anchors[index % N], and

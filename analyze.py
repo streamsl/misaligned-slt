@@ -99,7 +99,7 @@ def analyze_segmenter_errors(
             pred_idx for pred_idx, pred in enumerate(pred_segments) if pred_idx not in overlapping_gold_by_pred
             and pred.start_s >= 0.0 and pred.end_s <= float(durations.get(video_id, pred.end_s))
         }
-        counts["oversegmentation"] += len(overseg_gold)
+        counts["oversegmentation"] += sum(len(overlapping_pred_by_gold[g]) for g in overseg_gold)
         counts["undersegmentation"] += len(underseg_pred)
         counts["phantom"] += len(phantom_pred)
         counts["skipped"] += len(set(range(len(gold_segments))) - matched_gold - overseg_gold - underseg_gold)

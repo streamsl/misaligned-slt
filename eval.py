@@ -196,14 +196,19 @@ def controlled_windows(
 def evaluate_predicted_events(
     predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float]
 ) -> dict[str, Any]:
-    """RQ2 scoring under ActivityNet DVC protocol (Krishna et al. 2017, `densevid_eval`), translations in place of captions. Per tIoU threshold: 
-    predictions and gold are matched 1-TO-1 (greedy by tIoU, the codebase's canonical rule), unmatched predictions and missed gold both dilute 
-    the score via SODA's count normalization, and `compute_text_metrics` scores 1 VIDEO's pairs at a time — densevid calls its scorers per video 
-    (`scorer.compute_score(gts[vid], res[vid])`) and means over videos, which is also Moryossef's macro convention, so RQ2 and segmenter-eval 
-    report 1 statistic. TEXT is scored over matched pairs only (densevid's convention); unmatched predictions and missed gold move SEGMENTATION 
-    score, not this one. `threshold_average` means over the grid, as densevid reports. Ours on top: emission latency + best-match tIoU."""
+    """RQ2 scoring, SODA-style (Fujita et al. 2020) with translations in place of captions. Per tIoU threshold: predictions and gold are 
+    matched 1-to-1 by tIoU (metrics.match_segments); segmentation block reports that localization P/R/F1; TEXT block is a localization-aware 
+    F1 — per-pair sentence scores summed, then precision = Σ/n_pred and recall = Σ/n_gold (`compute_text_metrics(localization_aware=True)`), 
+    macro-averaged over videos.
+
+    Matched-pairs-only text (a mean over survivors) is not used: it conditions translation quality on localization success, so a higher-tIoU 
+    column scores an easier survivor subset and an over-generating cascade is scored only on spans it happens to localize while its spurious 
+    spans go uncharged. The SODA fusion charges spurious predictions (n_pred) and missed gold (n_gold) in the SAME number. densevid_eval's 
+    garbage-ref alternative is avoided: with corpus BLEU it rewards over-generation via the brevity penalty, and it charges only predictions,
+    not misses. `threshold_average` means over the grid. Ours on top: emission latency + best-match tIoU."""
     results = []
     all_video_ids = sorted(set(predicted) | set(gold))
+    pair_memo: dict[tuple[str, str], dict[str, float]] = {}  # (hyp, ref) -> sentence scores; reused across thresholds
     for threshold in thresholds:
         per_video: list[dict[str, float]] = []
         vid_prec, vid_rec, latencies, best_tious = [], [], [], []
@@ -230,28 +235,25 @@ def evaluate_predicted_events(
                 if pred_events[pi].commit_time_s is not None: # Emission latency.
                     latencies.append(float(pred_events[pi].commit_time_s) - float(gold_events[gi].end_s))
 
-            # TEXT reuses SAME 1-to-1 pairing as segmentation, so both views describe 1 assignment. densevid pairs many-to-many, which lets 
-            # a duplicate span score against a gold another span already claimed — the permissiveness SODA was written to fix; COCO AP and 
-            # action localization are 1-to-1 too.
+            # TEXT: per-pair sentence scores over the 1-to-1 matched pairs, memoised across thresholds (BLEURT is a model forward). 
+            # The video's F1 normalises by ITS n_pred/n_gold, so an empty-match video scores 0 and is charged — not skipped.
             hyps, refs = [], []
             for pi, gi, _ in one_to_one:
                 if pred_events[pi].text is None or gold_events[gi].text is None: continue
                 hyps.append(pred_events[pi].text); refs.append(gold_events[gi].text)
             n_pairs += len(hyps)
             n_unmatched_pred += len(pred_events) - len(one_to_one)
-            # MATCHED PAIRS ONLY, so the column means 1 thing in every row: translation quality GIVEN correct localisation. densevid instead 
-            # scores spurious spans against a random reference, which drags the column down for localisation reasons — that makes GT-span rows 
-            # (1-2, f1=1, no spurious spans) incomparable with predicted-span rows (3-6) and contaminates the (5-4) and (6-5) contrasts the 
-            # ladder exists to isolate. Both localisation failures live in `segmentation`: spurious spans in precision, missed gold in recall.
-            # Only videos with at least 1 matched pair: a zero-pair video has no translation quality to report, and appending its all-zero row 
-            # would let a LOCALISATION failure move this column — the thing the paragraph above says it must not do.
-            if hyps: per_video.append(compute_text_metrics(hyps, refs))
+            per_video.append(compute_text_metrics(
+                hyps, refs, localization_aware=True, n_pred=len(pred_events), n_gold=len(gold_events), memo=pair_memo
+            ))
 
-        # Mean over videos that HAVE matched pairs only (see above). If no video has any, the row is degenerate and
-        # `scored_pairs` == 0 says so — emit the zero-filled schema so downstream keys stay stable.
-        text_metrics = ({k: float(np.mean([r[k] for r in per_video])) for k in per_video[0]} if per_video else compute_text_metrics([], []))
+        # Macro over every video with predictions OR gold (empty-match videos contribute 0, charging the miss).
+        text_metrics = {
+            k: float(np.mean([r[k] for r in per_video])) for k in per_video[0]
+        } if per_video else compute_text_metrics([], [], localization_aware=True, n_pred=0, n_gold=0)
         precision = float(np.mean(vid_prec)) if vid_prec else 0.0
         recall = float(np.mean(vid_rec)) if vid_rec else 0.0
+        
         latency_block, tiou_block = {}, {}
         if latencies:
             arr = np.sort(np.asarray(latencies, dtype=np.float64))

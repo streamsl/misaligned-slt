@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from data.windowing import BIO
+from sacrebleu import sentence_bleu
 import torch
 
 
@@ -225,6 +226,9 @@ _CJK_PUNCT_TABLE = str.maketrans({
     '（': '(', '）': ')', '【': '[', '】': ']', '《': '<', '》': '>', '「': '"', '」': '"', '『': '"', '』': '"', 
     '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '–': '-', '·': '.', '…': '...', '　': ' ', '﹏': '_', '～': '~', 
 })
+_TEXT_KEYS = ("bleu4", "bleurt", "rougeL", "meteor")  # per-pair-able; CIDEr (corpus-df) is corpus-mode only
+
+
 def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizing metrics such as CIDEr.
     out: list[str] = []
     for ch in text:
@@ -257,50 +261,107 @@ def _rouge_l(hyps: list[str], refs: list[str]) -> float:
         except Exception: return 0.0
 
 
-def compute_text_metrics(
-    predictions: list[str], references: list[str], sacrebleu_tokenize: str = "13a",
-    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation"
-) -> dict[str, float]:
-    scores = {"bleu4": 0.0, "bleurt": 0.0, "rougeL": 0.0, "cider": 0.0, "meteor": 0.0}
-    if not predictions: return {f"{prefix}_{key}": value for key, value in scores.items()}
-    # Preprocess EXACTLY like Uni-Sign's eval (fine_tuning.py:284-288 + SLRT_metrics.translation_performance) for
-    # paper-comparable numbers. A full punctuation map on BOTH sides DEPRESSES ROUGE-L by ~0.03 (LCS sees a
-    # different sequence). BLEURT scores RAW text.
+def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> list[float]:
+    # Per-example BLEURT on RAW text (BleurtScorer.score is inherently per-example). No checkpoint / failure -> zeros.
+    if not checkpoint or not hyps: return [0.0] * len(hyps)
+    try:
+        from bleurt.score import BleurtScorer
+        return [float(x) for x in BleurtScorer(checkpoint).score(candidates=list(hyps), references=list(refs))]
+    except Exception: return [0.0] * len(hyps)
+
+
+def _uni_sign_preprocess(predictions: list[str], references: list[str]) -> tuple[list[str], list[str], bool]:
+    """Uni-Sign eval preprocessing (fine_tuning.py:284-288 + SLRT_metrics): word-level for non-CJK, char-split
+    for CJK with the asymmetric ref-only punctuation map. Returned so corpus and per-pair scorers preprocess
+    identically. `is_cjk` is detected over the references so scoring level never drifts within one call."""
     is_cjk = any(_char_split_cjk(ref) != ref for ref in references)
 
     def _proc(s: str, is_ref: bool) -> str:
-        if not is_cjk: return s                                  # word-level for non-CJK (Uni-Sign level='word')
+        if not is_cjk: return s
         s = s.replace(" ", "").replace("\n", "")
-        if is_ref: s = s.replace("，", ",").replace("？", "?")    # Uni-Sign's asymmetric ref-only normalization
-        return " ".join(list(s))                                 # char-split (Uni-Sign level='char')
+        if is_ref: s = s.replace("，", ",").replace("？", "?")
+        return " ".join(list(s))
 
-    pred_proc = [_proc(p, False) for p in predictions]
-    ref_proc = [_proc(r, True) for r in references]
-    ref_proc_nested = [[r] for r in ref_proc]
+    return [_proc(p, False) for p in predictions], [_proc(r, True) for r in references], is_cjk
 
-    bleu = _load_evaluate_metric("sacrebleu")
-    if bleu is not None:
-        # '13a' over the char-split strings = Uni-Sign's `sableu`: char-level BLEU for CJK, word BLEU otherwise.
-        try: scores["bleu4"] = float(bleu.compute(
-                predictions=pred_proc, references=ref_proc_nested, tokenize=sacrebleu_tokenize
-            )["score"])
-        except Exception: pass
-    scores["rougeL"] = _rouge_l(pred_proc, ref_proc)
 
-    cider = _load_evaluate_metric("sunhill/cider")
-    if cider is not None:
-        try: scores["cider"] = float(cider.compute(predictions=pred_proc, references=ref_proc_nested)["cider_score"])
-        except Exception: pass
+def _corpus_metric(name: str, predictions, references, *, key: str, **kw) -> float:
+    # Load an `evaluate` metric and score it, returning 0.0 if the metric is unavailable or the compute fails.
+    metric = _load_evaluate_metric(name)
+    if metric is None: return 0.0
+    try: return float(metric.compute(predictions=predictions, references=references, **kw)[key])
+    except Exception: return 0.0
 
+
+def _sentence_text_scores(
+    hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20",
+) -> list[dict[str, float]]:
+    """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. BLEU
+    here is smoothed sentence-BLEU (corpus BLEU/CIDEr pool across pairs and can't be split; CIDEr is corpus-only)."""
+    if not hyps: return []
+    pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs)
+    bleu = [float(sentence_bleu(h, [r], tokenize=sacrebleu_tokenize).score) for h, r in zip(pred_proc, ref_proc)]
+    bleurt = _bleurt_scores(hyps, refs, bleurt_checkpoint)
+    rouge = [_rouge_l([h], [r]) for h, r in zip(pred_proc, ref_proc)]
     meteor = _load_evaluate_metric("meteor")
-    if meteor is not None:
-        try: scores["meteor"] = float(meteor.compute(predictions=pred_proc, references=ref_proc)["meteor"])
-        except Exception: pass
+    met = [
+        float(meteor.compute(predictions=[h], references=[r])["meteor"]) for h, r in zip(pred_proc, ref_proc)
+    ] if meteor is not None else [0.0] * len(hyps)
+    return [dict(zip(_TEXT_KEYS, vals)) for vals in zip(bleu, bleurt, rouge, met)]
 
-    if bleurt_checkpoint:
-        try:
-            from bleurt.score import BleurtScorer
-            bleurt_scores = BleurtScorer(bleurt_checkpoint).score(candidates=predictions, references=references)
-            scores["bleurt"] = float(sum(bleurt_scores) / max(1, len(bleurt_scores)))
-        except Exception: pass
-    return {f"{prefix}_{key}": float(value) for key, value in scores.items()}
+
+def compute_text_metrics(
+    predictions: list[str], references: list[str], *, localization_aware: bool = False,
+    n_pred: int | None = None, n_gold: int | None = None, memo: dict[tuple[str, str], dict[str, float]] | None = None,
+    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation",
+) -> dict[str, float]:
+    """Translation-quality metrics, in two modes.
+
+    localization_aware=False (default — RQ1, GT-span rows, analysis-b): CORPUS BLEU-4/ROUGE-L/METEOR/CIDEr/BLEURT
+    over the whole set. Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence
+    means; BLEU-4 and CIDEr pool across the set, so they are computed corpus-level.
+
+    localization_aware=True (RQ2 dense/streaming): SODA F1 (Fujita et al. 2020) over the MATCHED (pred, gold) pairs.
+    Per-pair sentence scores are summed, then precision = Σ/n_pred, recall = Σ/n_gold, F1 = 2PR/(P+R) — charging
+    spurious predictions AND missed gold, so a spammy or under-generating method cannot inflate the score by scoring
+    only the subset it localizes. Sentence-BLEU (corpus BLEU/CIDEr don't split per pair). Needs n_pred/n_gold;
+    `memo` caches per-pair scores across tIoU thresholds (BLEURT is a model forward).
+    """
+    if localization_aware:
+        if n_pred is None or n_gold is None: 
+            raise ValueError("localization_aware=True needs n_pred and n_gold (SODA count normalisation)")
+        
+        pairs = list(zip(predictions, references))
+        if memo is None: per_pair = _sentence_text_scores(predictions, references, sacrebleu_tokenize, bleurt_checkpoint)
+        else:
+            uncached = [p for p in pairs if p not in memo]
+            if uncached:
+                scored = _sentence_text_scores(
+                    [h for h, _ in uncached], [r for _, r in uncached], sacrebleu_tokenize, bleurt_checkpoint
+                )
+                for p, sc in zip(uncached, scored): memo[p] = sc
+            per_pair = [memo[p] for p in pairs]
+
+        out: dict[str, float] = {}
+        for k in _TEXT_KEYS:
+            s = float(sum(p[k] for p in per_pair))
+            p_ = s / n_pred if n_pred else 0.0
+            r_ = s / n_gold if n_gold else 0.0
+            out[f"{prefix}_{k}"] = 2 * p_ * r_ / (p_ + r_) if (p_ + r_) > 0 else 0.0
+        return out
+
+    keys = (*_TEXT_KEYS, "cider")
+    if not predictions: return {f"{prefix}_{k}": 0.0 for k in keys}
+    # BLEURT scores RAW text; the rest use the Uni-Sign preprocessing (paper-comparable) — the ref-only punctuation
+    # map avoids depressing ROUGE-L, whose LCS would otherwise see a different sequence.
+    pred_proc, ref_proc, _ = _uni_sign_preprocess(predictions, references)
+    ref_nested = [[r] for r in ref_proc]
+    bleurt = _bleurt_scores(predictions, references, bleurt_checkpoint)
+    out = {
+        "bleu4": _corpus_metric("sacrebleu", pred_proc, ref_nested, key="score", tokenize=sacrebleu_tokenize),
+        "bleurt": float(sum(bleurt) / len(bleurt)) if bleurt else 0.0,
+        "rougeL": _rouge_l(pred_proc, ref_proc),
+        "meteor": _corpus_metric("meteor", pred_proc, ref_proc, key="meteor"),
+        # "cider": _corpus_metric("sunhill/cider", pred_proc, ref_nested, key="cider_score"),
+    }
+    return {f"{prefix}_{k}": float(out[k]) for k in keys}

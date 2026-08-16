@@ -402,8 +402,10 @@ class MisalignedSLTModel(nn.Module):
                     omega_bias=None if omega_bias is None else omega_bias[idx],
                 )
                 translation_loss = dlm_out["translation_loss"]
-                trans_weight = ((labels[idx] != -100) & (labels[idx] != self.tokenizer.pad_token_id)).sum()
-                trans_weight = trans_weight.to(dtype=translation_loss.dtype).clamp(min=1)
+                # Pool weight = L_OPUT's OWN denominator (valid x0 positions, INCLUDING eos_supervision slots), not label-token count: L_OPUT 
+                # was averaged over the former, so trans_weight*L_OPUT reproduces the OPUT loss sum exactly. Label count omits ~block_size EOS 
+                # slots, which under-weighted OPUT (over-weighted CB) by ~eos/(len+eos) at λ=1. cb_weight already uses cb.loss's denominator.
+                trans_weight = dlm_out["row_valid_count"].sum().to(dtype=translation_loss.dtype).clamp(min=1)
                 self._log_per_mode(
                     logs, mode_to_indices, idx_list if isinstance(mode_names, list) else [],
                     dlm_out.get("row_loss_sum"), dlm_out.get("row_valid_count")
@@ -467,7 +469,8 @@ class MisalignedSLTModel(nn.Module):
                     )
                     full_tokens = full_decode.sequences
 
-                    # The gate reads the *real* decode's confidence/argmax (what DCD sees at inference) → stays no_grad.
+                    # Decode ONLY to pick which slots to defer-counterfactual (where the truncated decode disagrees
+                    # with the full-evidence one) — its confidence does NOT gate the loss (see below).
                     trunc_decode = self.dlm_decoder.decode_spd_dcd(
                         enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len,
                         diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
@@ -476,8 +479,7 @@ class MisalignedSLTModel(nn.Module):
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
                         top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_trunc,
                     )
-                trunc_tokens = trunc_decode.sequences
-                trunc_confidence = trunc_decode.confidence
+                trunc_decoded = trunc_decode.sequences
 
                 # Align the reference to the decode layout. The decode emits [BOS, tok1, ..., eos, ...] while the mBART tokenizer emits
                 # [tok1, ..., eos, lang]: decode slot j holds reference slot j-1. Without this shift the verified gate (f_i == r_i)
@@ -486,16 +488,24 @@ class MisalignedSLTModel(nn.Module):
                 cb_ref_ids = torch.cat([bos_col, ref_ids[:, :-1]], dim=1)
                 cb_ref_mask = torch.cat([torch.ones_like(ref_mask[:, :1]), ref_mask[:, :-1]], dim=1)
 
-                # Gate first, then 1 grad-bearing forward with the gated slots re-masked in an otherwise committed
-                # sequence — the deferral counterfactual DCD would face (dlm_decoder.remasked_logits).
-                cb_active_mask = confidence_bound_gate(
-                    full_tokens=full_tokens, trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence,
-                    reference_tokens=cb_ref_ids, valid_mask=cb_ref_mask, tau_cb=confidence_bound_tau, 
+                # CANDIDATE remask positions = disagreement slots (trunc≠full, full==ref, valid) — WHICH slots to feed the deferral 
+                # counterfactual. Confidence threshold is NOT applied here; it is applied by confidence_bound_loss on the REMASKED logits, so 
+                # the gate reads SAME distribution the CE trains. Gating on the decode confidence instead (the deployed commit path) leaves the 
+                # loss free to push the deferral forward to confidently emit unseen continuation — the hallucination the AR arm's shared-logits 
+                # fixed point rules out (measured: the DLM deferral forward hallucinated the continuation while the AR arm deferred). A constant 
+                # confidence here just reuses the gate's disagreement/verified/pad conditions to pick candidates.
+                candidate = confidence_bound_gate(
+                    full_tokens=full_tokens, trunc_tokens=trunc_decoded, 
+                    trunc_confidence=torch.ones_like(trunc_decode.confidence), tau_cb=0.0, reference_tokens=cb_ref_ids, valid_mask=cb_ref_mask,
                     verified_full_evidence_gate=verified_full_evidence_gate, pad_token_id=self.tokenizer.pad_token_id,
                 )
-                if cb_active_mask.any(): trunc_logits = self.dlm_decoder.remasked_logits(
-                    enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, decoded_tokens=trunc_tokens, 
-                    remask_positions=cb_active_mask, omega_bias=cb_omega_trunc,
+                # trunc_tokens/confidence=None + active_mask=None → confidence_bound_loss derives π and ŷ from
+                # trunc_logits itself (the remasked forward), exactly as the AR arm does: gate and CE share one
+                # distribution, so CE lowering p(ŷ) lowers the gate confidence and the slot self-deactivates.
+                trunc_tokens = trunc_confidence = cb_active_mask = None
+                if candidate.any(): trunc_logits = self.dlm_decoder.remasked_logits(
+                    enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, decoded_tokens=trunc_decoded,
+                    remask_positions=candidate, omega_bias=cb_omega_trunc,
                 )
                 else: trunc_logits = None
             else: # AR Mode-2a: reuse the cb_omega_* built above the arm split.
@@ -515,21 +525,29 @@ class MisalignedSLTModel(nn.Module):
                 trunc_tokens, trunc_confidence = None, None
                 cb_ref_ids, cb_ref_mask, cb_active_mask = ref_ids, ref_mask, None
 
-            if trunc_logits is not None:
-                cb = confidence_bound_loss(
-                    trunc_logits=trunc_logits, full_tokens=full_tokens, reference_tokens=cb_ref_ids,
-                    valid_mask=cb_ref_mask, trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence,
-                    tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
-                    enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
-                )
-                # Fold CB into the SAME token-weighted pool as the OPUT modes (L_OPUT for 1/3, L_cb for 2a). A flat add
-                # would weight 2a independently of its batch share — ~9% of windows supplying most of the translation
-                # gradient (the epoch-4 loss shock). λ_cb=1.0 then IS the spec composition; ≠1 is an explicit deviation.
-                cb_weight = cb_ref_mask.to(dtype=translation_loss.dtype).sum().clamp(min=1)
-                translation_loss = (translation_loss * trans_weight + float(cb_lambda) * cb_weight * cb.loss) \
-                    / (trans_weight + cb_weight).clamp(min=1)
-                logs["cb_loss"] = cb.loss.detach()
-                logs["cb_active_count"] = cb.active_count.detach().to(translation_loss.dtype)
+            # Fold CB into SAME token-weighted pool as the OPUT modes (L_OPUT for 1/3, L_cb for 2a). A flat add would weight 2a independently 
+            # of its batch share — ~9% of windows supplying most of the translation gradient. λ_cb=1.0 then IS the spec composition; ≠1 is an 
+            # explicit deviation. The Mode-2a reference tokens ALWAYS enter the denominator (they are valid tokens carrying ZERO loss when no 
+            # slot is active), so OPUT normalizes identically whether the gate fired or not — AR and DLM arms stay comparable on zero-active 
+            # batches. cb_weight uses SAME [:, :seq_len] slice the loss scores, so cb_weight·L_cb is CB loss SUM exactly in both arms (the AR 
+            # layout shift drops the trailing lang-code column). The expensive remasked forward is still skipped when nothing is active.
+            if cb_ref_mask is not None:
+                seq_len = full_tokens.shape[1] if trunc_logits is None else min(trunc_logits.shape[1], full_tokens.shape[1])
+                cb_weight = cb_ref_mask[:, :seq_len].to(dtype=translation_loss.dtype).sum().clamp(min=1)
+                cb_loss_val, cb_active_count = translation_loss.new_zeros(()), translation_loss.new_zeros(())
+                if trunc_logits is not None:
+                    cb = confidence_bound_loss(
+                        trunc_logits=trunc_logits, full_tokens=full_tokens, reference_tokens=cb_ref_ids,
+                        valid_mask=cb_ref_mask, trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence,
+                        tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
+                        enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
+                    )
+                    cb_loss_val = cb.loss
+                    cb_active_count = cb.active_count.detach().to(translation_loss.dtype)
+                translation_loss = (translation_loss * trans_weight + float(cb_lambda) * cb_weight * cb_loss_val) \
+                                                                        / (trans_weight + cb_weight).clamp(min=1)
+                logs["cb_loss"] = cb_loss_val.detach()
+                logs["cb_active_count"] = cb_active_count
 
         # `lambda_bio=0` = translation-only: the faithful Uni-Sign SLT recipe (1 label-smoothed CE) for the clean-floor arm. 
         # Also methodological — L_BIO teaches the shared pose trunk sentence boundaries, exactly the competence RQ1-A claims 

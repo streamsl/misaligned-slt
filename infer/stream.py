@@ -183,7 +183,7 @@ class StreamingSLTRunner:
         # rare, but one UNK frame in a gap would leave a span terminator-less (commit deferred to the cap → spurious PARTIAL)
         # and O→UNK→I would never open (_span_opens needs prev==O exactly).
         bio_tags = torch.where(bio_tags == BIO["UNK"], torch.full_like(bio_tags, BIO["O"]), bio_tags)
-        if self.duration_prior is not None and bio_tags.numel() > 2:
+        if bio_tags.numel() > 2 and self.duration_prior is not None:
             dt = ts[0, 1:] - ts[0, :-1]
             # Clamp fps to [1,120]: a degenerate ~0 median dt gives fps ~1e6 -> lmax OOM in the DP.
             fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0) if dt.numel() else 24.0
@@ -195,13 +195,14 @@ class StreamingSLTRunner:
                 duration_split_tags(bio_tags.cpu().numpy(), pB, fps_b, self.duration_prior, mark_onsets=False, split_open_tail="survival"),
                 device=bio_tags.device, dtype=bio_tags.dtype,
             )
-            # χ-boundary onset restoration (alternate-sentence-drop guard). The re-split folds all B's to I and never splits at the ≤δ 
-            # leftover seam → a back-to-back successor's onset lands in buffer-start I, which _span_opens cannot open → emits sentences 
-            # k, k+2, k+4, ... χ certifies a sentence ENDED there, so the 1st mid-run signing frame at-or-after χ IS that onset: mark it B 
-            # (no-op if the seam is in a gap). Only when `_committed_is_terminator`: a cap cut is mid-sentence, where a B fabricates a 
-            # boundary, re-opens the fragment "skip" drops, and re-emits committed frames. At stream start frame 0 IS a real onset, else 
-            # a mid-signing stream never opens a span.
-            if start_s <= 0.0 and self._committed_until_s <= 0.0 and bio_tags.numel():
+        # χ-boundary onset restoration (alternate-sentence-drop guard). Back-to-back successor's onset lands in buffer-start I, which 
+        # _span_opens can't open → emits sentences k,k+2,k+4,... χ certifies sentence ENDED there, so 1st mid-run signing frame at-or-after 
+        # χ IS that onset: mark it B (no-op if the seam is in a gap). Only when `_committed_is_terminator`: a cap cut is mid-sentence, where 
+        # B fabricates a boundary, re-opens the fragment "skip" drops, and re-emits committed frames. At stream start frame 0 IS a real onset, 
+        # else a mid-signing stream never opens a span. BOTH are commit-log facts, so they apply under plain argmax too — where B rarely wins 
+        # at a seam, making them MORE necessary, not less. Mirrored by duration_decode.deployed_decode_tags so the gate anchors on same tags.
+        if bio_tags.numel():
+            if start_s <= 0.0 and self._committed_until_s <= 0.0:
                 if int(bio_tags[0].item()) == BIO["I"]: bio_tags[0] = BIO["B"]
             if self._committed_until_s > 0.0 and self._committed_is_terminator:
                 abs_t = ts_b[0] + float(start_s)

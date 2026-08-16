@@ -252,29 +252,35 @@ def deployed_decode_tags(
     device = bio_logits.device
     tags = bio_logits.detach().argmax(dim=-1)
     tags = torch.where(tags == BIO["UNK"], torch.full_like(tags, BIO["O"]), tags)
-    if duration_prior is None: return tags
     pB = torch.softmax(bio_logits.detach().float(), dim=-1)[..., BIO["B"]].cpu().numpy()
     tags_np = tags.cpu().numpy()
 
     for b in range(tags_np.shape[0]):
         n = int(lengths[b].item())
         if n <= 2: continue
-        
-        fps_b = 24.0 # Default fallback if timestamps are missing or degenerate.
-        if timestamps_s is not None and n > 1:
-            dt = timestamps_s[b, 1:n] - timestamps_s[b, : n - 1]
-            # Clamp: duplicate-timestamp median ~0 → fps ~1e6, so lmax = cap_s*fps OOMs the LP array / O(T*lmax) DP.
-            if dt.numel(): fps_b = min(max(1.0 / max(float(dt.median().item()), 1e-6), 1.0), 120.0)
+        if duration_prior is not None:
+            fps_b = 24.0 # Default fallback if timestamps are missing or degenerate.
+            if timestamps_s is not None and n > 1:
+                # Span-based rate, NOT median-of-diffs: fps-augmented windows are sub-sampled onto the native
+                # 24fps lattice, so consecutive gaps are integer multiples of 1/24 and the median quantises a
+                # true 15-22fps window to 12 or 24 — mis-scaling the duration prior on ~half of training. The
+                # total-span estimate recovers the true rate and still gives 24 exactly on native uniform buffers.
+                span = float(timestamps_s[b, n - 1] - timestamps_s[b, 0])
+                if span > 1e-6: fps_b = min(max((n - 1) / span, 1.0), 120.0)
 
-        tags_np[b, :n] = duration_split_tags(
-            tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
-        )
-        # Stream-start onset, mirroring the FSM (stream.py step — same position, after the re-split and before the χ
-        # mint): on the FIRST buffer of a stream a leading I IS a real onset, else a mid-signing stream never opens a
-        # span. Without it the gate saw a headless I-run where the FSM sees a span, and anchored Ω on "no span",
-        # flooring the very frames the FSM was decoding. Flag, not a timestamp test: window timestamps are
-        # window-relative (train/sampler.py), so "starts at 0" is true of every training window. Training passes False —
-        # a sampled window simulates a buffer at an arbitrary stream position, and a left-truncated one is Mode 2b.
+            tags_np[b, :n] = duration_split_tags(
+                tags_np[b, :n], pB[b, :n], fps_b, duration_prior, mark_onsets=False, split_open_tail="survival",
+            )
+        # Both restorations below are FSM COMMIT-LOG facts, independent of how tags were decoded, so they run whether or 
+        # not the re-split did. Under plain argmax they are needed at least as much: `B` rarely wins argmax at back-to-back
+        # seam, which is the premise the whole decode exists for. Gating them on `duration_prior` left every untuned corpus 
+        # (duration_decode_<arch>.default:false) emitting nothing on mid-signing stream start & dropping every b2b successor.
+        # Stream-start onset, mirroring the FSM (stream.py step — same position, after the re-split and before the χ mint): 
+        # on 1st buffer of a stream a leading I IS a real onset, else a mid-signing stream never opens a span. Without it 
+        # the gate saw a headless I-run where the FSM sees a span, and anchored Ω on "no span", flooring the very frames 
+        # the FSM was decoding. Flag, not a timestamp test: window timestamps are window-relative (train/sampler.py), so 
+        # "starts at 0" is true of every training window. Training passes False — a sampled window simulates a buffer at 
+        # an arbitrary stream position, and a left-truncated one is Mode 2b.
         if stream_start and tags_np[b, 0] == BIO["I"]: tags_np[b, 0] = BIO["B"]
         if commit_mask is not None and seam_is_terminator:
             cm = commit_mask[b, :n].detach().cpu().numpy().astype(bool)

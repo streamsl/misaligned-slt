@@ -15,6 +15,7 @@ from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
+from infer.duration_decode import duration_decode_params, fit_duration_prior
 from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
 from utils import load_yaml, language_model_name, resolve_pretrained
 
@@ -26,6 +27,7 @@ class SLTComponents:
     train_loader: DataLoader
     dev_loader: DataLoader | None
     slt_cfg: dict
+    checkpoint_meta: dict
 
 def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> None:
     """Gate δ/Λ_min train here but deploy from inference.yaml, and nothing links 2 configs — 
@@ -45,6 +47,25 @@ def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> No
         if s_val != i_val: raise ValueError(
             f"Membership-gate geometry mismatch: slt config {s_key}={s_val} but inference.yaml {i_key}={i_val}. "
             f"The gate trains and deploys under the SAME δ/Λ_min — reconcile 2 configs.")
+
+def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
+    """The config this stage-2 run is parameterized by, travelling with the weights.
+
+    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by tail-benefit, the decode triple by
+    tune-decode, and the mode mix / jitter by Analysis A — all AFTER a run may have started. Resuming across such
+    a change trains the two halves under different objectives, and without this record nothing in the artifacts
+    shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
+    """
+    gate_cfg = slt_cfg.get("membership_gate", {}) or {}
+    return {
+        "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
+        "gate": {k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps", "gamma")},
+        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), "duration_decode": duration_decode_params(inference_cfg, language),
+        "mode_ratios": slt_cfg.get("mode_ratios"), "jitter": slt_cfg.get("jitter"),
+        "bio_class_weights": slt_cfg.get("bio_class_weights"),  # resolved list, not the "balanced" string
+        "lambda_bio": float(slt_cfg.get("lambda_bio", 1.0)), "lambda_trans": float(slt_cfg.get("lambda_trans", 1.0)),
+        "batch_size": slt_cfg.get("batch_size"), "learning_rate": slt_cfg.get("learning_rate"),
+    }
 
 def _optional_int(value) -> int | None:
     return None if value is None else int(value)
@@ -194,7 +215,6 @@ def build_slt_components(
     # build_gate_omega re-splits merged back-to-back runs, so stage-2 trains on the tag stream deployment gates
     # on (§1.3 on-policy symmetry). Prior fit on TRAIN captions only; no-op when the gate is off.
     if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)):
-        from infer.duration_decode import duration_decode_params, fit_duration_prior
         params = duration_decode_params(inference_cfg, language)
         if params is not None:
             model.duration_prior = fit_duration_prior(train_records, **params)
@@ -202,7 +222,10 @@ def build_slt_components(
                 p = model.duration_prior
                 print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s "
                       f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g}", flush=True)
-    return SLTComponents(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg)
+    return SLTComponents(
+        model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg,
+        checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language),
+    )
 
 
 @torch.no_grad()
@@ -332,8 +355,8 @@ def evaluate_slt(
 
 
 def train_slt_epochs(
-    model: MisalignedSLTModel, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, 
-    epochs: int, slt_cfg: dict, dev_loader: DataLoader | None = None, resume: bool = False,
+    model: MisalignedSLTModel, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, epochs: int, 
+    slt_cfg: dict, dev_loader: DataLoader | None = None, resume: bool = False, checkpoint_meta: dict | None = None,
 ) -> list[dict[str, float]]:
     confidence_cfg = slt_cfg.get("confidence_bound", {})
     dcd_cfg = slt_cfg.get("dcd", {})
@@ -399,7 +422,7 @@ def train_slt_epochs(
                             gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
 
     return run_epoch_loop(
-        name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device,
-        epochs=epochs, cfg=slt_cfg, step_fn=step_fn, evaluate_fn=evaluate_fn,
-        default_monitor="val_loss", default_mode="min", dev_loader=dev_loader, resume=resume,
+        name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device, epochs=epochs,
+        cfg=slt_cfg, step_fn=step_fn, evaluate_fn=evaluate_fn, default_monitor="val_loss", default_mode="min",
+        dev_loader=dev_loader, resume=resume, checkpoint_meta=checkpoint_meta,
     )

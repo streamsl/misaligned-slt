@@ -124,7 +124,7 @@ def _fmt_metric(value) -> str:
 class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def __init__(
         self, stage: str, cfg: dict | None = None, epochs: int = 0,
-        steps_per_epoch: int = 0, monitor: str = "val_loss", enabled: bool = True,
+        steps_per_epoch: int = 0, monitor: str = "val_loss", enabled: bool = True, resumed: bool = False,
     ):
         # `enabled=False` (non-zero ranks under torchrun) makes every method a no-op: no console, no progress bar,
         # no history.csv, no wandb — one writer per artifact, one readable stream on stdout.
@@ -140,6 +140,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         self._epoch: int | None = None
         self._epoch_t0 = 0.0
         self._rows: list[dict] = []
+        self._resumed = bool(resumed)  # only a resume may carry forward prior rows (see _save_history_files)
         self._progress = None
         self._progress_total = max(0, self.epochs * self.steps_per_epoch)
         self._wandb = None
@@ -293,10 +294,13 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def _save_history_files(self) -> None:
         if not self._rows or self._history_csv is None: return
         self._history_csv.parent.mkdir(parents=True, exist_ok=True)
-        # A resumed run starts with an empty _rows, so rewriting would drop epochs 1..k of the curve — the only
-        # record of them when wandb is off. Carry forward any rows on disk this process did not produce.
+        # A RESUMED run starts with an empty _rows, so rewriting would drop epochs 1..k of the curve — the only
+        # record of them when wandb is off. Carry those forward, but ONLY on a resume: a fresh run in the same
+        # checkpoint dir would otherwise inherit the tail of a longer previous run (its epochs beyond this run's
+        # last), producing a file that reads as one curve with an unexplained jump. `_resumed` is set by the
+        # training loop; without it, a fresh run truncates the file to its own rows.
         rows = self._rows
-        if self._history_csv.exists():
+        if self._resumed and self._history_csv.exists():
             with self._history_csv.open("r", encoding="utf-8", newline="") as f:
                 prior = [r for r in csv.DictReader(f) if r.get("epoch") not in {str(r2.get("epoch")) for r2 in rows}]
             rows = prior + rows
@@ -348,7 +352,8 @@ def run_epoch_loop(
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
     # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
     if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint, meta=checkpoint_meta)
-    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor, enabled=dist.is_main())
+    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor,
+                         enabled=dist.is_main(), resumed=bool(resume))
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
         "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about "
@@ -369,6 +374,18 @@ def run_epoch_loop(
             raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
         
         state = load_train_state(latest_path, model, optimizer)
+        # Analysis stages rewrite inference.yaml (delta_enc_frames, min_span_frames, buffer_cap_s, duration_decode) and outputs/a_*.json 
+        # (mode mix, jitter) BETWEEN sessions, and those parameterize this training run. Resuming across such a change trains the 2nd half 
+        # under a different objective — visible afterwards only as an unexplained discontinuity in loss curves. Refuse, and name the keys.
+        saved_meta = dict(state.get("meta") or {})
+        if saved_meta and checkpoint_meta:
+            drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))
+            if drift: raise SystemExit(
+                f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
+                + "; ".join(f"{k}: {saved_meta.get(k)!r} -> {checkpoint_meta.get(k)!r}" for k in drift[:4])
+                + f". Restore those values to resume, or start a fresh run (move {latest_path}) — resuming across "
+                f"the change trains the two halves under different objectives."
+            )
         saved_epochs = int(state.get("epochs", epochs))
         if saved_epochs != int(epochs) and scheduler.scheduler is not None: raise SystemExit(
             f"--resume: run was launched with epochs={saved_epochs} but this invocation says {epochs}; the LR schedule horizon is baked "
@@ -424,7 +441,7 @@ def run_epoch_loop(
             latest_path, model=model, optimizer=optimizer,
             scheduler_state=scheduler.scheduler.state_dict() if scheduler.scheduler is not None else None,
             scaler_state=amp.scaler.state_dict() if amp.scaler.is_enabled() else None,
-            control_state=control.state_dict(), epoch=epoch, epochs=int(epochs),
+            control_state=control.state_dict(), epoch=epoch, epochs=int(epochs), meta=checkpoint_meta,
         )
     control.restore(model)
     logger.finish()

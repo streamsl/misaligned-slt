@@ -108,10 +108,12 @@ if __name__ == "__main__":
         # Skip frozen params; build_optimizer reads learning_rate/weight_decay (same keys every stage)
         optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
         logs = train_slt_epochs(
-            components.model, components.train_loader, optimizer, device=device, epochs=epochs,
-            slt_cfg=slt_cfg, dev_loader=components.dev_loader, resume=args.resume,
+            components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
+            dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,
         )
-        path = save_model_checkpoint(components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt")) if dist.is_main() else None
+        path = save_model_checkpoint(
+            components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"), meta=components.checkpoint_meta,
+        ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 

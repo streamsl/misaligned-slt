@@ -132,6 +132,7 @@ def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEven
 
 def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "events" in data: data = data["events"]  # stamped form (see _write_events_json)
     out: dict[str, list[PredictionEvent]] = {}
     if isinstance(data, dict):
         for video_id, segments in data.items():
@@ -836,13 +837,17 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     return predicted
 
 
-def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path) -> Path:
+def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
+    """Predicted events plus the DECODE BUDGET they were produced under.
+
+    RQ2 rows are only comparable at equal decode effort: `--method baseline` defaults to beam-4 (configs/baseline_eval.yaml) while the dlm/ar 
+    arms are pinned greedy, so a cascade row run without `--num-beams 1` carries a budget advantage that the numbers alone do not reveal.
+    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(
-        {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}, 
-        indent=2, sort_keys=True
-    ) + "\n", encoding="utf-8")
+    payload = {"events": {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}}
+    if provenance: payload["provenance"] = dict(provenance)
+    out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
 
 
@@ -865,24 +870,36 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     )
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
+    method_cfg = load_yaml(_method_config_path(args), language=args.language)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
-
+    prov = {
+        "method": args.method, 
+        "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4))) if args.method == "baseline" else 1, 
+        "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None), 
+        "segments": getattr(args, "segments", None)
+    }
+    # Loud, because it silently invalidates every row difference: the cascade rows use --method baseline, whose
+    # config default is beam-4, while the dlm/ar arms decode greedy. README prescribes --num-beams 1 for parity.
+    if args.method == "baseline" and int(prov["num_beams"]) != 1: print(
+        f"[rq2] WARNING: baseline decodes with num_beams={prov['num_beams']} while the dlm/ar arms are greedy — "
+        f"this row is NOT decode-budget comparable with them. Re-run with --num-beams 1 for the parity row.", flush=True
+    )
     if args.stream:
         predicted = run_streaming(args)
-        _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json")
+        _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json", prov)
         fsm_bio = getattr(run_streaming, "last_fsm_bio", None)
         if fsm_bio:  # FSM-internal BIO metric, persisted alongside the events
             path = Path(f"outputs/rq2_fsm_bio_{args.method}_{args.language}_{args.split}.json")
             path.write_text(json.dumps(fsm_bio, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif args.offline:
         predicted = run_offline(args)
-        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json")
+        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json", prov)
     elif args.segments:
         predicted = run_pipeline_floor(args)
         # Name by span source (--segments stem carries arch+lang+split) AND method, so cascade rows never collide.
         src = Path(args.segments).stem
-        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json")
+        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json", prov)
     else:
         predicted = load_event_predictions(args.predictions)
         # Same fail-loud contract as run_pipeline_floor's --segments guard. Here, not in the scorer: disjoint ids

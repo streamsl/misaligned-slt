@@ -56,7 +56,7 @@ def _atomic_torch_save(obj: dict, path: Path) -> Path:
 
 def save_train_state(
     path: str | Path, *, model: nn.Module, optimizer: torch.optim.Optimizer, scheduler_state: dict | None, 
-    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, step: int = 0
+    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, step: int = 0, meta: dict | None = None,
 ) -> Path:
     """Full resumable snapshot (latest.pt): weights + optimizer moments + scheduler/scaler + best-tracking.
 
@@ -70,6 +70,9 @@ def save_train_state(
         # and fast-forwards; 0 = epoch boundary (the pre-change semantics, and the default for old snapshots).
         "step": int(step),
         "epochs": int(epochs),  # schedule horizon: total_steps is baked into the scheduler state, so resume must match
+        # The run's training-critical config, compared on resume: analysis stages rewrite those configs between
+        # sessions, so without this a resumed run changes objective mid-training and nothing records it.
+        "meta": dict(meta or {}),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler_state,

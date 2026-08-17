@@ -95,10 +95,9 @@ def assert_normalized_coords(payloads, video_id: str = "") -> None:
         if vals.size: sample.append(float(np.median(np.abs(vals))))
         if len(sample) >= 64: break
     if sample and float(np.median(sample)) > 2.0: raise ValueError( # normalized median ~0.5; pixels are in hundreds
-        f"SignVerse video {video_id!r}: confident body coords look PIXEL-space (median |coord| "
-        f"{np.median(sample):.1f}), but the converter forwards NORMALIZED [0,1] coords to crop_scale (as every "
-        f"verified shard is). The deleted pre-release README claimed pixel space — this shard may use it; "
-        f"verify the shard format (and re-normalize to x/W,y/H) before converting."
+        f"SignVerse video {video_id!r}: confident body coords look PIXEL-space (median |coord| {np.median(sample):.1f}), "
+        f"but the converter forwards NORMALIZED [0,1] coords to crop_scale (as every verified shard is). Verify the shard"
+        f"shard format (and re-normalize to x/W,y/H) before converting."
     )
 
 
@@ -136,8 +135,17 @@ def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int]:
     )
     fps = SIGNVERSE_DEFAULT_FPS
     total = int(np.asarray(z["total_frames"]).item()) if "total_frames" in z.files else 0
-    indices = np.asarray(z["frame_indices"]).astype(np.int64)   # 1-based video frame numbers
     payloads = z["frame_payloads"]
+    # Two shard layouts exist. SPARSE carries `frame_indices` (1-based video frame numbers) alongside a payload
+    # list that may skip undetected frames. DENSE omits it and stores one payload per frame, so the row position
+    # IS the frame. Requiring `frame_indices` crashed with KeyError on dense shards.
+    if "frame_indices" in z.files: indices = np.asarray(z["frame_indices"]).astype(np.int64)
+    else:
+        if total and total != len(payloads): raise ValueError(
+            f"{npz_path}: dense layout expected one payload per frame, got total_frames={total} but "
+            f"{len(payloads)} payloads and no `frame_indices` to align them (keys: {sorted(z.files)})"
+        )
+        indices = np.arange(1, len(payloads) + 1, dtype=np.int64)
     widths = np.asarray(z["frame_widths"]).astype(np.float64) if "frame_widths" in z.files else None
     heights = np.asarray(z["frame_heights"]).astype(np.float64) if "frame_heights" in z.files else None
 

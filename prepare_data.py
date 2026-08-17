@@ -31,7 +31,7 @@ upload frontier, no failure markers), a few are indexed but absent from their sh
 both are reported and reconciled, not errors.
 """
 from __future__ import annotations
-import argparse, csv, json, shutil, sys, tarfile, urllib.request
+import argparse, csv, json, shutil, sys, tarfile, urllib.request, zipfile
 import numpy as np
 
 from pathlib import Path
@@ -78,22 +78,36 @@ def _pick_caption(files: dict[str, bytes], target_code: str) -> tuple[str, bytes
 
 
 def _download(url: str, dest: Path, resume: bool = True) -> Path:
+    """Download to `<dest>.part` and promote ONLY once the byte count matches what the server advertised.
+
+    An interrupted transfer ends `copyfileobj` normally, so promoting unconditionally publishes a truncated file that every later stage treats 
+    as complete — the download stage skips it ("already present") and the convert stage dies with `tarfile.ReadError: unexpected end of data`. 
+    Leaving the `.part` in place instead keeps the bytes for the next resume.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     headers = {}
     start = tmp.stat().st_size if resume and tmp.exists() else 0
     if start: headers["Range"] = f"bytes={start}-"
     req = urllib.request.Request(url, headers=headers)
+    expected = None
     try:
         with urllib.request.urlopen(req) as r:
-            # Server ignored our Range (200, not 206) → it is sending the WHOLE file; 
+            # Server ignored our Range (200, not 206) → it is sending the WHOLE file;
             # appending onto the partial would corrupt the tar. Restart from byte 0.
             append = start > 0 and r.status == 206
-            with open(tmp, "ab" if append else "wb") as f:
-                shutil.copyfileobj(r, f, length=1 << 20)
+            # 206 reports "bytes A-B/TOTAL"; 200 reports the whole length in Content-Length.
+            crange = r.headers.get("Content-Range")
+            if crange and "/" in crange: expected = int(crange.rsplit("/", 1)[1])
+            elif r.headers.get("Content-Length") is not None: expected = int(r.headers["Content-Length"]) + (start if append else 0)
+            with open(tmp, "ab" if append else "wb") as f: shutil.copyfileobj(r, f, length=1 << 20)
     except urllib.error.HTTPError as e:
         if e.code == 416 and tmp.exists(): pass  # already fully downloaded (range beyond EOF)
         else: raise
+    got = tmp.stat().st_size if tmp.exists() else 0
+    if expected is not None and got != expected: raise IOError(
+        f"{dest.name}: incomplete download ({got}/{expected} bytes). Kept {tmp.name} — re-run download stage to resume from byte {got}."
+    )
     tmp.rename(dest)
     return dest
 
@@ -153,6 +167,35 @@ def stage_download(args, plan: dict) -> None:
         _download(f"{HF_BASE}/dataset/{shard}", dest)
 
 
+def stage_verify(args, plan: dict) -> None:
+    """Check every cached shard against the size the server reports, and name the ones to re-download.
+
+    Local size alone cannot decide this — shards legitimately range from ~1 MB to ~3 GB — and reading the archive conflates a truncated 
+    download with a cloud-storage file that has not hydrated. The server's Content-Length is the only authority.
+    """
+    cache = Path(args.cache or Path(args.root) / "signverse_shards")
+    shards = sorted(plan["shards"])
+    if args.limit: shards = shards[: args.limit]
+    bad, missing, ok = [], [], 0
+    for i, shard in enumerate(shards, 1):
+        dest = cache / shard
+        if not dest.exists(): missing.append(shard); continue
+        req = urllib.request.Request(f"{HF_BASE}/dataset/{shard}", method="HEAD")
+        try:
+            with urllib.request.urlopen(req) as r: expected = int(r.headers["Content-Length"])
+        except Exception as e:
+            print(f"verify | [{i}/{len(shards)}] {shard}: HEAD failed ({e}) — skipped", flush=True); continue
+        got = dest.stat().st_size
+        if got == expected: ok += 1
+        else:
+            bad.append((shard, got, expected))
+            print(f"verify | [{i}/{len(shards)}] {shard}: {got} bytes, server says {expected} — TRUNCATED", flush=True)
+    print(f"\nverify | {ok} complete, {len(bad)} truncated, {len(missing)} not downloaded", flush=True)
+    if bad:
+        print("verify | delete these and re-run --stage download:", flush=True)
+        for shard, _, _ in bad: print(f"    rm {cache / shard}", flush=True)
+
+
 def _convert_one(tar: tarfile.TarFile, vid: str, lang_root: Path, tmp_dir: Path, tcode: str, subtitle_cfg: dict) -> dict | None:
     members = [m for m in tar.getmembers() if m.name.startswith(f"{vid}/")]
     if not any(m.name.startswith(f"{vid}/npz/") for m in members): return None
@@ -191,7 +234,8 @@ def stage_convert(args, plan: dict) -> None:
     subtitle_cfg = data_cfg.get("subtitles", {}) or {}
     targets = _lang_targets(data_cfg, {v["language"] for v in plan["videos"].values()})
     per_lang_meta: dict[str, dict[str, dict]] = {}
-    report = {"converted": 0, "skipped_existing": 0, "empty_heavy": [], "npz_missing": [], "not_downloaded": 0, "no_caption": 0}
+    report = {"converted": 0, "skipped_existing": 0, "empty_heavy": [], 
+              "npz_missing": [], "npz_corrupt": [], "not_downloaded": 0, "no_caption": 0}
 
     def _meta_for(lang: str) -> dict:
         return per_lang_meta.setdefault(lang, load_video_meta(root / lang / META_FILENAME))
@@ -227,13 +271,31 @@ def stage_convert(args, plan: dict) -> None:
         if wanted:
             print(f"convert | {shard}: {len(wanted)} video(s)", flush=True)
             tmp_dir = cache / "_extract"
+            # A truncated shard raises deep inside tarfile with no clue which file is bad. Name it and say what to do: the archive is 
+            # unusable, so the only fix is to delete and re-download it. getmembers(), not open(): a truncated tar opens fine (its 1st 
+            # header is intact) and only fails when the index is walked to the end.
+            try:
+                with tarfile.open(tar_path) as _probe: _probe.getmembers()
+            except tarfile.ReadError as e: raise SystemExit(
+                f"convert | {tar_path} is corrupt or truncated ({e}). This is a partial download, not a data problem. "
+                f"Delete it and re-run the download stage:\n    rm {tar_path}"
+            ) from e
             with tarfile.open(tar_path) as tar:
+                shard_corrupt: list[str] = []
                 for vid in wanted:
                     lang = plan["videos"][vid]["language"]
                     lang_root = root / lang
-                    stats = _convert_one(tar, vid, lang_root, tmp_dir, targets.get(lang, "en"), subtitle_cfg)
-                    if stats is None:
-                        # Upstream inconsistency, nothing to retry — record it so the final tally reconciles.
+                    # A per-video npz can be corrupt inside a structurally valid tar (CRC failure on the inner zip member). That is 1 
+                    # unusable video, not a bad run: record it and continue, so a multi-hour conversion is not lost to a single upstream 
+                    # byte error. A shard where MANY videos fail is a bad download instead, and is escalated below.
+                    try: stats = _convert_one(tar, vid, lang_root, tmp_dir, targets.get(lang, "en"), subtitle_cfg)
+                    except (zipfile.BadZipFile, EOFError, ValueError) as e:
+                        shutil.rmtree(tmp_dir / vid, ignore_errors=True)
+                        shard_corrupt.append(vid)
+                        report["npz_corrupt"].append(vid)
+                        print(f"convert |   {vid}: unreadable npz in {shard} ({type(e).__name__}: {e}) — skipped", flush=True)
+                        continue
+                    if stats is None: # Upstream inconsistency, nothing to retry — record it so the final tally reconciles.
                         report["npz_missing"].append(vid)
                         print(f"convert |   {vid}: npz absent from {shard} (upstream index/packaging gap) — skipped", flush=True)
                         continue
@@ -248,6 +310,13 @@ def stage_convert(args, plan: dict) -> None:
                     if stats["frames"] and stats["empty_frames"] / stats["frames"] > 0.5:
                         report["empty_heavy"].append((vid, round(stats["empty_frames"] / stats["frames"], 2)))
 
+                # Widespread failure in ONE shard is a corrupt download, not upstream data: same remedy as a
+                # corrupt tar index, so fail with the same instruction rather than silently dropping the shard.
+                if len(shard_corrupt) >= max(3, len(wanted) // 2): raise SystemExit(
+                    f"convert | {len(shard_corrupt)}/{len(wanted)} videos in {tar_path} have unreadable npz data. That is a "
+                    f"corrupt download, not an upstream gap. Delete it and re-run the download stage:\n    rm {tar_path}"
+                )
+
         # Persist meta AFTER EACH SHARD: a crash then costs one shard, not the whole run.
         for lang in touched_langs: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
         if args.delete_tars: tar_path.unlink()
@@ -257,16 +326,21 @@ def stage_convert(args, plan: dict) -> None:
 
     # Full reconciliation: every split video lands in exactly one bucket, so the counts add up on their own.
     n_split = len(plan["videos"]) + len(plan["missing"])
-    accounted = report["converted"] + report["skipped_existing"] + len(plan["missing"]) + len(report["npz_missing"]) + report["not_downloaded"]
-    print(f"convert | reconciliation ({n_split} split videos = {accounted} accounted): converted {report['converted']} + "
-          f"already present {report['skipped_existing']} + not uploaded upstream {len(plan['missing'])} + npz absent "
-          f"from shard {len(report['npz_missing'])} + shard not downloaded {report['not_downloaded']}")
+    accounted = (report["converted"] + report["skipped_existing"] + len(plan["missing"]) + len(report["npz_missing"])
+                 + len(report["npz_corrupt"]) + report["not_downloaded"])
+    print(f"convert | reconciliation ({n_split} split videos = {accounted} accounted): converted {report['converted']} + already present "
+          f"{report['skipped_existing']} + not uploaded upstream {len(plan['missing'])} + npz absent from shard {len(report['npz_missing'])} + "
+          f"unreadable npz {len(report['npz_corrupt'])} + shard not downloaded {report['not_downloaded']}")
     if report["not_downloaded"]: print(f"convert | {report['not_downloaded']} video(s) are in shards not present in {cache} — "
                                        f"run `--stage download` (or `--stage all` without --limit) to fetch them.")
     print(f"convert | {report['converted'] - report['no_caption']} video(s) captioned from their shard track (caption_source=shard); "
           f"{report['no_caption']} without a usable shard caption → `--stage subs` gap-fills from subtitles tar (else the loader drops them)")
     if report["empty_heavy"]: print(f"convert | {len(report['empty_heavy'])} converted video(s) have >50% undetected-signer frames.")
     if report["npz_missing"]: print("convert | npz absent from shard (upstream gap, unrecoverable here): " + ", ".join(report["npz_missing"]))
+    if report["npz_corrupt"]: print(
+        f"convert | {len(report['npz_corrupt'])} videos had unreadable npz data and were skipped: " + ", ".join(report["npz_corrupt"]) +
+        "\nconvert | these are excluded from video_meta.csv. Re-download affected shards and re-run --stage convert to recover them."
+    )
 
 
 def stage_subs(args, plan: dict) -> None:
@@ -342,7 +416,7 @@ def stage_subs(args, plan: dict) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SignVerse-2M → repo language layout (poses/ + subs/ + video_meta.csv)")
-    parser.add_argument("--stage", default="all", choices=["plan", "download", "convert", "subs", "all"])
+    parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "subs", "all"])
     parser.add_argument("--languages", nargs="+", default=["asf", "bfi"])
     parser.add_argument("--split-csv", default=DEFAULT_SPLIT_CSV)
     parser.add_argument("--data-config", default="configs/data.yaml", help="reads languages[lang].target_lang for the caption language")
@@ -364,5 +438,6 @@ if __name__ == "__main__":
     if plan["missing"]: print(f"prepare | {len(plan['missing'])} video(s) not yet uploaded upstream (no failure markers) — skipped")
     if args.stage in ("plan",): stage_plan(args, plan)
     if args.stage in ("download", "all"): stage_download(args, plan)
+    if args.stage == "verify": stage_verify(args, plan)
     if args.stage in ("convert", "all"): stage_convert(args, plan)
     if args.stage in ("subs", "all"): stage_subs(args, plan)

@@ -271,7 +271,7 @@ class MisalignedSLTModel(nn.Module):
     def generate_from_poses(
         self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
         gate_enabled: bool = False, gate_delta: int = 3, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
-        commit_mask: torch.Tensor | None = None, gate_stream_start: bool = False, **decode_kwargs,
+        commit_mask: torch.Tensor | None = None, gate_stream_start: bool = False, gate_use_duration_prior: bool = True, **decode_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Poses → (bio_logits, tokens, confidence, gate_skip). Owns the BIO tap + membership gate; decode knobs (max_text_tokens / 
         diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) pass through to `generate_from_bio_tap`, 
@@ -287,17 +287,27 @@ class MisalignedSLTModel(nn.Module):
         omega_bias = None
         gate_skip = torch.zeros(poses.shape[0], dtype=torch.bool)
         if gate_enabled:
-            # gate_stream_start: this window is the 1st buffer of its stream, so a signing frame 0 IS a genuine onset. Without it a 
-            # window that opens mid-signing can never open a span (buffer-start I does not open), Ω falls to its no-span branch and 
+            # gate_stream_start: this window is the 1st buffer of its stream, so a signing frame 0 IS a genuine onset. Without it a
+            # window that opens mid-signing can never open a span (buffer-start I does not open), Ω falls to its no-span branch and
             # floors the whole window — on GT-span RQ1 windows, which begin exactly at sentence onset, that fires on a 3rd of them.
-            omega_bias, _ = self.build_gate_omega(
-                bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), commit_mask=commit_mask,
-                delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, timestamps_s=timestamps, stream_start=gate_stream_start,
-            )
-            gate_skip = gate_skip_flags(
-                bio_logits, mask, min_span_frames=gate_min_span_frames, duration_prior=getattr(self, "duration_prior", None), 
-                timestamps_s=timestamps, commit_mask=commit_mask, stream_start=gate_stream_start,
-            )
+            #
+            # gate_use_duration_prior=False: pick Ω anchor WITHOUT semi-Markov re-split. The re-split separates back-to-back sentences 
+            # in a RUNNING STREAM; its split_bias is a sentence-COUNT prior tuned on whole videos. On a controlled single-anchor window 
+            # it manufactures interior splits, 1st fragment becomes the anchor, and Ω's right wall floors the rest of the sentence being 
+            # scored. FSM keeps the prior — streams genuinely contain adjacent sentences; a controlled window by construction doesn't.
+            prior_hold = getattr(self, "duration_prior", None)
+            if not gate_use_duration_prior: self.duration_prior = None
+            try:
+                omega_bias, _ = self.build_gate_omega(
+                    bio_logits, None, mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), 
+                    commit_mask=commit_mask, delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames, 
+                    timestamps_s=timestamps, stream_start=gate_stream_start,
+                )
+                gate_skip = gate_skip_flags(
+                    bio_logits, mask, min_span_frames=gate_min_span_frames, duration_prior=getattr(self, "duration_prior", None),
+                    timestamps_s=timestamps, commit_mask=commit_mask, stream_start=gate_stream_start,
+                )
+            finally: self.duration_prior = prior_hold
         tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
         # DLM already strips its synthetic BOS in generate_from_bio_tap; the AR arm returns it raw (the Mode-2a
         # replay needs the start slot). Strip here so eval's confidence mean covers only produced tokens, both arms.

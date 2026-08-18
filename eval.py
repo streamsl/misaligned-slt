@@ -476,7 +476,13 @@ def _translate_windows(
     # Whether frame 0 is a genuine sentence ONSET is a property of how the caller cut this window, not a constant:
     # a window that starts BEFORE the sentence opens inside the predecessor, and minting a B there would anchor Ω
     # on the predecessor's tail and floor the sentence being scored. Baseline is ungated, so the flag is inert.
-    if gen_kwargs.get("gate_enabled"): gen_kwargs["gate_stream_start"] = bool(stream_start)
+    if gen_kwargs.get("gate_enabled"):
+        gen_kwargs["gate_stream_start"] = bool(stream_start)
+        # 2 flags are 1 judgement about the window's structure. stream_start=True means frame 0 is the target's onset — a fresh one-sentence 
+        # stream with no adjacent structure, where the re-split's sentence-count prior only manufactures interior splits and Ω anchors on a 
+        # fragment. stream_start=False means the window opens inside the predecessor — the mid-stream buffer geometry the re-split exists for, 
+        # so it stays on, exactly as the FSM runs it.
+        gen_kwargs["gate_use_duration_prior"] = not bool(stream_start)
     _, tokens, confidence, gate_skip = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
     tok = tokens.detach().cpu()
     conf = confidence.detach().float().cpu()
@@ -536,19 +542,28 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
         if poses.shape[0] == 0: continue
         materialized.append((window, poses, timestamps))
 
-    materialized.sort(key=lambda wp: int(wp[1].shape[0]))
     batch_size = max(1, int(rq_cfg.get("batch_size", 16)))
     grouped: dict[tuple[float, float], dict[str, list]] = {}
     rows = []
-    for start in tqdm(range(0, len(materialized), batch_size), desc="Translating windows"):
-        chunk = materialized[start : start + batch_size]
-        # The severity grid includes NEGATIVE head offsets (configs/eval.yaml severity_grid_rel), whose windows start before the sentence — 
-        # frame 0 lies in the predecessor, so it is not an onset. Chunks are grouped by grid cell, so the whole chunk shares one offset.
-        heads = {round(float(w.delta_head_s), 6) for (w, _, _) in chunk}
+    # `stream_start` is a per-WINDOW property (does frame 0 sit at the sentence onset, or inside the predecessor?), but it is applied per batch. 
+    # The severity grid holds NEGATIVE head offsets (configs/eval.yaml severity_grid_rel), so PARTITION by sign before chunking: length-sorting 
+    # alone interleaves grid cells, and a per-chunk `all(head >= 0)` would then drop the flag for onset windows that merely share a batch with a
+    # lead-in one — making the result depend on batch_size. Length-sorting (padding efficiency) still applies WITHIN each partition, and padding 
+    # is masked, so batching never changes a window's output.
+    partitions = [
+        ([m for m in materialized if float(m[0].delta_head_s) >= 0.0], True),   # starts at/inside the sentence
+        ([m for m in materialized if float(m[0].delta_head_s) < 0.0], False),   # starts in the predecessor
+    ]
+    chunks = []
+    for part, is_stream_start in partitions:
+        part.sort(key=lambda wp: int(wp[1].shape[0]))
+        chunks += [(part[s : s + batch_size], is_stream_start) for s in range(0, len(part), batch_size)]
+
+    for chunk, is_stream_start in tqdm(chunks, desc="Translating windows"):
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
-            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device, 
-            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=all(h >= 0.0 for h in heads),
+            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
+            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start,
         )
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
@@ -758,6 +773,9 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
         f"[pipeline_floor] WARNING: {len(segments) - len(matched)}/{len(segments)} segment video_ids "
         f"are absent from --split {args.split}; scoring only the {len(matched)} that match.", flush=True)
 
+    # Same single-sentence-unit rule as run_rq1: a cascade window IS the span to translate — the upstream segmenter already did the splitting,
+    # so re-splitting inside it would anchor Ω on a fragment of the very span being scored. Gate-off methods (baseline) never read the prior.
+    model.duration_prior = None
     predicted: dict[str, list[PredictionEvent]] = {}
     for video_id, spans in tqdm(segments.items(), desc="Processing segments"):
         record = records_by_id.get(video_id)

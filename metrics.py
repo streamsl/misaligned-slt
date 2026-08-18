@@ -316,20 +316,26 @@ def _sentence_text_scores(
 def compute_text_metrics(
     predictions: list[str], references: list[str], *, localization_aware: bool = False,
     n_pred: int | None = None, n_gold: int | None = None, memo: dict[tuple[str, str], dict[str, float]] | None = None,
-    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "translation",
+    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str | None = None,
 ) -> dict[str, float]:
-    """Translation-quality metrics, in two modes.
+    """Translation-quality metrics, in 2 modes that are NOT comparable and are therefore named differently.
+
+    2 modes answer different questions, so they get different key prefixes (`translation_*` vs `soda_*`). Sharing 1 name 
+    invites exactly 1 mistake: reading a fused RQ2 cell as if it were translation quality & concluding the model collapsed. 
+    The relationship is  soda_X ~= (mean per-pair X) * segmentation.f1, so a fused cell divided by the f1 reported beside 
+    it recovers the per-pair quality — no extra metric needed.
 
     localization_aware=False (default — RQ1, GT-span rows, analysis-b): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT
     over the whole set. Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence
     means; BLEU-4 pools across the set, so it is computed corpus-level.
 
-    localization_aware=True (RQ2 dense/streaming): SODA F1 (Fujita et al. 2020) over the MATCHED (pred, gold) pairs.
-    Per-pair sentence scores are summed, then precision = Σ/n_pred, recall = Σ/n_gold, F1 = 2PR/(P+R) — charging
-    spurious predictions AND missed gold, so a spammy or under-generating method cannot inflate the score by scoring
-    only the subset it localizes. Sentence-BLEU (corpus BLEU does not split per pair). Needs n_pred/n_gold;
-    `memo` caches per-pair scores across tIoU thresholds (BLEURT is a model forward).
+    localization_aware=True (RQ2 dense/streaming), prefix `soda`: SODA F1 (Fujita et al. 2020) over MATCHED (pred, gold) 
+    pairs. Per-pair sentence scores are summed, then precision = Σ/n_pred, recall = Σ/n_gold, F1 = 2PR/(P+R) — charging
+    spurious predictions AND missed gold, so a spammy or under-generating method cannot inflate the score by scoring only 
+    the subset it localizes. Sentence-BLEU (corpus BLEU does not split per pair). Needs n_pred/n_gold; `memo` caches 
+    per-pair scores across tIoU thresholds (BLEURT is a model forward).
     """
+    prefix = prefix if prefix is not None else ("soda" if localization_aware else "translation")
     if localization_aware:
         if n_pred is None or n_gold is None: 
             raise ValueError("localization_aware=True needs n_pred and n_gold (SODA count normalisation)")

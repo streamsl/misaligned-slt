@@ -19,14 +19,18 @@ class ConfidenceBoundStats:
 
 
 def masked_cross_entropy(
-    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None, class_weights: torch.Tensor | None = None,
+    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor | None = None, 
+    class_weights: torch.Tensor | None = None, label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     # CE over valid positions, optionally per-class weighted. Normalized by valid-frame count 
     # (not by summed class weights) so the scale stays comparable to the unweighted loss.
     if logits.ndim != targets.ndim + 1: raise ValueError(f"logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}")
     weight = None
     if class_weights is not None: weight = class_weights.to(dtype=logits.dtype, device=logits.device)
-    token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), weight=weight, reduction="none").reshape_as(targets)
+    token_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), weight=weight, 
+        reduction="none", label_smoothing=float(label_smoothing)
+    ).reshape_as(targets)
     
     if valid_mask is None: return token_loss.mean()
     mask = valid_mask.to(dtype=token_loss.dtype, device=token_loss.device)

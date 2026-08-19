@@ -319,7 +319,7 @@ class MisalignedSLTModel(nn.Module):
         self, batch: dict, lambda_trans: float = 1.0, lambda_bio: float = 1.0,
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
-        oput_rollout_eval_mode: bool = True, oput_eos_supervision: int | None = None,
+        oput_label_smoothing: float = 0.0, oput_rollout_eval_mode: bool = True, oput_eos_supervision: int | None = None,
         confidence_bound_enabled: bool = True, confidence_bound_active: bool = True, confidence_bound_tau: float = 0.75,
         cb_lambda: float = 0.3, verified_full_evidence_gate: bool = True, cb_decode_steps: int = 64,
         cb_dcd_window_length: int | None = None, cb_dcd_max_window_length: int | None = None, cb_dcd_window_type: str = "sliding",
@@ -355,6 +355,12 @@ class MisalignedSLTModel(nn.Module):
         translation_loss = bio_tap.sum() * 0.0
         trans_weight = translation_loss.detach() * 0.0  # token weight of the OPUT pool (0 when no supervised windows)
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
+        # REALIZED mode mix (materialize() relabels windows the jitter reshapes, so the drawn ratios are not what trains). mean_logs over an 
+        # epoch gives the realized fractions — the numbers the paper's "trained under the measured error distribution" claim actually refers to.
+        realized = batch.get("mode_names")
+        if isinstance(realized, list) and realized:
+            for m in ("mode1", "mode2", "mode3", "mode4"):
+                logs[f"mode_frac_{m}"] = bio_tap.new_tensor(sum(n == m for n in realized) / len(realized))
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
 
@@ -408,7 +414,7 @@ class MisalignedSLTModel(nn.Module):
                 dlm_out = self.dlm_decoder.oput_forward(
                     enc_hidden=enc_hidden[idx], enc_mask=enc_mask[idx],
                     labels=labels[idx], t_low=oput_t_low, t_high=oput_t_high,
-                    loss_over_all_positions=True, sample_rollout=oput_sample_rollout,
+                    loss_over_all_positions=True, sample_rollout=oput_sample_rollout, label_smoothing=oput_label_smoothing,
                     rollout_eval_mode=oput_rollout_eval_mode, eos_supervision=int(
                         oput_eos_supervision if oput_eos_supervision is not None else self.dlm_decoder.block_size
                     ),

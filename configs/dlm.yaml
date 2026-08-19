@@ -56,6 +56,9 @@ oput:
     # bias the SPD/DCD decode turns into truncation.) Diagnose with val_translation_len_ratio: <1 and falling = too
     # much EOS pressure (or commit threshold too low); hallucinated tails past sentence end = too little.
     eos_supervision_tokens: 4 # = block_size; 0 to disable
+    # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss). 
+    # Without it the DLM is the only arm with an unsmoothed CE.
+    label_smoothing: 0.2
 confidence_bound:
     # Right-truncated (Mode 2a) term. The full-evidence decode is a no-grad stop-grad self-target; the gate reads the real
     # SPD+DCD decode's confidence; the CE gradient flows through ONE cheap forward on the decoded sequence with the gated slots
@@ -137,6 +140,9 @@ mode2_subcase_weights:
     right: 0.45
     left: 0.45
     both: 0.10
+# Mode-3 span count {k: weight}: how many complete sentences a mode-3 window spans (k >= 2). Unset = always 2. The FSM reaches k>=3 
+# buffers (a commit retires 1 sentence per >=hysteresis strides while the buffer grows every stride), so a tail here trains that regime.
+# mode3_span_counts: {2: 0.6, 3: 0.3, 4: 0.1}
 # Pose augmentation — TRAIN windows only (the Mode-2a full-evidence view and dev are never augmented).
 # SPATIAL ops (centroid rotation + affine/spatial_mask jitter) — schema + defaults in poses/augmentation.py.
 # The `fps` sub-block is the TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden):

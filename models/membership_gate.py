@@ -71,6 +71,7 @@ def membership_logm(
     """
     B, T = hinge.shape
     device = hinge.device
+    in_dtype, hinge = hinge.dtype, hinge.float()
     Cpad = F.pad(torch.cumsum(hinge, dim=1), (1, 0))  # (B, T+1): Cpad[b,j] = sum_{k<j} hinge
     s = starts.clamp(0, T - 1).long()
     Cs = Cpad.gather(1, s.view(B, 1))                 # (B,1) = sum_{k<s} hinge
@@ -88,7 +89,7 @@ def membership_logm(
     if lengths is not None:                           # padded frames never gate real ones; keep them at floor
         valid = t < lengths.view(B, 1)
         logm = torch.where(valid, logm, ln_eps.expand_as(logm))
-    return logm
+    return logm.to(in_dtype)
 
 
 def _band_entropy(entropy: torch.Tensor, center: torch.Tensor, half: int, lengths: torch.Tensor) -> torch.Tensor:

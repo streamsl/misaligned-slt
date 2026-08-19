@@ -50,11 +50,9 @@ def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float
 
 
 def oput_two_pass_loss(
-    clean_ids: torch.Tensor, valid_mask: torch.Tensor,
-    decode_fn: Callable[[torch.Tensor], torch.Tensor],
-    mask_token_id: int, t_low: float = 0.3, t_high: float = 0.8,
-    loss_over_all_positions: bool = True, sample_rollout: bool = False,
-    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    clean_ids: torch.Tensor, valid_mask: torch.Tensor, decode_fn: Callable[[torch.Tensor], torch.Tensor], mask_token_id: int, 
+    t_low: float = 0.3, t_high: float = 0.8, loss_over_all_positions: bool = True, sample_rollout: bool = False, 
+    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor] | None = None, label_smoothing: float = 0.0,
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
@@ -89,16 +87,19 @@ def oput_two_pass_loss(
 
     pred_logits = decode_fn(pred_ids)
     loss_mask = valid_mask if loss_over_all_positions else masked
-    mask_loss = masked_cross_entropy(mask_logits, clean_ids, loss_mask)
-    pred_loss = masked_cross_entropy(pred_logits, clean_ids, loss_mask)
+    mask_loss = masked_cross_entropy(mask_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
+    pred_loss = masked_cross_entropy(pred_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
     with torch.no_grad():
         m = loss_mask.to(dtype=mask_logits.dtype)
-        rows = sum(
+        rows = 0.5 * sum(
             F.cross_entropy(lg.reshape(-1, lg.shape[-1]), clean_ids.reshape(-1), reduction="none").reshape_as(clean_ids) * m
             for lg in (mask_logits, pred_logits)
         ).sum(dim=1)
+    # MEAN of 2 passes, not their sum: the pooled translation loss weighs OPUT rows and Mode-2a CB rows by
+    # token count, and the AR arm's CE is single-pass — a summed two-pass OPUT would silently double the DLM's
+    # per-token translation scale relative to both (halving CB's share on the DLM arm only).
     return OPUTOutput(
-        loss=mask_loss + pred_loss, mask_loss=mask_loss, pred_loss=pred_loss, masked_positions=masked, 
+        loss=0.5 * (mask_loss + pred_loss), mask_loss=mask_loss, pred_loss=pred_loss, masked_positions=masked,
         rollout_tokens=pred_ids.detach(), row_loss_sum=rows, row_valid_count=m.sum(dim=1),
     )
 
@@ -126,7 +127,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         loss_over_all_positions: bool = True, sample_rollout: bool = False,
         rollout_eval_mode: bool = True, eos_supervision: int | None = None,
         rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None,
-        omega_bias: torch.Tensor | None = None,
+        omega_bias: torch.Tensor | None = None, label_smoothing: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
@@ -165,7 +166,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             decode_fn=lambda noisy_ids: self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias),
             mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high,
             loss_over_all_positions=loss_over_all_positions, sample_rollout=sample_rollout,
-            rollout_decode_fn=rollout_decode_fn,
+            rollout_decode_fn=rollout_decode_fn, label_smoothing=label_smoothing
         )
         assert enc_hidden._version == enc_version, "OPUT conditioning mutated between passes (fixed c)"
         return {

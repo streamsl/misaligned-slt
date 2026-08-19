@@ -445,8 +445,9 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
 
 @torch.no_grad()
 def _translate_windows(
-    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]], device: torch.device, 
+    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]], device: torch.device,
     inference_cfg: dict, method_cfg: dict, batch_size: int | None = None, stream_start: bool = False,
+    commit_frontier_s: list[float] | None = None, use_duration_prior: bool | None = None,
 ) -> list[tuple[str, float, bool]]:
     """Pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)]. The loop-decode entry point:
     ONE `generate_from_poses` path for every method.
@@ -458,8 +459,9 @@ def _translate_windows(
     if batch_size is not None and int(batch_size) < len(items):
         out: list[tuple[str, float, bool]] = []
         for i in range(0, len(items), max(1, int(batch_size))): out.extend(_translate_windows(
-            model, tokenizer, method, items[i:i + max(1, int(batch_size))], 
-            device, inference_cfg, method_cfg, stream_start=stream_start,
+            model, tokenizer, method, items[i:i + max(1, int(batch_size))], device, 
+            inference_cfg, method_cfg, stream_start=stream_start, use_duration_prior=use_duration_prior,
+            commit_frontier_s=commit_frontier_s[i:i + max(1, int(batch_size))] if commit_frontier_s else None,
         ))
         return out
     visual_padding = str(method_cfg.get("visual_padding", "none"))
@@ -478,11 +480,13 @@ def _translate_windows(
     # on the predecessor's tail and floor the sentence being scored. Baseline is ungated, so the flag is inert.
     if gen_kwargs.get("gate_enabled"):
         gen_kwargs["gate_stream_start"] = bool(stream_start)
-        # 2 flags are 1 judgement about the window's structure. stream_start=True means frame 0 is the target's onset — a fresh one-sentence 
-        # stream with no adjacent structure, where the re-split's sentence-count prior only manufactures interior splits and Ω anchors on a 
-        # fragment. stream_start=False means the window opens inside the predecessor — the mid-stream buffer geometry the re-split exists for, 
-        # so it stays on, exactly as the FSM runs it.
-        gen_kwargs["gate_use_duration_prior"] = not bool(stream_start)
+        gen_kwargs["gate_use_duration_prior"] = (not bool(stream_start)) if use_duration_prior is None else bool(use_duration_prior)
+        # commit_frontier_s (per item, window-relative): frames strictly before it are the already-handled predecessor — the FSM's χ. Without 
+        # it a window opening MID-SIGNING has an unopenable leading I-run (buffer-start I never opens; no χ mint fires) and Ω anchors on a 
+        # shifted fragment or the NEXT sentence. Measured on the offline row: the whole stream-vs-offline gap sat in back-to-back windows.
+        if commit_frontier_s is not None: gen_kwargs["commit_mask"] = timestamps < torch.tensor(
+            commit_frontier_s, dtype=timestamps.dtype, device=timestamps.device
+        ).unsqueeze(1)
     _, tokens, confidence, gate_skip = model.generate_from_poses(poses=poses, frame_mask=frame_mask, timestamps_s=timestamps, **gen_kwargs)
     tok = tokens.detach().cpu()
     conf = confidence.detach().float().cpu()
@@ -512,6 +516,11 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     # arms (pass 1); the literature floor keeps the config's beam-4.
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
+    _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+    if args.method == "baseline" and _rq1_beams != 1: print(
+        f"[rq1] WARNING: baseline decodes with num_beams={_rq1_beams} while the dlm/ar arms are greedy — "
+        f"re-run with --num-beams 1 for the parity row.", flush=True
+    )
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
     rq_cfg = eval_cfg.get("rq1", {})
@@ -563,7 +572,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
-            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start,
+            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start, use_duration_prior=False
         )
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
@@ -618,6 +627,18 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             "rq": "1", "language": args.language, "split": args.split, "method": args.method,
             # Per-axis grids as ACTUALLY swept: with head/tail overrides `grid` alone misdescribes the axes (kept for old readers).
             "severity_mode": mode, "grid": grid, "grid_head": head_grid, "grid_tail": tail_grid,
+            # Decode provenance, mirroring RQ2's events stamp: two sweeps under different flags were previously
+            # indistinguishable JSONs, so cross-method RQ1 comparisons could silently mix decode budgets.
+            "provenance": {
+                "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+                             if args.method == "baseline" else 1,
+                "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
+                "checkpoint": getattr(args, "checkpoint", None),
+                "duration_decode": duration_decode_params(load_yaml(args.inference_config), args.language),
+                # Held constant across the sweep (see the _translate_windows call above); recorded because a grid
+                # swept under a varying gate configuration is not a degradation curve.
+                "gate_use_duration_prior": False,
+            },
             "windows": len(rows), "severity": severity, "rows": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[rq1] wrote {out}", flush=True)
@@ -846,21 +867,24 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         else: tags = bio_logits.argmax(dim=-1)[0].cpu()
         segments = bio_tags_to_segments(tags, timestamps.tolist())
 
-        items, bounds = [], []
+        items, bounds, frontiers = [], [], []
         delta_lead_s = float(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3)) / float(record.pose.fps)
         for span in segments:
-            # Decode the span inside a buffer-shaped window (δ lead + context to buffer_cap), gated — the FSM's conditioning, 
-            # which is also the training one. A tight crop is stream.py's 'span' mode: untrained, and it force-disables Ω there 
-            # because select_target_span would sub-anchor inside the sentence and mask part of it.
+            # Decode the span inside a buffer-shaped window (δ lead + context to buffer_cap), gated. A tight crop is stream.py's 'span' mode: 
+            # untrained, and it force-disables Ω because select_target_span would sub-anchor inside the sentence and mask part of it. 
+            # Cap-length trailing context is DELIBERATE and measured: cutting it to the FSM's commit-time tail lowered this row.
             w_start = max(0.0, float(span.start_s) - delta_lead_s)
             w_end = min(float(record.pose.duration_s), w_start + buffer_cap_s)
             span_poses, span_ts = load_pose_window(record.pose, w_start, w_end, normalize=True)
             if span_poses.shape[0] == 0: continue
             items.append((span_poses, span_ts, w_start))
             bounds.append((float(span.start_s), min(float(span.end_s), w_end)))
+            # χ for this window: the δ lead is the PREDECESSOR's tail — already handled, exactly the FSM's post-commit leftover. Without it, 
+            # a back-to-back lead is mid-signing, the merged I-run cannot open a span, and Ω anchors on the NEXT sentence.
+            frontiers.append(max(0.0, float(span.start_s) - w_start))
         results = _translate_windows( # Offline windows are extended by delta_lead_s before the span, so frame 0 precedes the sentence.
             model, tokenizer, args.method, items, device, inference_cfg, method_cfg,
-            batch_size=int(args.batch_size), stream_start=False,
+            batch_size=int(args.batch_size), stream_start=False, commit_frontier_s=frontiers,
         )
         predicted[record.video_id] = [
             PredictionEvent(video_id=record.video_id, start_s=s0, end_s=s1, text=text)
@@ -903,6 +927,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
+    if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
     prov = {

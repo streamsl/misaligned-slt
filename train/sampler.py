@@ -34,11 +34,10 @@ class WindowSampler:
     DEFAULT_MODE2_SUBCASE_WEIGHTS = {"right": 0.45, "left": 0.45, "both": 0.10}
 
     def __init__(
-        self, records: list[VideoRecord], jitter: JitterSampler,
-        mode_ratios: dict[str, float], buffer_cap_s: float,
-        seed: int = 42, mode2_subcase_weights: dict[str, float] | None = None,
+        self, records: list[VideoRecord], jitter: JitterSampler, mode_ratios: dict[str, float], buffer_cap_s: float,
+        mode2_subcase_weights: dict[str, float] | None = None, mode3_span_counts: dict[int, float] | None = None,
         fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
-        pose_augment_cfg: dict | None = None, min_span_frames: int = 0,
+        pose_augment_cfg: dict | None = None, min_span_frames: int = 0, seed: int = 42
     ):
         self.records = records
         self.jitter = jitter
@@ -66,8 +65,19 @@ class WindowSampler:
 
         probs = np.asarray([float(weights[k]) for k in self._mode2_subcases], dtype=np.float64)
         self._mode2_subcase_probs = probs / probs.sum()
+        # Mode-3 span-count distribution {k: weight}: how many COMPLETE sentences a mode-3 window spans. FSM reaches k>=3 buffers (a commit 
+        # retires 1 sentence per >=hysteresis strides while the buffer grows every stride), so a hard-wired 2 leaves that regime untrained.
+        counts = {int(k): float(v) for k, v in (mode3_span_counts or {2: 1.0}).items()} # Default {2: 1.0}
+        if any(k < 2 for k in counts): 
+            raise ValueError(f"mode3_span_counts keys must be >= 2 (k=1 is mode1's job; labelling it mode3 corrupts the mix): {sorted(counts)}")
+        
+        cprobs = np.asarray([counts[k] for k in sorted(counts)], dtype=np.float64)
+        if cprobs.sum() <= 0: raise ValueError(f"mode3_span_counts weights must sum > 0: {counts}")
+        self._mode3_counts = sorted(counts)
+        self._mode3_count_probs = cprobs / cprobs.sum()
         self.anchors = [(ri, si) for ri, rec in enumerate(records) for si, _ in enumerate(rec.sentences)]
         if not self.anchors: raise ValueError("WindowSampler requires at least one sentence anchor.")
+
 
     def configure_worker(self, seed: int) -> None:
         """Give a forked DataLoader worker its OWN rng so parallel workers don't replay identical mode/jitter streams.
@@ -133,11 +143,10 @@ class WindowSampler:
                 # A 0 default trained Lambda_min=0 targets against a delta+1 deployment when the key was absent.
                 int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1,
             )),
-            seed=int(slt_cfg.get("seed", 42)), mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"),
+            mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"), mode3_span_counts=slt_cfg.get("mode3_span_counts"),
             fps_aug_enabled=bool((aug_cfg or {}).get("enabled", aug_cfg is not None) and fps_cfg.get("enabled", aug_cfg is not None)),
-            fps_aug_min=float(fps_cfg.get("min_fps", 15.0)),
-            fps_aug_max=float(fps_cfg.get("max_fps", 30.0)),
-            pose_augment_cfg=pose_augment_cfg,
+            fps_aug_min=float(fps_cfg.get("min_fps", 15.0)), fps_aug_max=float(fps_cfg.get("max_fps", 30.0)),
+            pose_augment_cfg=pose_augment_cfg, seed=int(slt_cfg.get("seed", 42))
         )
 
     def _choose_mode(self) -> str:
@@ -251,12 +260,19 @@ class WindowSampler:
 
 
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
-        """Span the anchor and its successor so ≥2 sentences are fully inside; degrade to Mode 1 if the pair does not yield 2 complete spans. 
-        The translation target is later chosen by `first_complete_span`. Edges carry Analysis-A jitter like every other mode — an exact 
-        [anchor B, successor end] window would train a boundary distribution (B at frame 0) the streaming buffer never produces."""
+        """Span the anchor plus k-1 successors, k drawn from `mode3_span_counts` (default: always 2), so >=2 sentences are fully inside; 
+        degrade to Mode 1 if even the pair yields no 2 complete spans. The translation target is later chosen by `first_complete_span`. 
+        Edges carry Analysis-A jitter like every other mode — an exact [anchor B, last end] window would train a boundary distribution 
+        (B at frame 0) the buffer never produces. The drawn k clamps to the sentences the video has left and to the buffer cap: acceptance 
+        only requires >=2 completes, so an over-ambitious k degrades to the widest window that fits, not to a retry storm."""
         anchor = rec.sentences[anchor_idx]
-        next_idx = min(anchor_idx + 1, len(rec.sentences) - 1)
-        end_anchor = rec.sentences[next_idx]
+        k = int(self.rng.choice(self._mode3_counts, p=self._mode3_count_probs))
+        end_idx = min(anchor_idx + k - 1, len(rec.sentences) - 1)
+        end_anchor = rec.sentences[max(end_idx, min(anchor_idx + 1, len(rec.sentences) - 1))]
+        
+        # Respect the buffer cap: walk the end sentence back until the clean window fits, never below the pair.
+        while end_idx > anchor_idx + 1 and rec.sentences[end_idx].end_s - anchor.start_s > self.buffer_cap_s: end_idx -= 1
+        end_anchor = rec.sentences[min(max(end_idx, anchor_idx + 1), len(rec.sentences) - 1)]
         eps = 1.0 / rec.pose.fps
 
         for _ in range(20):

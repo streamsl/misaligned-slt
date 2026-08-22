@@ -1,8 +1,7 @@
 """S1 — in-system BIO head pretrain on FROZEN Uni-Sign pose features (docs/membership_gate.md §1.4 "competence
 before coupling").
 
-This is the DEPLOYED FSM head, NOT the Moryossef analysis segmenter (moryossef26/: raw keypoints, for Analysis A/B
-+ the RQ2 cascade). Different input space by design (§1.4), so Analysis A's calibration is non-circular.
+This is the deployed FSM head, not the external Moryossef segmenter. Their input spaces and checkpoints differ.
 
 Two jobs:
   1. **gate warm start**: S2 starts from a sharp head, so the gate couples on-policy from step one with
@@ -114,7 +113,7 @@ def build_bio_s1(
     cfg = load_yaml(config)
     # Precedence: CLI --language > config `language:` > data.yaml active_languages. Reload only when it changes, 
     # so ${language} in checkpoint.dir re-points to the right dataset dir.
-    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
+    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
     inference_cfg = load_yaml(inference_config)
     # train_bio_s1_epochs re-reads these for the monitor's duration prior; record the CLI paths so a run with
@@ -141,8 +140,7 @@ def build_bio_s1(
     dev_loader = streaming_loader(
         dev_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers)
 
-    # Language's released Uni-Sign checkpoint (OpenASL for asf/bfi, CSL for csl) — MUST match the SLT model's
-    # warm-start so S1 features == S2 initial features (§1.4).
+    # Language's configured Uni-Sign checkpoint — MUST match the SLT model's warm-start so S1 features == S2 initial features.
     pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg

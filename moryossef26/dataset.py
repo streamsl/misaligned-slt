@@ -1,4 +1,4 @@
-"""Whole-video-chunk dataset for the faithful Moryossef analysis segmenter (Analysis A/B + RQ2 cascade floor).
+"""Whole-video-chunk dataset for the faithful Moryossef segmenter (segmenter-error analysis + RQ2 cascade floor).
 
 Random natural-timeline chunks — the Moryossef 2026 segmentation regime, not the SLT window sampler that trains
 the in-system BIO head. This model reads RAW pose keypoints (+ velocity) via a UNet CNN, so the raw-keypoint 

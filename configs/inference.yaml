@@ -3,7 +3,7 @@ stride_s: 1.0
 # `--segmenter-arch` value, so the block a run reads is derivable from its command line:
 #   duration_decode_s1        -> the in-system BIO head. THE DEPLOYED ONE: streaming FSM, membership gate
 #                                (training + inference), RQ1/RQ2, delta-enc, and S1's own segmenter-eval.
-#   duration_decode_moryossef -> the external baseline segmenter. Analysis A/B, its segmenter-eval, the RQ2
+#   duration_decode_moryossef -> the external baseline segmenter. Error calibration, segmenter-eval, and the RQ2
 #                                cascade's upstream segmenter. Nothing deployed reads it.
 duration_decode_s1:
     default: false

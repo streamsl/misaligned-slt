@@ -13,9 +13,8 @@ analogue of standard image-space augmentation (random rotate / resize / translat
   - `spatial_mask` — cutout of a random spatial box.
 Fixed-size random crop and colour jitter have no pose analogue; this augmentor does NOT flip.
 
-Width/height come from `PoseIndex.width/height` (per dataset — PHOENIX 210x260, CSL-Daily 512x512,
-etc.). When they are unknown, frame-referenced ops (affine / spatial_mask) are skipped and only the
-centroid-based rotation runs.
+Width/height come from `PoseIndex.width/height` (per dataset, etc.). When they are unknown, frame-referenced ops 
+(affine / spatial_mask) are skipped and only the centroid-based rotation runs.
 """
 import numpy as np
 

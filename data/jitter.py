@@ -17,7 +17,7 @@ class JitterSampler:
     head_scale_s: float = 0.5
     tail_loc_s: float = 0.0
     tail_scale_s: float = 0.5
-    # Empirical relative cut positions of over-segmentation events (Analysis A, analyze.py). 
+    # Empirical relative cut positions of over-segmentation events (segmenter-error analysis, analyze.py).
     # Mode 2 draws its truncation depth from these; empty → uniform interior fallback.
     cut_positions: np.ndarray | None = None
 
@@ -29,7 +29,7 @@ class JitterSampler:
             # Like the sampler's mode_ratios guard: configured-but-missing must FAIL, not silently train
             # fallback_laplace while claiming measured jitter. `source: null` = designed, explicitly.
             raise FileNotFoundError(
-                f"jitter.source is set but missing: {source!r} (cwd={Path.cwd()}). Run Analysis A first, or set "
+                f"jitter.source is set but missing: {source!r} (cwd={Path.cwd()}). Run segmenter-error analysis first, or set "
                 f"jitter.source: null to explicitly use fallback_laplace."
             )
         if source and Path(source).exists():
@@ -55,8 +55,8 @@ class JitterSampler:
             # Same fail-loud rule as the missing-file guard above: without a fit we would silently draw the
             # hard-coded 0.0/0.5 defaults while claiming measured jitter (the print above would be a lie).
             if not laplace: raise ValueError(
-                f"jitter.source {source!r} has {n_pairs} pairs (< {RAW_REPLAY_MIN_PAIRS}) and no 'laplace' fit to "
-                f"fall back on. Re-run Analysis A (it writes both), or set jitter.source: null for the designed mix."
+                f"jitter.source {source!r} has {n_pairs} pairs (< {RAW_REPLAY_MIN_PAIRS}) and no 'laplace' fit to fall back on. "
+                f"Re-run segmenter-error analysis (it writes both), or set jitter.source: null for the designed mix."
             )
         else: laplace = cfg.get("fallback_laplace", {})
 
@@ -89,9 +89,8 @@ class JitterSampler:
     def sample_cut(self, rng: np.random.Generator, lo: float = 0.15, hi: float = 0.85) -> float:
         """Relative position in (0,1) of a Mode-2 spurious internal cut.
 
-        From Analysis A's measured over-segmentation cut positions when available; else uniform in [lo, hi]
-        (avoids near-empty windows). Uniform is the noninformative prior — over-seg cut positions are not 
-        in the matched-pair jitter CDF.
+        From segmenter-error analysis's measured over-segmentation cut positions when available; else uniform in [lo, hi] (avoids 
+        near-empty windows). Uniform is the noninformative prior — over-seg cut positions are not in the matched-pair jitter CDF.
         """
         if self.cut_positions is not None and len(self.cut_positions):
             return float(self.cut_positions[int(rng.integers(0, len(self.cut_positions)))])

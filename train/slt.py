@@ -52,8 +52,8 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
 
     δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by tail-benefit, the decode triple by tune-decode, and jitter 
-    by Analysis A. Resuming across such a change trains the two halves under different objectives, and without this record nothing in 
-    the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
+    by segmenter-error analysis. Resuming across such a change trains 2 halves under different objectives, and without this record 
+    nothing in the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
     """
     gate_cfg = slt_cfg.get("membership_gate", {}) or {}
     return {
@@ -80,7 +80,7 @@ def build_slt_components(
     slt_cfg = load_yaml(slt_config)
     # Precedence: --language > config `language:` > active_languages. Reload on override so ${language} 
     # in checkpoint.dir (+ ar/baseline children) re-points at the right dataset.
-    language = str(language or slt_cfg.get("language") or data_cfg.get("active_languages", ["phoenix"])[0])
+    language = str(language or slt_cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(slt_config, language=language)
     inference_cfg = load_yaml(inference_config)
     _assert_gate_inference_consistency(slt_cfg, inference_cfg)
@@ -148,8 +148,7 @@ def build_slt_components(
         bio_nhead=int(slt_cfg.get("bio_nhead", 8)),
         bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(slt_cfg.get("bio_conv_stem_layers", 2)),
-        # Per-language warm-start (data.yaml pretrained_slt; e.g. OpenASL for asf/bfi English, CSL for csl Chinese).
-        pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/csl_daily_pose_only_slt.pth"),
+        pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth"),
     )
     # S1 BIO init (docs/membership_gate.md §1.4 "competence before coupling"): load the pre-trained head from
     # train-bio so S2 trains exactly one new thing — the coupling — and membership_gate.warmup_epochs can be 0.

@@ -65,7 +65,7 @@ def _load_segments(path: str | Path) -> list[Segment]:
 
 def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict | None = None) -> Path:
     # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the arch/decode
-    # that made it is unrecoverable — Analysis A silently inherits whatever was last written under that filename.
+    # that made it is unrecoverable — calibration could silently inherit the wrong decode.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [
@@ -332,7 +332,7 @@ def _build_eval_model(
     lm_name = language_model_name(method_cfg)
 
     if method == "baseline":
-        # RELEASED Uni-Sign mT5 pose-only (no released mBART SLT) + AR beam search = the literature floor. 
+        # Released Uni-Sign mT5 pose-only model, or the in-domain baseline_train checkpoint.
         # Same `MisalignedSLTModel(decoder="ar")` as ar, released weights, BIO head unused.
         mt5_name = lm_name if "mt5" in lm_name.lower() else "google/mt5-base"
         tokenizer = T5Tokenizer.from_pretrained(mt5_name, legacy=False)
@@ -342,7 +342,7 @@ def _build_eval_model(
             bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384))
         )
         # Released ckpt ONLY — no `checkpoint.dir` fallback, so a concurrent train-slt run can't slip trained
-        # weights in. Per language: asf/bfi -> OpenASL, csl -> CSL.
+        # weights in. Retained languages use OpenASL or their in-domain clean baseline.
         ckpt = Path(checkpoint or resolve_pretrained(method_cfg, data_cfg, language, default="") or "")
         if not ckpt.exists(): raise FileNotFoundError(
             f"Missing released Uni-Sign checkpoint for baseline (language '{language}'): {ckpt!s}. Set "
@@ -405,9 +405,9 @@ def _prep_window(
 
 
 def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int) -> dict:
-    # `generate_from_poses` kwargs per method: baseline = AR beam search, ar / dlm greedy. Only DLM arm uses SPD/DCD params.
+    # Main AR rows are greedy; only DLM uses SPD/DCD params.
     if method == "baseline":
-        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
         return {"max_text_tokens": max_tokens, "num_beams": num_beams}
 
     trans_cfg = inference_cfg.get("translation", {})
@@ -515,14 +515,13 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
-    # --num-beams: decode-budget override. RQ2 delta arithmetic ((2-1)/(4-3)) needs BEAM PARITY with the greedy
-    # arms (pass 1); the literature floor keeps the config's beam-4.
+    # Optional per-run search override. Main comparisons use the greedy default.
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
-    _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+    _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
     if args.method == "baseline" and _rq1_beams != 1: print(
         f"[rq1] WARNING: baseline decodes with num_beams={_rq1_beams} while the dlm/ar arms are greedy — "
-        f"re-run with --num-beams 1 for the parity row.", flush=True
+        f"this run is not search-budget matched.", flush=True
     )
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
 
@@ -637,7 +636,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             # Decode provenance, mirroring RQ2's events stamp: two sweeps under different flags were previously
             # indistinguishable JSONs, so cross-method RQ1 comparisons could silently mix decode budgets.
             "provenance": {
-                "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4)))
+                "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
                              if args.method == "baseline" else 1,
                 "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
                 "checkpoint": getattr(args, "checkpoint", None),
@@ -901,11 +900,6 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
 
 def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
-    """Predicted events plus the DECODE BUDGET they were produced under.
-
-    RQ2 rows are only comparable at equal decode effort: `--method baseline` defaults to beam-4 (configs/baseline_eval.yaml) while the dlm/ar 
-    arms are pinned greedy, so a cascade row run without `--num-beams 1` carries a budget advantage that the numbers alone do not reveal.
-    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {"events": {vid: [asdict(ev) for ev in evs] for vid, evs in predicted.items()}}
@@ -937,33 +931,32 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
-    prov = {
+    provenance = {
         "method": args.method, 
-        "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 4))) if args.method == "baseline" else 1, 
+        "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1))) if args.method == "baseline" else 1,
         "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None),
         "segments": getattr(args, "segments", None), "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
     }
-    # Loud, because it silently invalidates every row difference: the cascade rows use --method baseline, whose
-    # config default is beam-4, while the dlm/ar arms decode greedy. README prescribes --num-beams 1 for parity.
-    if args.method == "baseline" and int(prov["num_beams"]) != 1: print(
-        f"[rq2] WARNING: baseline decodes with num_beams={prov['num_beams']} while the dlm/ar arms are greedy — "
-        f"this row is NOT decode-budget comparable with them. Re-run with --num-beams 1 for the parity row.", flush=True
+    # A deliberate beam override changes the search budget and cannot enter a main row delta.
+    if args.method == "baseline" and int(provenance["num_beams"]) != 1: print(
+        f"[rq2] WARNING: baseline decodes with num_beams={provenance['num_beams']} while the dlm/ar arms are greedy — "
+        f"this row is not search-budget matched.", flush=True
     )
     if args.stream:
         predicted = run_streaming(args)
-        _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json", prov)
+        _write_events_json(predicted, f"outputs/rq2_stream_events_{args.method}_{args.language}_{args.split}.json", provenance)
         fsm_bio = getattr(run_streaming, "last_fsm_bio", None)
         if fsm_bio:  # FSM-internal BIO metric, persisted alongside the events
             path = Path(f"outputs/rq2_fsm_bio_{args.method}_{args.language}_{args.split}.json")
             path.write_text(json.dumps(fsm_bio, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif args.offline:
         predicted = run_offline(args)
-        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json", prov)
+        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json", provenance)
     elif args.segments:
         predicted = run_pipeline_floor(args)
         # Name by span source (--segments stem carries arch+lang+split) AND method, so cascade rows never collide.
         src = Path(args.segments).stem
-        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json", prov)
+        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json", provenance)
     else:
         predicted = load_event_predictions(args.predictions)
         # Same fail-loud contract as run_pipeline_floor's --segments guard. Here, not in the scorer: disjoint ids
@@ -991,15 +984,14 @@ def run_segment_prf(args: argparse.Namespace) -> dict[str, Any]:
 def _load_segmenter(args):
     """Trained segmenter by --segmenter-arch (shared by eval --segmenter-eval and analyze --stage segmenter-infer).
 
-    moryossef (default): faithful Moryossef segmenter (raw keypoints + UNet) — a DIFFERENT input space from the FSM
-    head, hence the non-circular Analysis-A/B / RQ2-cascade instrument (gate-doc §1.4). s1: the in-system BIO head,
-    isolating system design from segmentation competence. rope_chunk_s is SECONDS (s1) or None (moryossef).
+    moryossef (default): faithful Moryossef segmenter (UNet) — a DIFFERENT input space from FSM head. It supplies calibration and RQ2 cascade 
+    spans. s1 is the in-system BIO head, isolating system design from segmentation competence. rope_chunk_s is SECONDS (s1) or None (moryossef).
     """
     device = pick_device(args.device)
     if args.segmenter_arch == "s1":
         from train.bio_pretrain import build_bio_s1_model
         cfg = load_yaml(args.bio_config, language=args.language)
-        pretrained = resolve_pretrained(cfg, load_yaml(args.data_config), args.language, default="checkpoints/csl_daily_pose_only_slt.pth")
+        pretrained = resolve_pretrained(cfg, load_yaml(args.data_config), args.language, default="checkpoints/openasl_pose_only_slt.pth")
         model = build_bio_s1_model(cfg, pretrained_path=pretrained)
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
         # Chunked RoPE at the head's TRAINED context, in SECONDS: training windows clamp to buffer_cap_s (sampler.py), so eval chunks there 
@@ -1101,20 +1093,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Write GT spans JSON (for --rq 2 --segments oracle-input rows) and exit")
     parser.add_argument("--segmenter-eval", action="store_true",
                         help="Standalone whole-video segmentation eval (Moryossef protocol) for --segmenter-arch, then exit")
-    parser.add_argument("--num-beams", type=int, default=None,
-                        help="decode-budget override for THIS run (baseline defaults to beam-4 from config; pass 1 for beam-parity delta rows)")
+    parser.add_argument("--num-beams", type=int, default=None, help="AR search override for this run; main comparisons default to greedy")
     parser.add_argument("--gate", default=None, choices=["on", "off"],
                         help="membership-gate override for THIS run (default: method config). RQ1 measures translation under controlled boundary "
                              "severity, so gate-on vs gate-off is the ablation separating translation quality from gate's conditioning effect")
     parser.add_argument("--segmenter-decode", default=None, choices=["duration", "plain"],
                         help="whole-video decode; default: s1 -> duration (semi-Markov re-split), moryossef -> plain (Moryossef argmax)")
     parser.add_argument("--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
-                        help="segmenter-eval backend: moryossef = Moryossef analysis segmenter (default), s1 = in-system head")
+                        help="segmenter-eval backend: moryossef = external Moryossef segmenter, s1 = in-system head")
     parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--num-sentences", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="windows per translate/forward batch in loop-decode paths (RQ2 rows, analysis-b, tail-benefit, delta-enc)")
+    parser.add_argument("--batch-size", type=int, default=8, help="windows per translate/forward batch in loop-decode paths")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
     parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
@@ -1134,7 +1124,7 @@ def build_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = build_parser().parse_args()
     data_cfg = load_yaml(args.data_config)
-    if args.language is None: args.language = str(data_cfg.get("active_languages", ["csl"])[0])
+    if args.language is None: args.language = str(data_cfg.get("active_languages", ["asf"])[0])
     if args.emit_gold_segments:
         records, _ = load_language_records(data_cfg, args.language, split=args.split)
         path = write_gold_segments(records, args.emit_gold_segments)

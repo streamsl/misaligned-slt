@@ -1,12 +1,8 @@
-# AR-vs-DLM de-risk baseline (§9.3) — a go/no-go gate on the diffusion choice.
-#
-# Per spec §4.8/§9.3 the AR variant must share EVERYTHING with our DLM except the decoder family:
-# identical Uni-Sign pose -> prompt -> LM-encoder -> BIO front end, identical window sampler
-# (Analysis-A `mode_ratios` + `jitter` + `mode2_subcase_weights`), identical confidence-bound
-# term (AR-adapted), identical optimization. Otherwise the result conflates "diffusion vs AR"
-# with "robust-window vs clean-window training", which Analysis B already isolates. So this file
-# only overrides the decoder + outputs and inherits the rest from dlm.yaml (OPUT/SPD/DCD
-# blocks it inherits are simply unused by the AR path).
+# AR variant must share EVERYTHING with our DLM except the decoder family: same Uni-Sign pose -> prompt ->
+# LM-encoder -> BIO front end, same window sampler (`mode_ratios` + measured `jitter` + `mode2_subcase_weights`),
+# same confidence-bound term (AR-adapted), same optimization. Otherwise the result conflates "diffusion vs AR"
+# with "robust-window vs clean-window training". This file only overrides the decoder + outputs
+# and inherits the rest from dlm.yaml (OPUT/SPD/DCD blocks it inherits are simply unused by the AR path).
 extends: dlm.yaml
 decoder: ar
 checkpoint:

@@ -569,7 +569,7 @@ class MisalignedSLTModel(nn.Module):
                 logs["cb_active_count"] = cb_active_count
 
         # `lambda_bio=0` = translation-only: the faithful Uni-Sign SLT recipe (1 label-smoothed CE) for the clean-floor arm. 
-        # Also methodological — L_BIO teaches the shared pose trunk sentence boundaries, exactly the competence RQ1-A claims 
+        # Also methodological — L_BIO teaches the shared pose trunk sentence boundaries, exactly the competence RQ1 claims
         # existing models LACK, so a floor trained with it would understate the misalignment problem.
         total = float(lambda_bio) * bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()

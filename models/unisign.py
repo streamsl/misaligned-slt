@@ -35,9 +35,7 @@ __all__ = [
     "UniSignFrontEndBase", "UniSignMT5FrontEnd", "UniSignMBartFrontEnd",
     "load_unisign_pretrained", "prompt_lang_for_target", "PROMPT_LANG_BY_TARGET",
 ]
-# target_lang (data.yaml) -> the prompt's language name
-# (Uni_Sign: 'Chinese' if 'CSL' in dataset else 'English'); de_DE = German for PHOENIX.
-PROMPT_LANG_BY_TARGET = {"zh_CN": "Chinese", "en_XX": "English", "de_DE": "German"}
+PROMPT_LANG_BY_TARGET = {"en_XX": "English"}
 
 def prompt_lang_for_target(target_lang: str | None) -> str:
     return PROMPT_LANG_BY_TARGET.get(str(target_lang or ""), "English")

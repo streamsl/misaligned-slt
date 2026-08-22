@@ -1,9 +1,7 @@
-"""Faithful Moryossef 2026 analysis segmenter: the INDEPENDENT instrument for Analysis A, 
-Analysis B's realistic operating point, and the RQ2 cascaded baseline.
+"""Faithful Moryossef 2026 external segmenter for calibration and the RQ2 cascade.
 
 Raw keypoints (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: a different input space from the
-in-system head's Uni-Sign features (docs/membership_gate.md §1.4), which makes Analysis A's calibration
-non-circular. Standalone on whole-video chunks, never the FSM head's bio_head_init.
+in-system head's Uni-Sign features. Standalone on whole-video chunks, never the FSM head's bio_head_init.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -26,7 +24,7 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(moryossef_config)
     # CLI --language > config language > active_languages; reload so ${language} in checkpoint.dir re-points.
-    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["csl"])[0])
+    language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != cfg.get("language"): cfg = load_yaml(moryossef_config, language=language)
     aug_cfg = cfg.get("augmentation", {}) or {}
     fps_cfg = aug_cfg.get("fps", {})

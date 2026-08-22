@@ -11,8 +11,8 @@ FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metric
 train/bio_pretrain.py, moryossef26/, eval.py (FSM-internal BIO diagnostic), analyze.py (tune-decode). ONE decode 
 rule for BOTH prediction and gold (default `signing_runs_with_b_splits`; why there); decoders parameterize `_bio_runs`.
 
-TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by
-eval.py (RQ2 tIoU brackets), analyze.py (Analysis A pred-vs-GT matching).
+TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by eval.py 
+(RQ2 tIoU brackets), analyze.py (segmenter-error analysis pred-vs-GT matching).
 
 TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/BLEURT).
 """
@@ -124,7 +124,7 @@ def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
 
     Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap): 
     a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
-    doesn't require one either. Interior `B`s split, feeding the Analysis-A over/under-segmentation taxonomy.
+    doesn't require one either. Interior `B`s split, feeding the segmenter-error over/under-segmentation taxonomy.
     """
     return _bio_runs(tags, split_on_b=True, open_on_i=True, close_on_unk=True)
 
@@ -325,9 +325,9 @@ def compute_text_metrics(
     The relationship is  soda_X ~= (mean per-pair X) * segmentation.f1, so a fused cell divided by the f1 reported beside 
     it recovers the per-pair quality — no extra metric needed.
 
-    localization_aware=False (default — RQ1, GT-span rows, analysis-b): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT
-    over the whole set. Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence
-    means; BLEU-4 pools across the set, so it is computed corpus-level.
+    localization_aware=False (default — RQ1 and GT-span controls): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT over the whole set. 
+    Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence means; BLEU-4 pools across the 
+    set, so it is computed corpus-level.
 
     localization_aware=True (RQ2 dense/streaming), prefix `soda`: SODA F1 (Fujita et al. 2020) over MATCHED (pred, gold) 
     pairs. Per-pair sentence scores are summed, then precision = Σ/n_pred, recall = Σ/n_gold, F1 = 2PR/(P+R) — charging

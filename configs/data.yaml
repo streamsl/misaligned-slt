@@ -1,11 +1,7 @@
 seed: 42
-active_languages: [csl]
+active_languages: [asf]
 
-# Each language entry carries the dataset routing (source/root/target_lang) plus a `pose:` block holding the
-# per-dataset POSE-EXTRACTION properties (everything that depends on how this dataset's keypoints were
-# produced — fps, confidence quality, coordinate frame). The pose-encoder ARCHITECTURE is the Uni-Sign backbone
-# (backbones/unisign.py); these `pose:` settings are data properties, so they live with the dataset.
-#
+# Each language entry defines one YouTube-SL-25 root, target language, warm start, and pose properties.
 # pose.fps is a FALLBACK only. Real pose fps is resolved per video as total_pose_frames / video_duration from
 # <root>/video_meta.csv. asf/bfi use SignVerse-2M poses at a UNIFORM 24 fps — `prepare_data.py` writes their
 # video_meta.csv (duration = frames/24, exact). The per-video-fps note below is the OWN-EXTRACTION route (ase):
@@ -14,63 +10,13 @@ active_languages: [csl]
 #   `python -m poses <root> [--format SEL]` (yt-dlp metadata fetch, no video download). A constant 25 there
 #   misplaced every timestamp ~2x (label-motion correlation 0.10 vs 0.26 corrected; ~44% of captions dropped).
 languages:
-    # Synthetic streaming corpora (built by e2e-slt-streaming/data_synth). All data_synth datasets share
-    # ONE schema, so each is just another entry with `source: streams` + its own `root` + `target_lang`
-    # (the only per-dataset knob — it sets the LM target/tokenizer language). Clean GT cue boundaries + exact-fps
-    # poses → the proven-working alternative to the noisy YouTube data. To add CSL-Daily / How2Sign later,
-    # drop another entry below (e.g. csl_daily: source streams, target_lang zh_CN, root data/csl_daily) and
-    # re-run Analysis A. PHOENIX is GERMAN: target_lang MUST be de_DE so mBART tokenizes German
-    # correctly; en_XX would tokenize German as near-<unk> and learn nothing.
-    phoenix:
-        name: PHOENIX-2014T (synthetic streams)
-        source: streams # routes load_language_records -> data.synth_streams.load_stream_records
-        target_lang: de_DE
-        # No released German Uni-Sign checkpoint — reuse the CSL one for the (language-agnostic) pose encoder;
-        # its Chinese mT5 is a poor German warm-start (relearns the output language). A base-mT5 init would be
-        # cleaner for German, but PHOENIX is not a current target, so keep status quo.
-        pretrained_slt: checkpoints/csl_daily_pose_only_slt.pth
-        root: data/phoenix
-        pose:
-            fps: 25.0
-            # width/height (the pixel frame) feed only the train-time spatial augmentations (affine/spatial_mask);
-            # Uni-Sign normalization is bbox-relative and resolution-independent. Auto-read from manifest src_meta
-            width: 210
-            height: 260
-    csl_pretrimmed:
-        name: CSL-Daily (official pre-trimmed, Uni-Sign pkl release)
-        # data.pretrimmed.load_pretrimmed_records — eval-only. One single-sentence record per clip, REAL context
-        # frames around [start,end) included, so RQ1 runs on real continuous context (no synthetic seams).
-        # `--rq 1 --language csl_pretrimmed --severity-grid-s 0.0 --method baseline` is the paper-comparable
-        # clean point (Uni-Sign CSL-Daily test BLEU-4 = 25.61). Synthetic-extracted sentences are NOT comparable
-        # to the paper (the stream builder filters sentences) — never present them as the literature baseline.
-        source: pretrimmed
-        target_lang: zh_CN
-        pretrained_slt: checkpoints/csl_daily_pose_only_slt.pth # Chinese-target released Uni-Sign checkpoint
-        root: data/csl_pretrimmed
-        pose:
-            fps: 30.0 # CSL-Daily videos are 30 fps (same RTMPose extraction the synthetic streams were rebuilt from)
-            width: 512
-            height: 512
-    csl:
-        name: CSL-Daily (synthetic streams)
-        source: streams # data.synth_streams.load_stream_records (pre-trimmed CSL-Daily cues + gaps)
-        target_lang: zh_CN # mT5 prompt language -> 'Chinese'; matches released csl_daily_pose_only_slt.pth
-        pretrained_slt: checkpoints/csl_daily_pose_only_slt.pth # Uni-Sign CSL-Daily release (Chinese mT5)
-        root: data/csl
-        pose:
-            fps: 30.0 # manifest.target_fps — regenerated at full 30 fps from Uni-Sign's pose-rtmpose-192-clean
-            # Uni-Sign normalization (conf>0.3 gate + bbox crop_scale) is internal and resolution-independent;
-            # width/height feed only the train-time spatial augmentations (affine/spatial_mask).
-            width: 512 # manifest src_meta
-            height: 512
     # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
     # `python prepare_data.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
     # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in the shards) and <root>/video_meta.csv (duration 
     # from frame_count/24, so per-video fps calibration recovers exactly 24.0). pose.fps stays the fallback only.
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
     # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
-    # init on both axes. The CSL checkpoint's mT5 emits Chinese and would be relearned. OpenASL is a first-class
-    # Uni-Sign dataset (their docs/DATASET.md), just not a headline benchmark in the paper; same arch, strict-loads.
+    # init on both axes. OpenASL uses the same architecture and strict-loads.
     asf:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX

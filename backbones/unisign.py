@@ -1,8 +1,7 @@
 """Uni-Sign pose-only encoder (the pose branch of `Uni_Sign`), vendored faithfully.
 
-Provenance: ZechengLi19/Uni-Sign @ models.py `Uni_Sign.__init__` / `.forward` pose branch
-(arXiv 2501.15187, ICLR 2025). RGB/PGF path (`rgb_support`) is intentionally dropped — this is
-the pose-only model that produced their CSL-Daily dev/test BLEU-4 25.27/25.61.
+Provenance: ZechengLi19/Uni-Sign @ models.py `Uni_Sign.__init__` / `.forward` pose branch. 
+RGB/PGF path (`rgb_support`) is intentionally dropped — this is the released pose-only model.
 
 Faithfulness points that make the released checkpoint load (strict=True) and behave identically:
   * submodule names match Uni_Sign exactly: proj_linear / gcn_modules / fusion_gcn_modules /

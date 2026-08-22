@@ -323,19 +323,6 @@ def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, st
 
 def load_language_records(data_cfg: dict, language: str, split: str | None = None) -> tuple[list[VideoRecord], dict[str, list[str]]]:
     lang_cfg = data_cfg["languages"][language]
-    # Synthetic streaming corpora (data_synth: PHOENIX / CSL-Daily / How2Sign / ...) share 1 self-contained layout 
-    # (per-stream npy + vtt, explicit splits, exact fps) — delegate to their shared loader. The YouTube path below 
-    # assumes poses/+subs/, per-video fps calibration, and SignVerse splits.
-    if str(lang_cfg.get("source", "")).lower() in {"streams", "synth_streams", "phoenix"}:
-        from data.synth_streams import load_stream_records
-        return load_stream_records(data_cfg, language, split=split)
-
-    # Official pre-trimmed benchmark releases: one single-sentence record per clip, real context frames included — 
-    # the clean literature-comparison corpus for RQ1 (--severity-grid-s 0.0 = the paper-comparable point).
-    if str(lang_cfg.get("source", "")).lower() == "pretrimmed":
-        from data.pretrimmed import load_pretrimmed_records
-        return load_pretrimmed_records(data_cfg, language, split=split)
-
     root = Path(lang_cfg["root"])
     # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
     # config pose_fps is fallback-only: without the sidecar timestamps drift ~2x and ~44% of captions get dropped.
@@ -388,10 +375,9 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
-        # `s < duration`: the sentence ONSET must land inside the extracted poses, else no visible signing to anchor
-        # on. SignVerse streams end before their caption timeline (duration = pose_frames/24 underestimates the
-        # video), so late captions start past the poses; `e <= duration + 1.0` bounds only the END. Without it the
-        # sampler builds start_s > end_s windows → load_pose_frames raises. No-op for stream corpora.
+        # `s < duration`: sentence ONSET must land inside extracted poses, else no visible signing to anchor on. SignVerse streams 
+        # end before their caption timeline (duration = pose_frames/24 underestimates the video), so late captions start past the poses; 
+        # `e <= duration + 1.0` bounds only the END. Without it, the sampler builds start_s > end_s windows → load_pose_frames raises.
         dur = pose_index[video_id].duration_s
         spans = tuple(
             SentenceSpan(video_id=video_id, start_s=s, end_s=e, text=t)

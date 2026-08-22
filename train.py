@@ -20,7 +20,7 @@ def smoke_data(args: argparse.Namespace) -> dict:
     data_cfg = load_yaml(args.data_config)
     slt_cfg = load_yaml(args.slt_config)
     inference_cfg = load_yaml(args.inference_config)
-    language = str(args.language or data_cfg.get("active_languages", ["phoenix"])[0])
+    language = str(args.language or data_cfg.get("active_languages", ["asf"])[0])
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(args.slt_config, language=language)
     records, splits = load_language_records(data_cfg, language, split=args.split)
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
@@ -86,7 +86,7 @@ if __name__ == "__main__":
         path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"), meta=_meta) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-moryossef":
-        # Faithful Moryossef analysis segmenter for Analysis A/B + RQ2 cascade: raw keypoints + UNet, a different input space 
+        # Faithful Moryossef external segmenter for error calibration + RQ2 cascade: raw keypoints + UNet.
         # from the FSM head. Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
         from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
         train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.moryossef_config, language=args.language)

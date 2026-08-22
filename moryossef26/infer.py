@@ -54,7 +54,7 @@ def _phrase_logits(
 
 def _set_rope_chunk(model, record, rope_chunk_s: float | None) -> None:
     # S1 only: RoPE chunk = TRAINED context in SECONDS (= buffer_cap_s) × this stream's fps, so it is
-    # dataset-general (CSL 30fps → 540, PHOENIX 25fps → 450).
+    # Convert the chunk duration to frames at the video's rate.
     if rope_chunk_s is not None and hasattr(model, "bio_head"):
         model.bio_head.chunk_size = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
 
@@ -64,7 +64,7 @@ def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device,
     velocity: bool = True, rope_chunk_s: float | None = None, duration_prior: DurationPrior | None = None,
 ) -> dict[str, list[Segment]]:
-    # Phrase segments per video (Analysis A / B / RQ2 cascade upstream). `duration_prior` from
+    # Phrase segments per video for calibration and the RQ2 cascade. `duration_prior` from
     # fit_duration_prior(train records); semi-Markov is the validated default for whole-video use.
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}

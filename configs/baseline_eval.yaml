@@ -1,28 +1,23 @@
-# baseline — the literature-comparison FLOOR: the released Uni-Sign mT5 model, AR beam search, NO
-# streaming machinery (no membership gate, no confidence-bound). EVAL-ONLY by default.
+# baseline — clean Uni-Sign AR model, greedy decode, NO streaming machinery (no membership gate, no confidence-bound).
 #
-# `extends: dlm.yaml` so the ~15 shared scalars (seed, language, language_model, checkpoint.*, wandb.*,
-# visual_padding, freeze_*, bio_* head shape, max_text_tokens, ...) live in ONE place and never drift. This file
-# keeps ONLY what makes it the baseline: the AR decoder, the gate/CB turned OFF, beam-search dev decoding, and its
-# own output dir. The inherited streaming blocks (oput / dcd / spd / mode_ratios / jitter / augmentation) are inert
-# on the eval-only AR path — same tolerated pattern as bio_pretrain.yaml.
+# `extends: dlm.yaml` so the ~15 shared scalars (seed, language, language_model, checkpoint.*, wandb.*, visual_padding,
+# freeze_*, bio_* head shape, max_text_tokens, ...) live in 1 place and never drift. This file keeps only what makes it
+# the baseline: AR decoder, the gate/CB turned off, and its own output dir. The inherited streaming blocks (oput / dcd /
+# spd / mode_ratios / jitter / augmentation) are inert on the eval-only AR path — same tolerated pattern as bio_pretrain.yaml.
 extends: dlm.yaml
 
 decoder: ar
 membership_gate:
-    enabled: false        # the clean floor is UNGATED (cf. ar.yaml, the GATED AR de-risk of §9.3)
+    enabled: false # the clean floor is UNGATED (cf. ar.yaml, the GATED AR de-risk of §9.3)
 confidence_bound:
-    enabled: false        # no Mode-2a CB term on the baseline
+    enabled: false # no Mode-2a CB term on the baseline
 checkpoint:
-    dir: checkpoints/baseline/${language}  # output dir (best.json / any optional retrain)
-    # EVAL loads ONLY the released Uni-Sign pose-only SLT checkpoint — resolved PER LANGUAGE from data.yaml
-    # `pretrained_slt` (OpenASL for asf/bfi, CSL for csl; utils.resolve_pretrained) — with NO fallback to a trained
-    # checkpoint dir (enforced in eval._build_eval_model), so a concurrent/prior train-slt run can never make the
-    # baseline silently pick up trained/empty weights (the BLEU 21 -> 0.01 footgun).
+    dir: checkpoints/baseline/${language} # output dir (best.json / any optional retrain)
+    # EVAL loads ONLY released Uni-Sign pose-only SLT checkpoint — resolved PER LANGUAGE from data.yaml `pretrained_slt`
+    # (utils.resolve_pretrained) — with NO fallback to a trained checkpoint dir (enforced in eval._build_eval_model), so
+    # a concurrent/prior train-slt run can never make the baseline silently pick up trained/empty weights.
 wandb:
     enabled: false
     name: baseline_${language}
 validation:
-    # The baseline is the literature floor, so it decodes with beam search (num_beams=4); the SLT AR/DLM arms
-    # stay greedy (beam vs greedy is worth several BLEU). max_translation_samples is inherited (0 = all dev sentences).
-    num_beams: 4
+    num_beams: 1

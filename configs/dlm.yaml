@@ -1,5 +1,5 @@
 seed: 42
-language: csl # active dataset = CSL-Daily (override --language per dataset).
+language: asf # default YouTube-SL-25 language; --language overrides it.
 # The pose encoder is always Uni-Sign; the LANGUAGE MODEL is selected here: google/mt5-base (Path A default, the
 # released Uni-Sign weights load on top) | facebook/mbart-large-cc25 (the mT5-vs-mBART ablation; mBART starts from base).
 language_model:
@@ -11,11 +11,10 @@ checkpoint:
     # (docs/membership_gate.md §1.4). Missing file with the gate ENABLED → hard FileNotFoundError (train/slt.py); 
     # warning + fresh head only with the gate off, or set bio_head_init: null AND membership_gate.warmup_epochs >= 2.
     bio_head_init: checkpoints/bio_s1/${language}/model.pt
-    # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint. Resolved PER LANGUAGE from
-    # data.yaml `languages[lang].pretrained_slt` (CSL→Chinese mT5, OpenASL→English mT5; utils.resolve_pretrained),
-    # because the right warm-start depends on the target language. Uncomment `from_pretrained` below to force one
-    # checkpoint regardless of language (an ablation override):
-    # from_pretrained: checkpoints/csl_daily_pose_only_slt.pth
+    # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint. Resolved PER LANGUAGE from data.yaml 
+    # `languages[lang].pretrained_slt` (utils.resolve_pretrained), because the right warm-start depends on the target 
+    # language. Uncomment `from_pretrained` below to force 1 checkpoint regardless of language (an ablation override):
+    # from_pretrained: checkpoints/openasl_pose_only_slt.pth
     save_best: true # write on every new best dev value (not just end of training)
     # Best-checkpoint SELECTION (separate from early stopping). Select on dev BLEU, not val_loss: the composite
     # val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the small corpus while BLEU is still
@@ -59,8 +58,7 @@ confidence_bound:
     enabled: true
     verified_full_evidence_gate: true # penalize only where full-evidence decode == reference
     tau_cb: 0.75
-    # Keep the auxiliary confidence term below the complete-evidence translation loss.
-    lambda: 0.3
+    lambda: 0.3  # Keep the auxiliary confidence term below the complete-evidence translation loss.
     # The verified gate rejects wrong full-evidence tokens, so the S1/baseline warm start needs no CB warmup.
     # cb_active_count can rise as teacher coverage grows or fall as errors lose confidence. It is not a quality metric.
     warmup_epochs: 0
@@ -101,8 +99,8 @@ membership_gate:
     # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
 mode_ratios:
-    # Fixed coverage mix, shared by all datasets. Analysis-A event counts are not FSM state probabilities.
-    # Analysis A still supplies boundary jitter and Mode-2 cut depths.
+    # Fixed coverage mix, shared by all datasets. segmenter-error event counts are not FSM state probabilities.
+    # Segmenter-error analysis supplies boundary jitter and Mode-2 cut depths.
     source: null
     degenerate_mode1_threshold: 0.9
     fallback:
@@ -124,8 +122,7 @@ mode2_subcase_weights:
 # SPATIAL ops (centroid rotation + affine/spatial_mask jitter) — schema + defaults in poses/augmentation.py.
 # The `fps` sub-block is the TEMPORAL augmentation (Moryossef 2026: essential, 0.58→0.49 without; speed_aug forbidden):
 # BIO labels are rebuilt from the resampled timestamps. apply_fps_aug only downsamples, so the range must dip below the
-# source rate — the synthetic CSL streams run at 30 fps (data.yaml csl pose.fps), so [15, 30] gives real 0.5–1.0x density
-# variation (RoPE keeps true seconds); max_fps == source draws are native-density no-ops.
+# source rate. YouTube-SL-25 poses are 24 fps, so this range gives downsampled and native-density views.
 augmentation:
     enabled: true
     rotation: { deg: 15.0, prob: 0.5 }
@@ -153,10 +150,9 @@ bio_nhead: 8
 bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
-    # Measured boundary-offset distribution (same Analysis-A run as mode_ratios.source; Laplace loc/scale fitted
-    # from matched-pair offsets — empirically the right family: the deployed decode's placement errors are
-    # leptokurtic, and much more so at the head than the tail (asf: excess kurtosis +10.9 head, +1.3 tail).
-    # Laplace beats Gaussian in held-out log-lik on both.
+    # Measured boundary-offset distribution from segmenter-error analysis; Laplace loc/scale fitted from matched-pair 
+    # offsets — empirically the right family: the deployed decode's placement errors are leptokurtic, and much more so 
+    # at the head than the tail. Laplace beats Gaussian in held-out log-lik on both.
     source: outputs/a_jitter_${language}.json
     fallback_laplace:
         head_loc_s: 0.0
@@ -170,10 +166,8 @@ num_workers:
     # exact per-epoch coverage comes from the INDEX-driven anchor (sampler.sample(index) -> anchors[index % N], and
     # DataLoader partitions indices across workers); WindowSampler.configure_worker only RESEEDS each worker's rng so
     # the per-window jitter/mode draws decorrelate. (configure_worker does NOT partition anchors — the index does.)
-# CONVERGED-CHECKPOINT fine-tune LR. The init (released Uni-Sign SLT) is already converged on CSL — Uni-Sign's own
-# 3e-4 is for fine-tuning from its stage-2 PRETRAIN checkpoint, and the closest analog to our setting (DMax adding
-# OPUT to a converged model) uses 2e-6. 2e-4 near-constant reproduced the observed best-BLEU-at-epoch-1-then-decay
-# signature (train_trans 1.02→0.36 in 3 epochs while val_trans rose): the model is pushed out of its basin at full LR.
+# Uni-Sign initialization is already converged — its own 3e-4 is for fine-tuning from its stage-2 PRETRAIN checkpoint, 
+# and the closest analog to our setting (DMax adding OPUT to a converged model) uses 2e-6.
 learning_rate: 5.0e-5
 weight_decay: 1.0e-4
 epochs: 50

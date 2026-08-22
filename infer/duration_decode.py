@@ -10,8 +10,8 @@ One tuned block PER SEGMENTER in inference.yaml (`duration_decode_<arch>`, resol
 two heads have differently calibrated posteriors, so one shared triple would decode the baseline with our head's
 tuning. `duration_decode_s1` is the DEPLOYED one and drives `infer.stream.step`, the gate's anchor selection
 (`build_gate_omega`, keeping the gate on-policy), whole-video eval, and `analyze --stage delta-enc` — which must
-use the deployed decode or it reports argmax instability. `duration_decode_moryossef` drives Analysis A/B and the
-baseline's own segmenter-eval.
+use the deployed decode or it reports argmax instability. `duration_decode_moryossef` drives calibration and
+the external segmenter's own evaluation.
 """
 from __future__ import annotations
 from dataclasses import dataclass

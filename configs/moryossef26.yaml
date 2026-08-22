@@ -1,14 +1,9 @@
-# Faithful Moryossef 2026 analysis segmenter (spec §4.6) — the INDEPENDENT instrument for Analysis A (§8.1),
-# Analysis B's realistic operating point (§8.2), and the RQ2 cascaded baseline (§9.2). It is NOT the in-system FSM
+# Faithful Moryossef 2026 external segmenter for error calibration and the RQ2 cascade. It is not the in-system FSM
 # head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads RAW pose keypoints (+velocity)
 # through a UNet CNN, a DIFFERENT input space from the in-system head's Uni-Sign features (docs/membership_gate.md
-# §1.4 "weights do not transfer"). That input-space independence is what makes Analysis A's calibration non-circular.
-#
-# NOTE on the corpus: on clean synthetic CSL streams (concatenated pre-trimmed clips, clean GT boundaries) ANY
-# segmenter is near-perfect, so Analysis A is degenerate and the sampler falls back to the designed mix regardless
-# — this segmenter's measured-calibration value is realized only on genuinely noisy corpora (PHOENIX / YouTube-SL-25).
+# §1.4 "weights do not transfer"). That input-space difference keeps calibration independent.
 seed: 42
-language: csl # active dataset; --language overrides
+language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
     dir: checkpoints/moryossef/${language}
     save_best: true
@@ -57,8 +52,8 @@ num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked 
 steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames / num_frames)
 batch_size: 8
 augmentation:
-    # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip below the
-    # source rate to do anything: CSL streams are 30 fps (data.yaml) → [15, 30].
+    # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip 
+    # below the source rate to do anything. YouTube-SL-25 poses are 24 fps.
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
     frame_dropout: 0.15 # Moryossef repo default: drop 0-15% middle frames during train.
     body_part_dropout: 0.1 # Moryossef repo default: zero each hand independently during train.
@@ -76,5 +71,5 @@ scheduler:
     eta_min: 1.0e-6
 mixed_precision: auto
 max_grad_norm: 1.0
-# NB: the Analysis-A pred→GT match bar is NOT here — it is an analysis knob (analyze.ANALYSIS_A_MATCH_TIOU = 0.1,
+# The pred→GT match bar is an analysis knob (`analyze.SEGMENTER_ERROR_MATCH_TIOU = 0.1`,
 # override with `analyze.py --tiou-threshold`), not a segmenter-training param.

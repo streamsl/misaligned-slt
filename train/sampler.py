@@ -1,5 +1,4 @@
-"""Misalignment-aware window sampler. Turns GT sentence anchors into real-timeline training windows across 4 modes whose 
-mix is calibrated by Analysis A's measured segmenter-error rates."""
+"""Misalignment-aware window sampler over four real-timeline window modes."""
 from __future__ import annotations
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -18,13 +17,13 @@ from poses import load_pose_window, build_pose_augmentor, apply_fps_aug
 class WindowSampler:
     """Emit one real-timeline training window per step.
 
-    Each step picks a GT sentence anchor and a mode (probabilities from Analysis A's measured segmenter-error rates), 
+    Each step picks a GT sentence anchor and a mode from the configured coverage mix,
     then cuts a window on the *real* video timeline — neighbour content and gaps inside the jittered range are the actual 
     adjacent frames, never concatenated clips (avoids seam artifacts). The 4 modes mirror the inference-time buffer states:
 
     - **Mode 1** — anchor fully inside (jittered head/tail). OPUT target = anchor.
     - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge, → confidence-bound),
-      `left` (no B, → no translation loss, trains silence), `both` (interior, rare).
+      `left` (no B, no translation loss), `both` (interior, rare).
     - **Mode 3** — ≥2 complete sentences; target = earliest complete span (first-complete-span rule, identical at train and inference).
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
 
@@ -103,32 +102,24 @@ class WindowSampler:
         if source and Path(source).exists():
             loaded = json.loads(Path(source).read_text(encoding="utf-8"))
             measured = loaded.get("mode_ratios", loaded)
-        elif source:
-            # FAIL, don't fall back: a configured-but-missing measurement file (typo, wrong CWD, Analysis A not run) would otherwise 
-            # silently train the DESIGNED mix while every log and the paper claim the MEASURED one — a methodological substitution no 
-            # one can detect afterwards. `mode_ratios.source: null` is the one explicit way to request the designed mix.
+        elif source: # An explicit ablation source must exist. The main method uses source: null and the fixed mix.
             raise FileNotFoundError(
                 f"mode_ratios.source is set but missing: {source!r} (cwd={Path.cwd()}). Run `analyze.py --stage segmenter-infer` + "
-                f"`--stage analysis-a` for this language first, or set mode_ratios.source: null to explicitly train the designed fallback."
+                f"`--stage segmenter-errors` for this language first, or set mode_ratios.source: null for the fixed mix."
             )
         print(f"[sampler] mode_ratios: {'MEASURED ' + str(source) if measured is not None else 'designed fallback'} "
               f"-> {normalized_mode_ratios(measured if measured is not None else fallback_ratios)}", flush=True)
 
         jitter_cfg = dict(slt_cfg.get("jitter", {}))
         mode_ratios = measured if measured is not None else fallback_ratios
-        # Degenerate-measurement guard. On a clean corpus, the retrained segmenter is near-perfect, so Analysis A measures almost all 
-        # Mode 1 and a ~0-offset jitter CDF. Training on that = no misalignment = robustness method learns nothing — here faithfulness 
-        # to the "derive ratios from Analysis A" becomes a bug, because that rule assumed a NONTRIVIAL measured error distribution. 
-        # When the measurement is degenerate we fall back to the DESIGNED distribution (fallback ratios + fallback_laplace jitter) and 
-        # warn; robustness is then evaluated by the segmenter-agnostic RQ1 controlled sweep, which never depended on a noisy segmenter.
+        # Guard the optional event-mix ablation against a degenerate all-clean measurement.
         threshold = float(ratios_cfg.get("degenerate_mode1_threshold", 0.9))
         if measured is not None and normalized_mode_ratios(measured).get("mode1", 0.0) >= threshold:
             print(
-                f"[sampler] WARNING: measured Analysis-A mode ratios are degenerate "
-                f"(mode1={normalized_mode_ratios(measured).get('mode1', 0.0):.3f} >= {threshold}); the "
-                f"segmenter is too clean to yield a useful misalignment distribution. Using the DESIGNED "
-                f"fallback ratios + jitter (configs/dlm.yaml: mode_ratios.fallback, jitter."
-                f"fallback_laplace). Robustness is evaluated via the controlled RQ1 sweep.", flush=True,
+                f"[sampler] WARNING: measured event-mix ratios are degenerate "
+                f"(mode1={normalized_mode_ratios(measured).get('mode1', 0.0):.3f} >= {threshold}); the segmenter is too clean to yield a "
+                f"useful misalignment distribution. Using the DESIGNED fallback ratios + jitter (configs/dlm.yaml: mode_ratios.fallback, "
+                f"jitter.fallback_laplace). Robustness is evaluated via the controlled RQ1 sweep.", flush=True,
             )
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
@@ -175,7 +166,7 @@ class WindowSampler:
         return start_s, end_s
 
     def _cut_time(self, anchor, lo: float = 0.05, hi: float = 0.95) -> float:
-        # Absolute time of a spurious internal cut, from Analysis A's over-seg cut-position distribution
+        # Absolute time of a spurious internal cut, from segmenter-error analysis's over-seg cut-position distribution
         # (JitterSampler.sample_cut; uniform fallback). Clamped away from the exact edges.
         rel = min(max(self.jitter.sample_cut(self.rng), lo), hi)
         return float(anchor.start_s + rel * anchor.duration_s)
@@ -187,7 +178,7 @@ class WindowSampler:
         eps = 1.0 / rec.pose.fps
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
-            # Analysis A stores signed offsets as pred_boundary - gt_boundary.
+            # segmenter-error analysis stores signed offsets as pred_boundary - gt_boundary.
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
             # The end check mirrors first_complete_span(min_tail_s=1/fps) in materialize(); a looser check here
             # would classify the window complete yet yield no translation target (silently unsupervised Mode 1).
@@ -218,10 +209,10 @@ class WindowSampler:
         """`right` keeps the start, cuts before the end (B, no terminator); `left` cuts after the start, keeps the end + its terminator 
         frame (no B); `both` is a strictly-interior slice (all I).
 
-        The truncation depth — where the window cuts *inside* the anchor — is drawn from Analysis A's measured over-segmentation cut 
-        positions (`JitterSampler.sample_cut`), the empirical answer to "where does the segmenter split a sentence". The *surviving* 
-        outer edge carries ordinary boundary jitter (Δ_head/Δ_tail), so e.g. a right-truncated window's true start still wobbles like 
-        a real Started-Pre/Post-Signing event. Uniform interior cut is used only when no over-seg was measured."""
+        The truncation depth — where the window cuts *inside* the anchor — is drawn from measured over-segmentation cut positions 
+        (`JitterSampler.sample_cut`), the empirical answer to "where does the segmenter split a sentence". The *surviving* outer edge 
+        carries ordinary boundary jitter (Δ_head/Δ_tail), so e.g. a right-truncated window's true start still wobbles like a real 
+        Started-Pre/Post-Signing event. Uniform interior cut is used only when no over-seg was measured."""
         anchor = rec.sentences[anchor_idx]
         subcase = str(self.rng.choice(self._mode2_subcases, p=self._mode2_subcase_probs))
         eps = max(1.0 / rec.pose.fps, 1e-3)
@@ -239,11 +230,11 @@ class WindowSampler:
             # so the terminator frame (O, or the next sentence's B) stays inside — otherwise the GT end leaves the window and labels no longer 
             # describe a left-truncation (P2: labels follow the window).
             cut = min(self._cut_time(anchor), anchor.end_s - eps)
-            # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end), so the terminator is inside; tail 
-            # jitter only extends it further out — abs(dt), NOT max(dt, eps): with max(), half of a zero-loc jitter draw collapses to a window 
-            # edge EXACTLY on GT terminator, a zero-error corner Analysis A measures at ~3% — the head learns "window edge = sentence edge",
-            # a shortcut that is false at deployment (FSM buffers start at terminator−δ; whole-video chunks on an arbitrary 18s grid) and 
-            # that doubles B-at-frame-0 mass under the measured mix.
+            # End must sit strictly past the anchor end (classify_anchor_visibility uses end_s < window_end), so the terminator is 
+            # inside; tail jitter only extends it further out — abs(dt), NOT max(dt, eps): with max(), half of a zero-loc jitter draw 
+            # collapses to a window edge EXACTLY on GT terminator, a zero-error corner segmenter-error analysis measures at ~3% — the 
+            # head learns "window edge = sentence edge", a shortcut that is false at deployment (FSM buffers start at terminator−δ; 
+            # whole-video chunks on an arbitrary 18s grid) and that doubles B-at-frame-0 mass under the measured mix.
             start_s, end_s = self._clip_window(rec, cut, min(rec.pose.duration_s, anchor.end_s + max(abs(dt), eps)))
         else:  # "right": keep the true start, cut before the end. Head jitter only pulls the start outward.
             cut = max(self._cut_time(anchor), anchor.start_s + eps)
@@ -262,8 +253,8 @@ class WindowSampler:
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
         """Span the anchor plus k-1 successors, k drawn from `mode3_span_counts` (default: always 2), so >=2 sentences are fully inside; 
         degrade to Mode 1 if even the pair yields no 2 complete spans. The translation target is later chosen by `first_complete_span`. 
-        Edges carry Analysis-A jitter like every other mode — an exact [anchor B, last end] window would train a boundary distribution 
-        (B at frame 0) the buffer never produces. The drawn k clamps to the sentences the video has left and to the buffer cap: acceptance 
+        Edges carry measured jitter like every other mode — an exact [anchor B, last end] window would train a boundary distribution
+        (B at frame 0) the buffer never produces. The drawn k clamps to the sentences the video has left and to buffer cap: acceptance 
         only requires >=2 completes, so an over-ambitious k degrades to the widest window that fits, not to a retry storm."""
         anchor = rec.sentences[anchor_idx]
         k = int(self.rng.choice(self._mode3_counts, p=self._mode3_count_probs))

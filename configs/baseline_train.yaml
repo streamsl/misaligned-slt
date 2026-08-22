@@ -1,8 +1,4 @@
-# baseline_train — TRAIN the clean-floor translator for corpora with NO released in-domain SLT checkpoint
-# (YouTube-SL-25 asf/bfi: zero-shot OpenASL on Auslan/BSL is floored at BLEU ~1 — BANZSL is not ASL; a floored
-# baseline makes Analysis B, RQ1-A PANEL (b) (the self-anchored continuous-corpus curve — panel (a) is the
-# csl_pretrimmed literature anchor and is unaffected), and the RQ2 cascade rows uninformative on those corpora).
-#
+# Train the clean translator for YouTube-SL-25 languages without an in-domain released checkpoint.
 # Recipe = Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh), strict 
 # warm-start from the released checkpoint (data.yaml pretrained_slt).
 #
@@ -10,11 +6,10 @@
 # sampler window exactly the GT caption span + one terminator frame, deterministically (at 1e-9 scales mode1's
 # jittered-retry acceptance never fires and the clean-clip fallback always wins; anchors are index-driven, so
 # one epoch = exact coverage of every train caption). NB these spans are CAPTION-cut, not studio-trimmed:
-# onset noise and back-to-back bleed are IN the training windows, so this baseline's RQ1-A panel is
-# SELF-ANCHORED at its own (0,0) — like the csl streams panel, NOT literature-anchored like csl_pretrimmed
-# (README "RQ1 design"). Deliberate deviations from Uni-Sign, both documented for the paper: no 256-frame
-# random subsampling (their memory heuristic; our encoder runs native-rate and deployment never subsamples —
-# introducing it would create a rate mismatch OUR system never sees), and single-GPU batch sizing below.
+# onset noise and back-to-back bleed remain in the training windows. The RQ1 curve is self-anchored at (0,0).
+# Deliberate deviations from Uni-Sign: no 256-frame random subsampling (their memory heuristic; our encoder runs 
+# native-rate and deployment never subsamples — introducing it would create a rate mismatch OUR system never sees), 
+# and single-GPU batch sizing below.
 #
 # After training: point data.yaml <lang>.pretrained_slt at checkpoints/baseline_train/<lang>/model.pt and RERUN 
 # the per-language chain from step 2c (train-bio -> delta-enc -> stage 2): bio_s1's frozen encoder and the arms' 
@@ -49,9 +44,8 @@ checkpoint:
     bio_head_init: null              # explicit: extends deep-merges, so dlm.yaml's S1 path would leak through a
                                      # partial checkpoint override (it did — caught by the 'loaded S1 BIO head init'
                                      # log line; lambda_bio: 0 also hard-skips it in code, belt and braces)
-    monitor: val_translation_bleu4   # selection by dev BLEU, as in Uni-Sign (their dev decode is beam-4; the
-    mode: max                        # training monitor here decodes greedy — selection only; final numbers come
-                                     # from eval.py --method baseline --checkpoint ... (beam-4), like every arm.
+    monitor: val_translation_bleu4   # selection by dev BLEU
+    mode: max
 
 wandb:
     name: baseline_train_${language}

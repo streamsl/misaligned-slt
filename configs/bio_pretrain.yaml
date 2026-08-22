@@ -12,7 +12,7 @@
 #   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init.
 # The FROZEN pose encoder is loaded from the language's released Uni-Sign checkpoint, resolved PER LANGUAGE from
 # data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained) — the SAME warm-start the SLT model uses,
-# so S1 features == S2 initial features (§1.4). OpenASL for English asf/bfi, CSL for Chinese csl.
+# so S1 features == S2 initial features.
 extends: dlm.yaml
 
 checkpoint:
@@ -28,7 +28,7 @@ checkpoint:
 wandb:
     name: bio_s1_${language} # own run name (else inherits dlm's)
 
-# S1 and stage 2 share the fixed coverage mix. Analysis A supplies only jitter and Mode-2 cut depths.
+# S1 and stage 2 share the fixed coverage mix. Segmenter-error analysis supplies jitter and Mode-2 cut depths.
 # The external Moryossef segmenter remains an independent measurement instrument.
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.

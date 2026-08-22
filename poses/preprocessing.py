@@ -36,10 +36,10 @@ def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.n
 
     Args:
         keypoints: (frames, 133, 3) x, y, confidence — COCO-WholeBody, coords NORMALIZED per-axis to [0,1]
-            (x/W, y/H), the exact domain the released Uni-Sign checkpoints were trained on. crop_scale below uses a
-            SINGLE shared scale for both axes, so it is invariant to UNIFORM scaling but aspect-ratio DEPENDENT —
-            feeding pixels (x·W, y·H, W≠H) would distort the skeleton. data/pretrimmed.py feeds this same [0,1]
-            domain and reproduces the paper BLEU; SignVerse (poses/signverse.py) keeps its stored [0,1] unchanged.
+            (x/W, y/H), the exact domain the released Uni-Sign checkpoints were trained on. crop_scale below uses 
+            a SINGLE shared scale for both axes, so it is invariant to UNIFORM scaling but aspect-ratio DEPENDENT 
+            — feeding pixels (x·W, y·H, W≠H) would distort the skeleton. SignVerse feeds this same [0,1] domain 
+            and reproduces the paper BLEU; SignVerse (poses/signverse.py) keeps its stored [0,1] unchanged.
     Returns:
         (frames, 69, 3) in part order [body 9 | left 21 | right 21 | face_all 18].
     """

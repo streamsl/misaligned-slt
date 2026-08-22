@@ -82,9 +82,8 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
 class MoryossefSegmenter(nn.Module):
     """CNN-medium-attn segmenter with a phrase BIO head.
 
-    The INDEPENDENT analysis instrument (Analysis A/B + RQ2 cascaded baseline), not the in-system BIO head: raw keypoints via 
-    a UNet CNN is a different input space from the in-system Uni-Sign features, which is what makes Analysis A non-circular 
-    (docs/membership_gate.md §1.4 — weights do not transfer).
+    The external segmenter for calibration and the RQ2 cascade, not the in-system BIO head. Raw keypoints through a UNet are a different 
+    input space from the in-system Uni-Sign features. (docs/membership_gate.md §1.4 — weights do not transfer).
 
     Moryossef 2026's sign (sub-sentence) head needs sign-level annotations; our corpora carry only sentence boundaries, so it's omitted.
     """

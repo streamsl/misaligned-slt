@@ -45,13 +45,7 @@ def _deep_merge(base: dict, override: dict) -> dict: # `override` wins; nested d
 
 
 def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: str | None = None) -> str | None:
-    """Uni-Sign warm-start checkpoint for a language.
-
-    Per-TARGET-LANGUAGE (like target_lang), hence data.yaml `languages[lang].pretrained_slt`: CSL and OpenASL ship
-    DIFFERENT released checkpoints (same arch, but the mT5 LM emits Chinese vs English and the pose encoder saw
-    CSL vs ASL), so each is the wrong warm-start for the other.
-
-    Order: model/method `checkpoint.from_pretrained` (ablation override) > `pretrained_slt` > `default`."""
+    # Resolve the warm start: method override, then language config, then default.
     explicit = cfg_get(model_cfg, "checkpoint", "from_pretrained", default=None)
     if explicit: return explicit
     lang_ckpt = ((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("pretrained_slt")
@@ -59,12 +53,7 @@ def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: 
 
 
 def resolve_placeholders(cfg: dict) -> dict:
-    """Substitute `${key}` in string values from the config's own TOP-LEVEL scalar keys.
-
-    Makes configs dataset-agnostic: with `language: phoenix` every `${language}` path resolves to phoenix, so
-    switching corpus is a one-line change (roots/target_lang stay per-entry in data.yaml). Unknown placeholders
-    are left untouched — a no-op for configs that use none.
-    """
+    # Substitute `${key}` in string values from the config's own TOP-LEVEL scalar keys.
     scalars = {k: v for k, v in cfg.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
     if not scalars: return cfg
 

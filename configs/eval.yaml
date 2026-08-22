@@ -1,10 +1,10 @@
 seed: 42
-languages: [csl] # active corpus (documentation only; eval.py resolves --language, default = data.yaml active_languages[0])
+languages: [asf, bfi] # documentation only; eval.py uses --language or data.yaml active_languages[0]
 rq1:
     # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
     # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
     # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative
-    # tail = right-trunc (early-trigger) stress test; range must exceed Analysis A's measured tails so the curve is informative.
+    # tail = right-truncation stress test; the range must exceed the measured jitter tail.
     severity_mode: relative
     severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3] # fractions of sentence duration
     smoke_grid_rel: [-0.2, 0.0, 0.2]
@@ -12,18 +12,8 @@ rq1:
     smoke_grid_s: [-1.0, 0.0, 1.0]
     smoke_num_sentences: 10
     batch_size: 64 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
-    # RQ1 CORPUS POLICY — split by QUESTION, not by grid sign (README "RQ1 design"). The OLD policy assigned corpora by the 
-    # offset's sign; it scattered each method's four quadrants across two corpora and confounded baseline-vs-arms with domain, 
-    # so it is RETIRED. Run ONE full 2-D product per curve; pass the axes with `=` (negative-leading lists need it): 
-    # --severity-grid-head / --severity-grid-tail.
-    #   RQ1-A (baseline only — "the PROBLEM"): the full product on each panel it applies to —
-    #     (a) --language csl_pretrimmed: the literature anchor (extension cells clamp on ~0.55 s rest margins —
-    #         watch clamped_fraction, so only the truncation quadrant is fully realized there);
-    #     (b) --language <continuous corpus>: self-anchored at its own (0,0), relative degradation only.
-    #   RQ1-B (all arms — "the SOLUTION"): the full product on ONE shared continuous corpus, all arms, with an
-    #     equal decode budget (pass --num-beams 1 on the baseline arm; do NOT edit baseline_eval.yaml).
-    # Every severity row also reports clamped_fraction + realized delta_*_s_mean, so a corpus/grid mismatch is
-    # self-reporting (high clamp = the corpus lacked the requested context).
+    # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction + 
+    # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
 rq2:
     tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
 # Clean-trained translator, head fixed at GT start, trailing context swept; the elbow is

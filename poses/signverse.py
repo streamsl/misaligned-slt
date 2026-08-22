@@ -8,9 +8,8 @@ to the image (x/W, y/H), one npz per video in one of TWO packaging schemes (both
     extracted at a unified 24 fps per the dataset card)
 
 Output (T, 133, 3) float32 keeps coords NORMALIZED [0,1] — the contract of poses.preprocessing.normalize_keypoints_unisign 
-and the domain data/pretrimmed.py feeds (reproduces the paper BLEU). Do NOT scale to pixels: the released Uni-Sign weights 
-were trained on x/W,y/H, and crop_scale uses ONE shared scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent). 
-Downstream (build_pose_index, load_pose_window, augmentations, both segmenters, SLT) runs unchanged.
+used by the released Uni-Sign weights. Do NOT scale to pixels: released weights were trained on x/W,y/H, and crop_scale 
+uses ONE shared scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent). 
 
 The deleted pre-release README confirms `person_000` = primary signer and OpenPose-18 body (viz: --style openpose), 
 but its schema is stale (nested `person_0: {body: float[18,3]}`, `caption.json`, "pixel space") vs the release: 

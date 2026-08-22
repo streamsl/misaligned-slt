@@ -67,8 +67,14 @@ def mode_weights_from_events(counts: dict[str, int]) -> dict[str, float]:
 
 def analyze_segmenter_errors(
     predicted: dict[str, list[Segment]], gold: dict[str, list[Segment]],
-    durations: dict[str, float], tiou_threshold: float = 0.1,
+    durations: dict[str, float], material_overlap_s: float = 0.0, tiou_threshold: float = 0.1
 ) -> SegmenterErrorAnalysis: # Analysis-A event counts and regular-match jitter samples.
+
+    # `material_overlap_s`: a pred counts as covering a gold (for over/under-segmentation tests) only when their overlap exceeds this.
+    # 0 = any-overlap, which DOUBLE-COUNTS small boundary offsets on back-to-back corpora: a span grazing its neighbour by a fraction of
+    # a second is boundary JITTER (the Laplace's job), yet any-overlap reclassifies the event as under-segmentation, so stage 2 trained
+    # on a far harsher mix than deployment produces. Principled floor = Λ_min in seconds: a fragment shorter than the minimum selectable
+    # span cannot form a second window at deployment, so it cannot make the event multi-sentence.
 
     # Jitter excludes over-segmented GT and under-segmenting pred spans — separate window modes, not 1-to-1 boundary noise.
     jitter_samples: list[JitterSample] = []
@@ -88,7 +94,7 @@ def analyze_segmenter_errors(
         for pred_idx, pred in enumerate(pred_segments):
             for gold_idx, gt in enumerate(gold_segments):
                 overlap = max(0.0, min(pred.end_s, gt.end_s) - max(pred.start_s, gt.start_s))
-                if overlap > 0:
+                if overlap > float(material_overlap_s):
                     overlapping_pred_by_gold.setdefault(gold_idx, []).append(pred_idx)
                     overlapping_gold_by_pred.setdefault(pred_idx, []).append(gold_idx)
 
@@ -364,10 +370,16 @@ def analysis_a(args: argparse.Namespace) -> dict:
     _assert_predictions_match_pinned_decode(args)
     gold_segments = {record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences] for record in records}
     durations = {record.video_id: float(record.pose.duration_s) for record in records}
+    # Convert the frame floor to this corpus's time base. YouTube-SL-25 is 24 fps; synthetic corpora can differ.
+    median_fps = float(np.median([float(record.pose.fps) for record in records])) if records else 24.0
+    lam_s = int(load_yaml(args.inference_config)["span_selection"]["min_span_frames"]) / median_fps
     analysis = analyze_segmenter_errors(
-        predicted=predictions, gold=gold_segments, durations=durations,
-        tiou_threshold=float(args.tiou_threshold if args.tiou_threshold is not None else ANALYSIS_A_MATCH_TIOU),
+        predicted=predictions, gold=gold_segments, durations=durations, material_overlap_s=lam_s,
+        tiou_threshold=float(args.tiou_threshold if args.tiou_threshold is not None else ANALYSIS_A_MATCH_TIOU)
     )
+    print(f"[analysis-a] event taxonomy with material_overlap_s={lam_s:.3f}s "
+          f"(= span_selection.min_span_frames/{median_fps:g}fps): "
+          f"a graze shorter than the minimum selectable span is boundary jitter, not a second sentence.", flush=True)
     paths = write_analysis_a_outputs(analysis, args.output_dir, args.language)
     return {
         "language": args.language, "split": args.split, "event_counts": analysis.event_counts, "mode_ratios": analysis.mode_ratios, 

@@ -374,9 +374,8 @@ def run_epoch_loop(
             raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
         
         state = load_train_state(latest_path, model, optimizer)
-        # Analysis stages rewrite inference.yaml (delta_enc_frames, min_span_frames, buffer_cap_s, duration_decode) and outputs/a_*.json 
-        # (mode mix, jitter) BETWEEN sessions, and those parameterize this training run. Resuming across such a change trains the 2nd half 
-        # under a different objective — visible afterwards only as an unexplained discontinuity in loss curves. Refuse, and name the keys.
+        # Analysis stages rewrite inference.yaml and the jitter artifact between sessions. Both parameterize this run. Resuming across such 
+        # a change trains the 2nd half under a different objective — visible afterwards only as an unexplained discontinuity in loss curves.
         saved_meta = dict(state.get("meta") or {})
         if saved_meta and checkpoint_meta:
             drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))

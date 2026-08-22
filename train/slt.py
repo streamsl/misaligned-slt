@@ -51,10 +51,9 @@ def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> No
 def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
 
-    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by tail-benefit, the decode triple by
-    tune-decode, and the mode mix / jitter by Analysis A — all AFTER a run may have started. Resuming across such
-    a change trains the two halves under different objectives, and without this record nothing in the artifacts
-    shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
+    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by tail-benefit, the decode triple by tune-decode, and jitter 
+    by Analysis A. Resuming across such a change trains the two halves under different objectives, and without this record nothing in 
+    the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
     """
     gate_cfg = slt_cfg.get("membership_gate", {}) or {}
     return {
@@ -282,7 +281,7 @@ def evaluate_slt(
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
             oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
             confidence_bound_enabled=bool(confidence_cfg.get("enabled", True)), confidence_bound_active=cb_on,
-            confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_lambda=float(confidence_cfg.get("lambda", 0.3)),
+            confidence_bound_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_lambda=float(confidence_cfg.get("lambda", 1.0)),
             verified_full_evidence_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
             cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
             cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", slt_cfg.get("block_size", 8))),
@@ -352,8 +351,9 @@ def evaluate_slt(
         metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
         # Hyp/ref length ratio (BLEU brevity-penalty input, char-level for CJK): early-EOS diagnostic — < 1 and FALLING across epochs 
         # means the decode commits EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr punish as brevity.
-        total_ref = sum(len(r) for r in ref_texts)
-        metrics["val_translation_len_ratio"] = float(sum(len(p) for p in pred_texts)) / max(1, total_ref)
+        # WORD tokens, matching BLEU's BP. Characters disagree with it materially, so char ratio reads healthy while BLEU is penalised.
+        total_ref = sum(len(r.split()) for r in ref_texts)
+        metrics["val_translation_len_ratio"] = float(sum(len(p.split()) for p in pred_texts)) / max(1, total_ref)
     return metrics
 
 
@@ -372,7 +372,7 @@ def train_slt_epochs(
     # OPUT warmup holds the confidence-bound term off until full-evidence decode is trustworthy; gate warmup holds Ω off while a fresh 
     # BIO head sharpens on Dice (0 when bio_head_init is present — prefer a real S1 pretrain). Per-epoch flags, feeding step AND eval.
     cb_warmup_epochs = int(confidence_cfg.get("warmup_epochs", 1))
-    cb_lambda = float(confidence_cfg.get("lambda", 0.3))
+    cb_lambda = float(confidence_cfg.get("lambda", 1.0))
     gate_enabled_cfg = bool(gate_cfg.get("enabled", False))
     gate_warmup_epochs = int(gate_cfg.get("warmup_epochs", 0))
     # There is no safe default: warmup 0 is only correct when a trained S1 head was loaded.

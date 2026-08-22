@@ -28,13 +28,8 @@ checkpoint:
 wandb:
     name: bio_s1_${language} # own run name (else inherits dlm's)
 
-# NO circularity: Analysis A is measured by the INDEPENDENT external segmenter (train-moryossef; moryossef26.yaml),
-# NOT this head — so S1 inherits dlm.yaml's mode_ratios / jitter and trains on the SAME misalignment distribution
-# the SLT model uses (S1↔SLT window-distribution parity). dlm.yaml now points those sources at the MEASURED
-# outputs/a_*_${language}.json (from Analysis A run with the deployed duration decode), so S1 must be (re)trained
-# AFTER analysis-a for this language — regenerate both if the segmenter/decode changes. The mode1>=0.9 degenerate
-# guard only fires once a measurement EXISTS; with the source file absent the sampler raises (run analysis-a first).
-# There is no loop: the analysis segmenter is not in the FSM, so S1 is never trained on its own errors.
+# S1 and stage 2 share the fixed coverage mix. Analysis A supplies only jitter and Mode-2 cut depths.
+# The external Moryossef segmenter remains an independent measurement instrument.
 
 # S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
 epochs: 50

@@ -57,14 +57,12 @@ import torch.nn.functional as F
 # Attention-mask builders + canvas-tail supervision
 # ════════════════════════════════════════════════════════════════════════════
 
-def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, max_tokens=32):
-    '''Mark the first `max_tokens` padding slots after the sentence as supervised EOS targets.
+def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, block_size=None, max_tokens=32):
+    '''Mark padding up to the next block boundary as supervised EOS targets.
 
     Both reference implementations supervise the canvas tail beyond the sentence end:
-      - dLLM AppendEOSBlockWrapper (dllm/core/trainers/bd3lm.py) pads input_ids AND labels with
-        eos_token_id to the block boundary, so the padded tail is maskable and supervised.
-      - DMax process_mdm_sft_example (dFactory/tasks/dataset/data_transform.py) keeps loss on the
-        first 32 EOS of the trailing run and sets labels to -100 only after that.
+      - dLLM AppendEOSBlockWrapper pads input_ids and labels to the next block boundary.
+      - DMax keeps at most 32 EOS tokens on its much longer fixed canvas.
     Without this, slots beyond [eos, lang] are never supervised; at inference, masked slots past
     the true sentence end produce arbitrary high-confidence tokens before EOS commits — hallucinated
     tails and corrupted commit-gate confidence. Assumes right-padded sequences (no interior pads).
@@ -73,8 +71,13 @@ def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, max_tokens=32):
     '''
     if max_tokens <= 0 or eos_index is None: return x0, valid_mask
     n_content = (x0 != pad_index).long().sum(dim=1)  # includes BOS; right-padding assumed
+    if block_size is not None:
+        to_boundary = (-n_content) % int(block_size)
+        tail_count = torch.minimum(to_boundary, torch.full_like(to_boundary, int(max_tokens)))
+    else:
+        tail_count = torch.full_like(n_content, int(max_tokens))
     positions = torch.arange(x0.shape[1], device=x0.device).unsqueeze(0)
-    tail = (positions >= n_content.unsqueeze(1)) & (positions < (n_content + int(max_tokens)).unsqueeze(1))
+    tail = (positions >= n_content.unsqueeze(1)) & (positions < (n_content + tail_count).unsqueeze(1))
     x0 = torch.where(tail, torch.full_like(x0, int(eos_index)), x0)
     return x0, valid_mask | tail
 
@@ -167,9 +170,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         self.sampling_eps_max = sampling_eps_max
         self.antithetic_sampling = antithetic_sampling
         self.ignore_bos = ignore_bos
-        # Default = block_size: EOS supervision is DECODER GEOMETRY, not a corpus constant. One block past the
-        # sentence end is exactly the region the block-causal decode can visit before a committed EOS truncates
-        # the canvas (eos_pos) — the dLLM AppendEOSBlockWrapper pad-to-block-boundary analog. Corpus-independent.
+        # Cap for EOS padding to the next block boundary. The default matches dLLM's AppendEOSBlockWrapper.
         self.eos_supervision_tokens = int(eos_supervision_tokens) if eos_supervision_tokens is not None else int(block_size)
         self.neg_infinity = -1e9
 
@@ -246,12 +247,9 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
             x0 = F.pad(x0, (0, aligned_len - x0.shape[1]), value=self.pad_index)
             valid = F.pad(valid, (0, aligned_len - valid.shape[1]), value=False)
 
-        # Supervised EOS tail after [.., eos, lang] (dLLM AppendEOSBlockWrapper / DMax 32-trailing-eos): without it, 
-        # slots past the sentence end are never trained and decode to confident garbage before EOS commits, which the 
-        # commit gate then reads as hardened. See block_diffusion.supervise_trailing_eos.
-        return supervise_trailing_eos(
-            x0, valid, pad_index=self.pad_index, eos_index=self.eos_index,
-            max_tokens=self.eos_supervision_tokens if eos_supervision is None else int(eos_supervision),
+        return supervise_trailing_eos( # Supervise padding only to next block boundary. Later canvas slots stay ignored.
+            x0, valid, pad_index=self.pad_index, eos_index=self.eos_index, block_size=self.block_size,
+            max_tokens=self.eos_supervision_tokens if eos_supervision is None else int(eos_supervision)
         )
 
 

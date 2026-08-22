@@ -154,8 +154,8 @@ def controlled_windows(
     records: list[VideoRecord], grid: list[float], relative: bool = True, max_sentences: int | None = None, 
     tail_grid: list[float] | None = None, drop_counts: dict[tuple[float, float], int] | None = None,
 ) -> list[ControlledWindow]:
-    """RQ1 signed-offset windows: start = gt_start + delta_head, end = gt_end + delta_tail (Analysis A delta =
-    predicted minus GT); negative delta_tail = the right-truncation stress test.
+    """RQ1 signed-offset boundaries: start = gt_start + delta_head, end = gt_end + delta_tail. The loaded input
+    includes one frame after the requested end so a zero-offset target contains its terminator.
 
     `relative=True` (default): grid values are FRACTIONS of sentence duration — absolute seconds mix regimes (0.3s
     destroys a 1s sentence, not a 10s one) at one x-point.
@@ -176,8 +176,11 @@ def controlled_windows(
                     dh = float(gh) * duration if relative else float(gh)
                     dt = float(gt) * duration if relative else float(gt)
                     start_s = max(0.0, float(span.start_s) + dh)
-                    end_s = min(float(record.pose.duration_s), float(span.end_s) + dt)
-                    if end_s <= start_s:
+                    boundary_end_s = min(float(record.pose.duration_s), float(span.end_s) + dt)
+                    # The boundary is at boundary_end_s. The input also needs the following frame, which carries
+                    # O or the next B and makes a zero-offset target complete under the FSM rule.
+                    end_s = min(float(record.pose.duration_s), boundary_end_s + 1.0 / float(record.pose.fps))
+                    if boundary_end_s <= start_s:
                         # Fully truncated: dropped but COUNTED — dropping silently biases the row 
                         # toward longer sentences (dropped_fraction exposes it).
                         if drop_counts is not None: drop_counts[(float(gh), float(gt))] = drop_counts.get((float(gh), float(gt)), 0) + 1
@@ -188,7 +191,7 @@ def controlled_windows(
                         window_start_s=start_s, window_end_s=end_s,
                         # REALIZED offsets, not requested dh/dt: the request overstates severity where pre-trimmed
                         # data clamps. grid_head/grid_tail keep the request, for grouping.
-                        delta_head_s=start_s - float(span.start_s), delta_tail_s=end_s - float(span.end_s),
+                        delta_head_s=start_s - float(span.start_s), delta_tail_s=boundary_end_s - float(span.end_s),
                         grid_head=float(gh), grid_tail=float(gt),
                     ))
     return windows
@@ -554,14 +557,13 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     batch_size = max(1, int(rq_cfg.get("batch_size", 16)))
     grouped: dict[tuple[float, float], dict[str, list]] = {}
     rows = []
-    # `stream_start` is a per-WINDOW property (does frame 0 sit at the sentence onset, or inside the predecessor?), but it is applied per batch. 
-    # The severity grid holds NEGATIVE head offsets (configs/eval.yaml severity_grid_rel), so PARTITION by sign before chunking: length-sorting 
-    # alone interleaves grid cells, and a per-chunk `all(head >= 0)` would then drop the flag for onset windows that merely share a batch with a
-    # lead-in one — making the result depend on batch_size. Length-sorting (padding efficiency) still applies WITHIN each partition, and padding 
-    # is masked, so batching never changes a window's output.
+
+    # Mint the stream-start onset only when frame 0 is the realized sentence onset. A positive head offset has removed that onset; 
+    # a negative offset starts in leading context. Partition before batching so this flag is row-invariant.
+    _rq1_stream_start = lambda delta_head_s: abs(float(delta_head_s)) <= 1e-6
     partitions = [
-        ([m for m in materialized if float(m[0].delta_head_s) >= 0.0], True),   # starts at/inside the sentence
-        ([m for m in materialized if float(m[0].delta_head_s) < 0.0], False),   # starts in the predecessor
+        ([m for m in materialized if  _rq1_stream_start(m[0].delta_head_s)], True),
+        ([m for m in materialized if not _rq1_stream_start(m[0].delta_head_s)], False),
     ]
     chunks = []
     for part, is_stream_start in partitions:
@@ -572,7 +574,12 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
-            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start, use_duration_prior=False
+            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start, use_duration_prior=False,
+            # chi for a lead-in window: frames before the sentence onset are the predecessor's tail, already handled — the same commit frontier
+            # run_offline supplies. Without it a lead-in window on back-to-back pair has an unopenable leading I-run (buffer-start I never opens,
+            # no chi mint), so Omega anchors on the merged predecessor+target run and the gated arms are scored on a mis-anchored decode while
+            # ungated baseline is untouched. delta_head_s < 0 means the window opens that far before the onset.
+            commit_frontier_s=[max(0.0, -float(w.delta_head_s)) for (w, _p, _t) in chunk],
         )
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)

@@ -46,16 +46,9 @@ oput:
     # the distribution inference sees. true = faithful (1 extra no-grad decoder forward PLUS 1 full LM-encoder forward
     # per mode group on Mode 1/3 batches); false = reuse the dropout-noised L_mask logits (cheaper approximation).
     rollout_eval_mode: true
-    # Supervise the first K canvas slots after [.., eos, lang] with EOS targets. Without this the post-sentence canvas is never
-    # trained and decodes to confident garbage before EOS commits (hallucinated tails; corrupted commit-gate confidence).
-    # HOW TO SET (any dataset): K is DECODER GEOMETRY, not a corpus constant — one block (= block_size) is exactly the
-    # region the block-causal decode can visit past the sentence end before a committed EOS truncates the canvas
-    # (eos_pos), i.e. the dLLM AppendEOSBlockWrapper pad-to-block-boundary analog. Omit the key and the code defaults
-    # to block_size automatically; it never needs per-dataset tuning. (DMax's K=32 is calibrated to its 2048-4096
-    # canvas ≈1% of supervised mass; on our 128-slot targets with ~10-20-token sentences it was 62-76% — early-EOS
-    # bias the SPD/DCD decode turns into truncation.) Diagnose with val_translation_len_ratio: <1 and falling = too
-    # much EOS pressure (or commit threshold too low); hallucinated tails past sentence end = too little.
-    eos_supervision_tokens: 4 # = block_size; 0 to disable
+    # Maximum EOS padding. The target stops at the next block boundary, as in dLLM's AppendEOSBlockWrapper.
+    # This prevents an unsupervised canvas tail without adding one full EOS block to every short sentence.
+    eos_supervision_tokens: 4
     # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss). 
     # Without it the DLM is the only arm with an unsmoothed CE.
     label_smoothing: 0.2
@@ -66,16 +59,10 @@ confidence_bound:
     enabled: true
     verified_full_evidence_gate: true # penalize only where full-evidence decode == reference
     tau_cb: 0.75
-    # Makes τ_cb "the only new training-time hyperparameter" and weights Mode-2a's L_cb by λ_trans alone — an extra multiplier
-    # trains 2a at a fraction of the specced calibration pressure. FALLBACK: if CB destabilizes training right after its warmup
-    # (translation-loss spikes on the 2a slice), drop to the prior de-risk value 0.3 and record the deviation.
-    lambda: 1.0
-    # 0 is CORRECT with verified_full_evidence_gate: true — trust in the self-target is enforced PER SLOT by the
-    # f==r check (an untrustworthy full-evidence slot is simply inactive, never a wrong label), so a batch-level
-    # "wait until trustworthy" warmup is redundant: early on few slots pass verification (small cb_active_count,
-    # little signal, no harm) and the active set grows as the decode improves — self-annealing. This mirrors the
-    # gate's §1.4 resolution: S0 (the released translator) IS the competence stage CB leans on; no separate stage
-    # or warmup needed. Watch cb_active_count grow; set >0 only if verified_full_evidence_gate is ever disabled.
+    # Keep the auxiliary confidence term below the complete-evidence translation loss.
+    lambda: 0.3
+    # The verified gate rejects wrong full-evidence tokens, so the S1/baseline warm start needs no CB warmup.
+    # cb_active_count can rise as teacher coverage grows or fall as errors lose confidence. It is not a quality metric.
     warmup_epochs: 0
     # SPEED: the Mode-2a self-target runs TWO full SPD/DCD decodes per batch (full-evidence + truncated) — the
     # dominant DLM training cost. It is internal (it only picks 'confidently wrong' slots), so it decodes FAST and
@@ -114,19 +101,9 @@ membership_gate:
     # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
 mode_ratios:
-    # MEASURED calibration (Analysis A): stage-2 trains under the window-error distribution the DEPLOYED segmenter
-    # (duration decode, infer/duration_decode.py) actually produces — the injection path that carries the improved
-    # segmentation into joint training. Regenerate per language BEFORE train-slt, with the deployed decode as the
-    # instrument (order coupling is back, deliberately):
-    #   python analyze.py --stage segmenter-infer --segmenter-arch moryossef --segmenter-decode duration --language <lang> --split dev
-    #   python analyze.py --stage analysis-a --predictions outputs/segmenter_predictions_moryossef_<lang>_dev.json --language <lang>
-    # Measure on DEV, not train: both segmenters were fit on train, so train-split errors are optimistically biased.
-    # On these corpora clean complete anchors are rare at deployment (most windows truncate or hold multiple
-    # sentences) — the premise the method rests on. The designed fallback below covers only an explicitly-null
-    # source or a degenerate measurement; a configured-but-MISSING source file raises (run analysis-a first,
-    # train/sampler.py), and the mode1>=0.9 guard auto-falls-back on too-clean corpora (e.g. pre-trimmed CSL).
-    # Read the live ratios from the `source:` artifact, not from here.
-    source: outputs/a_mode_ratios_${language}.json
+    # Fixed coverage mix, shared by all datasets. Analysis-A event counts are not FSM state probabilities.
+    # Analysis A still supplies boundary jitter and Mode-2 cut depths.
+    source: null
     degenerate_mode1_threshold: 0.9
     fallback:
         mode1: 0.55

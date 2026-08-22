@@ -21,6 +21,7 @@ def smoke_data(args: argparse.Namespace) -> dict:
     slt_cfg = load_yaml(args.slt_config)
     inference_cfg = load_yaml(args.inference_config)
     language = str(args.language or data_cfg.get("active_languages", ["phoenix"])[0])
+    if language != slt_cfg.get("language"): slt_cfg = load_yaml(args.slt_config, language=language)
     records, splits = load_language_records(data_cfg, language, split=args.split)
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
 

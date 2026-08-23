@@ -26,6 +26,7 @@ from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisig
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
 from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
+from infer.stability import TAU_GRID, group_tracks, build_policies, score_policy
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
 from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
 
@@ -718,7 +719,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
                                             + (f"; tuned {dd}" if dd else "") + ")", flush=True)
         else: print(f"[streaming] duration_decode requested but <10 usable train captions — decoding plain argmax", flush=True)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg, duration_prior=duration_prior)
+    if getattr(args, "stability", False): runner.trace = []
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    stability_tracks: list = []
 
     predicted: dict[str, list[PredictionEvent]] = {}
     fsm_bio_rows: list[dict[str, float]] = []
@@ -728,7 +731,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             predicted[record.video_id] = []
             continue
 
+        if runner.trace is not None: runner.trace.clear()
         events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps))
+        if runner.trace: stability_tracks.extend(group_tracks(runner.trace, delta_s=runner.gate_delta / max(1.0, float(record.pose.fps))))
         predicted[record.video_id] = [PredictionEvent(
             video_id=record.video_id, start_s=float(ev.start_s), end_s=float(ev.end_s),
             text=tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True).strip(),
@@ -753,11 +758,24 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} "
         f"translation_ok={s.get('translation_ok',0)} committed={s.get('committed',0)} "
         f"forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
-        f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True)
+        f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True
+    )
+    if stability_tracks:
+        # Stable-prefix comparison on the SAME decodes the FSM already produced: how much earlier could text appear,
+        # and what does freezing it early cost? commit_only is what ships today (latency ceiling, zero error).
+        rows = {name: score_policy(stability_tracks, pol) for name, pol in build_policies().items()}
+        print(f"[stability] {len(stability_tracks)} tracks | tau grid {TAU_GRID}", flush=True)
+        print(f"  {'policy':<26}{'latency_s':>11}{'revealed':>10}{'frozen_err':>12}{'rewrite_rate':>14}", flush=True)
+        for name, r in rows.items(): print(
+            f"  {name:<26}{r['first_token_latency_s']:>11.3f}{r['revealed_fraction']:>10.3f}"
+            f"{r['frozen_prefix_error']:>12.3f}{r['contradicted_track_rate']:>14.3f}", flush=True
+        )
+        Path(f"outputs/stability_{args.method}_{args.language}_{args.split}.json").write_text(
+            json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     if fsm_bio_rows:
         fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
-        print("[stream] FSM BIO (stitched per-frame argmax vs GT): "
-              + " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
+        print("[stream] FSM BIO (stitched per-frame argmax vs GT): " + " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
         run_streaming.last_fsm_bio = fsm_bio  # run_rq2 picks this up for the output payload
     else: run_streaming.last_fsm_bio = None
     return predicted
@@ -1098,6 +1116,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline", action="store_true",
                         help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span")
     parser.add_argument("--stream", action="store_true", help="Run the streaming FSM engine to produce events")
+    parser.add_argument("--stability", action="store_true",
+                        help="With --stream: also score stable-prefix display policies (LA-n vs confidence) from the per-stride candidate "
+                             "decodes the FSM already computes. No extra decoding.")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)

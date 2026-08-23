@@ -18,6 +18,16 @@ def leading_i_run_end(bio_tags: torch.Tensor) -> int | None:
 
 
 @dataclass
+class StrideHypothesis: # One stride's candidate decode for the span the FSM is currently considering (committed or not).
+    commit_time_s: float      # wall-clock of the stride that produced it
+    span_start_s: float       # absolute span bounds; used to group strides that concern the same sentence
+    span_end_s: float
+    token_ids: torch.Tensor
+    token_confidence: torch.Tensor
+    committed: bool
+
+
+@dataclass
 class StreamingEvent:
     start_s: float
     end_s: float
@@ -45,9 +55,9 @@ class StreamingSLTRunner:
         spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
         dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none", 
-        decode_conditioning: str = "window", min_span_frames: int | None = None, forced_tail_policy: str = "skip",
-        gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4, duration_prior=None,
+        dcd_top_p: float | None = None, dcd_cache_type: str = "none", decode_conditioning: str = "window", min_span_frames: int | None = None, 
+        forced_tail_policy: str = "skip", gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4, 
+        duration_prior=None, record_trace: bool = False,
     ):
         # decode_conditioning: "window" (default) decodes under the FULL buffer — the training conditioning (Mode 1/3 feed
         # the whole jittered window; right-context is learned to be disregarded, not cropped). "span" crops to the BIO span,
@@ -120,6 +130,8 @@ class StreamingSLTRunner:
         # Did the LAST commit end at a real BIO terminator (O-or-B) rather than a cap cut? Only that certifies "a sentence
         # ENDED here", the χ-restoration's premise. Persistent: the seam is re-examined while the leftover lives.
         self._committed_is_terminator = False
+        # Per-stride candidate hypotheses for offline stable-prefix analysis; None = disabled (the default).
+        self.trace: list[StrideHypothesis] | None = [] if record_trace else None
         # Why-did-it-(not)-commit counters across run() calls. Low streaming recall with near-perfect frame BIO is usually
         # the gate; spans_seen vs boundary_ok vs translation_ok says which signal blocks (usually translation_ok).
         self.gate_stats: dict[str, int] = {}
@@ -271,6 +283,28 @@ class StreamingSLTRunner:
         s_idx, term_idx = span
         tokens, confidence = self._decode_span(bio_tap, mask, slice(s_idx, max(s_idx + 1, term_idx)), omega_bias=omega_bias)
         decision = self.commit_gate.update(span, token_confidence=confidence[0])
+        # Stability trace: this candidate decode is recomputed every stride and DISCARDED whenever the gate defers, so
+        # recording it costs nothing and captures how the hypothesis for one sentence evolves as frames arrive — the
+        # input a stable-prefix policy replays offline (infer/stability.py). Off by default; never affects the FSM.
+        if self.trace is not None:
+            # Trim at EOS before recording. After a committed EOS the decoder back-fills pad slots with a FABRICATED
+            # confidence of 1.0 (infer/decode.py) — pi was never computed there — so an untrimmed hypothesis would let a
+            # reveal policy "confidently" display padding and would inflate every ratio scored against its length.
+            tok_row, conf_row = tokens[0].detach().cpu(), confidence[0].detach().cpu()
+            keep = int(tok_row.numel())
+            tk = getattr(self.model, "tokenizer", None)
+            if tk is not None:
+                stop = {i for i in (getattr(tk, "eos_token_id", None), getattr(tk, "pad_token_id", None)) if i is not None}
+                for i, t in enumerate(tok_row.tolist()):
+                    if int(t) in stop: keep = i; break
+            self.trace.append(StrideHypothesis(
+                commit_time_s=float(end_s),
+                span_start_s=float(start_s + ts_b[0, s_idx].item()),
+                span_end_s=float(start_s + ts_b[0, term_idx].item()),
+                token_ids=tok_row[:keep].clone(),
+                token_confidence=conf_row[:keep].clone(),
+                committed=bool(decision.should_commit),
+            ))
         self._bump("spans_seen")
         if decision.boundary_stable: self._bump("boundary_ok")
         if decision.translation_confident: self._bump("translation_ok")

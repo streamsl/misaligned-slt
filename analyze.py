@@ -601,7 +601,7 @@ def delta_enc(args: argparse.Namespace) -> dict:
     # delta is not a standalone constant. On commit the buffer is cut at terminator-delta, so the next buffer opens
     # with a delta-frame leftover of the sentence just emitted; Lambda_min must exceed delta or that leftover is
     # selectable as a span (infer/stream.py's own rule and default). dlm.yaml's gate must equal both. Written
-    # together so the four values cannot drift — a stale pair is exactly what leaves the FSM in an invalid geometry.
+    # together so 4 values cannot drift — a stale pair is exactly what leaves the FSM in an invalid geometry.
     lam = delta + 1
     p10_frames = int(np.percentile([s.duration_s for r in records for s in r.sentences], 10) * fps_hint) if records else 0
     if p10_frames and lam > p10_frames: print(

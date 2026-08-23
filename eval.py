@@ -58,11 +58,6 @@ class ControlledWindow:
     grid_tail: float = 0.0
 
 
-def _load_segments(path: str | Path) -> list[Segment]:
-    rows = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows]
-
-
 def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict | None = None) -> Path:
     # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the arch/decode
     # that made it is unrecoverable — calibration could silently inherit the wrong decode.
@@ -702,9 +697,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     """Drive the sawtooth FSM end-to-end over each video → committed events.
 
     This is the *usable inference engine* for RQ2: Our own BIO head + commit gate, recompute-each-stride, no cross-stride decoder state. 
-    FSM methods (dlm/ar) only; the clean baseline's RQ2 is the segment-then-translate pipeline floor (--predictions).
+    FSM methods (dlm/ar) only; the clean baseline's RQ2 is the segment-then-translate cascade (--segments).
     """
-    if args.method == "baseline": raise SystemExit("Streaming RQ2 uses the FSM (dlm/ar). For the baseline pipeline-floor, pass --predictions.")
+    if args.method == "baseline": raise SystemExit("Streaming RQ2 uses the FSM (dlm/ar). For cascaded baselines, pass --segments.")
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
@@ -769,13 +764,13 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
 
 @torch.no_grad()
-def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
-    """Segment-then-translate pipeline floor: predicted spans (analyze.py --stage segmenter-infer JSON, via --segments)
+def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
+    """Segment-then-translate cascade: predicted spans (analyze.py --stage segmenter-infer JSON, via --segments)
     are cut from the pose stream and translated offline. Scored by the same tIoU/translation harness as the streaming FSM.
 
-    Pipeline FLOOR = an independent (Moryossef) segmenter's spans translated by CLEAN baseline, so pass `--method baseline`. Translation uses 
-    `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT ablation (Moryossef spans + our DLM, offline) — a legitimate RQ2 row, 
-    but not the floor. The method is encoded in output filename so the two never collide; just pass the right --method for the row you want.
+    The prior-art FLOOR is an independent (Moryossef) segmenter's spans translated by the CLEAN baseline, so pass `--method baseline`.
+    Translation uses `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT row (Moryossef spans + our DLM, offline) — legitimate,
+    but not the floor. The method is encoded in the output filename so the two never collide; pass the --method for the row you want.
     """
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
@@ -797,7 +792,7 @@ def run_pipeline_floor(args: argparse.Namespace) -> dict[str, list[PredictionEve
         f"nothing to translate (output would be all-zero). Pass --split test (+ --allow-test) for test gold spans."
     )
     if len(matched) < len(segments): print(
-        f"[pipeline_floor] WARNING: {len(segments) - len(matched)}/{len(segments)} segment video_ids "
+        f"[cascade] WARNING: {len(segments) - len(matched)}/{len(segments)} segment video_ids "
         f"are absent from --split {args.split}; scoring only the {len(matched)} that match.", flush=True)
 
     # Same single-sentence-unit rule as run_rq1: a cascade window IS the span to translate — the upstream segmenter already did the splitting,
@@ -833,8 +828,8 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     offline-bidirectional) segmentation, so it is a conservative baseline, not a pure-refinement control.
     """
     if args.method == "baseline": raise SystemExit(
-        "Offline RQ2 (row 5) uses the trained model's own BIO head (dlm/ar); the baseline has no "
-        "trained head. For the external-segmenter cascade floor, pass --segments."
+        "Offline RQ2 uses the trained model's own BIO head (ar/dlm); the baseline has no "
+        "trained head. For the external-segmenter cascade rows, pass --segments."
     )
     from moryossef26.infer import bio_tags_to_segments
     data_cfg = load_yaml(args.data_config)
@@ -923,7 +918,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run RQ2 on test without --allow-test")
     if not args.predictions and not args.stream and not args.segments and not args.offline: raise SystemExit(
         "--rq 2 needs --stream (streaming FSM), --offline (final model self-segments offline), "
-        "--segments (external-segmenter cascade floor, rows 3/4), or --predictions (score an events JSON)"
+        "--segments (given-spans cascaded baselines), or --predictions (score an events JSON)"
     )
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
@@ -939,7 +934,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     }
     # A deliberate beam override changes the search budget and cannot enter a main row delta.
     if args.method == "baseline" and int(provenance["num_beams"]) != 1: print(
-        f"[rq2] WARNING: baseline decodes with num_beams={provenance['num_beams']} while the dlm/ar arms are greedy — "
+        f"[rq2] WARNING: baseline decodes with num_beams={provenance['num_beams']} while the ar/dlm arms are greedy — "
         f"this row is not search-budget matched.", flush=True
     )
     if args.stream:
@@ -953,14 +948,12 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         predicted = run_offline(args)
         _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json", provenance)
     elif args.segments:
-        predicted = run_pipeline_floor(args)
+        predicted = run_cascade(args)
         # Name by span source (--segments stem carries arch+lang+split) AND method, so cascade rows never collide.
         src = Path(args.segments).stem
-        _write_events_json(predicted, f"outputs/rq2_pipeline_floor_{src}_{args.method}.json", provenance)
+        _write_events_json(predicted, f"outputs/rq2_cascade_{src}_{args.method}.json", provenance)
     else:
         predicted = load_event_predictions(args.predictions)
-        # Same fail-loud contract as run_pipeline_floor's --segments guard. Here, not in the scorer: disjoint ids
-        # are legitimate for its video-local matching.
         gold_ids = {r.video_id for r in records}
         if predicted and not (set(predicted) & gold_ids): raise SystemExit(
             f"--predictions has {len(predicted)} video_ids, none in the {len(gold_ids)} '{args.split}' records — "
@@ -972,13 +965,6 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
     summary.set_index("tiou_threshold", inplace=True)
     return _format_threshold_table(summary.T)
-
-
-def run_segment_prf(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.pred or not args.gold: raise SystemExit("--pred and --gold JSON files are required when --rq is omitted")
-    pred = _load_segments(args.pred)
-    gold = _load_segments(args.gold)
-    return segmentation_prf(pred, gold, tiou_threshold=args.tiou_threshold)
 
 
 def _load_segmenter(args):
@@ -1106,18 +1092,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8, help="windows per translate/forward batch in loop-decode paths")
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--predictions", default=None, help="RQ2 event JSON with start_s/end_s and optional text")
-    parser.add_argument("--segments", default=None, help="RQ2 pipeline floor: segmenter spans JSON (analyze --stage segmenter-infer)")
-    parser.add_argument("--stream", action="store_true", help="RQ2 row 6: run the streaming FSM engine to produce events")
+    parser.add_argument("--predictions", default=None,
+                        help="RQ2: re-score a saved events JSON (outputs/rq2_*_events_*.json) without re-running the model")
+    parser.add_argument("--segments", default=None, help="Segmenter spans JSON (analyze --stage segmenter-infer)")
     parser.add_argument("--offline", action="store_true",
                         help="Final misaligned model self-segments each whole video offline (its own BIO head) and translates each span")
+    parser.add_argument("--stream", action="store_true", help="Run the streaming FSM engine to produce events")
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")
-    parser.add_argument("--pred", default=None, help="Legacy segment-PRF predicted JSON list")
-    parser.add_argument("--gold", default=None, help="Legacy segment-PRF gold JSON list")
-    parser.add_argument("--tiou-threshold", type=float, default=0.1)
     return parser
 
 
@@ -1137,5 +1121,8 @@ if __name__ == "__main__":
 
     if args.rq == "1": result = run_rq1(args)
     elif args.rq == "2": result = run_rq2(args)
-    else: result = run_segment_prf(args)
+    else: raise SystemExit(
+        "eval.py needs a mode: --rq 1 (controlled misalignment sweep), --rq 2 (end-to-end ladder), "
+        "--segmenter-eval (whole-video segmentation), or --emit-gold-segments (write GT spans)."
+    )
     display(result)

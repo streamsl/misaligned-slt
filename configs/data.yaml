@@ -17,6 +17,18 @@ languages:
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
     # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
     # init on both axes. OpenASL uses the same architecture and strict-loads.
+    ase:
+        name: ASL
+        target_lang: en_XX
+        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
+        # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
+        # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
+        # pretrained_slt: checkpoints/baseline_train/ase/model.pt
+        root: data/youtube-sl-25/ase
+        pose:
+            fps: 24.0
+            width: 1920
+            height: 1080
     asf:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
@@ -37,18 +49,6 @@ languages:
         # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
         # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
-        pose:
-            fps: 24.0
-            width: 1920
-            height: 1080
-    ase:
-        name: ASL
-        target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
-        # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
-        # pretrained_slt: checkpoints/baseline_train/ase/model.pt
-        root: data/youtube-sl-25/ase
         pose:
             fps: 24.0
             width: 1920

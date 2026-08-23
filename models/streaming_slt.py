@@ -323,8 +323,8 @@ class MisalignedSLTModel(nn.Module):
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
         oput_label_smoothing: float = 0.0, oput_rollout_eval_mode: bool = True, oput_eos_supervision: int | None = None,
-        confidence_bound_enabled: bool = True, confidence_bound_active: bool = True, confidence_bound_tau: float = 0.75,
-        cb_lambda: float = 0.3, verified_full_evidence_gate: bool = True, cb_decode_steps: int = 64,
+        cb_enabled: bool = True, cb_active: bool = True, cb_tau: float = 0.75, cb_lambda: float = 0.3, 
+        cb_verified_gate: bool = True, cb_decode_steps: int = 64, cb_belief_gap: bool = True,
         cb_dcd_window_length: int | None = None, cb_dcd_max_window_length: int | None = None, cb_dcd_window_type: str = "sliding",
         cb_dcd_decode_algo: str = "threshold", cb_dcd_decode_param: int | float | None = None, cb_dcd_sample_top_k: int | None = None,
         cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, 
@@ -333,16 +333,15 @@ class MisalignedSLTModel(nn.Module):
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
-        ``L = lambda_bio * L_BIO + lambda_trans * L_translation``, translation routed per window mode (`mode_names` from
-        the sampler) to enforce premise P1: a truncated visual input never receives a partial text label.
+        ``L = lambda_bio * L_BIO + lambda_trans * L_translation``, translation routed per window mode (`mode_names` from sampler) to enforce 
+        premise P1: a truncated visual input never receives a partial text label.
 
         - BIO (all modes): Dice(1.5)+CE over in-window frames; padding/UNK ignored.
-        - Mode 1 / Mode 3 (complete-anchor / first-complete-span): OPUT under fixed full conditioning
-          (`dlm_decoder.oput_forward`; plain CE for AR). Raises if any other mode reaches that path.
-        - Mode 2a (right-truncated): confidence-bound term only — gated CE toward the model's own no-grad full-evidence
-          decode, at slots where that decode is reference-verified and the truncated decode confidently disagrees. Off
-          during OPUT warmup (``confidence_bound_active=False``), weighted by ``cb_lambda``; see
-          `dlm_decoder.remasked_logits` for why its gradient uses 1 re-masked forward, not back-prop through the decode.
+        - Mode 1 / Mode 3 (complete-anchor / first-complete-span): OPUT under fixed full conditioning (`dlm_decoder.oput_forward`; plain CE 
+          for AR). Raises if any other mode reaches that path.
+        - Mode 2a (right-truncated): confidence-bound term only — gated CE toward the model's own no-grad full-evidence decode, at slots where 
+          that decode is reference-verified and the truncated decode confidently disagrees. Off during OPUT warmup (`cb_active=False`), weighted 
+          by `cb_lambda`; see `dlm_decoder.remasked_logits` for why its gradient uses 1 re-masked forward, not back-prop through the decode.
         - Mode 2b / 2c / Mode 4 (left/both-truncated, all-gap): BIO only. The FSM does not call the decoder.
 
         Per-mode losses logged separately.
@@ -429,7 +428,7 @@ class MisalignedSLTModel(nn.Module):
                     dlm_out.get("row_loss_sum"), dlm_out.get("row_valid_count")
                 )
 
-        if (confidence_bound_enabled and confidence_bound_active and batch.get("full_evidence") is not None
+        if (cb_enabled and cb_active and batch.get("full_evidence") is not None
             and batch.get("full_evidence_indices") is not None and batch["full_evidence_indices"].numel() > 0
             and batch.get("reference_tokens") is not None):
             cb_indices = batch["full_evidence_indices"].to(bio_tap.device)
@@ -483,19 +482,19 @@ class MisalignedSLTModel(nn.Module):
                     full_enc_hidden, full_enc_mask = self.front_end.encode_memory(full_bio_tap, full_mask)
                     full_decode = self.dlm_decoder.generate_spd_dcd(
                         enc_hidden=full_enc_hidden, enc_mask=full_enc_mask, max_length=max_len,
-                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
+                        diffusion_steps=cb_decode_steps, tau_dec=cb_tau, top_k=cb_spd_top_k,
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
                         top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_full,
                     )
-                    full_tokens = full_decode.sequences
+                    full_tokens, full_conf = full_decode.sequences, full_decode.confidence
 
                     # Decode ONLY to pick which slots to defer-counterfactual (where the truncated decode disagrees
                     # with the full-evidence one) — its confidence does NOT gate the loss (see below).
                     trunc_decode = self.dlm_decoder.decode_spd_dcd(
                         enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len,
-                        diffusion_steps=cb_decode_steps, tau_dec=confidence_bound_tau, top_k=cb_spd_top_k,
+                        diffusion_steps=cb_decode_steps, tau_dec=cb_tau, top_k=cb_spd_top_k,
                         spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
                         window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
                         decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
@@ -519,7 +518,7 @@ class MisalignedSLTModel(nn.Module):
                 candidate = confidence_bound_gate(
                     full_tokens=full_tokens, trunc_tokens=trunc_decoded, 
                     trunc_confidence=torch.ones_like(trunc_decode.confidence), tau_cb=0.0, reference_tokens=cb_ref_ids, valid_mask=cb_ref_mask,
-                    verified_full_evidence_gate=verified_full_evidence_gate, pad_token_id=self.tokenizer.pad_token_id,
+                    verified_full_evidence_gate=cb_verified_gate, pad_token_id=self.tokenizer.pad_token_id,
                 )
                 # trunc_tokens/confidence=None + active_mask=None → confidence_bound_loss derives π and ŷ from
                 # trunc_logits itself (the remasked forward), exactly as the AR arm does: gate and CE share one
@@ -532,9 +531,13 @@ class MisalignedSLTModel(nn.Module):
                 else: trunc_logits = None
             else: # AR Mode-2a: reuse the cb_omega_* built above the arm split.
                 with torch.no_grad(), eval_mode(self):
-                    full_tokens, _ = self.generate_from_bio_tap(
+                    full_tokens, full_conf = self.generate_from_bio_tap(
                         full_bio_tap, full_mask, max_text_tokens=max(1, max_len - 1), omega_bias=cb_omega_full
                     )
+                    if full_conf is not None:
+                        if full_conf.shape[1] < max_len:
+                            full_conf = torch.cat([full_conf, full_conf.new_zeros((full_conf.shape[0], max_len - full_conf.shape[1]))], dim=1)
+                        else: full_conf = full_conf[:, :max_len]
                     full_tokens = self._pad_or_trim_tokens(full_tokens, max_len)
 
                 trunc_logits, _ = self._ar_confidence_bound_logits(
@@ -544,6 +547,7 @@ class MisalignedSLTModel(nn.Module):
                 # it lines full_tokens[:, 1:] slot j up with reference slot j ([tok1, ..., eos, lang]); the loss's
                 # min-length slicing trims the dangling lang code. DON'T slice the reference too — shifts the gate by 1.
                 full_tokens = full_tokens[:, 1:]
+                if full_conf is not None: full_conf = full_conf[:, 1:]
                 trunc_tokens, trunc_confidence = None, None
                 cb_ref_ids, cb_ref_mask, cb_active_mask = ref_ids, ref_mask, None
 
@@ -557,10 +561,10 @@ class MisalignedSLTModel(nn.Module):
                 cb_loss_val, cb_active_count = translation_loss.new_zeros(()), translation_loss.new_zeros(())
                 if trunc_logits is not None:
                     cb = confidence_bound_loss(
-                        trunc_logits=trunc_logits, full_tokens=full_tokens, reference_tokens=cb_ref_ids,
-                        valid_mask=cb_ref_mask, trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence,
-                        tau_cb=confidence_bound_tau, verified_full_evidence_gate=verified_full_evidence_gate,
+                        trunc_logits=trunc_logits, full_tokens=full_tokens, reference_tokens=cb_ref_ids, valid_mask=cb_ref_mask, 
+                        trunc_tokens=trunc_tokens, trunc_confidence=trunc_confidence, tau_cb=cb_tau, verified_full_evidence_gate=cb_verified_gate,
                         enabled=True, pad_token_id=self.tokenizer.pad_token_id, active_mask=cb_active_mask,
+                        full_confidence=full_conf if cb_belief_gap else None,
                     )
                     cb_loss_val = cb.loss
                     cb_active_count = cb.active_count.detach().to(translation_loss.dtype)

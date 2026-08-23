@@ -165,13 +165,20 @@ def confidence_bound_loss(
     trunc_logits: torch.Tensor, full_tokens: torch.Tensor, reference_tokens: torch.Tensor | None = None,
     valid_mask: torch.Tensor | None = None, trunc_tokens: torch.Tensor | None = None, trunc_confidence: torch.Tensor | None = None,
     tau_cb: float = 0.75, verified_full_evidence_gate: bool = True, enabled: bool = True, pad_token_id: int | None = None,
-    active_mask: torch.Tensor | None = None,
+    active_mask: torch.Tensor | None = None, full_confidence: torch.Tensor | None = None
 ) -> ConfidenceBoundStats:
     """Confidence-bound loss for right-truncated Mode 2a windows: CE toward the full-evidence tokens on the slots `confidence_bound_gate` 
     marks active. With the verified gate on, the active-slot target ALGEBRAICALLY equals the reference token (gate requires f==r), so this 
     is verified error-triggered reference CE — a direct signal. What the self-decode teacher adds is the MASK (the slot is achievable from 
     full evidence at current capacity, and the truncated view is confidently wrong there) and the on-policy decoded context; neither can 
     inject a wrong label — teacher failure yields silence (no active slots), never corruption. Monitor cb_active_count for a dead gate.
+
+    `full_confidence` (the teacher's own per-slot confidence) turns the gate's hard argmax-disagreement test into a graded BELIEF GAP: 
+    w = (pi_T - q(y))_+, the margin between what full evidence supports and what truncated view already assigns to that token. Slots the 
+    student nearly has right get little push; slots the teacher is itself unsure about get little push. This is monotone in gold coordinate 
+    of a forward KL to the teacher, but it keeps the CE target algebraically gold — a soft-target KL would instead move mass onto teacher's 
+    runner-up tokens, which on this gated set (student confidently AND verifiably wrong) partly protects the very token being corrected. 
+    The weight is DETACHED: it scales the correction, it is not itself an objective. None -> unweighted (the hard-gate behaviour).
     """
     if not enabled:
         zero = trunc_logits.sum() * 0.0
@@ -202,12 +209,17 @@ def confidence_bound_loss(
     if not active.any(): loss = logits.sum() * 0.0
     else:
         token_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), full.reshape(-1), reduction="none").reshape_as(full)
+        weight = active.to(token_loss.dtype)
+        if full_confidence is not None: # q(y) under the SAME distribution the CE trains, so the weight shrinks as the slot is corrected.
+            q_gold = logits.detach().softmax(dim=-1).gather(-1, full.unsqueeze(-1)).squeeze(-1)
+            gap = (full_confidence[:, :seq_len].to(device=q_gold.device, dtype=q_gold.dtype) - q_gold).clamp(min=0.0)
+            weight = weight * gap.detach()
         # Normalize by VALID reference slots, not gated slots: L_cb as a position sum in OPUT's form (per-valid-token). 
         # A per-ACTIVE-slot mean is sparsity-invariant — 1 gated slot would carry the same gradient magnitude as a 
         # fully-gated batch, giving Mode-2a windows most of the translation gradient.
         denom = (valid_mask[:, :seq_len].to(device=token_loss.device, dtype=token_loss.dtype).sum()
                  if valid_mask is not None else token_loss.new_tensor(float(active.numel())))
-        loss = (token_loss * active.to(token_loss.dtype)).sum() / denom.clamp(min=1)
+        loss = (token_loss * weight).sum() / denom.clamp(min=1)
     return ConfidenceBoundStats(
         loss=loss, active_positions=active, active_count=active.sum(),
         trunc_tokens=trunc_pred, trunc_confidence=trunc_conf,

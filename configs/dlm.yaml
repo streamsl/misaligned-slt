@@ -57,6 +57,9 @@ confidence_bound:
     # re-masked (DCD deferral counterfactual), not ~64-step decode. See models/streaming_slt.py + dlm_decoder.remasked_logits.
     enabled: true
     verified_full_evidence_gate: true # penalize only where full-evidence decode == reference
+    # Weight each corrected slot by the BELIEF GAP (teacher confidence - student's probability on that token) instead
+    # of treating every gated slot equally. Near-misses and slots the teacher is itself unsure of get a small push.
+    belief_gap: true # false = the original hard-gate CE.
     tau_cb: 0.75
     lambda: 0.3  # Keep the auxiliary confidence term below the complete-evidence translation loss.
     # The verified gate rejects wrong full-evidence tokens, so the S1/baseline warm start needs no CB warmup.
@@ -98,12 +101,11 @@ membership_gate:
     # default: the code default is 0, and train-slt REFUSES gate+warmup 0 without a bio_head_init — training
     # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
-mode_ratios:
-    # Fixed coverage mix, shared by all datasets. segmenter-error event counts are not FSM state probabilities.
+mode_ratios: 
     # Segmenter-error analysis supplies boundary jitter and Mode-2 cut depths.
-    source: null
+    source: null  # measured event-mix ABLATION only; set a path to run it. Main method = the fixed mix below.
     degenerate_mode1_threshold: 0.9
-    fallback:
+    fallback:     # Fixed coverage mix, shared by all datasets. segmenter-error event counts are not FSM state probabilities.
         mode1: 0.55
         mode2: 0.20
         mode3: 0.20

@@ -5,6 +5,7 @@ import torch
 from data.windowing import BIO
 from infer.commit_gate import CommitGate, open_span_start, select_target_span
 from infer.duration_decode import duration_split_tags
+from infer.stability import display_prefix
 
 
 def leading_i_run_end(bio_tags: torch.Tensor) -> int | None:
@@ -287,22 +288,22 @@ class StreamingSLTRunner:
         # recording it costs nothing and captures how the hypothesis for one sentence evolves as frames arrive — the
         # input a stable-prefix policy replays offline (infer/stability.py). Off by default; never affects the FSM.
         if self.trace is not None:
-            # Trim at EOS before recording. After a committed EOS the decoder back-fills pad slots with a FABRICATED
-            # confidence of 1.0 (infer/decode.py) — pi was never computed there — so an untrimmed hypothesis would let a
-            # reveal policy "confidently" display padding and would inflate every ratio scored against its length.
-            tok_row, conf_row = tokens[0].detach().cpu(), confidence[0].detach().cpu()
-            keep = int(tok_row.numel())
+            # Defensive trim only: generate_from_bio_tap already slices the DLM output at the first EOS (models/
+            # streaming_slt.py), and the AR arm returns no trailing pad, so there is normally nothing here to cut. Kept
+            # so a future decode path that DID leak post-EOS pad (fabricated confidence 1.0, infer/decode.py) can't
+            # silently feed a reveal policy padding. It does NOT explain DLM over-reveal — that is real decode drift.
             tk = getattr(self.model, "tokenizer", None)
-            if tk is not None:
-                stop = {i for i in (getattr(tk, "eos_token_id", None), getattr(tk, "pad_token_id", None)) if i is not None}
-                for i, t in enumerate(tok_row.tolist()):
-                    if int(t) in stop: keep = i; break
+            tok_row, conf_row = display_prefix(
+                tokens[0].detach().cpu(), confidence[0].detach().cpu(),
+                eos_id=getattr(tk, "eos_token_id", None) if tk is not None else None,
+                pad_id=getattr(tk, "pad_token_id", None) if tk is not None else None,
+            )
             self.trace.append(StrideHypothesis(
                 commit_time_s=float(end_s),
                 span_start_s=float(start_s + ts_b[0, s_idx].item()),
                 span_end_s=float(start_s + ts_b[0, term_idx].item()),
-                token_ids=tok_row[:keep].clone(),
-                token_confidence=conf_row[:keep].clone(),
+                token_ids=tok_row.clone(),
+                token_confidence=conf_row.clone(),
                 committed=bool(decision.should_commit),
             ))
         self._bump("spans_seen")

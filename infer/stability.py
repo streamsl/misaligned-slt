@@ -51,6 +51,23 @@ class Track: # Successive hypotheses for ONE sentence, in stride order.
         return float(self.hyps[-1].commit_time_s) if self.hyps else float("nan")
 
 
+def display_prefix(token_ids, token_confidence, eos_id: int | None = None, pad_id: int | None = None):
+    """Cut a decoded canvas down to the tokens a viewer could actually be shown.
+
+    The DLM writes a FABRICATED confidence of 1.0 into every slot it back-fills with pad after a committed EOS
+    (infer/decode.py) — pi was never computed there. generate_from_bio_tap already slices at the first EOS on the
+    live path, so this is defence in depth for any caller that records raw decodes; it does NOT explain long
+    hypotheses. A stride can legitimately decode MORE real tokens than the final commit (a no-EOS canvas — the
+    hallucinated-continuation mode the CB term targets); those are charged via vanished_track_rate, never trimmed.
+    """
+    stop = {int(i) for i in (eos_id, pad_id) if i is not None}
+    keep = int(token_ids.numel())
+    if stop:
+        for i, t in enumerate(token_ids.tolist()):
+            if int(t) in stop: keep = i; break
+    return token_ids[:keep], token_confidence[:keep]
+
+
 def group_tracks(trace, delta_s: float) -> list[Track]:
     """Group stride hypotheses by the sentence they concern.
 
@@ -182,11 +199,12 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
                              of revealing early. 0 for commit_only by construction. This is the FIRST-ORDER cost only:
                              the traces come from unfrozen re-translation, so it cannot capture a frozen prefix
                              degrading the continuation. That needs prefix-forced decoding.
-    revealed_fraction        how much of the sentence was visible before the commit.
+    revealed_fraction        how much of the COMMITTED sentence was visible before the commit, in [0, 1]. Surplus
+                             tokens (revealed then erased) are charged to frozen_prefix_error, not counted here.
     contradicted_track_rate  fraction of sentences whose revealed prefix was contradicted at least once — the
                              user-visible rewrite rate, and the decision number for prefix forcing.
     """
-    lat, err, revealed, contradicted = [], [], [], []
+    lat, err, revealed, contradicted, vanished = [], [], [], [], []
     for tr in tracks:
         if not tr.hyps: continue
         reveals = policy(tr, **kw)
@@ -197,7 +215,12 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
 
         pre = [n for t, n in reveals if t < commit_t]
         k = max(pre) if pre else 0
-        revealed.append(k / max(1, len(final)))
+        # CAPPED at 1: this answers "how much of the committed sentence was on screen early", and a sentence can't be more 
+        # than fully revealed. A policy that displays MORE tokens than the commit ends up with isn't more informative — 
+        # the surplus is text that must vanish, and it is charged in frozen_prefix_error / vanished_track_rate. Uncapped, 
+        # the ratio divided a count taken from one stride's hypothesis by the length of a different (shorter) one, which 
+        # is what produced revealed_fraction > 1 on the DLM.
+        revealed.append(min(k, len(final)) / max(1, len(final)))
         wrong = 0
         
         for t, n in reveals:
@@ -205,10 +228,18 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
             hyp = next((h for h in tr.hyps if h.commit_time_s == t), None)
             if hyp is None: continue
             toks = [int(x) for x in hyp.token_ids.tolist()][:n]
-            wrong = max(wrong, sum(1 for a, b in zip(toks, final[:n]) if a != b))
+            # Positions revealed BEYOND the committed sentence are contradictions too: they were displayed and the
+            # final sentence does not contain them. zip() alone silently drops them, understating the error for a
+            # decoder whose hypothesis length shrinks between strides (the DLM canvas does exactly that).
+            mism = sum(1 for a, b in zip(toks, final) if a != b) + max(0, len(toks) - len(final))
+            wrong = max(wrong, mism)
 
         err.append(wrong / max(1, k) if k else 0.0)
         contradicted.append(1.0 if wrong else 0.0)
+        # Revealing MORE tokens than the sentence finally has means displayed text later disappears — a distinct
+        # failure from a token changing, and the signature of a reveal policy reading slots the decode never really
+        # scored (post-EOS padding carries a fabricated confidence of 1.0). Should be ~0 on a trimmed trace.
+        vanished.append(1.0 if k > len(final) else 0.0)
     return {
         "n_tracks": len(lat),
         "first_token_latency_s": float(np.mean(lat)) if lat else 0.0,
@@ -217,4 +248,5 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
         # Fraction of SENTENCES whose display would visibly rewrite at least once. This is the number that decides
         # whether prefix-forced decoding is worth building: near 0 means unforced re-translation is already stable.
         "contradicted_track_rate": float(np.mean(contradicted)) if contradicted else 0.0,
+        "vanished_track_rate": float(np.mean(vanished)) if vanished else 0.0,
     }

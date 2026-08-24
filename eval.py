@@ -755,9 +755,8 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     s = runner.gate_stats
     seen = s.get("spans_seen", 0)
     if seen: print(
-        f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} "
-        f"translation_ok={s.get('translation_ok',0)} committed={s.get('committed',0)} "
-        f"forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
+        f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} translation_ok={s.get('translation_ok',0)} "
+        f"committed={s.get('committed',0)} forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
         f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True
     )
     if stability_tracks:
@@ -765,9 +764,14 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         # and what does freezing it early cost? commit_only is what ships today (latency ceiling, zero error).
         rows = {name: score_policy(stability_tracks, pol) for name, pol in build_policies().items()}
         print(f"[stability] {len(stability_tracks)} tracks | tau grid {TAU_GRID}", flush=True)
-        print(f"  {'policy':<26}{'latency_s':>11}{'revealed':>10}{'frozen_err':>12}{'rewrite_rate':>14}", flush=True)
+        # ANCHORS DIFFER, deliberately. RQ2 `emission_latency` = commit_time - GOLD SENTENCE END: when the SCORED translation is complete, 
+        # under commit_only, the only policy the FSM actually runs. `latency_s` here is first_reveal - COMMIT: how much earlier a policy would put 
+        # text on screen. Latency to first text = emission_latency + latency_s (negative). Keep them separate — quoting a prefix's latency against 
+        # the full sentence's BLEU would describe 2 different objects.
+        print("latency_s is relative to the COMMIT (negative = earlier); add RQ2 emission_latency for the gold-anchored number.", flush=True)
+        print(f"{'policy':<30}{'latency_s':>11}{'revealed':>10}{'frozen_err':>12}{'rewrite_rate':>14}", flush=True)
         for name, r in rows.items(): print(
-            f"  {name:<26}{r['first_token_latency_s']:>11.3f}{r['revealed_fraction']:>10.3f}"
+            f"{name:<30}{r['first_token_latency_s']:>11.3f}{r['revealed_fraction']:>10.3f}"
             f"{r['frozen_prefix_error']:>12.3f}{r['contradicted_track_rate']:>14.3f}", flush=True
         )
         Path(f"outputs/stability_{args.method}_{args.language}_{args.split}.json").write_text(

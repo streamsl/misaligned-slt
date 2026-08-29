@@ -85,15 +85,22 @@ class RoPETransformerEncoderLayer(nn.Module):
 
 
 def chunked_rope_encode(
-    layers: nn.ModuleList, x: torch.Tensor, timestamps_s: torch.Tensor | None, 
-    chunk_size: int | None, key_mask: torch.Tensor | None = None,
+    layers: nn.ModuleList, x: torch.Tensor, timestamps_s: torch.Tensor | None,
+    chunk_size: int | None, key_mask: torch.Tensor | None = None, overlap: bool = False,
 ) -> torch.Tensor:
     """Run pre-norm RoPE layers over fixed-size chunks (Moryossef chunked inference).
 
-    Shared by `RoPEBIOHead` (BioS1Model) and the analysis `MoryossefSegmenter.encoder_attn`. Each chunk attends only within itself; 
-    RoPE relative time in seconds keeps positions consistent across boundaries, so train-size chunked eval matches the training 
-    distribution. `chunk_size=None` (or T <= chunk_size) is one full pass. Timestamps are dim-normalized up front, else 1-D inputs 
+    Shared by `RoPEBIOHead` (BioS1Model) and the analysis `MoryossefSegmenter.encoder_attn`. Each chunk attends only within itself;
+    RoPE relative time in seconds keeps positions consistent across boundaries, so train-size chunked eval matches the training
+    distribution. `chunk_size=None` (or T <= chunk_size) is one full pass. Timestamps are dim-normalized up front, else 1-D inputs
     are dropped on the chunked path and fall back to the 50fps index assumption, breaking fps-augmented inputs.
+
+    `overlap=True` — OVERLAP-STITCHED chunking for the S1 whole-video paths. Contiguous chunks give frames at a seam context on ONE 
+    side only, so a sentence straddling a chunk boundary is decoded from two truncated halves — with ~18s chunks and ~4-6s sentences 
+    that is a large fraction of sentences, and it is a decode ARTIFACT, not head error (the FSM never suffers it: its buffer follows 
+    commits). Windows advance by half a chunk and each frame keeps the estimate from the window where it is most INTERIOR, so every 
+    frame (stream edges aside) has at least a quarter-chunk of context on both sides. Window size stays the TRAINED extent — only the 
+    stitching changes. The external Moryossef baseline keeps `overlap=False`: its released protocol is contiguous chunks.
     """
     if timestamps_s is not None:
         if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(x.shape[0], -1)
@@ -103,15 +110,29 @@ def chunked_rope_encode(
         for layer in layers: x = layer(x, timestamps_s, key_mask=key_mask)
         return x
 
-    chunks: list[torch.Tensor] = []
-    for start in range(0, x.shape[1], int(chunk_size)):
-        end = min(x.shape[1], start + int(chunk_size))
+    def run(start: int, end: int) -> torch.Tensor:
         chunk = x[:, start:end]
         chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None else None
         chunk_mask = key_mask[:, start:end] if key_mask is not None else None
         for layer in layers: chunk = layer(chunk, chunk_ts, key_mask=chunk_mask)
-        chunks.append(chunk)
-    return torch.cat(chunks, dim=1)
+        return chunk
+
+    chunk_size, T = int(chunk_size), x.shape[1]
+    if not overlap: return torch.cat([run(s, min(T, s + chunk_size)) for s in range(0, T, chunk_size)], dim=1)
+
+    stride = max(1, chunk_size // 2)
+    margin = (chunk_size - stride) // 2  # context kept beyond each window's retained core
+    out = torch.empty_like(x)
+    write_from, start = 0, 0
+    while write_from < T:
+        end = min(T, start + chunk_size)
+        if end == T: start = max(0, T - chunk_size)  # right-align the final window: full trained extent
+        chunk = run(start, end)
+        keep_hi = T if end == T else end - margin
+        out[:, write_from:keep_hi] = chunk[:, write_from - start : keep_hi - start]
+        write_from = keep_hi
+        start += stride
+    return out
 
 
 class ClassifierHead(nn.Module): # Two-layer MLP classifier.
@@ -177,6 +198,9 @@ class RoPEBIOHead(nn.Module):
     ):
         super().__init__()
         self.chunk_size = chunk_size
+        # Runtime flag, set by the whole-video S1 paths (_set_rope_chunk, run_offline): overlap-stitched chunking.
+        # False for training (windows fit one chunk; the flag is inert) and for the faithful Moryossef baseline.
+        self.chunk_overlap = False
         self.input_proj = nn.Identity() if input_dim == hidden_dim else nn.Linear(input_dim, hidden_dim)
         self.input_norm = nn.RMSNorm(hidden_dim)
         self.conv_stem = TemporalConvStem(
@@ -196,7 +220,7 @@ class RoPEBIOHead(nn.Module):
         # Conv stem runs on the full sequence BEFORE RoPE chunking: local/translation-equivariant, so it does not
         # reintroduce the absolute-position issue chunking eliminates. Mask-aware (see TemporalConvStem).
         if self.conv_stem is not None: x = self.conv_stem(x, key_mask=frame_mask)
-        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size, key_mask=frame_mask)
+        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size, key_mask=frame_mask, overlap=bool(self.chunk_overlap))
 
     def forward(
         self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None

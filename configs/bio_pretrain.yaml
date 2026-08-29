@@ -66,8 +66,8 @@ pretrain_temperature: 0.3
 # pretrain, which is not a learned representation, and the backbone would never adapt to misaligned input before
 # stage 2. The encoder trains at backbone_lr (default learning_rate×0.3) so the released weights are adapted, not
 # overwritten. `bio_head_init` carries this encoder into stage 2, preserving "S1 features == S2 initial features".
-epochs: 30
-batch_size: 64
+epochs: 50
+batch_size: 16
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 early_stopping:

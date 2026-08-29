@@ -51,10 +51,13 @@ def _phrase_logits(
 
 
 def _set_rope_chunk(model, record, rope_chunk_s: float | None) -> None:
-    # S1 only: RoPE chunk = TRAINED context in SECONDS (= buffer_cap_s) × this stream's fps, so it is
-    # Convert the chunk duration to frames at the video's rate.
+    # S1 only: RoPE chunk = TRAINED context in SECONDS (= buffer_cap_s), converted to frames at the video's rate.
+    # Overlap-stitched (models/bio_head.chunked_rope_encode): contiguous chunks would decode every seam-straddling
+    # sentence from 2 truncated halves — an artifact of the stitching, not of the head. Window size stays the
+    # trained extent. The Moryossef arch never routes here; its released contiguous chunking is untouched.
     if rope_chunk_s is not None and hasattr(model, "bio_head"):
         model.bio_head.chunk_size = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
+        model.bio_head.chunk_overlap = True
 
 
 @torch.no_grad()
@@ -147,6 +150,11 @@ def evaluate_segmenter_whole_video(
         # prefix "bio" (trainer convention): bio_f1 is BINARY signing-vs-not F1; under "phrase" it would sit next
         # to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
         row = dict(bio_frame_metrics(logits, labels, prefix="bio"))
+        # Moryossef 2023's IoU (binary signing-vs-not, per video then averaged) = PR/(P+R−PR), algebraically F1/(2−F1). 
+        # Reported for the cross-paper (F1, IoU, %) triple; weak alone — on dense corpora 1 all-signing span scores 
+        # high IoU while resolving no boundaries, so the 1-to-1 tIoU F1 stays the headline.
+        _p, _r = row["bio_precision"], row["bio_recall"]
+        row["bio_iou"] = (_p * _r / (_p + _r - _p * _r)) if (_p + _r - _p * _r) > 0 else 0.0
         row.update(_segment_rows(logits, labels, tiou_thresholds))
         rows.append(row)
     if not rows: return {}

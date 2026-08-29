@@ -106,7 +106,7 @@ membership_gate:
     # default: the code default is 0, and train-slt REFUSES gate+warmup 0 without a bio_head_init — training
     # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
-mode_ratios:      # Fixed coverage schedule. Target segmenter-errors supplies jitter and Mode-2 cut depths separately.
+mode_ratios:      # Fixed coverage schedule; jitter and Mode-2 cut depths come from the designed `jitter:` block below.
     source: null  # measured event-mix ABLATION only; set a path to run it. Main method = the fixed mix below.
     degenerate_mode1_threshold: 0.9
     fallback:     # Fixed coverage mix, shared by all datasets. A DESIGN choice, not a measured distribution: the

@@ -896,7 +896,9 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         f"[offline] BIO chunking at the TRAINED cap {float(_trained_cap):.2f}s (live inference.yaml says "
         f"{buffer_cap_s:.2f}s); translation windows keep the live cap.", flush=True
     )
-    # Same deployed decode as every other inference.yaml consumer — else offline argmaxes while streaming duration-decodes and the 
+    min_span_frames = int((inference_cfg.get("span_selection", {}) or {}).get(
+        "min_span_frames", int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1))
+    # Same deployed decode as every other inference.yaml consumer — else offline argmaxes while streaming duration-decodes and the
     # rows compare decodes, not deployments. Whole-video input has ended, so nothing is right-censored (unlike FSM's "survival" buffers).
     dd = duration_decode_params(inference_cfg, args.language)
     duration_prior = None
@@ -906,6 +908,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         print(f"[offline] whole-video duration decode ON (prior from {len(train_records)} train videos)", flush=True)
 
     predicted: dict[str, list[PredictionEvent]] = {}
+    n_sub_lambda = 0
     for record in tqdm(records, desc="Offline (self-segment + translate)"):
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
         if poses.shape[0] == 0:
@@ -918,10 +921,19 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         
         bio_tap, bio_mask, ts_out = model.front_end.extract_bio_tap(poses_t, mask_t, ts_t)
         model.bio_head.chunk_size = max(1, int(round(seg_chunk_cap_s * float(record.pose.fps))))
+        model.bio_head.chunk_overlap = True
         bio_logits = model.bio_head(bio_tap, timestamps_s=ts_out, frame_mask=bio_mask).logits
+        
         if duration_prior is not None: tags = duration_decode_tags(bio_logits, float(record.pose.fps), duration_prior).cpu()
         else: tags = bio_logits.argmax(dim=-1)[0].cpu()
         segments = bio_tags_to_segments(tags, timestamps.tolist())
+        # Deployed span floor, offline too: Λ_min is POLICY (span_selection — a sub-floor span is unresolvable from
+        # boundary evidence and the FSM never emits one), not streaming machinery. Without it this row emits flicker
+        # spans the deployed system cannot produce, each charged by SODA as a spurious prediction plus a junk
+        # translation — so (8−7) would partly measure the missing floor, not streaming.
+        kept = [s for s in segments if (float(s.end_s) - float(s.start_s)) * float(record.pose.fps) >= float(min_span_frames)]
+        n_sub_lambda += len(segments) - len(kept)
+        segments = kept
 
         items, bounds, frontiers = [], [], []
         delta_lead_s = float(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3)) / float(record.pose.fps)
@@ -946,6 +958,8 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             PredictionEvent(video_id=record.video_id, start_s=s0, end_s=s1, text=text)
             for (s0, s1), (text, _, _) in zip(bounds, results)
         ]
+    if n_sub_lambda: print(f"[offline] dropped {n_sub_lambda} sub-Λ_min span(s) (< {min_span_frames} frames) — "
+                           f"parity with the FSM's span selection, which can never commit them.", flush=True)
     return predicted
 
 

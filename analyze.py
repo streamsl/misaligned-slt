@@ -347,9 +347,9 @@ def tune_decode(args: argparse.Namespace) -> dict:
     return payload_out
 
 
-def _assert_predictions_match_pinned_decode(args: argparse.Namespace) -> None: # Refuse spans decoded with a triple that is no longer pinned.
-
-    # Segmenter-error analysis supplies stage-2 jitter and cut depths. Re-tuning the upstream decode invalidates it.
+def _assert_predictions_match_pinned_decode(args: argparse.Namespace) -> None: # Refuse spans decoded with triple that is no longer pinned.
+    # Segmenter-error analysis feeds the reported taxonomy and measured-jitter ABLATION (main recipe trains on the designed distributions). 
+    # Re-tuning the upstream decode still invalidates the artifacts.
     stamped = json.loads(Path(args.predictions).read_text(encoding="utf-8"))
     if not isinstance(stamped, dict) or "provenance" not in stamped: return  # unstamped legacy file
     prov = stamped["provenance"]
@@ -360,7 +360,8 @@ def _assert_predictions_match_pinned_decode(args: argparse.Namespace) -> None: #
     raise SystemExit(
         f"{args.predictions} was decoded with {used}, but {decode_config_key(arch)}.{args.language} "
         f"now pins {pinned}. Segmenter-error analysis must reflect the decode you report — re-run "
-        f"`analyze.py --stage segmenter-infer --segmenter-arch {arch} --segmenter-decode duration`, then retrain S1."
+        f"`analyze.py --stage segmenter-infer --segmenter-arch {arch} --segmenter-decode duration` (and retrain "
+        f"any measured-jitter ablation run that consumed the old artifacts)."
     )
 
 

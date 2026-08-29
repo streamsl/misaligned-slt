@@ -24,7 +24,8 @@ class GCN_unit(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, x, len_x=None):
+    def forward(self, x, frame_mask=None):
+        # Temporally kernel-1 (the t_* args are commented out below), so no frame can reach another: nothing to mask.
         x = self.conv(x)
         n, kc, t, v = x.size()
         x = x.view(n, self.kernel_size, kc // self.kernel_size, t, v)
@@ -61,9 +62,21 @@ class STGCN_block(nn.Module):
         )
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, x, len_x=None):
+    def forward(self, x, frame_mask=None):
+        """`frame_mask` (N, T) marks REAL frames. Padded frames are zeroed before the temporal conv.
+
+        The temporal conv has kernel 5 / padding 2, so without this a real frame within 2 steps of the pad reads
+        whatever the collator wrote there (repeat-last, i.e. a frozen pose that looks like sustained signing) and
+        its output depends on the batch it landed in. Zeroing reproduces exactly what Conv2d's own zero padding
+        would contribute at the end of an exact-length sequence, so a padded batch matches an unpadded one.
+        """
+        m = None if frame_mask is None else frame_mask[:, None, :, None].to(x.dtype)
+        if m is not None: x = x * m
         res = self.residual(x)
-        x = self.gcn(x, len_x)
+        x = self.gcn(x, frame_mask)
+        # Re-zero AFTER the gcn: its BatchNorm and bias make padded positions non-zero again, and it is the tcn
+        # (kernel 5) that would then mix them into real frames.
+        if m is not None: x = x * m
         x = self.tcn(x) + res
         return self.act(x)
 
@@ -76,6 +89,11 @@ class STGCNChain(nn.Sequential):
             for j in range(depth):
                 self.add_module(f'layer{i}_{j}', STGCN_block(last_dim, channel, kernel_sizes, A.clone(), adaptive))
                 last_dim = channel
+
+    def forward(self, x, frame_mask=None):
+        # nn.Sequential.forward takes one argument and would silently drop the mask, so forward it per block.
+        for block in self: x = block(x, frame_mask)
+        return x
 
 
 def get_stgcn_chain(in_dim, level, kernel_size, A, adaptive):

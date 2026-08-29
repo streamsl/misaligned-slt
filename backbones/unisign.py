@@ -104,16 +104,27 @@ class UniSignPoseEncoder(nn.Module):
 
 
     def forward(self, poses: torch.Tensor, frame_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """poses: (B, T, 69, 3) -> (B, T, out_dim). `frame_mask` is accepted for interface parity with the
-        other backbones but unused: Uni-Sign's ST-GCN has no mask-aware norm, and padded frames are masked
-        downstream by the mT5 encoder's attention_mask, exactly as in the upstream model."""
+        """poses: (B, T, 69, 3) -> (B, T, out_dim).
+
+        `frame_mask` (B, T, True = real frame) zeroes padded frames before each TEMPORAL conv (kernel 5, three
+        blocks = a +-6 frame reach). Without it a real frame within 6 of the pad mixes in whatever the collator
+        wrote there, so its features depend on which batch it landed in — measured at 44-66% relative error on
+        those frames, a fixed offset every step reapplies in the same direction. The downstream attention mask
+        hides the pad COLUMNS but cannot undo corruption already folded into the real ones, and here the affected
+        frames carry the sentence terminator the commit gate reads. With the mask, a padded batch reproduces an
+        exact-length forward bit-for-bit; a fully packed batch is unchanged, and the released weights still load
+        strict. `None` keeps the original (leaky) behaviour.
+
+        NOT covered: the 33 BatchNorm2d layers still pool padded frames into their batch statistics when the
+        encoder is unfrozen. That is a separate decision, not a bug fix — see docs.
+        """
         parts = self._split_parts(poses)
         features = []
         body_feat = None
         
         for part in self.modes:
             proj_feat = self.proj_linear[part](parts[part]).permute(0, 3, 1, 2)  # B,C,T,V
-            gcn_feat = self.gcn_modules[part](proj_feat)  # spatial GCN
+            gcn_feat = self.gcn_modules[part](proj_feat, frame_mask)  # spatial GCN (kernel-1 in time)
             if part == "body": body_feat = gcn_feat
             else:
                 assert body_feat is not None
@@ -121,7 +132,7 @@ class UniSignPoseEncoder(nn.Module):
                 elif part == "right": gcn_feat = gcn_feat + body_feat[..., -1][..., None].detach()
                 elif part == "face_all": gcn_feat = gcn_feat + body_feat[..., 0][..., None].detach()
 
-            gcn_feat = self.fusion_gcn_modules[part](gcn_feat)  # temporal GCN (stride 1)
+            gcn_feat = self.fusion_gcn_modules[part](gcn_feat, frame_mask)  # temporal GCN (kernel 5, stride 1)
             pool_feat = gcn_feat.mean(-1).transpose(1, 2)  # B,T,C
             features.append(pool_feat)
 

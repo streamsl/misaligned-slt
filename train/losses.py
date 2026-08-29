@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
-from data.windowing import BIO, make_bio_labels
+from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 
 
 @dataclass
@@ -50,23 +50,24 @@ def binary_sign_dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_in
     return 1.0 - numerator / denominator
 
 
-def bio_label_counts(records, trusted_gap_s: float | None = None) -> list[int]:
+def bio_label_counts(records, trusted_gap_s: float | None = TRUSTED_GAP_S) -> list[int]:
     """Corpus BIO label histogram (UNK/O/B/I) over each record's full timeline, for `balanced` class weights.
 
-    Calls the real labeller on a uniform per-video timeline rather than re-deriving prevalence, so UNK/trusted-gap
-    handling can never drift from training. No poses are read.
+    Calls the real labeller on a uniform per-video timeline rather than re-deriving prevalence, so UNK/trusted-gap handling can never drift from 
+    training. No poses are read. The default matches the labellers' own default; Trainer that OVERRIDES trusted_gap_s for its labels (moryossef26) 
+    must pass the same value here, or the weights are measured on a different UNK/O marginal than the labels they scale — `None` (no trusted gaps)
+    is a legal override and is honoured, not treated as "unset".
     """
     counts = np.zeros(4, dtype=np.int64)
     for rec in records:
         fps = float(rec.pose.fps); duration = float(rec.pose.duration_s)
         n = max(1, int(round(duration * fps)))
-        kw = {} if trusted_gap_s is None else {"trusted_gap_s": trusted_gap_s}
-        labels = make_bio_labels(np.arange(n) / fps, rec.sentences, 0.0, duration, video_duration_s=duration, **kw)
+        labels = make_bio_labels(np.arange(n) / fps, rec.sentences, 0.0, duration, video_duration_s=duration, trusted_gap_s=trusted_gap_s)
         counts += np.bincount(np.asarray(labels), minlength=4)[:4]
     return [int(c) for c in counts]
 
 
-def resolve_bio_class_weights(cfg: dict, records, trusted_gap_s: float | None = None) -> None:
+def resolve_bio_class_weights(cfg: dict, records, trusted_gap_s: float | None = TRUSTED_GAP_S) -> None:
     """Replace a `bio_class_weights: balanced` config entry with the concrete 4-list measured on `records`.
 
     Resolved once at setup, in place, so every consumer sees the same numbers and the run's saved config records

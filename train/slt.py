@@ -16,8 +16,13 @@ from train import distributed as dist
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from infer.duration_decode import duration_decode_params, fit_duration_prior
-from metrics import bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import load_yaml, language_model_name, resolve_pretrained
+from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
+from utils import checkpoint_dir, load_yaml, language_model_name, pool_key, resolve_pretrained
+
+
+# DEFAULT S1 config. `checkpoint.bio_head_init: auto` resolves the S1 checkpoint through it, and the pool-provenance check reads its 
+# `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
+BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
 
 
 @dataclass
@@ -74,7 +79,7 @@ def _optional_float(value) -> float | None:
 
 def build_slt_components(
     data_config: str = "configs/data.yaml", slt_config: str = "configs/dlm.yaml", inference_config: str = "configs/inference.yaml",
-    decoder: str | None = None, include_dev: bool = False, language: str | None = None,
+    decoder: str | None = None, include_dev: bool = False, language: str | None = None, bio_config: str = BIO_S1_CONFIG,
 ) -> SLTComponents:
     data_cfg = load_yaml(data_config)
     slt_cfg = load_yaml(slt_config)
@@ -86,6 +91,7 @@ def build_slt_components(
     _assert_gate_inference_consistency(slt_cfg, inference_cfg)
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
+    slt_cfg["target_lang"] = target_lang  # metric scoring level is declared, not sniffed (metrics.char_level_for_target)
     # Uni-Sign front end. language_model.name picks the LM + tokenizer: mT5 (Path A default) or mBART
     # (mT5-vs-mBART ablation); same pose encoder + prompt either way.
     lm_name = language_model_name(slt_cfg)
@@ -120,14 +126,16 @@ def build_slt_components(
     # split) and workers reseed their rng (data.loader.streaming_loader / WindowSampler.configure_worker).
     num_workers = int(slt_cfg.get("num_workers", 0))
     train_loader = streaming_loader(
-        train_dataset, dist.per_rank_batch_size(int(slt_cfg.get("batch_size", 4))), collator, num_workers=num_workers
+        train_dataset, dist.per_rank_batch_size(int(slt_cfg.get("batch_size", 4))), collator, num_workers=num_workers,
+        # See train/bio_pretrain.py: length bucketing, same coverage, fewer padded frames.
+        bucket_by_length=bool(slt_cfg.get("bucket_by_length", True)), bucket_seed=int(slt_cfg.get("seed", 42)),
     )
     dev_loader = None
     if include_dev:
         dev_records, _ = load_language_records(data_cfg, language, split="dev")
         # Dev scoring should cover the same experimental unit as standard SLT training: 1 sentence anchor, not 1 video.
         # With len(dev_records), validation sampled only 1 fixed window per video and could miss most sentences.
-        dev_steps = sum(len(record.sentences) for record in dev_records)
+        dev_steps = sum(sum(1 for sp in record.sentences if getattr(sp, 'reliable', True)) for record in dev_records)
         dev_dataset = StreamingWindowDataset(
             dev_records, slt_cfg=slt_cfg, inference_cfg=inference_cfg,
             steps_per_epoch=max(dev_steps, 1), deterministic=True,  # fixed dev windows across epochs
@@ -153,22 +161,28 @@ def build_slt_components(
     # S1 BIO init (docs/membership_gate.md §1.4 "competence before coupling"): load the pre-trained head from
     # train-bio so S2 trains exactly one new thing — the coupling — and membership_gate.warmup_epochs can be 0.
     bio_init = slt_cfg.get("checkpoint", {}).get("bio_head_init")
+    bio_cfg = load_yaml(bio_config, language=language)
+    # `auto` DERIVES the path via the same resolver every other consumer uses, so pooled S1 is found by its pool key instead of 
+    # a literal copied into this config. Hardcoded `checkpoints/bio_s1/multi_<pool>/model.pt` goes stale the moment `pretrain_languages` 
+    # changes, and if the old directory still exists stage 2 silently initialises the gate from the PREVIOUS pool's head.
+    if str(bio_init).lower() == "auto": bio_init = str(Path(checkpoint_dir(bio_cfg, default="checkpoints/bio_s1")) / "model.pt")
     if float(slt_cfg.get("lambda_bio", 1.0)) == 0.0:
         if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)): raise SystemExit(
             "lambda_bio: 0 with membership_gate.enabled: true is incoherent — the gate reads the BIO head's posteriors, but "
             "lambda_bio: 0 skips the head's forward and leaves it untrained/frozen. Either train the head (lambda_bio > 0) "
             "or disable the gate (the clean-floor recipe does both)."
         )
-        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip the S1 init entirely, head
-        # AND its pose encoder (the baseline must start from the RELEASED weights only), and freeze the head so
-        # the optimizer never sees it. forward_loss skips its forward, so the branch costs nothing.
+        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip S1 init entirely, head AND its pose encoder, 
+        # and freeze the head so the optimizer never sees it. forward_loss skips its forward, so the branch costs nothing. The floor 
+        # must stay the PRIOR-ART recipe: S1's encoder is adapted by SEGMENTATION objective, and transplanting it into translation-only 
+        # baseline would neither match the arms (which need it only so their BIO head meets the features it trained on) nor keep this 
+        # row a faithful Uni-Sign transfer. The mono-vs-multi S1 ablation is where the pool's contribution is measured.
         for p in model.bio_head.parameters(): p.requires_grad_(False)
         # generate_from_poses skips the head's forward too: with the gate off nobody reads frozen-random logits.
         model.bio_branch_off = True
         print("slt | lambda_bio=0: BIO branch OFF — head frozen at random init, forward SKIPPED in training and decode; "
               + ("bio_head_init IGNORED (clean-floor recipe trains the released front end only)" \
                 if bio_init else "no bio_head_init configured"), flush=True)
-
     elif bio_init and Path(bio_init).exists():
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
@@ -181,6 +195,14 @@ def build_slt_components(
             f"bio_head_init dim mismatch: S1 head reads {int(s1_dim.shape[1])}-d features but this SLT model's "
             f"bio_tap is {int(front_end.bio_tap_dim)}-d ({lm_name}). Retrain train-bio with feat_dim="
             f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml), or use the mT5 arm (the released checkpoints are mT5-768)."
+        )
+        # PROVENANCE, same rule as eval.py: the checkpoint records which pool trained it. Stage 2 must not warm-start
+        # the gate from a head trained on a different pool — that is a different model, and the failure is silent.
+        _s1_meta = blob.get("meta", {}) if isinstance(blob, dict) else {}
+        _want = pool_key(bio_cfg)
+        if "pretrain_pool" in _s1_meta and _s1_meta.get("pretrain_pool") != _want: raise SystemExit(
+            f"{bio_init} was trained on pool {_s1_meta.get('pretrain_pool')!r}, but bio_pretrain.yaml now expects "
+            f"{_want!r}. Retrain S1 for this pool, or point checkpoint.bio_head_init at the matching model."
         )
         model.bio_head.load_state_dict(head_sd, strict=True)
         # Carry S1's pose encoder so the head meets the features it trained on. No-op under S1 freeze_backbone:true 
@@ -348,7 +370,9 @@ def evaluate_slt(
     if was_training: model.train()
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
-        metrics.update(compute_text_metrics(pred_texts, ref_texts, prefix="val_translation"))
+        metrics.update(compute_text_metrics(
+            pred_texts, ref_texts, prefix="val_translation", char_level=char_level_for_target(slt_cfg.get("target_lang"))
+        ))
         # Hyp/ref length ratio (BLEU brevity-penalty input, char-level for CJK): early-EOS diagnostic — < 1 and FALLING across epochs 
         # means the decode commits EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr punish as brevity.
         # WORD tokens, matching BLEU's BP. Characters disagree with it materially, so char ratio reads healthy while BLEU is penalised.

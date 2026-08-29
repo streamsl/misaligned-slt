@@ -10,7 +10,12 @@ checkpoint:
     # With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent head from step one 
     # (docs/membership_gate.md §1.4). Missing file with the gate ENABLED → hard FileNotFoundError (train/slt.py); 
     # warning + fresh head only with the gate off, or set bio_head_init: null AND membership_gate.warmup_epochs >= 2.
-    bio_head_init: checkpoints/bio_s1/${language}/model.pt
+    # Multilingual SEGMENTATION pretraining (configs/bio_pretrain.yaml pretrain_languages) writes ONE
+    # language-agnostic checkpoint under checkpoints/bio_s1/multi_<pool>/. Point here for the monolingual
+    # S1 recipe: checkpoints/bio_s1/${language}/model.pt
+    # `auto` resolves through utils.checkpoint_dir against configs/bio_pretrain.yaml, so a pooled S1 is found by
+    # its pool key and this file never carries a stale copy of the pool name. An explicit path still wins.
+    bio_head_init: auto
     # Weights to fine-tune from: the released Uni-Sign pose-only SLT checkpoint. Resolved PER LANGUAGE from data.yaml 
     # `languages[lang].pretrained_slt` (utils.resolve_pretrained), because the right warm-start depends on the target 
     # language. Uncomment `from_pretrained` below to force 1 checkpoint regardless of language (an ablation override):
@@ -61,7 +66,7 @@ confidence_bound:
     # of treating every gated slot equally. Near-misses and slots the teacher is itself unsure of get a small push.
     belief_gap: true # false = the original hard-gate CE.
     tau_cb: 0.75
-    lambda: 0.3  # Keep the auxiliary confidence term below the complete-evidence translation loss.
+    lambda: 1.0
     # The verified gate rejects wrong full-evidence tokens, so the S1/baseline warm start needs no CB warmup.
     # cb_active_count can rise as teacher coverage grows or fall as errors lose confidence. It is not a quality metric.
     warmup_epochs: 0
@@ -101,13 +106,14 @@ membership_gate:
     # default: the code default is 0, and train-slt REFUSES gate+warmup 0 without a bio_head_init — training
     # from a fresh head deliberately requires setting warmup_epochs >= 2 by hand.
     warmup_epochs: 0
-mode_ratios: 
-    # Segmenter-error analysis supplies boundary jitter and Mode-2 cut depths.
+mode_ratios:      # Fixed coverage schedule. Target segmenter-errors supplies jitter and Mode-2 cut depths separately.
     source: null  # measured event-mix ABLATION only; set a path to run it. Main method = the fixed mix below.
     degenerate_mode1_threshold: 0.9
-    fallback:     # Fixed coverage mix, shared by all datasets. segmenter-error event counts are not FSM state probabilities.
-        mode1: 0.55
-        mode2: 0.20
+    fallback:     # Fixed coverage mix, shared by all datasets. A DESIGN choice, not a measured distribution: the
+        # segmenter-error event mix gives mode1~3% (too little complete-sentence supervision), so the mix is set to
+        # cover each behaviour. mode1+mode3 = 0.65 complete-sentence targets; the extra mode2 mass feeds the CB signal.
+        mode1: 0.45
+        mode2: 0.30
         mode3: 0.20
         mode4: 0.05
 # Within Mode 2, each over-segmentation event yields one right-trunc + one left-trunc window, so right~=left dominate;
@@ -152,15 +158,25 @@ bio_nhead: 8
 bio_dropout: 0.1
 bio_conv_stem_layers: 2
 jitter:
-    # Measured boundary-offset distribution from segmenter-error analysis; Laplace loc/scale fitted from matched-pair 
-    # offsets — empirically the right family: the deployed decode's placement errors are leptokurtic, and much more so 
-    # at the head than the tail. Laplace beats Gaussian in held-out log-lik on both.
-    source: outputs/a_jitter_${language}.json
+    # MAIN RECIPE: designed corruption for BOTH stages. `source: null` draws boundary jitter from fallback_laplace
+    # and Mode-2 cut depths uniformly from fallback_cut_range — the same distributions S1 pretrains under. Designed,
+    # not measured, deliberately: (a) S1↔S2 parity — swapping the nuisance model between stages injects a shift
+    # justified only by fidelity to a segmenter we do not deploy; (b) deployment windows are cut by OUR head under
+    # the tuned semi-Markov decode and the terminator−δ commit — a different error law from the analysis
+    # segmenter's whole-video argmax errors, so a measured Laplace is not "matched to deployment" either;
+    # (c) robustness training wants coverage: the designed scales sit deliberately above measured boundary offsets,
+    # and sensitivity is MEASURED by the RQ1 sweep, not assumed from a proxy. The segmenter-error taxonomy stays in
+    # the paper as evidence that real segmenters produce exactly these event types, inside the designed support.
+    # MEASURED ABLATION: point `source` at the INDEPENDENT segmenter's artifact (never an `_s1_` file —
+    # self-calibration): outputs/a_jitter_moryossef_${language}.json. Laplace is the right family either way:
+    # measured offsets are leptokurtic (Laplace beats Gaussian in held-out log-lik on both edges).
+    source: null
     fallback_laplace:
         head_loc_s: 0.0
-        head_scale_s: 0.6
+        head_scale_s: 0.6 # deliberately broader than measured head offsets (coverage, not point-matching)
         tail_loc_s: 0.0
-        tail_scale_s: 0.8
+        tail_scale_s: 0.8 # broader still: deployment tails also carry cap-forced commits and survival splits
+    fallback_cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off the edges so mode2 stays distinct from mode1/4
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 32
 num_workers:

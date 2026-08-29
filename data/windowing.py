@@ -21,6 +21,10 @@ class SentenceSpan:
     start_s: float
     end_s: float
     text: str
+    # False = a QUARANTINED region: real sentences whose internal boundaries can't be located in time (punctuated chains longer 
+    # than the buffer, see loader.reconstruct_sentences). Frames get UNK (no BIO supervision), the span is never a translation 
+    # anchor, and eval treats it as an ignore region. Labeled wrongly is worse than not labeled: same rule as trusted-gap UNK.
+    reliable: bool = True
 
     @property
     def duration_s(self) -> float:
@@ -86,6 +90,18 @@ def make_bio_labels(
     for span in spans_overlapping_window:
         in_span = (frame_times_s >= span.start_s) & (frame_times_s < span.end_s)
         if not in_span.any(): continue
+        # Quarantined region: interior sentence boundaries cannot be time-located, so they are UNK (never I: I would
+        # assert "one phrase" across a multi-sentence span, teaching under-segmentation; never O: that is "signing->O").
+        # The ONSET is exempt — it is a real cue timestamp — so it keeps its B below.
+        if not getattr(span, "reliable", True):
+            # Its INTERIOR boundaries are unlocatable, but its ONSET is not: a quarantined chain begins at a cue
+            # timestamp where Punkt placed a sentence boundary — the same evidence that validates a reliable merged
+            # chain's outer bounds. Dropping it would discard ~12% of all `B` supervision (the rarest, most heavily
+            # weighted class) and bias the `balanced` class-weight fit, which is derived from this labeller.
+            labels[in_span] = BIO["UNK"]
+            first_q = int(np.argmax(in_span))
+            if span.start_s >= window_start_s: labels[first_q] = BIO["B"]   # same guard as the reliable branch
+            continue
 
         first = int(np.argmax(in_span))
         if span.start_s >= window_start_s:  # frame_times_s[first] >= span.start_s by construction of in_span
@@ -116,6 +132,7 @@ def first_complete_span(
     sentence the gate never anchors, silently conditioning the decoder on the wrong sentence's Ω mask.
     """
     for span in sorted(spans, key=lambda s: (s.start_s, s.end_s)):
+        if not getattr(span, "reliable", True): continue     # quarantined: never a translation target
         if span.end_s - span.start_s < min_span_s: continue  # Λ_min: never a deployable commit target
         has_b = span.start_s >= window_start_s
         has_terminator = span.end_s + min_tail_s <= window_end_s
@@ -140,6 +157,6 @@ def count_complete_spans(
     # this and targets with that; a floor on only one leaves a sub-Λ_min-only window a nominal mode1 with
     # target=None (silently unsupervised).
     return sum(
-        1 for span in spans if span.end_s - span.start_s >= min_span_s
+        1 for span in spans if getattr(span, "reliable", True) and span.end_s - span.start_s >= min_span_s
         and span.start_s >= window_start_s and span.end_s + min_tail_s <= window_end_s
     )

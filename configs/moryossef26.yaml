@@ -5,7 +5,9 @@
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
-    dir: checkpoints/moryossef/${language}
+    # ${corpus} = pool key (multi_<pool>) when pretrain_languages is set, else the language — same
+    # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
+    dir: checkpoints/moryossef/${corpus}
     save_best: true
     # 1-to-1 tIoU-matched segment F1 (metrics.segmentation_prf — the metric RQ2 uses): collapse-resistant
     # (neither all-I nor over-segmentation games it). On clean gap-separated streams a good detector is near-ceiling.
@@ -21,7 +23,7 @@ checkpoint:
 wandb:
     enabled: false
     project: misaligned-slt
-    name: segmenter_${language}
+    name: segmenter_${corpus}
     mode: online
 
 # MoryossefSegmenter arch (moryossef26/model.py) — the faithful 2026 release: UNet CNN → RoPE Transformer → phrase
@@ -50,7 +52,7 @@ bio_class_weights: balanced
 # Whole-video chunk training (Moryossef-style; distinct from the SLT window sampler).
 num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked inference
 steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames / num_frames)
-batch_size: 8
+batch_size: 64
 augmentation:
     # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip 
     # below the source rate to do anything. YouTube-SL-25 poses are 24 fps.
@@ -60,7 +62,7 @@ augmentation:
 
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-epochs: 50
+epochs: 30
 eval_every_epochs: 1
 early_stopping:
     enabled: true
@@ -68,8 +70,14 @@ early_stopping:
     min_delta: 0.0
 scheduler:
     type: cosine
-    eta_min: 1.0e-6
+    warmup_epochs: 2
 mixed_precision: auto
 max_grad_norm: 1.0
 # The pred→GT match bar is an analysis knob (`analyze.SEGMENTER_ERROR_MATCH_TIOU = 0.1`,
 # override with `analyze.py --tiou-threshold`), not a segmenter-training param.
+
+# Matched to configs/bio_pretrain.yaml: the baseline segmenter trains on the SAME language pool as S1, so the RQ2
+# cascade rows compare methods rather than the amount of segmentation data each arm saw. Set both to null together
+# for the monolingual recipe.
+pretrain_languages: [ase, asf, bfi]
+pretrain_temperature: 0.3

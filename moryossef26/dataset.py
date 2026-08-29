@@ -17,15 +17,17 @@ from poses import load_pose_window, apply_fps_aug
 
 class SegmenterChunkDataset(Dataset):
     def __init__(
-        self, records: list[VideoRecord],
-        num_frames: int = 1024, steps_per_epoch: int | None = None,
-        fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
-        velocity: bool = True, training: bool = True,
-        frame_dropout: float = 0.0, body_part_dropout: float = 0.0,
+        self, records: list[VideoRecord], num_frames: int = 1024, steps_per_epoch: int | None = None, 
+        records_for_epoch=None, fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
+        velocity: bool = True, training: bool = True, frame_dropout: float = 0.0, body_part_dropout: float = 0.0,
         seed: int = 42, trusted_gap_s: float | None = TRUSTED_GAP_S,
     ):
         if not records: raise ValueError("SegmenterChunkDataset requires at least one record")
         self.records = records
+        # Optional `epoch -> records` provider, identical to StreamingWindowDataset's: a multilingual pool
+        # re-draws its balanced sub-sample each epoch so coverage rotates. Without it this arm trains on one
+        # fixed epoch-0 slice while S1 rotates, and the RQ2 cascade would compare methods AND data exposure.
+        self._records_for_epoch = records_for_epoch
         self.num_frames = int(num_frames)
         if steps_per_epoch is None and training:
             # Epoch = enough chunks to COVER the corpus once, not one per video — 
@@ -47,11 +49,16 @@ class SegmenterChunkDataset(Dataset):
     def __len__(self) -> int:
         return self.steps_per_epoch
 
+    def set_epoch(self, epoch: int) -> None:
+        if not self.training or self._records_for_epoch is None: return
+        records = self._records_for_epoch(int(epoch))
+        if records: self.records = records
+
     def __getitem__(self, index: int) -> dict:
         # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from (seed, index) so the 
         # SAME chunks are scored every epoch — a per-epoch-random dev set makes the early-stopping monitor noise.
         rng = self.rng if self.training else np.random.default_rng(self.seed * 100_003 + int(index))
-        rec = self.records[int(rng.integers(0, len(self.records)))]
+        rec = self.records[int(index) % len(self.records)]
         chunk_s = self.num_frames / rec.pose.fps
 
         start_s = 0.0 if rec.pose.duration_s <= chunk_s else float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))

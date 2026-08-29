@@ -17,7 +17,7 @@ pd.set_option("display.width", None)               # auto-detect terminal width
 pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blocks
 
 from poses import load_pose_window
-from data.windowing import make_bio_labels
+from data.windowing import BIO, make_bio_labels
 from data.loader import VideoRecord, load_language_records
 from data.batch import frame_mask_for, repeat_last_frame
 
@@ -25,10 +25,11 @@ from transformers import T5Tokenizer, AutoTokenizer
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
-from moryossef26.infer import duration_decode_params, duration_decode_tags, evaluate_segmenter_whole_video, fit_duration_prior
+from moryossef26.infer import duration_decode_tags, evaluate_segmenter_whole_video
+from infer.duration_decode import duration_decode_params, fit_duration_prior
 from infer.stability import TAU_GRID, group_tracks, build_policies, score_policy
-from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics
-from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained
+from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics, char_level_for_target
+from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained, pool_key, target_language
 
 
 @dataclass(frozen=True)
@@ -89,10 +90,26 @@ def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
     return predictions
 
 
+def _drop_quarantined_predictions(predicted: dict[str, list[PredictionEvent]], records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]:
+    """Ignore-region protocol, prediction side. Gold already excludes quarantined spans (reliable=False); a prediction majority-inside one must 
+    not count as unmatched either — the region is unscoreable, not empty. Majority-overlap, not any-overlap: a span merely grazing a quarantine 
+    edge is still a real, scoreable event."""
+    zones = {r.video_id: [(s.start_s, s.end_s) for s in r.sentences if not getattr(s, "reliable", True)] for r in records}
+    out: dict[str, list[PredictionEvent]] = {}
+    for vid, events in predicted.items():
+        keep = []
+        for ev in events:
+            dur = max(1e-9, float(ev.end_s) - float(ev.start_s))
+            inside = sum(max(0.0, min(ev.end_s, b) - max(ev.start_s, a)) for a, b in zones.get(vid, []))
+            if inside / dur <= 0.5: keep.append(ev)
+        out[vid] = keep
+    return out
+
+
 def _gold_events(records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]:
     return {record.video_id: [PredictionEvent(
         video_id=record.video_id, start_s=float(span.start_s), end_s=float(span.end_s), text=span.text,
-    ) for span in record.sentences] for record in records}
+    ) for span in record.sentences if getattr(span, "reliable", True)] for record in records}
 
 
 def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
@@ -101,7 +118,7 @@ def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
     # Feeds the RQ2 oracle-input (ceiling) rows: `--rq 2 --segments <this>` is RQ1 @ delta=0, framed for RQ2.
     rows = {record.video_id: [
         {"start_s": float(span.start_s), "end_s": float(span.end_s), "text": span.text}
-        for span in record.sentences
+        for span in record.sentences if getattr(span, "reliable", True)
     ] for record in tqdm(records, desc="Extracting gold segments")}
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +181,7 @@ def controlled_windows(
     tail_values = grid if tail_grid is None else tail_grid
     for record in records:
         for span in record.sentences:
+            if not getattr(span, "reliable", True): continue  # quarantined: no correct target exists
             if max_sentences is not None and count >= int(max_sentences): return windows
             count += 1
             duration = max(1e-6, float(span.end_s) - float(span.start_s))
@@ -194,7 +212,7 @@ def controlled_windows(
 
 
 def evaluate_predicted_events(
-    predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float]
+    predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], thresholds: list[float], char_level: bool = False
 ) -> dict[str, Any]:
     """RQ2 scoring, SODA-style (Fujita et al. 2020) with translations in place of captions. Per tIoU threshold: predictions and gold are 
     matched 1-to-1 by tIoU (metrics.match_segments); segmentation block reports that localization P/R/F1; TEXT block is a localization-aware 
@@ -244,13 +262,13 @@ def evaluate_predicted_events(
             n_pairs += len(hyps)
             n_unmatched_pred += len(pred_events) - len(one_to_one)
             per_video.append(compute_text_metrics(
-                hyps, refs, localization_aware=True, n_pred=len(pred_events), n_gold=len(gold_events), memo=pair_memo
+                hyps, refs, localization_aware=True, n_pred=len(pred_events), n_gold=len(gold_events), memo=pair_memo, char_level=char_level
             ))
 
         # Macro over every video with predictions OR gold (empty-match videos contribute 0, charging the miss).
         text_metrics = {
             k: float(np.mean([r[k] for r in per_video])) for k in per_video[0]
-        } if per_video else compute_text_metrics([], [], localization_aware=True, n_pred=0, n_gold=0)
+        } if per_video else compute_text_metrics([], [], localization_aware=True, n_pred=0, n_gold=0, char_level=char_level)
         precision = float(np.mean(vid_prec)) if vid_prec else 0.0
         recall = float(np.mean(vid_rec)) if vid_rec else 0.0
         
@@ -594,6 +612,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence, "gate_would_skip": bool(gate_skip)})
 
     severity = []
+    _char_level = char_level_for_target(target_language(data_cfg, args.language))
     for (gh, gt), values in tqdm(sorted(grouped.items()), desc="Computing severity"):
         confs = values["confidences"]
         head_s, tail_s = values["head_s"], values["tail_s"]
@@ -610,7 +629,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             # High -> this row averages over a longer-sentence subset.
             "dropped_fraction": float(dropped) / max(1, dropped + len(values["predictions"])),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
-            "text_metrics": compute_text_metrics(values["predictions"], values["references"]),
+            "text_metrics": compute_text_metrics(values["predictions"], values["references"], char_level=_char_level),
             # GATED methods only (baseline skip rate 0). The FSM SKIPS no-span windows by design; force-decoding
             # them against the inert Ω gives near-empty hallucinations whose brevity penalty tanks the cell's
             # corpus BLEU superlinearly. Read WITH gate_skip_rate; text_metrics above is the pessimistic bound.
@@ -620,6 +639,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             severity[-1]["text_metrics_decoded_only"] = compute_text_metrics(
                 [p for p, s in zip(values["predictions"], values["gate_skips"]) if not s],
                 [r for r, s in zip(values["references"], values["gate_skips"]) if not s],
+                char_level=_char_level,
             )
     # Sweeps are expensive and the artifacts feed the paper plots.
     if args.output:
@@ -744,11 +764,13 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         # the deployed head as the FSM saw it (latest estimate per frame).
         if runner._bio_timeline is not None:
             gold = make_bio_labels(timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s)
-            tags = runner._bio_timeline
+            tags = runner._bio_timeline.clone()
+            # Ignore-region: where gold is UNK (quarantine / untrusted gap) the pred is neither right nor wrong —
+            # mask it too, or every phantom "segment" there deflates precision for a region that has no GT.
+            gold_t = torch.as_tensor(np.asarray(gold)).long()
+            tags[gold_t == BIO["UNK"]] = BIO["UNK"]
             logits_1hot = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=4).float().unsqueeze(0) * 10.0
-            fsm_bio_rows.append(moryossef_segment_metrics(
-                logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio",
-            ))
+            fsm_bio_rows.append(moryossef_segment_metrics(logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio"))
 
     # Why-did-it-(not)-commit: low streaming recall with near-perfect frame BIO = the gate suppressed emission;
     # boundary_ok / translation_ok (of spans_seen, complete spans) say which signal blocks.
@@ -864,6 +886,16 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
+    # SEGMENTATION context comes from the cap the head TRAINED under (checkpoint meta), same rule _load_segmenter applies to S1: `tail-benefit 
+    # --write-config` rewrites buffer_cap_s after training, and re-chunking a trained head over context it never saw degrades it (measured on 
+    # S1). The live cap still shapes TRANSLATION windows below — that is deployment geometry, not the head's trained attention span.
+    _ckpt = args.checkpoint or checkpoint_dir(method_cfg, default="")
+    _trained_cap = (load_checkpoint_meta(_ckpt) or {}).get("buffer_cap_s") if _ckpt else None
+    seg_chunk_cap_s = float(_trained_cap or buffer_cap_s)
+    if _trained_cap and abs(float(_trained_cap) - buffer_cap_s) > 1e-6: print(
+        f"[offline] BIO chunking at the TRAINED cap {float(_trained_cap):.2f}s (live inference.yaml says "
+        f"{buffer_cap_s:.2f}s); translation windows keep the live cap.", flush=True
+    )
     # Same deployed decode as every other inference.yaml consumer — else offline argmaxes while streaming duration-decodes and the 
     # rows compare decodes, not deployments. Whole-video input has ended, so nothing is right-censored (unlike FSM's "survival" buffers).
     dd = duration_decode_params(inference_cfg, args.language)
@@ -883,8 +915,9 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         poses_t = torch.as_tensor(poses, dtype=torch.float32, device=device).unsqueeze(0)
         ts_t = torch.as_tensor(timestamps, dtype=torch.float32, device=device).unsqueeze(0)
         mask_t = torch.ones(poses_t.shape[:2], dtype=torch.bool, device=device)
+        
         bio_tap, bio_mask, ts_out = model.front_end.extract_bio_tap(poses_t, mask_t, ts_t)
-        model.bio_head.chunk_size = max(1, int(round(buffer_cap_s * float(record.pose.fps))))
+        model.bio_head.chunk_size = max(1, int(round(seg_chunk_cap_s * float(record.pose.fps))))
         bio_logits = model.bio_head(bio_tap, timestamps_s=ts_out, frame_mask=bio_mask).logits
         if duration_prior is not None: tags = duration_decode_tags(bio_logits, float(record.pose.fps), duration_prior).cpu()
         else: tags = bio_logits.argmax(dim=-1)[0].cpu()
@@ -981,9 +1014,19 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
             f"--predictions has {len(predicted)} video_ids, none in the {len(gold_ids)} '{args.split}' records — "
             f"wrong split or wrong events file (score would be silently near-zero)."
         )
+        # Partial mismatch (same handling as run_cascade): a predicted video absent from this split has no gold, so it would be scored as pure 
+        # phantoms — charging per-video precision 0 and a 0-F1 text row for events that belong to ANOTHER split, not being flagged as wrong file.
+        foreign = set(predicted) - gold_ids
+        if foreign:
+            print(f"[rq2] WARNING: {len(foreign)}/{len(predicted)} --predictions video_ids are absent from "
+                  f"--split {args.split}; scoring only the {len(predicted) - len(foreign)} that match.", flush=True)
+            predicted = {vid: evs for vid, evs in predicted.items() if vid in gold_ids}
         
+    predicted = _drop_quarantined_predictions(predicted, records)
     gold = _gold_events(records)
-    summary = evaluate_predicted_events(predicted, gold, thresholds).get("thresholds", [])
+    summary = evaluate_predicted_events(
+        predicted, gold, thresholds, char_level=char_level_for_target(target_language(data_cfg, args.language))
+    ).get("thresholds", [])
     summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
     summary.set_index("tiou_threshold", inplace=True)
     return _format_threshold_table(summary.T)
@@ -1001,6 +1044,8 @@ def _load_segmenter(args):
         cfg = load_yaml(args.bio_config, language=args.language)
         pretrained = resolve_pretrained(cfg, load_yaml(args.data_config), args.language, default="checkpoints/openasl_pose_only_slt.pth")
         model = build_bio_s1_model(cfg, pretrained_path=pretrained)
+        # A pooled (multilingual) S1 is ONE language-agnostic checkpoint; per-language analysis on any --language
+        # reads the same pool directory (that IS the zero-shot protocol). checkpoint_dir does the substitution.
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
         # Chunked RoPE at the head's TRAINED context, in SECONDS: training windows clamp to buffer_cap_s (sampler.py), so eval chunks there 
         # too (wrapper converts to frames per stream fps). Larger chunks would attend over untrained context.
@@ -1016,7 +1061,9 @@ def _load_segmenter(args):
     # checkpoint.dir expanded ${language} from the config's OWN `language:` key, so a differing CLI --language
     # would load another corpus's checkpoint.
     ckpt_dir = checkpoint_dir(cfg, default=ckpt_default)
-    if args.language and str(cfg.get("language", args.language)) != str(args.language): ckpt_dir = ckpt_default
+    # A differing CLI --language would otherwise read another corpus's checkpoint (the config expanded ${language}
+    # from its OWN key). Pooled runs are exempt: the pool IS language-agnostic, so every --language reads it.
+    if (args.language and not pool_key(cfg) and str(cfg.get("language", args.language)) != str(args.language)): ckpt_dir = ckpt_default
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
     load_model_checkpoint(model, checkpoint, strict=True)
     # S1's RoPE chunk is the buffer cap the head TRAINED under, which the checkpoint records. It wins over both the
@@ -1024,8 +1071,16 @@ def _load_segmenter(args):
     # after training and following it re-chunks a trained head over context it never saw (measured: dev
     # tIoU-F1@0.5 fold B 0.5014 -> 0.4763 under an unchanged tuned decode). Checkpoints predating the meta field
     # fall through to the config pin.
+    # PROVENANCE: the config says which pool this run expects; the checkpoint records which pool produced it. A
+    # mismatch means the wrong segmenter is about to be evaluated — silently, with a plausible-looking score — so
+    # it fails loud. Checkpoints written before `pretrain_pool` existed carry no key and are exempt.
+    _meta = load_checkpoint_meta(checkpoint)
+    if "pretrain_pool" in _meta and _meta.get("pretrain_pool") != pool_key(cfg): raise SystemExit(
+        f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --checkpoint "
+        f"at the matching model, or align `pretrain_languages` (a pooled checkpoint is a DIFFERENT model from a monolingual one)."
+    )
     if args.segmenter_arch == "s1":
-        trained_chunk = load_checkpoint_meta(checkpoint).get("rope_eval_chunk_s")
+        trained_chunk = _meta.get("rope_eval_chunk_s")
         if trained_chunk:
             if abs(float(trained_chunk) - float(rope_chunk_s)) > 1e-6: print(
                 f"segmenter | rope_eval_chunk_s {float(trained_chunk):.2f}s from the checkpoint (config/buffer_cap_s "
@@ -1058,8 +1113,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={'duration' if duration_prior else 'plain'})", flush=True)
     decode = "duration" if duration_prior else "plain"
 
-    # RQ2's tIoU grid so THRESHOLDS line up, but cells are NOT comparable: per-video MACRO with UNK-masked gold
-    # here vs RQ2's MICRO corpus P/R against caption-span gold (gap predictions = false positives). Trends only.
+    # RQ2's tIoU grid so THRESHOLDS line up, but cells are NOT comparable — both are per-video MACRO, and they
+    # still differ 2 ways: this stage averages per-video F1s while RQ2 builds F1 from macro-averaged P/R, and
+    # gold here is the UNK-masked BIO stream vs RQ2's caption spans (gap predictions = false positives).
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     metrics = evaluate_segmenter_whole_video(
         model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds, duration_prior=duration_prior,
@@ -1137,7 +1193,10 @@ if __name__ == "__main__":
     if args.emit_gold_segments:
         records, _ = load_language_records(data_cfg, args.language, split=args.split)
         path = write_gold_segments(records, args.emit_gold_segments)
-        result = {"emit_gold_segments": str(path), "videos": len(records), "segments": sum(len(r.sentences) for r in records)}
+        result = {
+            "emit_gold_segments": str(path), "videos": len(records), 
+            "segments": sum(1 for r in records for sp in r.sentences if getattr(sp, "reliable", True))
+        }
         print(json.dumps(result, indent=2, sort_keys=True))
         raise SystemExit(0)
     if args.segmenter_eval:

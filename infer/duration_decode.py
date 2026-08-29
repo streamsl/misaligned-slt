@@ -103,7 +103,9 @@ def fit_duration_prior(
 ) -> DurationPrior | None:
     # Fit the lognormal on a TRAIN split's caption durations (filter mirrors data.yaml bounds). `split_bias` /
     # `snap_radius_s`: per-language overrides from `duration_decode_params`; None -> module defaults.
-    durs = np.asarray([s.duration_s for r in records for s in r.sentences if 0.1 < s.duration_s < 60.0])
+    durs = np.asarray([
+        s.duration_s for r in records for s in r.sentences if getattr(s, "reliable", True) and 0.1 < s.duration_s < 60.0
+    ])
     if durs.size < 10: return None
     logd = np.log(durs)
     return DurationPrior(

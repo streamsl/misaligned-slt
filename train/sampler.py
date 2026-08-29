@@ -7,6 +7,7 @@ import json
 import numpy as np
 from data.jitter import JitterSampler, normalized_mode_ratios
 from data.loader import VideoRecord
+from utils import pool_key
 from data.windowing import (
     TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
@@ -56,6 +57,9 @@ class WindowSampler:
         self.fps_aug_min = float(fps_aug_min)
         self.fps_aug_max = float(fps_aug_max)
         self.rng = np.random.default_rng(seed)
+        # Base for index-seeded per-window draws (spec_for). Workers offset it, so parallel workers stay
+        # decorrelated while each index still maps to ONE window within a given worker layout.
+        self.draw_seed = int(seed)
         weights = dict(mode2_subcase_weights or self.DEFAULT_MODE2_SUBCASE_WEIGHTS)
         # _mode2_spec dispatches by string compare with a bare else -> a typo'd key would silently sample as 'right'.
         unknown = set(weights) - {"right", "left", "both"}
@@ -74,7 +78,8 @@ class WindowSampler:
         if cprobs.sum() <= 0: raise ValueError(f"mode3_span_counts weights must sum > 0: {counts}")
         self._mode3_counts = sorted(counts)
         self._mode3_count_probs = cprobs / cprobs.sum()
-        self.anchors = [(ri, si) for ri, rec in enumerate(records) for si, _ in enumerate(rec.sentences)]
+        # Quarantined spans (reliable=False) occupy time for gap/window purposes but are never anchors: no correct supervision exists for them.
+        self.anchors = [(ri, si) for ri, rec in enumerate(records) for si, sp in enumerate(rec.sentences) if getattr(sp, "reliable", True)]
         if not self.anchors: raise ValueError("WindowSampler requires at least one sentence anchor.")
 
 
@@ -88,6 +93,9 @@ class WindowSampler:
         the per-window draws.) Called from data.loader.streaming_loader's worker_init_fn.
         """
         self.rng = np.random.default_rng(int(seed))
+        # draw_seed is deliberately NOT reseeded: `spec_for` derives its rng from draw_seed + INDEX, so windows are
+        # already decorrelated across indices without per-worker offsets — and a worker-varying base would make a
+        # worker realise a different window than the length pre-pass predicted, silently disabling bucketing.
         if self.pose_augmentor is not None: self.pose_augmentor.rng = np.random.default_rng(int(seed) + 997)
 
 
@@ -111,6 +119,11 @@ class WindowSampler:
               f"-> {normalized_mode_ratios(measured if measured is not None else fallback_ratios)}", flush=True)
 
         jitter_cfg = dict(slt_cfg.get("jitter", {}))
+        pool = pool_key(slt_cfg) # Pooled segmentation run uses designed calibration, never target language's measured artifact
+        if pool and jitter_cfg.get("source"): raise ValueError(
+            f"pooled run ({pool}) cannot read measured jitter {jitter_cfg['source']!r}; "
+            "set jitter.source: null to use the designed pretraining distribution"
+        )
         mode_ratios = measured if measured is not None else fallback_ratios
         # Guard the optional event-mix ablation against a degenerate all-clean measurement.
         threshold = float(ratios_cfg.get("degenerate_mode1_threshold", 0.9))
@@ -124,16 +137,28 @@ class WindowSampler:
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
+        if pool:
+            geometry = slt_cfg.get("pretrain_geometry", {}) or {}
+            missing = {"buffer_cap_s", "min_span_frames"} - set(geometry)
+            if missing: raise ValueError(
+                f"pooled run ({pool}) needs pretrain_geometry.{'/'.join(sorted(missing))}; "
+                "target inference geometry must not leak into multilingual pretraining"
+            )
+            buffer_cap_s, min_span_frames = float(geometry["buffer_cap_s"]), int(geometry["min_span_frames"])
+            if buffer_cap_s <= 0 or min_span_frames < 1: raise ValueError(
+                f"invalid pretrain_geometry: buffer_cap_s={buffer_cap_s}, min_span_frames={min_span_frames}"
+            )
+        else:
+            buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
+            min_span_frames = int((inference_cfg.get("span_selection", {}) or {}).get(
+                "min_span_frames", int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1,
+            ))
+
         aug_cfg = slt_cfg.get("augmentation", {})
         fps_cfg = (aug_cfg or {}).get("fps", {})
         return cls(
             records=records, jitter=JitterSampler.from_config(jitter_cfg),
-            mode_ratios=mode_ratios, buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
-            min_span_frames=int((inference_cfg.get("span_selection", {}) or {}).get("min_span_frames",
-                # Same missing-key derivation as the FSM (infer/stream.py) and the consistency assert: delta+1.
-                # A 0 default trained Lambda_min=0 targets against a delta+1 deployment when the key was absent.
-                int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1,
-            )),
+            mode_ratios=mode_ratios, buffer_cap_s=buffer_cap_s, min_span_frames=min_span_frames,
             mode2_subcase_weights=slt_cfg.get("mode2_subcase_weights"), mode3_span_counts=slt_cfg.get("mode3_span_counts"),
             fps_aug_enabled=bool((aug_cfg or {}).get("enabled", aug_cfg is not None) and fps_cfg.get("enabled", aug_cfg is not None)),
             fps_aug_min=float(fps_cfg.get("min_fps", 15.0)), fps_aug_max=float(fps_cfg.get("max_fps", 30.0)),
@@ -259,10 +284,11 @@ class WindowSampler:
         anchor = rec.sentences[anchor_idx]
         k = int(self.rng.choice(self._mode3_counts, p=self._mode3_count_probs))
         end_idx = min(anchor_idx + k - 1, len(rec.sentences) - 1)
-        end_anchor = rec.sentences[max(end_idx, min(anchor_idx + 1, len(rec.sentences) - 1))]
-        
-        # Respect the buffer cap: walk the end sentence back until the clean window fits, never below the pair.
-        while end_idx > anchor_idx + 1 and rec.sentences[end_idx].end_s - anchor.start_s > self.buffer_cap_s: end_idx -= 1
+        # Respect the buffer cap AND skip quarantined successors (reliable=False): a quarantined span cannot be a
+        # window end target — it has no usable boundary, and a 20s+ one would blow the window past the cap anyway.
+        while end_idx > anchor_idx + 1 and (
+            not getattr(rec.sentences[end_idx], "reliable", True) or rec.sentences[end_idx].end_s - anchor.start_s > self.buffer_cap_s
+        ): end_idx -= 1
         end_anchor = rec.sentences[min(max(end_idx, anchor_idx + 1), len(rec.sentences) - 1)]
         eps = 1.0 / rec.pose.fps
 
@@ -292,8 +318,11 @@ class WindowSampler:
         # an "all-gap" window there could be all-signing, the exact opposite of what Mode 4 trains (stay quiet on non-signing input).
         gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S]
         if not gaps:
-            idx = int(self.rng.integers(0, len(rec.sentences)))
-            return self._mode2_spec(rec, idx)
+            # Reliable spans only: this is the one path that bypasses `self.anchors`, and a quarantined anchor would
+            # send its multi-sentence text to the confidence-bound reference — the exact label quarantine exists to
+            # withhold. `self.anchors` guarantees at least one reliable span in any record that reaches the sampler.
+            cands = [i for i, sp in enumerate(rec.sentences) if getattr(sp, "reliable", True)]
+            return self._mode2_spec(rec, cands[int(self.rng.integers(0, len(cands)))])
 
         gap = gaps[int(self.rng.integers(0, len(gaps)))]
         length = min(self.buffer_cap_s, max(0.5, gap[1] - gap[0]))
@@ -302,7 +331,14 @@ class WindowSampler:
         return WindowSpec(rec.video_id, start_s, end_s, "mode4")
 
 
-    def sample(self, index: int) -> WindowSample:
+    def spec_for(self, index: int) -> tuple[VideoRecord, WindowSpec]:
+        """The WindowSpec for a global sample index, WITHOUT loading poses.
+
+        Draws are seeded from the index, so this is a pure function: same index yields same window in main process and in any DataLoader worker. 
+        That is what lets a length-bucketing batch sampler predict a window's frame count from a ~0.02 ms call instead of materialising it (see 
+        data.loader.LengthBucketSampler), and it also makes an epoch's content reproducible across a resume, which per-worker rng state never was.
+        """
+        self.rng = np.random.default_rng(self.draw_seed + int(index))
         rec, anchor_idx = self._choose_anchor(index)
         mode = self._choose_mode()
         if mode == "mode1": spec = self._mode1_spec(rec, anchor_idx)
@@ -310,6 +346,19 @@ class WindowSampler:
         elif mode == "mode3": spec = self._mode3_spec(rec, anchor_idx)
         elif mode == "mode4": spec = self._mode4_spec(rec)
         else: raise ValueError(f"Unknown mode {mode}")
+        return rec, spec
+
+    def spec_frames(self, index: int) -> int:
+        # Frame count the window will have, for length BUCKETING — an ordering key, not a contract. It mirrors load_pose_window's floor/ceil framing 
+        # (+1 for inclusive end) so it never UNDER-estimates; fps augmentation only ever down-samples, so realised window is never longer than this.
+        rec, spec = self.spec_for(index)
+        fps = float(rec.pose.fps)
+        start_f = int(np.floor(max(0.0, spec.start_s) * fps))
+        end_f = int(np.ceil(min(spec.end_s, rec.pose.duration_s) * fps))
+        return max(1, end_f - start_f + 1)
+
+    def sample(self, index: int) -> WindowSample:
+        rec, spec = self.spec_for(index)   # index-seeded: the window a bucketing pre-pass predicted
         # Augment the sampled training window; the Mode-2a full-evidence view (materialized separately
         # with defaults) stays un-augmented so the no-grad self-target matches inference conditions.
         return self.materialize(rec, spec, fps_aug=self.fps_aug_enabled, augment=self.pose_augmentor is not None)

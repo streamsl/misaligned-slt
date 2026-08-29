@@ -1,14 +1,12 @@
 seed: 42
 active_languages: [asf]
 
-# Each language entry defines one YouTube-SL-25 root, target language, warm start, and pose properties.
-# pose.fps is a FALLBACK only. Real pose fps is resolved per video as total_pose_frames / video_duration from
-# <root>/video_meta.csv. asf/bfi use SignVerse-2M poses at a UNIFORM 24 fps — `prepare_data.py` writes their
-# video_meta.csv (duration = frames/24, exact). The per-video-fps note below is the OWN-EXTRACTION route (ase):
-#   own poses are extracted at native/2 fps and the NATIVE rate varies per YouTube video (measured on the legacy
-#   Auslan extraction: 62% eff 12.5, 30% at 15.0, 10% at 12.0, 8% at 25); generate its sidecar once with
-#   `python -m poses <root> [--format SEL]` (yt-dlp metadata fetch, no video download). A constant 25 there
-#   misplaced every timestamp ~2x (label-motion correlation 0.10 vs 0.26 corrected; ~44% of captions dropped).
+# Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. pose.fps is a 
+# FALLBACK only. Real pose fps is resolved per video as total_pose_frames/video_duration from <root>/video_meta.csv. 
+# ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_data.py` writes their video_meta.csv (duration = 
+# frames/24, exact). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are extracted at the 
+# NATIVE rate varies per YouTube video. You can generate its labels once with `python -m poses <root> [--format SEL]` 
+# (yt-dlp metadata fetch, no video download).
 languages:
     # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
     # `python prepare_data.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
@@ -32,10 +30,10 @@ languages:
     asf:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
-        # pretrained_slt: checkpoints/openasl_pose_only_slt.pth
+        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
         # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
-        pretrained_slt: checkpoints/baseline_train/asf/model.pt
+        # pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
         pose:
             fps: 24.0 # SignVerse unified extraction rate (dataset card; verified on real shard headers)
@@ -88,6 +86,21 @@ subtitles:
         - .en-orig.vtt
         - .orig.vtt
     min_caption_chars: 2
+    # WRONG-LANGUAGE videos: drop a video when more than this share of its ALPHABETIC caption characters is non-Latin. 
+    # `.en` subtitle track is not a guarantee — ASE pool carries Japanese Sign Language and Chinese-teaching content 
+    # whose captions are largely Japanese/Chinese, which are unusable as English translation targets. Judged per VIDEO, 
+    # never per cue: an English sentence quoting a foreign term ("and <han> in Chinese!") is real data. Measured on ase, 
+    # 2 populations separate cleanly — bilingual videos 0.39-0.48, English-with-quotes below 0.05 — so 0.15 sits in the 
+    # empty band between them and drops ~30/10588 videos. Set to 1.0 to disable (required for non-Latin TARGET language).
+    max_non_latin_ratio: 0.15
+    # Reconstruct SENTENCE units from display-wrapped caption cues by MERGING whole cues only — never splitting
+    # (docs/data_pipeline.md section 3). Punkt decides which cue junctions fall inside a sentence; each unit is then
+    # judged by the Punkt sentence count k of its own text, under the punctuation-reliability gate (max_tokens):
+    # k=1 punctuated chain -> one merged sentence; k>1 -> QUARANTINE (SentenceSpan.reliable=False: frames UNK,
+    # never an anchor or reference, ignore-region in eval) because its interior boundaries are provably mid-cue and
+    # interior splits are never minted (text-position interpolation is invalid under P1; measured ~35% BLEU deficit).
+    # Unreliable punctuation -> source cues kept. CHANGES the GT spans: re-run everything under one setting.
+    merge_sentences: true
     # Reject VTT variants that flatten the whole transcript into one short cue
     # (common in *.en-en-GB.vtt sidecars) before selecting the subtitle file.
     reject_flattened_transcripts: true

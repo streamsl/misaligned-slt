@@ -5,7 +5,8 @@ so frame units and seconds score identically. Numbers differ only because inputs
 (train/slt.py) = raw (ungated) BIO argmax on sampler dev WINDOWS, macro per window (`val_phrase_tiou_f1`); the S1
 monitor (train/bio_pretrain.py) scores the DEPLOYED duration-decoded tags whenever inference.yaml `duration_decode`
 is on for the language, so the two `val_phrase_tiou_f1` series are NOT comparable; RQ2 `--stream` = commit-GATED FSM
-events on whole VIDEOS vs GT sentences, corpus-micro.
+events on whole VIDEOS vs GT caption spans, per-video macro (F1 built from macro-averaged P/R — still not the same
+number as segmenter-eval's mean of per-video F1s; see README "segmenter-eval and RQ2").
 
 FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metrics; used by train/slt.py, 
 train/bio_pretrain.py, moryossef26/, eval.py (FSM-internal BIO diagnostic), analyze.py (tune-decode). ONE decode 
@@ -273,16 +274,28 @@ def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> 
     except Exception: return [0.0] * len(hyps)
 
 
-def _uni_sign_preprocess(predictions: list[str], references: list[str]) -> tuple[list[str], list[str], bool]:
-    """Uni-Sign eval preprocessing (fine_tuning.py:284-288 + SLRT_metrics): word-level for non-CJK, char-split
-    for CJK with the asymmetric ref-only punctuation map. Returned so corpus and per-pair scorers preprocess
-    identically. `is_cjk` is detected over the references so scoring level never drifts within one call."""
-    is_cjk = any(_char_split_cjk(ref) != ref for ref in references)
+def char_level_for_target(target_lang: str | None) -> bool:
+    # Whether a target language is scored per CHARACTER (Uni-Sign `level='char'`) or per WORD.
+    code = str(target_lang or "").split("_")[0].lower()
+    return code in ("zh", "ja", "ko")  # languages scored per CHARACTER, by ISO prefix of `target_lang`
+
+
+def _uni_sign_preprocess(
+    predictions: list[str], references: list[str], char_level: bool | None = None,
+) -> tuple[list[str], list[str], bool]:
+    """Uni-Sign eval preprocessing (fine_tuning.py:284-288 + SLRT_metrics): word-level, or char-split with the
+    full-width→ASCII punctuation fold when `char_level`. Shared by corpus and per-pair scorers so both preprocess identically.
+
+    `char_level=None` falls back to detecting CJK in the references — kept only so a caller that genuinely has no
+    language context still works on a Chinese corpus. Every caller that knows its target language should PASS the
+    value (see `char_level_for_target`); the fallback is batch-dependent and must not decide a reported number.
+    """
+    is_cjk = bool(char_level) if char_level is not None else any(_char_split_cjk(ref) != ref for ref in references)
 
     def _proc(s: str, is_ref: bool) -> str:
         if not is_cjk: return s
         s = s.replace(" ", "").replace("\n", "")
-        if is_ref: s = s.replace("，", ",").replace("？", "?")
+        s = s.translate(_CJK_PUNCT_TABLE)
         return " ".join(list(s))
 
     return [_proc(p, False) for p in predictions], [_proc(r, True) for r in references], is_cjk
@@ -297,12 +310,13 @@ def _corpus_metric(name: str, predictions, references, *, key: str, **kw) -> flo
 
 
 def _sentence_text_scores(
-    hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20",
+    hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", 
+    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", char_level: bool | None = None,
 ) -> list[dict[str, float]]:
     """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. BLEU
     here is smoothed sentence-BLEU: corpus BLEU pools across pairs and cannot be split per pair."""
     if not hyps: return []
-    pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs)
+    pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs, char_level)
     bleu = [float(sentence_bleu(h, [r], tokenize=sacrebleu_tokenize).score) for h, r in zip(pred_proc, ref_proc)]
     bleurt = _bleurt_scores(hyps, refs, bleurt_checkpoint)
     rouge = [_rouge_l([h], [r]) for h, r in zip(pred_proc, ref_proc)]
@@ -316,7 +330,8 @@ def _sentence_text_scores(
 def compute_text_metrics(
     predictions: list[str], references: list[str], *, localization_aware: bool = False,
     n_pred: int | None = None, n_gold: int | None = None, memo: dict[tuple[str, str], dict[str, float]] | None = None,
-    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str | None = None,
+    sacrebleu_tokenize: str = "13a", bleurt_checkpoint: str | None = "/tmp/BLEURT-20", 
+    char_level: bool | None = None, prefix: str | None = None
 ) -> dict[str, float]:
     """Translation-quality metrics, in 2 modes that are NOT comparable and are therefore named differently.
 
@@ -341,12 +356,12 @@ def compute_text_metrics(
             raise ValueError("localization_aware=True needs n_pred and n_gold (SODA count normalisation)")
         
         pairs = list(zip(predictions, references))
-        if memo is None: per_pair = _sentence_text_scores(predictions, references, sacrebleu_tokenize, bleurt_checkpoint)
+        if memo is None: per_pair = _sentence_text_scores(predictions, references, sacrebleu_tokenize, bleurt_checkpoint, char_level)
         else:
             uncached = [p for p in pairs if p not in memo]
             if uncached:
                 scored = _sentence_text_scores(
-                    [h for h, _ in uncached], [r for _, r in uncached], sacrebleu_tokenize, bleurt_checkpoint
+                    [h for h, _ in uncached], [r for _, r in uncached], sacrebleu_tokenize, bleurt_checkpoint, char_level
                 )
                 for p, sc in zip(uncached, scored): memo[p] = sc
             per_pair = [memo[p] for p in pairs]
@@ -360,9 +375,7 @@ def compute_text_metrics(
         return out
 
     if not predictions: return {f"{prefix}_{k}": 0.0 for k in _TEXT_KEYS}
-    # BLEURT scores RAW text; the rest use the Uni-Sign preprocessing (paper-comparable) — the ref-only punctuation
-    # map avoids depressing ROUGE-L, whose LCS would otherwise see a different sequence.
-    pred_proc, ref_proc, _ = _uni_sign_preprocess(predictions, references)
+    pred_proc, ref_proc, _ = _uni_sign_preprocess(predictions, references, char_level)
     ref_nested = [[r] for r in ref_proc]
     bleurt = _bleurt_scores(predictions, references, bleurt_checkpoint)
     out = {

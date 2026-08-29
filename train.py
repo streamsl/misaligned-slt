@@ -78,12 +78,9 @@ if __name__ == "__main__":
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
         logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
-        # Same meta as the save-on-best write (train/bio_pretrain.py), so both copies describe the same context.
-        _inf = load_yaml(str(cfg.get("inference_config", "configs/inference.yaml")))
-        _meta = {"rope_eval_chunk_s": float(cfg.get("rope_eval_chunk_s") or _inf.get("buffer_cap_s", 18.0)),
-                 "buffer_cap_s": float(_inf.get("buffer_cap_s", 18.0)),
-                 "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language")}
-        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/bio_s1"), meta=_meta) if dist.is_main() else None
+        path = save_model_checkpoint(
+            model, checkpoint_dir(cfg, default="checkpoints/bio_s1"), meta=cfg.get("checkpoint_meta")
+        ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-moryossef":
         # Faithful Moryossef external segmenter for error calibration + RQ2 cascade: raw keypoints + UNet.
@@ -94,14 +91,16 @@ if __name__ == "__main__":
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
         logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
-        path = save_model_checkpoint(model, checkpoint_dir(cfg, default="checkpoints/moryossef")) if dist.is_main() else None
+        path = save_model_checkpoint(
+            model, checkpoint_dir(cfg, default="checkpoints/moryossef"), meta=cfg.get("checkpoint_meta")
+        ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, train_slt_epochs
         # --language re-points ${language} in checkpoint.dir for training and the save below.
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
-            decoder=args.decoder, include_dev=True, language=args.language,
+            decoder=args.decoder, include_dev=True, language=args.language, bio_config=args.bio_config
         )
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))

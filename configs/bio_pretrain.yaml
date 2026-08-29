@@ -1,4 +1,4 @@
-# S1 — BIO pretrain on FROZEN Uni-Sign pose features (docs/membership_gate.md §1.4; train/bio_pretrain.py).
+# S1 — multilingual segmentation pretraining for the Uni-Sign pose encoder and BIO head.
 #
 # WHY `extends: dlm.yaml` — deliberate and important. S1 trains the in-system RoPE BIO head on the EXACT
 # window distribution the SLT model will couple it under: same `StreamingWindowDataset` + `WindowSampler`, so it
@@ -10,13 +10,17 @@
 # WHAT is inherited-but-UNUSED here (the BIO-only trainer reads none of these; ignore them):
 #   language_model, decoder, oput, confidence_bound, membership_gate, dcd, spd, block_size, diffusion_steps,
 #   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init.
-# The FROZEN pose encoder is loaded from the language's released Uni-Sign checkpoint, resolved PER LANGUAGE from
-# data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained) — the SAME warm-start the SLT model uses,
-# so S1 features == S2 initial features.
+# The pose encoder warm-starts from the RELEASED Uni-Sign checkpoint and TRAINS (`freeze_backbone: false` below —
+# the shipped recipe; a pooled run never reads the per-language `pretrained_slt`, which after the B1c re-root would
+# privilege 1 language inside language-agnostic pretraining). Stage 2 loads encoder AND head from this checkpoint 
+# via `bio_head_init`, which is what "S1 features == S2 initial features" means now.
 extends: dlm.yaml
 
 checkpoint:
-    dir: checkpoints/bio_s1/${language}
+    # ${corpus} = what this checkpoint is a function of: the pool key (multi_ase-asf-bfi) when
+    # pretrain_languages is set, else the language. One template serves both recipes — no path
+    # rewriting in code, and a pooled checkpoint can never be mistaken for a monolingual one.
+    dir: checkpoints/bio_s1/${corpus}
     save_best: true
     # val_mode3_tiou_f1, NOT the val_phrase_tiou_f1 headline: the headline is a per-window macro over a mix whose
     # single-span windows are near-saturated by ANY signing detector under the symmetric run-decode, and within a
@@ -26,32 +30,52 @@ checkpoint:
     mode: max
     restore_best: true
 wandb:
-    name: bio_s1_${language} # own run name (else inherits dlm's)
+    name: bio_s1_${corpus} # own run name (else inherits dlm's); pool key on a pooled run
 
-# S1 and stage 2 share the fixed coverage mix. Segmenter-error analysis supplies jitter and Mode-2 cut depths.
-# The external Moryossef segmenter remains an independent measurement instrument.
+# S1 and stage 2 share the fixed coverage mix AND the designed corruption (fallback jitter, uniform Mode-2 cuts):
+# one window distribution across both stages. The measured-jitter variant (dlm.yaml jitter.source, independent
+# Moryossef artifact) is an S2 ablation, not the main recipe.
 
-# S1 is a small head (~5M trainable) on a frozen backbone — its own optimisation budget, not the SLT model's.
-epochs: 50
-batch_size: 8
+# SEGMENTATION PRETRAINING. Sentence boundaries are marked by prosody (pauses, holds, movement dynamics) that is
+# shared across signed languages, so the pose encoder AND the BIO head pretrain on a POOL of languages; translation
+# is language-specific and stays monolingual in stage 2. Set `pretrain_languages: null` for the single-language
+# recipe (the monolingual-vs-multilingual ablation).
+#
+# The pool is sampled TEMPERATURE-FLATTENED (p ∝ n^tau): corpora differ several-fold in size, and proportional
+# pooling would make the largest the de-facto training set. tau 1.0 = proportional, 0.0 = uniform, 0.5 = the
+# standard multilingual-NMT compromise. The realised per-language counts are logged and written into the run
+# config — they are part of the experimental setup and belong in the paper.
+#
+# The BASELINE segmenter (configs/moryossef26.yaml) must use the SAME pool: if our segmenter sees 3 languages
+# and theirs sees 1, the cascade comparison measures a data advantage rather than a method.
+
+# Pooled S1 geometry is a PRETRAINING design value. It must not inherit δ, Λ, or buffer capacity from whichever
+# target language was analyzed last. Stage 2 measures and uses its own target-language geometry.
+pretrain_geometry:
+    buffer_cap_s: 18.0
+    min_span_frames: 1
+
+pretrain_languages: [ase, asf, bfi]
+# τ=1.0  ase 84% / asf 9%  / bfi 8%     (proportional)
+# τ=0.5  ase 62% / asf 20% / bfi 19%
+# τ=0.3  ase 50% / asf 25% / bfi 24%.   
+# τ=0.0  ase 33% / asf 33% / bfi 33%    (uniform)
+pretrain_temperature: 0.3
+
+# Multilingual pretraining trains the ENCODER too — a frozen backbone would leave only the ~6.7M-parameter head to
+# pretrain, which is not a learned representation, and the backbone would never adapt to misaligned input before
+# stage 2. The encoder trains at backbone_lr (default learning_rate×0.3) so the released weights are adapted, not
+# overwritten. `bio_head_init` carries this encoder into stage 2, preserving "S1 features == S2 initial features".
+epochs: 30
+batch_size: 64
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-freeze_backbone: true
-# backbone_lr: 1.0e-4  # optional: encoder LR when freeze_backbone: false (default learning_rate×0.1)
-
-# Whole-video chunked-inference RoPE window for the `--segmenter-arch s1` ABLATION only (analyze.py --stage
-# segmenter-infer / eval.py --segmenter-eval), in SECONDS. MUST match the head's trained context, not exceed it
-# (Moryossef's core lesson: train/inference context mismatch is his largest negative ablation): training windows
-# are clamped to buffer_cap_s (sampler.py), so eval chunks at buffer_cap_s too. DATASET-GENERAL — the inference
-# wrapper converts to frames at each stream's own fps. DEFAULTS to inference.yaml's buffer_cap_s when unset
-# (the value the FSM also deploys under, so eval matches deploy). CAVEAT for multi-dataset work: buffer_cap_s
-# is one scalar in the shared inference.yaml that tail-benefit rewrites per corpus. A head trains under
-# whatever buffer_cap_s was set THEN; if we later overwrite inference.yaml for another corpus and eval
-# this head, train/deploy context diverge (whole-system, not just eval). Keep one head ↔ one buffer_cap_s
-# (per-dataset configs, or pin it here):
-# PINNED, not defaulted — the hazard above already fired once. This head trained while buffer_cap_s was 16.27;
-# tail-benefit then raised the cap to 17.94 (it now adds stride + δ), and because the default tracks the LIVE cap
-# the head silently started chunking over 1.7s of context it never trained on. Measured cost: dev tIoU-F1@0.5 fold
-# B 0.5014 -> 0.4763 under the same tuned decode. The trained context is a property of the CHECKPOINT, so it must
-# not follow later re-measurements of a deployment quantity. Re-pin only when S1 is retrained under a new cap.
-rope_eval_chunk_s: 16.27
+early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+scheduler:
+    type: cosine
+    warmup_epochs: 2
+freeze_backbone: false
+# backbone_lr: 1.0e-4  # optional override of default 0.3×learning_rate

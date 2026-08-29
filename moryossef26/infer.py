@@ -9,14 +9,12 @@ import numpy as np
 import torch
 
 from data.loader import VideoRecord
-from data.windowing import TRUSTED_GAP_S, make_bio_labels
+from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 from moryossef26.dataset import append_velocity
 # Semi-Markov duration decode is OURS, not the Moryossef protocol; enters only via `duration_prior`
 # (None = faithful argmax, the default for `--segmenter-arch moryossef`).
-# duration_decode_params / fit_duration_prior are re-exported here for eval.py + analyze.py (one import site
-# for the whole duration-decode surface).
-from infer.duration_decode import DurationPrior, duration_decode_params, duration_decode_tags, fit_duration_prior
+from infer.duration_decode import DurationPrior, duration_decode_tags
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
@@ -90,6 +88,11 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
     for t in tiou_thresholds:
         seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
         row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
+        # Moryossef 2023's "%" metric: predicted/gold segment-count ratio, threshold-independent (counts come 
+        # from the decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper
+        # comparable pair to their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are
+        # gameable (a right count with wrong placements scores 1.0).
+        row.setdefault("phrase_segment_count_ratio", float(seg["phrase_n_pred"]) / max(1.0, float(seg["phrase_n_gold"])))
         for k in seg_keys:
             row[f"{k}@{t:g}"] = seg[k]
             per_key[k].append(seg[k])
@@ -134,6 +137,13 @@ def evaluate_segmenter_whole_video(
             tags = duration_decode_tags(logits, float(record.pose.fps), duration_prior)
             logits = torch.nn.functional.one_hot(tags.long(), num_classes=logits.shape[-1]).float().unsqueeze(0)
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
+        # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right nor
+        # wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
+        unk_mask = labels[0] == BIO["UNK"]
+        if unk_mask.any():
+            logits = logits.clone()
+            logits[0, unk_mask] = 0.0
+            logits[0, unk_mask, BIO["UNK"]] = 10.0
         # prefix "bio" (trainer convention): bio_f1 is BINARY signing-vs-not F1; under "phrase" it would sit next
         # to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
         row = dict(bio_frame_metrics(logits, labels, prefix="bio"))

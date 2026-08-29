@@ -35,13 +35,17 @@ def first_terminator_index(bio_tags: torch.Tensor | list[int]) -> int | None:
 
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
-    # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O or next B.
+    # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O, next B, or UNK.
+    # UNK closes like O — the same rule the deployed decode applies by remapping UNK->O before the FSM (infer/stream.py) 
+    # and that `_bio_runs(close_on_unk=True)` uses. It matters only in LABEL domain, where UNK marks a quarantined region: 
+    # without it, reliable sentence abutting a quarantine has no terminator, so its label-domain span swallows the quarantine 
+    # and the gate's GT anchor stops matching `first_complete_span`'s time-domain target — the two are required to agree.
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
     prev: int | None = None
     for idx, tag in enumerate(bio_tags.tolist()):
-        if start is not None and tag in (BIO["O"], BIO["B"]):
+        if start is not None and tag in (BIO["O"], BIO["B"], BIO["UNK"]):
             spans.append((start, idx))
             start = None
         if _span_opens(tag, prev, start is not None): start = idx

@@ -21,9 +21,23 @@ def cfg_get(cfg: dict, *path: str, default=None):
         cur = cur[key]
     return cur
 
-# Accessors for the consolidated `checkpoint:` / `language_model:` config blocks (§12).
+def pool_key(cfg: dict) -> str | None: # Accessors for the consolidated `checkpoint:` / `language_model:` config blocks.
+    # Corpus key naming a multilingual segmentation-pretraining pool, or None for a monolingual run.
+    langs = (cfg or {}).get("pretrain_languages") or None
+    return f"multi_{'-'.join(sorted(str(x) for x in langs))}" if langs else None
+
+
 def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
-    return cfg_get(cfg, "checkpoint", "dir", default=default)
+    # Resolved `checkpoint.dir`. Shipped segmentation configs template it with `${corpus}` (load_yaml), so it is
+    # already pool-correct here; the last-segment substitution below is the safety net for a `${language}`-templated
+    # config that sets pretrain_languages — without it a pooled run would silently write to one language's dir.
+    resolved = cfg_get(cfg, "checkpoint", "dir", default=default)
+    key = pool_key(cfg)
+    if not resolved or not key: return resolved
+    parts = str(resolved).rstrip("/").split("/")
+    langs = {str(x) for x in (cfg.get("pretrain_languages") or [])}
+    if parts and (parts[-1] in langs or parts[-1] == str(cfg.get("language", ""))): parts[-1] = key
+    return "/".join(parts)   # an explicit, non-language-templated dir is the caller's choice — never rewritten
 
 def pretrained_checkpoint(cfg: dict, default: str | None = None) -> str | None:
     # Start weights: released Uni-Sign pose-only checkpoint (mBART ablation uses only its pose encoder; LM starts from base).
@@ -35,6 +49,10 @@ def save_best_enabled(cfg: dict, default: bool = True) -> bool:
 def language_model_name(cfg: dict) -> str:
     # ONE key for the text model regardless of family: google/mt5-base OR facebook/mbart-large-cc25.
     return str(cfg_get(cfg, "language_model", "name", default="google/mt5-base"))
+
+def target_language(data_cfg: dict, language: str, default: str = "en_XX") -> str:
+    # Declared TEXT language of a dataset language's captions (`data.yaml languages.<lang>.target_lang`).
+    return str(((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("target_lang") or default)
 
 def _deep_merge(base: dict, override: dict) -> dict: # `override` wins; nested dicts merged recursively.
     out = dict(base)
@@ -77,9 +95,18 @@ def load_yaml(path: str | Path, language: str | None = None) -> dict:
 
     `language` overrides the config's own `language:` BEFORE resolution, so one `--language asf` re-points BOTH
     the active dataset AND every `${language}`-templated path without editing the shared configs.
+
+    `${corpus}` names the TRAINING CORPUS a checkpoint is a function of: the pool key on a pooled segmentation
+    run (`pretrain_languages` set), else the language. Segmentation-trainer configs template checkpoint/wandb
+    paths with it, so one file is correct for the pooled and the monolingual recipe with no path rewriting in
+    code. Derived before resolution, so it always agrees with the run's actual `pretrain_languages`; with
+    neither a pool nor a language, `${corpus}` stays literal and fails visibly rather than open.
     """
     merged = _load_yaml_raw(Path(path))
     if language is not None: merged["language"] = str(language)
+    if "corpus" not in merged:
+        corpus = pool_key(merged) or merged.get("language")
+        if corpus is not None: merged["corpus"] = str(corpus)
     return resolve_placeholders(merged)
 
 

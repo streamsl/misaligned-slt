@@ -28,7 +28,7 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
     Prefers top-level `learning_rate` / `weight_decay`; falls back to `optimizer.lr` / `optimizer.weight_decay`
     so older configs keep working.
 
-    `backbone_params`: optional second param set at `backbone_lr` (default learning_rate × 0.1) — discriminative
+    `backbone_params`: optional second param set at `backbone_lr` (default learning_rate × 0.3) — discriminative
     fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
     """
     opt = cfg.get("optimizer", {}) or {}
@@ -44,7 +44,7 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
 
     groups = wd_split(params, lr)
     if backbone_params is not None:
-        groups += wd_split(backbone_params, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.1))))
+        groups += wd_split(backbone_params, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.3))))
     # fused=True on CUDA: one multi-tensor kernel per step instead of a Python loop over ~800M trainable params.
     return torch.optim.AdamW(groups, lr=lr, fused=torch.cuda.is_available())
 
@@ -401,10 +401,17 @@ def run_epoch_loop(
                                  f"(best {control.monitor}={control.best_value} @ epoch {control.best_epoch})", flush=True)
 
     for epoch in range(start_epoch, int(epochs) + 1):
-        # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler).
+        # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler), and advance
+        # the dataset's own epoch cursor (StreamingWindowDataset capped-epoch coverage; no-op when uncapped).
         for ld in (loader, dev_loader):
-            sampler = getattr(ld, "sampler", None) if ld is not None else None
-            if hasattr(sampler, "set_epoch"): sampler.set_epoch(epoch)
+            # `batch_sampler` too: length bucketing lives there, and without its set_epoch every epoch would
+            # replay 1 grouping (and 1 batch order) forever.
+            for attr in ("sampler", "batch_sampler"):
+                sampler = getattr(ld, attr, None) if ld is not None else None
+                if hasattr(sampler, "set_epoch"): sampler.set_epoch(epoch)
+            ds = getattr(ld, "dataset", None) if ld is not None else None
+            if hasattr(ds, "set_epoch"): ds.set_epoch(epoch)
+            
         epoch_logs: list[dict[str, float]] = []
         for step, batch in enumerate(loader, start=1):
             batch = move_to_device(batch, device)
@@ -466,11 +473,19 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
         f"[{prefix}] WARNING: B-class collapse — predicted B rate {b_rate:.5f} vs gold {gold_rate:.5f}. "
         f"Check bio_class_weights (train/losses.py documents this failure).", flush=True
     )
-    tiou = next((v for k, v in out.items() if k.endswith("phrase_tiou_f1")), None)
-    alli = next((v for k, v in out.items() if k.endswith("alli_tiou_f1")), None)
+    # Compare on the MODE-3 slice when present, not the aggregate: mode-1/2 windows are ~one (fragment of a)
+    # jittered sentence, so the all-I control is near-optimal there by construction and the aggregate control is a
+    # floor no head can beat (README: the aggregate is saturated and gameable; checkpoints select on mode3). Only
+    # multi-sentence windows measure what the head adds: splitting adjacent sentences.
+    tiou = next((v for k, v in out.items() if k.endswith("mode3_tiou_f1") and "alli" not in k),
+                next((v for k, v in out.items() if k.endswith("phrase_tiou_f1")), None))
+    alli = next((v for k, v in out.items() if k.endswith("mode3_alli_tiou_f1")),
+                next((v for k, v in out.items() if k.endswith("alli_tiou_f1")), None))
     if tiou is not None and alli is not None and tiou <= alli: print(
-        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} — the head is "
-        f"contributing nothing over chopping by the duration prior.", flush=True
+        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} on multi-sentence "
+        f"windows — under THIS monitor's decode the head adds nothing over chopping by the duration prior. "
+        f"(Plain-argmax pooled monitoring understates a head whose value flows through the posterior; confirm "
+        f"with --segmenter-eval under the tuned decode before judging the checkpoint.)", flush=True
     )
     return out
 

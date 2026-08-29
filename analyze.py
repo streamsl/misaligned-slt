@@ -11,14 +11,15 @@ from data.loader import load_language_records
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 
-from models.checkpointing import load_model_checkpoint
-from infer.duration_decode import DEPLOYED_SEGMENTER_ARCH, decode_config_key, duration_split_tags
+from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
+from moryossef26.infer import _phrase_logits, _set_rope_chunk, predict_phrase_segments
 from infer.commit_gate import bio_complete_spans, select_target_span
-from moryossef26.infer import _phrase_logits, _set_rope_chunk, duration_decode_params, fit_duration_prior, predict_phrase_segments
-
+from infer.duration_decode import (
+    DEPLOYED_SEGMENTER_ARCH, decode_config_key, duration_split_tags, duration_decode_params, fit_duration_prior
+)
 from eval import _build_eval_model, _load_segmenter, _translate_windows, load_prediction_file, save_prediction_file
-from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics
-from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, resolve_pretrained
+from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics, char_level_for_target
+from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, pool_key, resolve_pretrained, target_language
 
 # Low on purpose: near-misses feed the (Δ_head, Δ_tail) jitter CDF as matched pairs, not phantom/skip events;
 # a high bar biases the CDF to zero. Override: --tiou-threshold.
@@ -87,6 +88,7 @@ def analyze_segmenter_errors(
         gold_segments = list(gold.get(video_id, []))
         matches = match_segments(pred_segments, gold_segments, threshold=tiou_threshold)
         matched_pairs += len(matches)
+        matched_pred = {pred_idx for pred_idx, _, _ in matches}
         matched_gold = {gold_idx for _, gold_idx, _ in matches}
 
         overlapping_pred_by_gold: dict[int, list[int]] = {}
@@ -101,11 +103,15 @@ def analyze_segmenter_errors(
         overseg_gold = {gold_idx for gold_idx, pred_indices in overlapping_pred_by_gold.items() if len(pred_indices) >= 2}
         underseg_pred = {pred_idx for pred_idx, gold_indices in overlapping_gold_by_pred.items() if len(gold_indices) >= 2}
         underseg_gold = {gold_idx for pred_idx in underseg_pred for gold_idx in overlapping_gold_by_pred.get(pred_idx, [])}
+        # Pred-level categories are made MUTUALLY EXCLUSIVE, or the mode weights double-charge single events: matching uses tIoU with no 
+        # absolute-overlap floor while the overlap maps use material_overlap_s, so a 1-to-1 matched pred whose raw overlap is under the 
+        # floor would otherwise ALSO count as phantom, and a pred bridging 2 gold sentences (1 under-segmentation event) would otherwise 
+        # ALSO be charged as an over-segmentation fragment of each over-segmented gold it touches.
         phantom_pred = {
-            pred_idx for pred_idx, pred in enumerate(pred_segments) if pred_idx not in overlapping_gold_by_pred
-            and pred.start_s >= 0.0 and pred.end_s <= float(durations.get(video_id, pred.end_s))
+            pred_idx for pred_idx, pred in enumerate(pred_segments) if pred_idx not in overlapping_gold_by_pred 
+            and pred_idx not in matched_pred and pred.start_s >= 0.0 and pred.end_s <= float(durations.get(video_id, pred.end_s))
         }
-        counts["oversegmentation"] += sum(len(overlapping_pred_by_gold[g]) for g in overseg_gold)
+        counts["oversegmentation"] += sum(sum(1 for pi in overlapping_pred_by_gold[g] if pi not in underseg_pred) for g in overseg_gold)
         counts["undersegmentation"] += len(underseg_pred)
         counts["phantom"] += len(phantom_pred)
         counts["skipped"] += len(set(range(len(gold_segments))) - matched_gold - overseg_gold - underseg_gold)
@@ -139,7 +145,7 @@ def analyze_segmenter_errors(
     )
 
 
-def write_segmenter_error_outputs(analysis: SegmenterErrorAnalysis, output_dir: str | Path, language: str) -> dict[str, str]:
+def write_segmenter_error_outputs(analysis: SegmenterErrorAnalysis, output_dir: str | Path, language: str, arch: str) -> dict[str, str]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,18 +153,18 @@ def write_segmenter_error_outputs(analysis: SegmenterErrorAnalysis, output_dir: 
     head = [row["delta_head_s"] for row in jitter_rows]
     tail = [row["delta_tail_s"] for row in jitter_rows]
     jitter_payload = {
-        "language": language, "samples": jitter_rows,
+        "language": language, "segmenter_arch": arch, "samples": jitter_rows,
         "laplace": {"head": _laplace_fit(head), "tail": _laplace_fit(tail)},
         "overseg_cut_positions": analysis.overseg_cut_positions,
     }
     mode_payload = {
-        "language": language,
+        "language": language, "segmenter_arch": arch,
         "mode_ratios": analysis.mode_ratios,
         "source_event_counts": analysis.event_counts,
         "source_weights": mode_weights_from_events(analysis.event_counts),
     }
     taxonomy_payload = {
-        "language": language,
+        "language": language, "segmenter_arch": arch,
         "event_counts": analysis.event_counts,
         "matched_pairs": analysis.matched_pairs,
         "regular_matches": analysis.regular_matches,
@@ -172,9 +178,9 @@ def write_segmenter_error_outputs(analysis: SegmenterErrorAnalysis, output_dir: 
         },
     }
     paths = {
-        "jitter": str(output_dir / f"a_jitter_{language}.json"),
-        "mode_ratios": str(output_dir / f"a_mode_ratios_{language}.json"),
-        "taxonomy": str(output_dir / f"a_error_taxonomy_{language}.json"),
+        "jitter": str(output_dir / f"a_jitter_{arch}_{language}.json"),
+        "mode_ratios": str(output_dir / f"a_mode_ratios_{arch}_{language}.json"),
+        "taxonomy": str(output_dir / f"a_error_taxonomy_{arch}_{language}.json"),
     }
     Path(paths["jitter"]).write_text(json.dumps(jitter_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     Path(paths["mode_ratios"]).write_text(json.dumps(mode_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -185,7 +191,7 @@ def write_segmenter_error_outputs(analysis: SegmenterErrorAnalysis, output_dir: 
 def dataset_summary(args: argparse.Namespace) -> dict:
     cfg = load_yaml(args.data_config)
     records, splits = load_language_records(cfg, args.language, split=args.split)
-    durations = [span.duration_s for rec in records for span in rec.sentences]
+    durations = [span.duration_s for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     # Λ_min (inference.yaml span_selection) = p1/2 of dev durations × median fps, an order of magnitude above the ≤2δ phantom scale. 
     # Per-corpus/per-fps: on a corpus switch reset min_span_frames + its dlm.yaml membership_gate mirror.
     p1_s = float(np.percentile(durations, 1)) if durations else 0.0
@@ -366,8 +372,18 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     records, _ = load_language_records(cfg, args.language, split=args.split)
     predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
     _assert_predictions_match_pinned_decode(args)
-    gold_segments = {record.video_id: [Segment(span.start_s, span.end_s) for span in record.sentences] for record in records}
+    gold_segments = {record.video_id: [
+        Segment(span.start_s, span.end_s) for span in record.sentences if getattr(span, "reliable", True)
+    ] for record in records}
+
+    # Ignore-region, prediction side (mirrors eval._drop_quarantined_predictions): a segmenter span majority-inside
+    # a quarantined region would otherwise count as PHANTOM and inflate mode4 in the measured mix.
+    zones = {r.video_id: [(sp.start_s, sp.end_s) for sp in r.sentences if not getattr(sp, "reliable", True)] for r in records}
+    predictions = {vid: [seg for seg in segs if sum(
+        max(0.0, min(seg.end_s, b) - max(seg.start_s, a)) for a, b in zones.get(vid, [])
+    ) / max(1e-9, seg.end_s - seg.start_s) <= 0.5] for vid, segs in predictions.items()}
     durations = {record.video_id: float(record.pose.duration_s) for record in records}
+
     # Convert the frame floor to this corpus's time base.
     median_fps = float(np.median([float(record.pose.fps) for record in records])) if records else 24.0
     lam_s = int(load_yaml(args.inference_config)["span_selection"]["min_span_frames"]) / median_fps
@@ -378,9 +394,10 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     print(f"[segmenter-errors] event taxonomy with material_overlap_s={lam_s:.3f}s "
           f"(= span_selection.min_span_frames/{median_fps:g}fps): "
           f"a graze shorter than the minimum selectable span is boundary jitter, not a second sentence.", flush=True)
-    paths = write_segmenter_error_outputs(analysis, args.output_dir, args.language)
+    paths = write_segmenter_error_outputs(analysis, args.output_dir, args.language, args.segmenter_arch)
     return {
-        "language": args.language, "split": args.split, "event_counts": analysis.event_counts, "mode_ratios": analysis.mode_ratios, 
+        "language": args.language, "split": args.split, "segmenter_arch": args.segmenter_arch,
+        "event_counts": analysis.event_counts, "mode_ratios": analysis.mode_ratios,
         "matched_pairs": analysis.matched_pairs, "regular_matches": analysis.regular_matches, "outputs": paths,
     }
 
@@ -413,10 +430,10 @@ def tail_benefit(args: argparse.Namespace) -> dict:
     device = pick_device(args.device)
     model, tokenizer = _eval_model_for("baseline", args, base_cfg, device)
 
-    durations = [span.duration_s for rec in records for span in rec.sentences]
+    durations = [span.duration_s for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
     fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
-    sentences = [(rec, span) for rec in records for span in rec.sentences]
+    sentences = [(rec, span) for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
 
     # ONE pose read per sentence at the LONGEST tail, sliced per grid point (per-frame normalization, so a slice of the long window == the 
@@ -437,11 +454,14 @@ def tail_benefit(args: argparse.Namespace) -> dict:
             if end_s < span.end_s + dt - 1e-6: per_tail[dt]["clamped"] += 1
 
     curve = []
+    _char_level = char_level_for_target(target_language(data_cfg, args.language))
     for dt in grid:
         preds = [t for t, _, _ in _translate_windows(
             model, tokenizer, "baseline", per_tail[dt]["items"], device, inference_cfg, base_cfg, batch_size=int(args.batch_size)
         )]
-        bleu = compute_text_metrics(preds, per_tail[dt]["references"])["translation_bleu4"]
+        # Declared scoring level (metrics.char_level_for_target): the elbow is read across grid points, so a
+        # per-point sniff could re-level one point of the curve against its neighbours.
+        bleu = compute_text_metrics(preds, per_tail[dt]["references"], char_level=_char_level)["translation_bleu4"]
         n = len(preds)
         clamped_fraction = per_tail[dt]["clamped"] / max(n, 1)
         curve.append({"delta_tail_s": dt, "bleu4": float(bleu), "n": n, "clamped_fraction": round(clamped_fraction, 4)})
@@ -495,13 +515,24 @@ def delta_enc(args: argparse.Namespace) -> dict:
     if args.split == "test" and not args.allow_test: raise SystemExit("Delta-enc runs on dev; --allow-test only for smoke debugging")
     from train.bio_pretrain import build_bio_s1_model
     data_cfg = load_yaml(args.data_config)
-    cfg = load_yaml(args.bio_config, language=args.language)  # ${language} in checkpoint.dir -> the right bio_s1 dir
+    cfg = load_yaml(args.bio_config, language=args.language)  # ${corpus} in checkpoint.dir -> pool dir, or this language's dir
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     device = pick_device(args.device)
 
     pretrained = resolve_pretrained(cfg, data_cfg, args.language, default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
+    # checkpoint_dir substitutes the pool key on a pooled config, so a multilingual S1 resolves here exactly
+    # as it does in train.py and eval.py. The language default is only for an untemplated monolingual config.
     checkpoint = args.checkpoint or str(Path(checkpoint_dir(cfg, default=f"checkpoints/bio_s1/{args.language}")) / "model.pt")
+    # Same pool-provenance refusal as eval.py's _load_segmenter. It matters MOST here: delta-enc is the WRITER of the deployed gate geometry 
+    # (--write-config persists delta/Lambda_min into inference.yaml AND dlm.yaml), a pooled and a monolingual BioS1Model are shape-identical 
+    # so a wrong checkpoint strict-loads cleanly, and the result is a plausible-looking delta measured on a head the FSM never deploys.
+    _meta = load_checkpoint_meta(checkpoint)
+    if "pretrain_pool" in _meta and _meta.get("pretrain_pool") != pool_key(cfg): raise SystemExit(
+        f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. "
+        f"Point --checkpoint at the matching model, or align `pretrain_languages` — delta-enc calibrates the DEPLOYED "
+        f"head's gate geometry, and a pooled checkpoint is a DIFFERENT model from a monolingual one."
+    )
     load_model_checkpoint(model, checkpoint, strict=True)
     model.eval().to(device)
     print(f"[delta-enc] S1 BIO head from {checkpoint}", flush=True)
@@ -522,7 +553,7 @@ def delta_enc(args: argparse.Namespace) -> dict:
           f"Lambda_min={min_span} frames", flush=True)
 
     fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
-    sentences = [(rec, span) for rec in records for span in rec.sentences]
+    sentences = [(rec, span) for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
     rng = np.random.default_rng(int(args.seed))
 
@@ -603,7 +634,9 @@ def delta_enc(args: argparse.Namespace) -> dict:
     # selectable as a span (infer/stream.py's own rule and default). dlm.yaml's gate must equal both. Written
     # together so 4 values cannot drift — a stale pair is exactly what leaves the FSM in an invalid geometry.
     lam = delta + 1
-    p10_frames = int(np.percentile([s.duration_s for r in records for s in r.sentences], 10) * fps_hint) if records else 0
+    p10_frames = int(np.percentile([
+        s.duration_s for r in records for s in r.sentences if getattr(s, "reliable", True)
+    ], 10) * fps_hint) if records else 0
     if p10_frames and lam > p10_frames: print(
         f"[delta-enc] WARNING: Lambda_min={lam} exceeds the p10 sentence ({p10_frames} frames) — >10% of real "
         f"sentences become unselectable. delta is inflated by snap_radius_s; re-tune the decode before accepting.", flush=True

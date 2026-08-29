@@ -20,9 +20,15 @@ class JitterSampler:
     # Empirical relative cut positions of over-segmentation events (segmenter-error analysis, analyze.py).
     # Mode 2 draws its truncation depth from these; empty → uniform interior fallback.
     cut_positions: np.ndarray | None = None
+    cut_lo: float = 0.15
+    cut_hi: float = 0.85
 
     @classmethod
     def from_config(cls, cfg: dict) -> "JitterSampler":
+        cut_range = [float(x) for x in cfg.get("fallback_cut_range", [0.15, 0.85])]
+        if len(cut_range) != 2 or not 0.0 < cut_range[0] < cut_range[1] < 1.0: raise ValueError(
+            f"jitter.fallback_cut_range must be [lo, hi] inside (0,1); got {cut_range}"
+        )
         cut_positions = None
         source = cfg.get("source")
         if source and not Path(source).exists():
@@ -48,7 +54,7 @@ class JitterSampler:
             n_pairs = samples.reshape(-1, 2).shape[0] if samples.size else 0
             if n_pairs >= RAW_REPLAY_MIN_PAIRS:
                 print(f"[jitter] {source}: RAW empirical replay ({n_pairs} measured pairs)", flush=True)
-                return cls(samples=samples.reshape(-1, 2), cut_positions=cut_positions)
+                return cls(samples=samples.reshape(-1, 2), cut_positions=cut_positions, cut_lo=cut_range[0], cut_hi=cut_range[1])
             print(f"[jitter] {source}: fitted-Laplace draws ({n_pairs} measured pairs < {RAW_REPLAY_MIN_PAIRS}; "
                   f"raw replay would censor tails and lattice the distribution)", flush=True)
             laplace = data.get("laplace", {})
@@ -74,7 +80,7 @@ class JitterSampler:
             head_scale_s=max(float(laplace.get("head_scale_s", 0.5)), 1e-6),
             tail_loc_s=float(laplace.get("tail_loc_s", 0.0)),
             tail_scale_s=max(float(laplace.get("tail_scale_s", 0.5)), 1e-6),
-            cut_positions=cut_positions,
+            cut_positions=cut_positions, cut_lo=cut_range[0], cut_hi=cut_range[1],
         )
 
     def sample(self, rng: np.random.Generator) -> tuple[float, float]:
@@ -86,19 +92,19 @@ class JitterSampler:
             float(rng.laplace(self.tail_loc_s, self.tail_scale_s)),
         )
 
-    def sample_cut(self, rng: np.random.Generator, lo: float = 0.15, hi: float = 0.85) -> float:
+    def sample_cut(self, rng: np.random.Generator) -> float:
         """Relative position in (0,1) of a Mode-2 spurious internal cut.
 
-        From segmenter-error analysis's measured over-segmentation cut positions when available; else uniform in [lo, hi] (avoids 
-        near-empty windows). Uniform is the noninformative prior — over-seg cut positions are not in the matched-pair jitter CDF.
+        From segmenter-errors when available. Otherwise draw uniformly from `fallback_cut_range`; the interior
+        range avoids nearly empty windows and is independent of matched-pair boundary jitter.
         """
         if self.cut_positions is not None and len(self.cut_positions):
             return float(self.cut_positions[int(rng.integers(0, len(self.cut_positions)))])
-        return float(rng.uniform(lo, hi))
+        return float(rng.uniform(self.cut_lo, self.cut_hi))
 
 
 def normalized_mode_ratios(raw: dict[str, float]) -> dict[str, float]:
     values = {k: max(float(v), 0.0) for k, v in raw.items()}
     total = sum(values.values())
-    if total <= 0: return {"mode1": 0.55, "mode2": 0.20, "mode3": 0.20, "mode4": 0.05}
+    if total <= 0: raise ValueError("mode ratios need positive mass; set mode_ratios.fallback in the training config")
     return {k: v / total for k, v in values.items()}

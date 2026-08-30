@@ -93,9 +93,9 @@ membership_gate:
     enabled: true
     # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
     # MUST match inference.yaml boundary_stability.delta_enc_frames.
-    delta: 13
+    delta: 7
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    min_span_frames: 14  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
+    min_span_frames: 8  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
     # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
     # Log gate_veto_rate — it should start near 0 and decay.
     iou_veto: 0.5

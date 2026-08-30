@@ -17,9 +17,9 @@ from infer.commit_gate import bio_complete_spans, select_target_span
 from infer.duration_decode import (
     DEPLOYED_SEGMENTER_ARCH, decode_config_key, duration_split_tags, duration_decode_params, fit_duration_prior
 )
-from eval import _build_eval_model, _load_segmenter, _translate_windows, load_prediction_file, save_prediction_file
-from metrics import Segment, match_segments, moryossef_segment_metrics, compute_text_metrics, char_level_for_target
-from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, pool_key, resolve_pretrained, target_language
+from eval import _load_segmenter, load_prediction_file, save_prediction_file
+from metrics import Segment, match_segments, moryossef_segment_metrics
+from utils import load_yaml, update_yaml_scalar, pick_device, checkpoint_dir, pool_key, resolve_pretrained
 
 # Low on purpose: near-misses feed the (Δ_head, Δ_tail) jitter CDF as matched pairs, not phantom/skip events;
 # a high bar biases the CDF to zero. Override: --tiou-threshold.
@@ -282,11 +282,12 @@ def tune_decode(args: argparse.Namespace) -> dict:
             f1s.append(moryossef_segment_metrics(oh, gold.unsqueeze(0), prefix="p", tiou_threshold=0.5)["p_tiou_f1"])
         return float(np.mean(f1s)) if f1s else 0.0
 
-    # Emission weight shifts the count-optimal bias (its logits are negative off-boundary), so the joint
-    # grid must cover higher bias than the w=0 sweep needed.
-    grid_bias = [round(float(b), 2) for b in np.arange(2.5, 8.01, 0.25)]
+    # Emission weight shifts the count-optimal bias (its logits are negative off-boundary), so the joint grid must cover higher bias than 
+    # the w=0 sweep needed. Upper ends extend past every value selected so far — a triple selected AT a grid edge means the optimum may 
+    # lie outside, and the pooled checkpoints selected the old w ceiling on both arches.
+    grid_bias = [round(float(b), 2) for b in np.arange(2.5, 10.01, 0.25)]
     grid_radius = [0.0, 0.5, 1.0, 1.5]
-    grid_weight = [0.0, 0.25, 0.5, 0.75, 1.0]
+    grid_weight = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
     rows, best = [], None
     for w_b in grid_weight:
         for bias in grid_bias:
@@ -403,101 +404,40 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     }
 
 
-def _eval_model_for(method: str, args: argparse.Namespace, method_cfg: dict, device: torch.device):
-    # eval.py's checkpoint-loading builder (plain scalars, no fake namespace).
-    data_cfg = load_yaml(args.data_config)
-    return _build_eval_model(method, args.checkpoint, args.language, data_cfg, method_cfg, device)
+def buffer_cap(args: argparse.Namespace) -> dict:
+    """Write buffer_cap_s = p99 sentence duration + stride_s + delta_enc/fps — a CAPACITY bound, from data + config alone.
 
+    The cap is a forced-commit TIMEOUT: the FSM buffer must hold a whole sentence (p99), plus the stride that detects its end, plus the 
+    delta-frame overlap a commit leaves behind. No model is built and nothing is decoded — by design, not convenience: the cap parameterizes 
+    TRAINING (the sampler clamps every window to it, and in the mode1-only baseline an over-cap sentence is silently unsupervised), so it 
+    must not depend on any trained translator.
 
-def tail_benefit(args: argparse.Namespace) -> dict:
-    """Tail-benefit curve sets BUFFER_CAP_S.
-
-    Clean-trained translator, dev, head at the true sentence start (Δ_head = 0), Δ_tail swept, BLEU-4 per point. Elbow = first grid point 
-    whose marginal BLEU/s drops below eval.yaml tail_benefit.latency_quality_coeff_bleu_per_s — not hand-picked, not %-of-clean.
-
-    The spec calls the elbow the buffer cap, but the FSM buffer holds the WHOLE sentence plus trailing context, 
-    so a 1–3 s elbow cannot be it: buffer_cap_s = p99 sentence duration + stride_s + delta/fps (raw terms in the JSON).
+    This stage is the ONE writer of inference.yaml buffer_cap_s. Run AFTER delta-enc (the formula reads delta_enc_frames). Re-run per 
+    language and after any GT-preprocessing change (p99 is a data property).
     """
-    if args.split == "test" and not args.allow_test: raise SystemExit("Tail-benefit runs on dev; --allow-test only for smoke debugging")
+    if args.split == "test" and not args.allow_test: raise SystemExit("buffer-cap runs on dev; --allow-test only for smoke debugging")
     data_cfg = load_yaml(args.data_config)
-    eval_cfg = load_yaml(args.eval_config)
-    base_cfg = load_yaml(args.baseline_config, language=args.language)
     inference_cfg = load_yaml(args.inference_config)
-    tb_cfg = eval_cfg.get("tail_benefit", {})
-    grid = [float(x) for x in tb_cfg.get("tail_grid_s", [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])]
-    coeff = float(tb_cfg.get("latency_quality_coeff_bleu_per_s", 0.5))
-
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
-    device = pick_device(args.device)
-    model, tokenizer = _eval_model_for("baseline", args, base_cfg, device)
 
     durations = [span.duration_s for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     p99_duration = float(np.percentile(durations, 99)) if durations else 0.0
     fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
-    sentences = [(rec, span) for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
-    if args.num_sentences: sentences = sentences[: int(args.num_sentences)]
-
-    # ONE pose read per sentence at the LONGEST tail, sliced per grid point (per-frame normalization, so a slice of the long window == the 
-    # short load), then batch-decode: len(grid) reads + len(grid) single-window beam decodes per sentence took hours on a network filesystem.
-    max_tail = max(grid)
-    per_tail: dict[float, dict[str, list]] = {dt: {"items": [], "references": [], "clamped": 0} for dt in grid}
-    for rec, span in tqdm(sentences, desc="tail-benefit: load"):
-        poses, timestamps = load_pose_window(rec.pose, span.start_s, min(rec.pose.duration_s, span.end_s + max_tail), normalize=True)
-        if poses.shape[0] == 0: continue
-        for dt in grid:
-            end_s = min(rec.pose.duration_s, span.end_s + dt)
-            n = int(np.searchsorted(timestamps, end_s, side="left"))
-            if n == 0: continue
-            per_tail[dt]["items"].append((poses[:n], timestamps[:n], float(span.start_s)))
-            per_tail[dt]["references"].append(span.text)
-            # Clamped = less tail than the grid point claims: a flat step at large dt can mean "no more video",
-            # not "no more benefit". Without this fraction the elbow is a tail-margin artifact.
-            if end_s < span.end_s + dt - 1e-6: per_tail[dt]["clamped"] += 1
-
-    curve = []
-    _char_level = char_level_for_target(target_language(data_cfg, args.language))
-    for dt in grid:
-        preds = [t for t, _, _ in _translate_windows(
-            model, tokenizer, "baseline", per_tail[dt]["items"], device, inference_cfg, base_cfg, batch_size=int(args.batch_size)
-        )]
-        # Declared scoring level (metrics.char_level_for_target): the elbow is read across grid points, so a
-        # per-point sniff could re-level one point of the curve against its neighbours.
-        bleu = compute_text_metrics(preds, per_tail[dt]["references"], char_level=_char_level)["translation_bleu4"]
-        n = len(preds)
-        clamped_fraction = per_tail[dt]["clamped"] / max(n, 1)
-        curve.append({"delta_tail_s": dt, "bleu4": float(bleu), "n": n, "clamped_fraction": round(clamped_fraction, 4)})
-        print(f"[tail-benefit] tail={dt:.1f}s BLEU4={bleu:.2f} (n={n}, clamped={clamped_fraction:.1%})", flush=True)
-
-    heavy = [c for c in curve if c["clamped_fraction"] > 0.2]
-    if heavy: print(f"[tail-benefit] WARNING: {len(heavy)} grid point(s) have >20% end-of-video clamping "
-                    f"(from tail={heavy[0]['delta_tail_s']}s); the elbow may reflect missing video, not saturated benefit.", flush=True)
-
-    elbow = grid[-1]
-    for prev, cur in zip(curve, curve[1:]):
-        gap_s = cur["delta_tail_s"] - prev["delta_tail_s"]
-        marginal = (cur["bleu4"] - prev["bleu4"]) / gap_s if gap_s > 0 else 0.0
-        if marginal < coeff:
-            elbow = prev["delta_tail_s"]
-            break
-
-    # CAPACITY, not the elbow: the buffer must hold the longest realistic sentence (p99), plus one stride for its
-    # terminator to appear, plus the delta commit tolerance. The elbow cannot size it — the curve's SIGN depends on
-    # what the scoring model trained on (span-trained baseline_train: context hurts, elbow pins to 0; buffer-trained
-    # arms: context helps), so it measures context appetite, not buffer requirement. The curve stays as a diagnostic.
     stride_s = float(inference_cfg.get("stride_s", 1.0))
     delta_s = float((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 0)) / max(fps_hint, 1.0)
-    buffer_cap_s = round(p99_duration + stride_s + delta_s, 2)
+    cap = round(p99_duration + stride_s + delta_s, 2)
+    
     payload = {
-        "language": args.language, "split": args.split, "sentences": len(sentences),
-        "latency_quality_coeff_bleu_per_s": coeff, "curve": curve,
-        "elbow_tail_s": elbow, "p99_sentence_duration_s": p99_duration, "buffer_cap_s": buffer_cap_s,
+        "language": args.language, "split": args.split, "sentences": len(durations),
+        "p99_sentence_duration_s": p99_duration, "buffer_cap_s": cap,
         "cap_terms": {"p99_s": p99_duration, "stride_s": stride_s, "delta_enc_s": round(delta_s, 3)},
     }
-    output = Path(args.output or f"outputs/tail_benefit_{args.language}.json")
+    output = Path(args.output or f"outputs/buffer_cap_{args.language}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if args.write_config and update_yaml_scalar(args.inference_config, ("buffer_cap_s",), buffer_cap_s):
+    if args.write_config and update_yaml_scalar(args.inference_config, ("buffer_cap_s",), cap):
         payload["config_updated"] = args.inference_config
+    print(f"[buffer-cap] buffer_cap_s={cap} (p99 {p99_duration:.2f} + stride {stride_s:g} + delta {delta_s:.3f})", flush=True)
     payload["output"] = str(output)
     return payload
 
@@ -627,9 +567,6 @@ def delta_enc(args: argparse.Namespace) -> dict:
         "language": args.language, "split": args.split, "noise_sigma": sigma,
         "sentences": len(sentences), "families": stats, "delta_enc_frames": delta,
     }
-    output = Path(args.output or f"outputs/delta_enc_{args.language}.json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     # delta is not a standalone constant. On commit the buffer is cut at terminator-delta, so the next buffer opens
     # with a delta-frame leftover of the sentence just emitted; Lambda_min must exceed delta or that leftover is
     # selectable as a span (infer/stream.py's own rule and default). dlm.yaml's gate must equal both. Written
@@ -654,6 +591,11 @@ def delta_enc(args: argparse.Namespace) -> dict:
                                             f"{', '.join(sorted(set(payload['config_updated'])))}", flush=True)
         else: print(f"[delta-enc] WARNING: --write-config changed nothing (keys missing or files unwritable): "
                     f"{args.inference_config}, {args.slt_config}", flush=True)
+    # Written AFTER min_span_frames/config_updated exist: the artifact must carry the derived Λ_min, or the file
+    # documents half the geometry it just froze.
+    output = Path(args.output or f"outputs/delta_enc_{args.language}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     payload["output"] = str(output)
     return payload
 
@@ -662,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
     parser.add_argument(
         "--stage", default="dataset-summary",
-        choices=["dataset-summary", "segmenter-infer", "tune-decode", "segmenter-errors", "tail-benefit", "delta-enc"],
+        choices=["dataset-summary", "segmenter-infer", "tune-decode", "segmenter-errors", "buffer-cap", "delta-enc"],
     )
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument(
@@ -687,15 +629,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--tiou-threshold", type=float, default=None)
     parser.add_argument("--num-sentences", type=int, default=None)
-    parser.add_argument(
-        "--batch-size", type=int, default=8,
-        help="windows per translate/forward batch in loop-decode paths (RQ2 rows, tail-benefit, delta-enc)"
-    )
     parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--write-config", action="store_true",
-        help="Persist measured constants: tail-benefit -> buffer_cap_s; delta-enc -> delta_enc_frames + "
+        help="Persist measured constants: buffer-cap -> buffer_cap_s; delta-enc -> delta_enc_frames + "
         "min_span_frames (both configs); tune-decode -> duration_decode_<arch>.<language>"
     )
     parser.add_argument("--device", default=None)
@@ -712,7 +650,7 @@ if __name__ == "__main__":
     elif args.stage == "segmenter-errors":
         if not args.predictions: raise SystemExit("--predictions is required for --stage segmenter-errors")
         result = segmenter_errors(args)
-    elif args.stage == "tail-benefit": result = tail_benefit(args)
+    elif args.stage == "buffer-cap": result = buffer_cap(args)
     elif args.stage == "delta-enc": result = delta_enc(args)
     else: raise ValueError(f"Unsupported stage: {args.stage}")
     print(json.dumps(result, indent=2, sort_keys=True))

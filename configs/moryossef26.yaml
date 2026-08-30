@@ -52,7 +52,7 @@ bio_class_weights: balanced
 # Whole-video chunk training (Moryossef-style; distinct from the SLT window sampler).
 num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked inference
 steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames / num_frames)
-batch_size: 16
+batch_size: 32
 augmentation:
     # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip 
     # below the source rate to do anything. YouTube-SL-25 poses are 24 fps.

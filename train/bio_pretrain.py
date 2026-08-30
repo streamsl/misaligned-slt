@@ -175,7 +175,7 @@ def build_bio_s1(
         dev_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers
     )
     if cfg.get("pretrain_mix"): # Multilingual pool: warm-start from Uni-Sign released checkpoint, not a per-language fine-tune.
-        # resolve_pretrained is per-language, and after README step 1c it points at baseline_train/<lang> — an encoder already 
+        # resolve_pretrained is per-language, and after the re-root, it points at baseline_train/<lang> — an encoder already 
         # adapted to ONE target language, which would (a) privilege that language inside a language-agnostic pretraining and (b) 
         # make the pool checkpoint depend on which --language launched it while writing to the same multi_* directory. S1 features 
         # == S2 initial features is preserved by bio_head_init carrying THIS encoder into stage 2, not by matching warm-starts.
@@ -287,7 +287,7 @@ def train_bio_s1_epochs(
             "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")}
     # The end-of-training save in train.py reuses THIS dict. A second, independently-built meta drops pretrain_pool/pretrain_mix 
     # (disarming eval.py's provenance assertion) and re-derives rope_eval_chunk_s from the live inference.yaml — which is the value 
-    # the stamp exists to override, since `analyze --stage tail-benefit --write-config` rewrites buffer_cap_s after training.
+    # the stamp exists to override, since `analyze --stage buffer-cap --write-config` rewrites buffer_cap_s after training.
     cfg["checkpoint_meta"] = meta
     return run_epoch_loop(
         name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, step_fn=step_fn, 

@@ -1081,10 +1081,8 @@ def _load_segmenter(args):
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
     load_model_checkpoint(model, checkpoint, strict=True)
     # S1's RoPE chunk is the buffer cap the head TRAINED under, which the checkpoint records. It wins over both the
-    # config pin and the live buffer_cap_s, because `analyze --stage tail-benefit --write-config` rewrites that cap
-    # after training and following it re-chunks a trained head over context it never saw (measured: dev
-    # tIoU-F1@0.5 fold B 0.5014 -> 0.4763 under an unchanged tuned decode). Checkpoints predating the meta field
-    # fall through to the config pin.
+    # config pin and the live buffer_cap_s, because `analyze --stage buffer-cap --write-config` rewrites that cap
+    # after training and following it re-chunks a trained head over context it never saw.
     # PROVENANCE: the config says which pool this run expects; the checkpoint records which pool produced it. A
     # mismatch means the wrong segmenter is about to be evaluated — silently, with a plausible-looking score — so
     # it fails loud. Checkpoints written before `pretrain_pool` existed carry no key and are exempt.

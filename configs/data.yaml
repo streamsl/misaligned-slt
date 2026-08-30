@@ -19,8 +19,10 @@ languages:
         name: ASL
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
-        # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
+        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
+        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
+        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
+        # checkpoint over the warm start, and buffer-cap builds no model at all.
         # pretrained_slt: checkpoints/baseline_train/ase/model.pt
         root: data/youtube-sl-25/ase
         pose:
@@ -31,8 +33,10 @@ languages:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
-        # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
+        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
+        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
+        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
+        # checkpoint over the warm start, and buffer-cap builds no model at all.
         # pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
         pose:
@@ -43,8 +47,10 @@ languages:
         name: BSL (SignVerse-2M poses)
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After README step 1b (baseline_train), re-root the language on the LOCAL clean-floor baseline so
-        # bio_s1 / delta-enc / stage-2 arms / baseline eval all share one init (§1.4 + controlled comparison):
+        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
+        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
+        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
+        # checkpoint over the warm start, and buffer-cap builds no model at all.
         # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
         pose:

@@ -11,7 +11,7 @@
 #   language_model, decoder, oput, confidence_bound, membership_gate, dcd, spd, block_size, diffusion_steps,
 #   lambda_trans, max_text_tokens, validation, checkpoint.bio_head_init.
 # The pose encoder warm-starts from the RELEASED Uni-Sign checkpoint and TRAINS (`freeze_backbone: false` below —
-# the shipped recipe; a pooled run never reads the per-language `pretrained_slt`, which after the B1c re-root would
+# the shipped recipe; a pooled run never reads the per-language `pretrained_slt`, which after the B2b re-root would
 # privilege 1 language inside language-agnostic pretraining). Stage 2 loads encoder AND head from this checkpoint 
 # via `bio_head_init`, which is what "S1 features == S2 initial features" means now.
 extends: dlm.yaml
@@ -52,7 +52,14 @@ wandb:
 # Pooled S1 geometry is a PRETRAINING design value. It must not inherit δ, Λ, or buffer capacity from whichever
 # target language was analyzed last. Stage 2 measures and uses its own target-language geometry.
 pretrain_geometry:
-    buffer_cap_s: 18.0
+    # Must COVER the pool's sentence durations, or the designed mode mix is unrealizable: a sentence longer than
+    # this cap can never appear COMPLETE in pretraining (the sampler clamps every window to the cap), so it is
+    # permanently mode-2 and the head never learns to close it — punished at whole-video eval as under-segmentation.
+    # 36 covers the worst per-language merged-sentence p99 (bfi ~34s; asf ~29s, ase ~28s) plus tail-jitter margin,
+    # and stays at or above every target's measured deployment cap (p99 + stride + delta/fps) so the S2-initialised
+    # head never meets contexts beyond its pretrained RoPE range. A DESIGN constant informed by pool sentence
+    # statistics — never a copy of one target's measured buffer_cap_s. Re-derive if the pool or GT settings change.
+    buffer_cap_s: 36.0
     min_span_frames: 1
 
 pretrain_languages: [ase, asf, bfi]
@@ -67,7 +74,7 @@ pretrain_temperature: 0.3
 # stage 2. The encoder trains at backbone_lr (default learning_rate×0.3) so the released weights are adapted, not
 # overwritten. `bio_head_init` carries this encoder into stage 2, preserving "S1 features == S2 initial features".
 epochs: 50
-batch_size: 16
+batch_size: 32
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 early_stopping:

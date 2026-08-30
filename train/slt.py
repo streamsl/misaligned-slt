@@ -56,7 +56,7 @@ def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> No
 def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
 
-    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by tail-benefit, the decode triple by tune-decode, and jitter 
+    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by buffer-cap, the decode triple by tune-decode, and jitter 
     by segmenter-error analysis. Resuming across such a change trains 2 halves under different objectives, and without this record 
     nothing in the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
     """

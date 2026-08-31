@@ -55,10 +55,15 @@ pretrain_geometry:
     # Must COVER the pool's sentence durations, or the designed mode mix is unrealizable: a sentence longer than
     # this cap can never appear COMPLETE in pretraining (the sampler clamps every window to the cap), so it is
     # permanently mode-2 and the head never learns to close it — punished at whole-video eval as under-segmentation.
-    # 36 covers the worst per-language merged-sentence p99 (bfi ~34s; asf ~29s, ase ~28s) plus tail-jitter margin,
-    # and stays at or above every target's measured deployment cap (p99 + stride + delta/fps) so the S2-initialised
-    # head never meets contexts beyond its pretrained RoPE range. A DESIGN constant informed by pool sentence
-    # statistics — never a copy of one target's measured buffer_cap_s. Re-derive if the pool or GT settings change.
+    # 36 covers every pool language's TRAIN-split sentence p99 (bfi ~34s; asf ~29s, ase ~28s) plus tail-jitter
+    # margin — the training distribution is what pretraining coverage means, and the residual tail is sub-1% per
+    # language. A TARGET's measured deployment cap MAY exceed this (it is dev-p99-based, a noisier tail statistic):
+    # that is fine and forces NO pretrain rerun, because the deployed head is the S2 head, fine-tuned at the
+    # target's own cap (the S2 sampler reads inference.yaml) — the S1 init merely starts slightly out-of-context
+    # on the sub-1% longest windows, which S2 training absorbs. The guarded hazard is unchanged and different:
+    # EVALUATING a FROZEN head beyond its trained context (standalone S1 always chunks at its checkpoint's cap).
+    # A DESIGN constant informed by pool sentence statistics — never a copy of one target's measured buffer_cap_s.
+    # Re-derive if the pool or the GT settings change.
     buffer_cap_s: 36.0
     min_span_frames: 1
 

@@ -79,7 +79,7 @@ confidence_bound:
     # decode_steps bounds only the FINAL settle pass; the per-block settles (bounded by block_size) dominate the
     # settle cost, so lowering this trims little — `revision: false` is the knob that removes the settle phase.
     # Set cache_type: none + window_type: sliding to make CB decode exactly like inference at the cost of speed.
-    decode_steps: 16
+    decode_steps: 32
     cache_type: prefix
     window_type: static
 membership_gate:
@@ -91,11 +91,11 @@ membership_gate:
     # SAME Ω via HF cross-attention forward-hooks (models.membership_gate.CrossAttnOmegaInjector), so §9.3 is a
     # gated-vs-gated decoder-family contrast. This block is inherited by ar.yaml (extends dlm).
     enabled: true
-    # δ: ramp width, boundary tolerance, 2δ trust-band half-width.
-    # MUST match inference.yaml boundary_stability.delta_enc_frames.
-    delta: 7
+    # δ (ramp width / boundary tolerance / 2δ trust-band half-width) and Λ_min are NOT set here: they are
+    # DERIVED at load from inference.yaml's per-language measured geometry (utils.resolve_inference →
+    # train/slt._inject_gate_geometry). A per-language value mirrored into this shared file is a stale-constant
+    # hazard — there is deliberately no key to drift.
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    min_span_frames: 8  # on-policy span selection; MUST match inference.yaml span_selection.min_span_frames (= delta+1, asf delta-enc).
     # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
     # Log gate_veto_rate — it should start near 0 and decay.
     iou_veto: 0.5
@@ -178,7 +178,7 @@ jitter:
         tail_scale_s: 0.8 # broader still: deployment tails also carry cap-forced commits and survival splits
     fallback_cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off the edges so mode2 stays distinct from mode1/4
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
-batch_size: 32
+batch_size: 16
 num_workers:
     4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any value:
     # exact per-epoch coverage comes from the INDEX-driven anchor (sampler.sample(index) -> anchors[index % N], and

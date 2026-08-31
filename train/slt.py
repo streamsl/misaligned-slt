@@ -17,7 +17,7 @@ from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from infer.duration_decode import duration_decode_params, fit_duration_prior
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import checkpoint_dir, load_yaml, language_model_name, pool_key, resolve_pretrained
+from utils import checkpoint_dir, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
 
 
 # DEFAULT S1 config. `checkpoint.bio_head_init: auto` resolves the S1 checkpoint through it, and the pool-provenance check reads its 
@@ -34,24 +34,18 @@ class SLTComponents:
     slt_cfg: dict
     checkpoint_meta: dict
 
-def _assert_gate_inference_consistency(slt_cfg: dict, inference_cfg: dict) -> None:
-    """Gate δ/Λ_min train here but deploy from inference.yaml, and nothing links 2 configs — 
-    mismatched geometry silently gives the decoder a different gate than the FSM runs."""
-    gate = slt_cfg.get("membership_gate", {})
-    if not gate.get("enabled", False): return
-    if "delta" not in gate or "min_span_frames" not in gate: 
-        raise ValueError(f"membership_gate is enabled but missing delta/min_span_frames: {sorted(gate)}")
+def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
+    """Derive the membership gate's δ/Λ_min from the RESOLVED per-language inference geometry — one source of truth.
+
+    The gate trains and deploys under the same geometry. It used to be MIRRORED into dlm.yaml and asserted equal,
+    but a mirror of a per-language value in a shared config is exactly the stale-constant hazard the per-language
+    inference schema removes — so the values are injected here at load and dlm.yaml carries none."""
+    gate = slt_cfg.get("membership_gate")
+    if not (gate or {}).get("enabled", False): return
     delta_i = int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))
     lam_i = inference_cfg.get("span_selection", {}).get("min_span_frames")
-    lam_i = delta_i + 1 if lam_i is None else int(lam_i)  # infer/stream.py's derivation
-    pairs = [
-        ("membership_gate.delta", int(gate["delta"]), "boundary_stability.delta_enc_frames", delta_i),
-        ("membership_gate.min_span_frames", int(gate["min_span_frames"]), "span_selection.min_span_frames", lam_i),
-    ]
-    for s_key, s_val, i_key, i_val in pairs:
-        if s_val != i_val: raise ValueError(
-            f"Membership-gate geometry mismatch: slt config {s_key}={s_val} but inference.yaml {i_key}={i_val}. "
-            f"The gate trains and deploys under the SAME δ/Λ_min — reconcile 2 configs.")
+    gate["delta"] = delta_i
+    gate["min_span_frames"] = delta_i + 1 if lam_i is None else int(lam_i)  # infer/stream.py's derivation
 
 def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
@@ -87,8 +81,8 @@ def build_slt_components(
     # in checkpoint.dir (+ ar/baseline children) re-points at the right dataset.
     language = str(language or slt_cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(slt_config, language=language)
-    inference_cfg = load_yaml(inference_config)
-    _assert_gate_inference_consistency(slt_cfg, inference_cfg)
+    inference_cfg = resolve_inference(load_yaml(inference_config), language)
+    _inject_gate_geometry(slt_cfg, inference_cfg)
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     slt_cfg["target_lang"] = target_lang  # metric scoring level is declared, not sniffed (metrics.char_level_for_target)

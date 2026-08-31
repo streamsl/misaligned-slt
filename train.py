@@ -13,14 +13,14 @@ from models.checkpointing import save_model_checkpoint
 from train import distributed as dist
 from train.helpers import build_optimizer
 from train.sampler import WindowSampler
-from utils import checkpoint_dir, load_yaml, pick_device
+from utils import checkpoint_dir, load_yaml, pick_device, resolve_inference
 
 
 def smoke_data(args: argparse.Namespace) -> dict:
     data_cfg = load_yaml(args.data_config)
     slt_cfg = load_yaml(args.slt_config)
-    inference_cfg = load_yaml(args.inference_config)
     language = str(args.language or data_cfg.get("active_languages", ["asf"])[0])
+    inference_cfg = resolve_inference(load_yaml(args.inference_config), language, strict=False)
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(args.slt_config, language=language)
     records, splits = load_language_records(data_cfg, language, split=args.split)
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")

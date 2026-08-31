@@ -4,6 +4,7 @@ import yaml, re
 import torch
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
+GEOMETRY_KEY_PATHS = (("buffer_cap_s",), ("boundary_stability", "delta_enc_frames"), ("span_selection", "min_span_frames"))
 
 def pick_device(preferred: str | None = None):
     # TF32 matmuls for the fp32 residue outside AMP autocast (Ampere+; no-op elsewhere). 
@@ -59,6 +60,40 @@ def _deep_merge(base: dict, override: dict) -> dict: # `override` wins; nested d
     for key, value in override.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict): out[key] = _deep_merge(out[key], value)
         else: out[key] = value
+    return out
+
+
+def resolve_inference(cfg: dict, language: str, strict: bool = True) -> dict:
+    """Resolve inference.yaml's PER-LANGUAGE measured geometry to flat scalars for one language.
+
+    buffer_cap_s / boundary_stability.delta_enc_frames / span_selection.min_span_frames resolves ONCE, right after load; 
+    downstream readers keep seeing plain scalars. A scalar value passes through unchanged (language-independent pins,
+    synthetic test configs).
+    """
+    out = dict(cfg)
+    for key_path in GEOMETRY_KEY_PATHS:
+        parent, node = out, out
+        for key in key_path[:-1]:
+            if not isinstance(node.get(key), dict): node = None; break
+            parent[key] = dict(node[key])   # copy-on-write down the path; never mutate the caller's dict
+            parent, node = parent[key], parent[key]
+
+        if node is None: continue
+        leaf = node.get(key_path[-1])
+        if not isinstance(leaf, dict): continue   # scalar or absent: already resolved / code defaults apply
+        if str(language) not in {str(k) for k in leaf}:
+            # strict=False: bootstrap/smoke mode — drop the unresolved leaf so flat `.get(..., default)`
+            # fallbacks engage (delta-enc's FIRST pass on a new language has no Λ_min row yet, by construction).
+            if not strict:
+                node.pop(key_path[-1], None)
+                continue
+            raise SystemExit(
+                f"inference config has no {'.'.join(key_path)} entry for language {language!r} (has: "
+                f"{sorted(map(str, leaf))}). Run the B1 MEASURE stages for this language "
+                f"(`analyze.py --stage delta-enc` / `--stage buffer-cap`, with --write-config) — borrowing another "
+                f"language's measured geometry would be silent miscalibration."
+            )
+        node[key_path[-1]] = {str(k): v for k, v in leaf.items()}[str(language)]
     return out
 
 
@@ -129,26 +164,46 @@ def _load_yaml_raw(path: str | Path) -> dict:
 def update_yaml_scalar(path: str | Path, key_path: tuple[str, ...] | list[str], value) -> bool:
     """Replace one scalar in a YAML file in place, preserving layout and comments.
 
-    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires 
-    freezing the constant). Line-targeted: walks the indentation stack to `key_path`, rewriting only that 
+    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires
+    freezing the constant). Line-targeted: walks the indentation stack to `key_path`, rewriting only that
     value and keeping any inline comment.
+
+    If the FINAL key is missing but its parent mapping exists, the key is INSERTED as a new child line —
+    this is how a new language gets its per-language geometry row without hand-editing the file. Parents
+    are never created.
     """
     path = Path(path)
     lines = path.read_text(encoding="utf-8").splitlines()
-    target = tuple(key_path)
-    stack: list[tuple[int, str]] = []
-    for i, line in enumerate(lines):
-        match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", line)
-        if not match: continue
+    target = tuple(str(k) for k in key_path)
 
-        indent = len(match.group(1))
-        while stack and stack[-1][0] >= indent: stack.pop()
-        stack.append((indent, match.group(2)))
-        if tuple(key for _, key in stack) != target: continue
+    def walk(want: tuple) -> int | None:
+        stack: list[tuple[int, str]] = []
+        for i, line in enumerate(lines):
+            match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", line)
+            if not match: continue
+            indent = len(match.group(1))
+            while stack and stack[-1][0] >= indent: stack.pop()
+            stack.append((indent, match.group(2)))
+            if tuple(key for _, key in stack) == want: return i
+        return None
 
+    i = walk(target)
+    if i is not None:
+        match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", lines[i])
         rest = match.group(3)
         comment = f"  #{rest.split('#', 1)[1]}" if "#" in rest else ""
         lines[i] = f"{match.group(1)}{match.group(2)}: {value}{comment}"
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return True
+
+    if len(target) >= 2:
+        j = walk(target[:-1])
+        if j is not None:
+            parent_match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", lines[j])
+            rest = parent_match.group(3).split("#", 1)[0].strip()
+            if rest: return False   # parent holds a scalar/flow value, not a block mapping — refuse to corrupt it
+            child_indent = parent_match.group(1) + "    "
+            lines.insert(j + 1, f"{child_indent}{target[-1]}: {value}")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
     return False

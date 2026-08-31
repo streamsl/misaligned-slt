@@ -30,7 +30,7 @@ from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
 from infer.duration_decode import deployed_decode_tags, duration_decode_params, fit_duration_prior
 from metrics import bio_frame_metrics, moryossef_segment_metrics
-from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_pretrained
+from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference, resolve_pretrained
 
 
 class BioS1Model(nn.Module):
@@ -119,7 +119,7 @@ def build_bio_s1(
     _requested_language = language   # raw CLI value, before defaulting (pooled runs refuse it)
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
-    inference_cfg = load_yaml(inference_config)
+    inference_cfg = resolve_inference(load_yaml(inference_config), language, strict=False)
     # train_bio_s1_epochs re-reads these for the monitor's duration prior; record the CLI paths so a run with
     # non-default configs monitors under the same decode/data as the sampler it just built.
     cfg["inference_config"], cfg["data_config"] = str(inference_config), str(data_config)

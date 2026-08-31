@@ -29,7 +29,7 @@ from moryossef26.infer import duration_decode_tags, evaluate_segmenter_whole_vid
 from infer.duration_decode import duration_decode_params, fit_duration_prior
 from infer.stability import TAU_GRID, group_tracks, build_policies, score_policy
 from metrics import Segment, match_segments, moryossef_segment_metrics, segmentation_prf, compute_text_metrics, char_level_for_target
-from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_pretrained, pool_key, target_language
+from utils import checkpoint_dir, load_yaml, language_model_name, pick_device, resolve_inference, resolve_pretrained, pool_key, target_language
 
 
 @dataclass(frozen=True)
@@ -556,7 +556,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     )
     records_by_id = {record.video_id: record for record in records}
     device = pick_device(args.device)
-    inference_cfg = load_yaml(args.inference_config)
+    inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
     
     # Length-sorted batches keep padding minimal.
@@ -725,7 +725,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
-    inference_cfg = load_yaml(args.inference_config)
+    inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
     # Opt-in buffer-level semi-Markov duration decode (inference.yaml duration_decode: true, or per-language tuned
@@ -820,7 +820,7 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
-    inference_cfg = load_yaml(args.inference_config)
+    inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     device = pick_device(args.device)
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
 
@@ -880,7 +880,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
-    inference_cfg = load_yaml(args.inference_config)
+    inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     device = pick_device(args.device)
 
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
@@ -1063,7 +1063,7 @@ def _load_segmenter(args):
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
         # Chunked RoPE at the head's TRAINED context, in SECONDS: training windows clamp to buffer_cap_s (sampler.py), so eval chunks there 
         # too (wrapper converts to frames per stream fps). Larger chunks would attend over untrained context.
-        buffer_cap_s = float(load_yaml(args.inference_config).get("buffer_cap_s", 18.0))
+        buffer_cap_s = float(resolve_inference(load_yaml(args.inference_config), args.language, strict=False).get("buffer_cap_s", 30.06))
         velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s") or buffer_cap_s)
     else:
         from moryossef26.trainer import build_segmenter

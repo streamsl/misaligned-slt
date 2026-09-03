@@ -22,6 +22,13 @@ def move_to_device(value, device: torch.device):
     return value
 
 
+def resolve_lrs(cfg: dict) -> tuple[float, float]:
+    # (learning_rate, backbone_lr): top-level keys first, `optimizer.*` fallback; backbone_lr defaults to 0.3× learning_rate.
+    opt = cfg.get("optimizer", {}) or {}
+    lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
+    return lr, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.3)))
+
+
 def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Optimizer:
     """AdamW from a config, reading the SAME keys for every stage.
 
@@ -32,7 +39,7 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
     fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
     """
     opt = cfg.get("optimizer", {}) or {}
-    lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
+    lr, backbone_lr = resolve_lrs(cfg)
     weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
 
     # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): decaying norm gains regularizes the wrong
@@ -43,8 +50,7 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
                             {"params": [p for p in ps if p.ndim <= 1], "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
 
     groups = wd_split(params, lr)
-    if backbone_params is not None:
-        groups += wd_split(backbone_params, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.3))))
+    if backbone_params is not None: groups += wd_split(backbone_params, backbone_lr)
     # fused=True on CUDA: one multi-tensor kernel per step instead of a Python loop over ~800M trainable params.
     return torch.optim.AdamW(groups, lr=lr, fused=torch.cuda.is_available())
 
@@ -637,14 +643,15 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
 
     total_steps = max(1, int(epochs) * max(1, int(steps_per_epoch)))
     if sched_type in {"onecycle", "one_cycle", "adamw-onecycle"}:
-        max_lr = float(sched_cfg.get("max_lr", optimizer.param_groups[0]["lr"]))
+        # Per-group peaks: a scalar would drive backbone_lr groups to main rate. `max_lr` rescales all groups together.
+        base = [float(g["lr"]) for g in optimizer.param_groups]
+        max_lr = [lr * float(sched_cfg["max_lr"]) / base[0] for lr in base] if "max_lr" in sched_cfg else base
         pct_start = float(sched_cfg.get("pct_start", 0.1))
         div_factor = float(sched_cfg.get("div_factor", 25.0))
         final_div_factor = float(sched_cfg.get("final_div_factor", 1e4))
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=max_lr, total_steps=total_steps,
-            pct_start=pct_start, div_factor=div_factor,
-            final_div_factor=final_div_factor,
+            optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=pct_start, 
+            div_factor=div_factor, final_div_factor=final_div_factor,
         )
         return SchedulerBundle(scheduler=scheduler, interval="step")
 

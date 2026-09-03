@@ -11,7 +11,6 @@ from data.windowing import BIO
 
 from models.checkpointing import save_model_checkpoint
 from train import distributed as dist
-from train.helpers import build_optimizer
 from train.sampler import WindowSampler
 from utils import checkpoint_dir, load_yaml, pick_device, resolve_inference
 
@@ -96,7 +95,7 @@ if __name__ == "__main__":
         ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
     elif args.stage == "train-slt":
-        from train.slt import build_slt_components, train_slt_epochs
+        from train.slt import build_slt_components, build_slt_optimizer, train_slt_epochs
         # --language re-points ${language} in checkpoint.dir for training and the save below.
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
@@ -105,8 +104,7 @@ if __name__ == "__main__":
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         device = dist_device or pick_device(args.device)
-        # Skip frozen params; build_optimizer reads learning_rate/weight_decay (same keys every stage)
-        optimizer = build_optimizer(slt_cfg, [p for p in components.model.parameters() if p.requires_grad])
+        optimizer = build_slt_optimizer(slt_cfg, components.model)
         logs = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
             dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,

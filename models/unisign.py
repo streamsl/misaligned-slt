@@ -320,7 +320,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
             ignore_index=-100, label_smoothing=float(label_smoothing), reduction="none",
         ).reshape_as(labels)
         keep = (labels != -100).to(dtype=flat.dtype)
-        loss = (flat * keep).sum() / keep.sum().clamp(min=1)  # == the old flat-CE mean over non-ignored tokens
+        loss = (flat * keep).sum() / keep.sum().clamp(min=1)  # == flat-CE mean over non-ignored tokens
         if not row_stats: return loss
         # Detached per-row (summed loss, valid count) so one merged call can report a per-mode breakdown.
         return loss, (flat * keep).detach().sum(dim=1), keep.detach().sum(dim=1)

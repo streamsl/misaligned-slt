@@ -22,6 +22,7 @@ extends: baseline_eval.yaml
 
 epochs: 50
 learning_rate: 3.0e-4
+backbone_lr: 3.0e-4     # Uni-Sign's transfer recipe trains everything at ONE rate; the arms keep the 0.3x default.
 weight_decay: 1.0e-4
 scheduler:
     type: cosine

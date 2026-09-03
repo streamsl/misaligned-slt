@@ -40,6 +40,10 @@ class JitterSampler:
             )
         if source and Path(source).exists():
             data = json.loads(Path(source).read_text(encoding="utf-8"))
+            if str(data.get("split", "dev")) == "test": raise SystemExit(
+                f"jitter.source {source!r} was measured on the TEST split — refusing to use it as a training input. "
+                f"Point at the dev artifact (a_jitter_<arch>_<lang>_dev.json)."
+            )
             cuts = np.asarray(data.get("overseg_cut_positions", []), dtype=np.float32).reshape(-1)
             if cuts.size: cut_positions = cuts
             

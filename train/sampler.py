@@ -109,6 +109,9 @@ class WindowSampler:
         measured = None
         if source and Path(source).exists():
             loaded = json.loads(Path(source).read_text(encoding="utf-8"))
+            if str(loaded.get("split", "dev")) == "test": raise SystemExit(
+                f"mode_ratios.source {source!r} was measured on TEST split — refusing a test-measured training input; point at dev artifact."
+            )
             measured = loaded.get("mode_ratios", loaded)
         elif source: # An explicit ablation source must exist. The main method uses source: null and the fixed mix.
             raise FileNotFoundError(

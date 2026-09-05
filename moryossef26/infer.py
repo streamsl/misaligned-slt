@@ -11,6 +11,7 @@ import torch
 from data.loader import VideoRecord
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
+from models.bio_head import chunk_normalized_logits
 from moryossef26.dataset import append_velocity
 # Semi-Markov duration decode is OURS, not the Moryossef protocol; enters only via `duration_prior`
 # (None = faithful argmax, the default for `--segmenter-arch moryossef`).
@@ -50,20 +51,27 @@ def _phrase_logits(
     return out["phrase"] if isinstance(out, dict) else out.logits  # MoryossefSegmenter dict vs BIOHeadOutput
 
 
-def _set_rope_chunk(model, record, rope_chunk_s: float | None) -> None:
-    # S1 only: RoPE chunk = TRAINED context in SECONDS (= buffer_cap_s), converted to frames at the video's rate.
-    # Overlap-stitched (models/bio_head.chunked_rope_encode): contiguous chunks would decode every seam-straddling
-    # sentence from 2 truncated halves — an artifact of the stitching, not of the head. Window size stays the
-    # trained extent. The Moryossef arch never routes here; its released contiguous chunking is untouched.
-    if rope_chunk_s is not None and hasattr(model, "bio_head"):
-        model.bio_head.chunk_size = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
-        model.bio_head.chunk_overlap = True
+def whole_video_logits(model, record: VideoRecord, device: torch.device, velocity: bool, rope_chunk_s: float | None):
+    """One video's phrase logits (1,T,C) and timestamps; (None, timestamps) for an empty video. S1 head: raw poses 
+    normalized PER CHUNK at the trained context (the frame it trained on; models.bio_head.chunk_normalized_logits). 
+    Moryossef arch: its released protocol, whole-video normalization and contiguous chunks."""
+    if hasattr(model, "bio_head"):
+        if rope_chunk_s is None: raise ValueError("S1 whole-video pass needs rope_chunk_s (the trained context)")
+        raw, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
+        if raw.shape[0] == 0: return None, timestamps
+        chunk = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
+        model.bio_head.chunk_size, model.bio_head.chunk_overlap = chunk, True   # a chunk-length input is one RoPE pass
+        forward = lambda p, m, t: model(p, frame_mask=m, timestamps_s=t).logits
+        return chunk_normalized_logits(forward, raw, timestamps, chunk, device), timestamps
+    poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
+    if poses.shape[0] == 0: return None, timestamps
+    return _phrase_logits(model, poses, timestamps, device, velocity), timestamps
 
 
 @torch.no_grad()
 def predict_phrase_segments(
-    model, records: list[VideoRecord], device: torch.device,
-    velocity: bool = True, rope_chunk_s: float | None = None, duration_prior: DurationPrior | None = None,
+    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
+    rope_chunk_s: float | None = None, duration_prior: DurationPrior | None = None,
 ) -> dict[str, list[Segment]]:
     # Phrase segments per video for calibration and the RQ2 cascade. `duration_prior` from
     # fit_duration_prior(train records); semi-Markov is the validated default for whole-video use.
@@ -71,12 +79,10 @@ def predict_phrase_segments(
     predictions: dict[str, list[Segment]] = {}
 
     for record in records:
-        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
-        if poses.shape[0] == 0:
+        logits, timestamps = whole_video_logits(model, record, device, velocity, rope_chunk_s)
+        if logits is None:
             predictions[record.video_id] = []
             continue
-        _set_rope_chunk(model, record, rope_chunk_s)
-        logits = _phrase_logits(model, poses, timestamps, device, velocity)
         if duration_prior is not None: tags = duration_decode_tags(logits, float(record.pose.fps), duration_prior)
         else: tags = logits.argmax(dim=-1)[0].detach().cpu()
         predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
@@ -130,14 +136,13 @@ def evaluate_segmenter_whole_video(
     segments_by_video: dict[str, list[Segment]] = {}
 
     for record in records:
-        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
-        if poses.shape[0] == 0: continue
-        _set_rope_chunk(model, record, rope_chunk_s)
+        logits, timestamps = whole_video_logits(model, record, device, velocity, rope_chunk_s)
+        if logits is None: continue
         gold = make_bio_labels(
             timestamps, record.sentences, 0.0, float(record.pose.duration_s),
             trusted_gap_s=trusted_gap_s, video_duration_s=record.pose.duration_s,
         )
-        logits = _phrase_logits(model, poses, timestamps, device, velocity).detach().cpu()
+        logits = logits.detach().cpu()
         if duration_prior is not None:
             # Score the ACTUAL decode: one-hot the re-split tags into the same metric path. Binary frame metrics
             # are unchanged by construction (splits only relabel I<->B).

@@ -309,7 +309,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
     def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
         # Uni-Sign uses an external label-smoothed CE (models.py:300), not the model's internal loss. `omega_bias`
         # gates cross-attn via HF hooks (CrossAttnOmegaInjector), so the AR de-risk arm trains under the same Ω as
-        # the DLM arm and translation loss backprops into the BIO logits through Ω.
+        # the DLM arm; Ω is built from detached BIO logits (conditioning only).
         with self.ar_omega_context(omega_bias):
             out = self.lm_model(
                 encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -120,18 +121,45 @@ def chunked_rope_encode(
     chunk_size, T = int(chunk_size), x.shape[1]
     if not overlap: return torch.cat([run(s, min(T, s + chunk_size)) for s in range(0, T, chunk_size)], dim=1)
 
-    stride = max(1, chunk_size // 2)
-    margin = (chunk_size - stride) // 2  # context kept beyond each window's retained core
     out = torch.empty_like(x)
-    write_from, start = 0, 0
+    for start, end, write_from, keep_hi in overlap_windows(T, chunk_size):
+        out[:, write_from:keep_hi] = run(start, end)[:, write_from - start : keep_hi - start]
+    return out
+
+
+def overlap_windows(T: int, chunk_size: int) -> list[tuple[int, int, int, int]]:
+    """Overlap-stitched windows over T frames as (start, end, write_from, keep_hi): windows advance by half a chunk, each frame
+    keeps the estimate from the window where it is most interior (a quarter-chunk of context on both sides), and the last window
+    is right-aligned to the full trained extent. One rule for the RoPE chunking and for per-chunk pose normalization."""
+    chunk_size, T = int(chunk_size), int(T)
+    stride = max(1, chunk_size // 2)
+    margin = (chunk_size - stride) // 2
+    windows, write_from, start = [], 0, 0
     while write_from < T:
         end = min(T, start + chunk_size)
-        if end == T: start = max(0, T - chunk_size)  # right-align the final window: full trained extent
-        chunk = run(start, end)
+        if end == T: start = max(0, T - chunk_size)
         keep_hi = T if end == T else end - margin
-        out[:, write_from:keep_hi] = chunk[:, write_from - start : keep_hi - start]
-        write_from = keep_hi
-        start += stride
+        windows.append((start, end, write_from, keep_hi))
+        write_from, start = keep_hi, start + stride
+    return windows
+
+
+def chunk_normalized_logits(forward, raw_poses: np.ndarray, timestamps: np.ndarray, chunk_size: int | None, device) -> torch.Tensor:
+    """Whole-video BIO logits (1, T, C) with pose normalization PER CHUNK at the trained context. The Uni-Sign body scale is one
+    scalar over the frames it is given and the head trained on per-window scales, so a whole-video scale is a frame the head never
+    saw. `forward(poses (1,t,69,3), frame_mask (1,t), timestamps_s (1,t)) -> logits (1,t,C)`; windows and stitching follow
+    `overlap_windows`, so every frame is decoded from the window it is most interior to."""
+    from poses import normalize_keypoints_unisign
+    if raw_poses.ndim != 3 or raw_poses.shape[1:] != (133, 3): raise ValueError(f"raw (T,133,3) poses expected, got {raw_poses.shape}")
+    T = int(raw_poses.shape[0])
+    windows = [(0, T, 0, T)] if chunk_size is None or T <= int(chunk_size) else overlap_windows(T, int(chunk_size))
+    out = None
+    for start, end, write_from, keep_hi in windows:
+        poses = torch.as_tensor(normalize_keypoints_unisign(raw_poses[start:end]), dtype=torch.float32, device=device).unsqueeze(0)
+        ts = torch.as_tensor(timestamps[start:end], dtype=torch.float32, device=device).unsqueeze(0)
+        logits = forward(poses, torch.ones(poses.shape[:2], dtype=torch.bool, device=device), ts)
+        if out is None: out = logits.new_empty((1, T, int(logits.shape[-1])))
+        out[:, write_from:keep_hi] = logits[:, write_from - start : keep_hi - start]
     return out
 
 
@@ -198,7 +226,7 @@ class RoPEBIOHead(nn.Module):
     ):
         super().__init__()
         self.chunk_size = chunk_size
-        # Runtime flag, set by the whole-video S1 paths (_set_rope_chunk, run_offline): overlap-stitched chunking.
+        # Runtime flag, set by whole-video S1 paths (moryossef26.infer.whole_video_logits, eval.run_offline): overlap-stitched chunking.
         # False for training (windows fit one chunk; the flag is inert) and for the faithful Moryossef baseline.
         self.chunk_overlap = False
         self.input_proj = nn.Identity() if input_dim == hidden_dim else nn.Linear(input_dim, hidden_dim)

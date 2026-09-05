@@ -13,7 +13,9 @@ duration_decode_s1:
     ase: {split_bias: 7.25, snap_radius_s: 0.0, boundary_logit_weight: 0.75}  # outputs/tune_decode_s1_ase_dev.json
     asf: {split_bias: 10.0, snap_radius_s: 0.5, boundary_logit_weight: 2.0}   # outputs/tune_decode_s1_asf_dev.json
     bfi: {split_bias: 7.0, snap_radius_s: 1.0, boundary_logit_weight: 0.75}   # outputs/tune_decode_s1_bfi_dev.json
-    # Valid at the checkpoint's pinned rope_eval_chunk_s — re-tune if S1 is retrained.
+    # Valid at the checkpoint's pinned rope_eval_chunk_s AND under per-chunk pose normalization of the whole-video pass
+    # (models.bio_head.chunk_normalized_logits) — re-tune if S1 is retrained or that normalization changes. Every row here
+    # predates per-chunk normalization: re-run B1a per language before its rows 6/7 and segmenter-eval, then B1a' if snap or w moved.
 # The FSM's OWN triple, selected UNDER THE STREAMING DECODE (analyze.py --stage tune-stream): the buffer's last sentence
 # is right-censored, so the same split_bias is far more permissive than in the whole-video decode above. Read by the
 # FSM, the gate's anchor decode (training and eval) and delta-enc; missing row -> the whole-video triple, with a note.
@@ -32,7 +34,7 @@ duration_decode_moryossef:
 # train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
 buffer_cap_s:
     ase: 29.08
-    asf: 31.18
+    asf: 31.01   # train p99 29.68 + stride 1 + delta 8/24 (outputs/new/buffer_cap_asf.json; the arms in checkpoints/*/asf_new stamp it)
     bfi: 35.72
 boundary_stability:
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
@@ -46,7 +48,7 @@ boundary_stability:
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
         ase: 11
-        asf: 12
+        asf: 8
         bfi: 21
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
     # Fixed commit lag (seconds) for a terminator DECIDED BY DURATION (a B placed by the re-split): the causal split decision
@@ -55,7 +57,7 @@ boundary_stability:
     # streaming split bias; 0 = commit as soon as hysteresis passes.
     commit_lag_s:
         ase: 0.0
-        asf: 5.0
+        asf: 4.0
         bfi: 0.0
 
 span_selection:
@@ -67,7 +69,7 @@ span_selection:
     # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
     min_span_frames:
         ase: 12
-        asf: 13
+        asf: 9
         bfi: 22
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is

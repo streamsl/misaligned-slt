@@ -54,6 +54,9 @@ class WindowSample:
     # precedes the window edge is one the FSM already committed (the left edge mimics the post-commit cut). Sampler
     # bookkeeping, not a model belief; at inference the FSM supplies it from its commit log.
     commit_mask: np.ndarray | None = None
+    # Every complete, reliable, >= Lambda_min sentence inside the window (time order): the multi-sentence target pool of a
+    # Mode-1/3 window; empty for the other modes (P1: no text for a sentence the window does not show whole).
+    candidate_sentences: tuple[SentenceSpan, ...] = ()
 
 
 def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, trusted_gap_s: float) -> list[tuple[float, float]]:

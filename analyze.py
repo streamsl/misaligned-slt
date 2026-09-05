@@ -10,11 +10,11 @@ from tqdm import tqdm
 from data.loader import load_language_records
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
-
 from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
-from moryossef26.infer import _phrase_logits, _set_rope_chunk, predict_phrase_segments
+
+from moryossef26.infer import predict_phrase_segments, whole_video_logits
 from infer.commit_gate import bio_complete_spans, select_target_span
-from infer.stream import StreamingSLTRunner
+from infer.stream import S1RunnerAdapter, StreamingSLTRunner
 from infer.duration_decode import (
     DEPLOYED_SEGMENTER_ARCH, STREAM_DECODE_ARCH, decode_config_key, duration_split_grid, duration_decode_params, 
     fit_duration_prior, streaming_decode_params, streaming_split_tags
@@ -239,7 +239,8 @@ def segmenter_infer(args: argparse.Namespace) -> dict: # Upstream segmenter for 
     output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
     save_prediction_file(predictions, output, provenance={
         "segmenter_arch": args.segmenter_arch, "decode": "duration" if duration_prior else "plain",
-        "decode_hparams": dd if duration_prior else None, "checkpoint": checkpoint, "language": args.language, "split": args.split,
+        "pose_normalization": "chunk" if args.segmenter_arch == "s1" else "video", "decode_hparams": dd if duration_prior else None, 
+        "checkpoint": checkpoint, "language": args.language, "split": args.split,
     })
     return {
         "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, 
@@ -325,10 +326,9 @@ def tune_decode(args: argparse.Namespace) -> dict:
     cached = []  # (video_id, tags, pB, gold, fps)
     with torch.no_grad():
         for rec in records:
-            poses, timestamps = load_pose_window(rec.pose, 0.0, rec.pose.duration_s, normalize=True)
-            if poses.shape[0] == 0: continue
-            _set_rope_chunk(model, rec, rope_chunk_s)
-            logits = _phrase_logits(model, poses, timestamps, device, velocity)[0].float().cpu()
+            logits, timestamps = whole_video_logits(model, rec, device, velocity, rope_chunk_s)
+            if logits is None: continue
+            logits = logits[0].float().cpu()
             gold = torch.as_tensor(np.asarray(make_bio_labels(
                 timestamps, rec.sentences, 0.0, float(rec.pose.duration_s),
                 trusted_gap_s=TRUSTED_GAP_S, video_duration_s=rec.pose.duration_s
@@ -397,6 +397,7 @@ def tune_decode(args: argparse.Namespace) -> dict:
             "boundary_logit_weight": selected["boundary_logit_weight"]
         }}},
         "rope_eval_chunk_s": rope_chunk_s,  # s1 only; the trained context this tuning is valid at
+        "pose_normalization": "chunk" if args.segmenter_arch == "s1" else "video",
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -419,22 +420,6 @@ def tune_decode(args: argparse.Namespace) -> dict:
     return payload_out
 
 
-class _S1RunnerAdapter(torch.nn.Module): # Present BioS1Model to StreamingSLTRunner: FSM needs only pose tap + BIO head (gate off, no decoder).
-    def __init__(self, s1):
-        super().__init__()
-        self.s1 = s1
-        self.bio_head = s1.bio_head
-        self.duration_prior = None   # the runner writes the prior here (hasattr gate)
-        adapter = self
-        class _FrontEnd:
-            @staticmethod
-            def extract_bio_tap(poses, frame_mask, timestamps_s=None):
-                return adapter.s1.pose_encoder(poses, frame_mask), frame_mask, timestamps_s
-            @staticmethod
-            def prompt_length(): return 0
-        self.front_end = _FrontEnd()
-
-
 def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --write-config.
     """Select the FSM's decode triple UNDER THE STREAMING DECODE on dev (inference.yaml duration_decode_s1_stream.<lang>).
 
@@ -453,7 +438,7 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
     model, device, _, _, checkpoint = _load_segmenter(args)
     model.eval().to(device)
 
-    adapter = _S1RunnerAdapter(model).to(device)
+    adapter = S1RunnerAdapter(model).to(device)
     boundary = inference_cfg.get("boundary_stability", {}) or {}
     runner = StreamingSLTRunner(
         adapter, stride_s=float(inference_cfg.get("stride_s", 1.0)), buffer_cap_s=float(inference_cfg["buffer_cap_s"]),
@@ -526,7 +511,9 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
     block = decode_config_key(STREAM_DECODE_ARCH)
     payload = {
         "language": args.language, "split": args.split, "segmenter_arch": "s1", "checkpoint": checkpoint, "videos": len(records), 
-        "pose_normalization": "buffer", "selected": selected, "heldout_f1@0.5": heldout_f1, "grid": rows, "pin_as": {block: {
+        "pose_normalization": "buffer", "delta_enc_frames": int(boundary.get("delta_enc_frames", 0)),
+        "min_span_frames": lambda_min_frames(inference_cfg), "selected": selected, "heldout_f1@0.5": heldout_f1, 
+        "grid": rows, "pin_as": {block: {
             str(args.language): {k: selected[k] for k in ("split_bias", "snap_radius_s", "boundary_logit_weight")}
         }, "boundary_stability": {"commit_lag_s": {str(args.language): selected["commit_lag_s"]}}}
     }

@@ -414,9 +414,13 @@ class WindowSampler:
             realized = classify_anchor_visibility(rec.sentences[spec.anchor_index], spec.start_s, spec.end_s)
             if realized in {"right", "left", "both"} and realized != spec.subcase: spec = replace(spec, subcase=realized)
 
-        if spec.mode in {"mode1", "mode3"}: target = first_complete_span(
-            rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps, min_span_s=self.min_span_frames / rec.pose.fps
-        )
+        candidates: tuple = ()
+        if spec.mode in {"mode1", "mode3"}:
+            target = first_complete_span(rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps, min_span_s=self.min_span_frames / rec.pose.fps)
+            candidates = tuple( # Same completeness rule as first_complete_span: B inside, terminator inside, reliable, >= Lambda_min.
+                sp for sp in sorted(rec.sentences, key=lambda s: (s.start_s, s.end_s)) if getattr(sp, "reliable", True) 
+                and sp.end_s - sp.start_s >= self.min_span_frames / rec.pose.fps and sp.start_s >= spec.start_s and sp.end_s + eps <= spec.end_s
+            )
         elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
             target = None
             # Attach the CB full-evidence view ONLY if the WHOLE anchor fits in a ≤buffer_cap_s window. An over-cap anchor (buffer-cap-clip 
@@ -426,12 +430,11 @@ class WindowSampler:
             if anchor.end_s - anchor.start_s <= self.buffer_cap_s:
                 full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
 
-        # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. 
-        # In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content 
-        # the FSM already emitted — the gate floors it unconditionally (no cross-seam duplication). The ANCHOR itself straddling 
-        # the edge (Mode 2b) is the MISSED-HEAD case, NOT a commit: the FSM's commit log would show nothing there (χ=0 at inference), 
-        # so training mirrors it with χ=0 and leaves those frames to the trust-scaled wall/ramp — which is what lets translation vote
-        # to relocate a start (§2.6). Inference-parity of χ is the invariant; the anchor test enforces it.
+        # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. In the streaming 
+        # interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content FSM already emitted — the gate 
+        # floors it unconditionally (no cross-seam duplication). The ANCHOR itself straddling the edge (Mode 2b) is MISSED-HEAD case, NOT a commit: 
+        # FSM's commit log would show nothing there (χ=0 at inference), so training mirrors it with χ=0 and leaves those frames to the trust-scaled 
+        # wall/ramp — which is what lets translation vote to relocate a start. Inference-parity of χ is invariant; the anchor test enforces it.
         commit_mask = np.zeros((poses.shape[0],), dtype=bool)
         for span in rec.sentences:
             straddles = span.start_s < spec.start_s < span.end_s
@@ -440,7 +443,7 @@ class WindowSampler:
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, 
             frame_mask=frame_mask, spans=rec.sentences, translation_target=target, anchor_span=anchor_span, 
-            full_evidence_spec=full_evidence_spec, commit_mask=commit_mask,
+            full_evidence_spec=full_evidence_spec, commit_mask=commit_mask, candidate_sentences=candidates
         )
 
     @staticmethod
@@ -451,4 +454,8 @@ class WindowSampler:
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
             "anchor_span": asdict(sample.anchor_span) if sample.anchor_span else None,
             "full_evidence_spec": asdict(sample.full_evidence_spec) if sample.full_evidence_spec else None,
+            "candidate_sentences": [
+                {"start_s": float(sp.start_s - sample.spec.start_s), "end_s": float(sp.end_s - sample.spec.start_s), "text": sp.text} 
+                for sp in sample.candidate_sentences
+            ]
         }

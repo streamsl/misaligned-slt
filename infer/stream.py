@@ -5,6 +5,7 @@ import torch
 from data.windowing import BIO
 from poses import normalize_keypoints_unisign
 from infer.commit_gate import CommitGate, open_span_start, select_target_span
+from infer.count_split import split_span_by_text
 from infer.duration_decode import streaming_split_tags, window_fps
 from infer.stability import display_prefix
 
@@ -42,6 +43,23 @@ class StreamingEvent:
     # Cut landed on a certified BIO terminator (any complete span, forced or not); false only on the mid-sentence open-span cap path. Not 
     # `not flagged_partial`: also holds for forced COMPLETE spans & gating χ-restoration on it drops alternate sentences under cap pressure.
     terminator_commit: bool = False
+
+
+class S1RunnerAdapter(torch.nn.Module):
+    # Present a BioS1Model to StreamingSLTRunner: the FSM needs only the pose tap and the BIO head (gate off, no decoder).
+    def __init__(self, s1):
+        super().__init__()
+        self.s1 = s1
+        self.bio_head = s1.bio_head
+        self.duration_prior = None   # the runner writes the prior here (hasattr gate)
+        adapter = self
+        class _FrontEnd:
+            @staticmethod
+            def extract_bio_tap(poses, frame_mask, timestamps_s=None):
+                return adapter.s1.pose_encoder(poses, frame_mask), frame_mask, timestamps_s
+            @staticmethod
+            def prompt_length(): return 0
+        self.front_end = _FrontEnd()
 
 
 class StreamingSLTRunner:
@@ -178,7 +196,7 @@ class StreamingSLTRunner:
     @torch.no_grad()
     def step(
         self, poses: torch.Tensor, timestamps_s: torch.Tensor, end_s: float, last_commit_t: float = 0.0, force: bool = False
-    ) -> StreamingEvent | None:
+    ) -> StreamingEvent | list[StreamingEvent] | None:
         """One sawtooth stride over raw (T,133,3) poses in [last_commit_t, end_s).
 
         The buffer grows from the last commit cut, not a fixed trailing window, so a committed sentence is never re-emitted.
@@ -331,12 +349,35 @@ class StreamingSLTRunner:
         self._bump("committed")
         if forced: self._bump("forced_commit")
         self.commit_gate.reset()
-        return StreamingEvent(
-            start_s=float(start_s + ts_b[0, s_idx].item()), end_s=float(start_s + ts_b[0, term_idx].item()),
-            token_ids=tokens[0].detach().cpu(), token_confidence=confidence[0].detach().cpu(),
-            bio_start_index=s_idx, bio_end_index=term_idx, flagged_partial=forced, commit_time_s=float(end_s),
-            terminator_commit=True,  # complete span: the cut IS its terminator, forced or not
-        )
+        span_s, span_e = float(start_s + ts_b[0, s_idx].item()), float(start_s + ts_b[0, term_idx].item())
+        tok_cpu, conf_cpu = tokens[0].detach().cpu(), confidence[0].detach().cpu()
+        common = dict(bio_start_index=s_idx, bio_end_index=term_idx, flagged_partial=forced, commit_time_s=float(end_s),
+                      terminator_commit=True)  # complete span: the cut IS its terminator, forced or not
+        pieces = self._count_split(span_s, span_e, tok_cpu)
+        if pieces is None: return StreamingEvent(start_s=span_s, end_s=span_e, token_ids=tok_cpu, token_confidence=conf_cpu, **common)
+        self._bump("count_split")
+        return [
+            StreamingEvent(start_s=s, end_s=e, token_ids=torch.tensor(ids, dtype=torch.long), token_confidence=conf_cpu, **common) 
+            for s, e, ids in pieces
+        ]
+
+
+    def _count_split(self, span_s: float, span_e: float, tokens: torch.Tensor):
+        """Sentence-count split of a committed span (infer/count_split): the translation's sentence count is the merge readout;
+        the cut is proportional to the sentences' token counts; None when the text holds one sentence (or no tokenizer)."""
+        tokenizer = getattr(self.model, "tokenizer", None)
+        if not self.translate or tokens.numel() == 0 or not callable(getattr(tokenizer, "decode", None)): return None
+        text = tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
+        token_len = lambda t: len(tokenizer(t, add_special_tokens=False)["input_ids"])
+        fps = float(getattr(self, "_fps", 0.0) or 24.0)
+        pieces = split_span_by_text(span_s, span_e, text, token_len, float(self.min_span_frames) / fps)
+        if len(pieces) < 2: return None
+        if self._bio_timeline is not None:   # the seams the count decided are boundaries the FSM acted on
+            for s, _, _ in pieces[1:]:
+                k = int(round(s * fps))
+                if 0 <= k < self._bio_timeline.numel(): self._bio_timeline[k] = BIO["B"]
+        return [(s, e, tokenizer(t, add_special_tokens=False)["input_ids"]) for s, e, t in pieces]
+
 
     @torch.no_grad()
     def run(self, poses: torch.Tensor, fps: float) -> list[StreamingEvent]:
@@ -354,8 +395,12 @@ class StreamingSLTRunner:
         self._committed_until_s = 0.0  # χ commit log resets per stream
         self._committed_is_terminator = False
         self._bio_timeline = torch.full((poses.shape[0],), int(BIO["UNK"]), dtype=torch.long)  # stitched tags
+        self._fps = float(fps)
 
-        def absorb(event: StreamingEvent) -> None:
+        def absorb(event) -> None:
+            if isinstance(event, list):   # a count-split commit: k pieces in time order; chi and the cut follow the last one
+                for piece in event: absorb(piece)
+                return
             nonlocal last_commit_t
             events.append(event)
             # The ≤δ overlap the next buffer keeps must be attention-floored by membership gate (seam-duplication guard §2.7).

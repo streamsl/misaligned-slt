@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from data.windowing import BIO
 from sacrebleu import sentence_bleu
+import numpy as np
+import random
 import torch
 
 
@@ -231,7 +233,13 @@ _CJK_PUNCT_TABLE = str.maketrans({
 # document frequency, so it has no per-pair form for the RQ2 fusion, and reporting it in one table only
 # would make the two incomparable.
 _TEXT_KEYS = ("bleu4", "bleurt", "rougeL", "meteor")
+_DVC_KEYS = (*_TEXT_KEYS, "cider")  # CIDEr exists only per video corpus (densevid), never per pair (SODA)
+_DENSEVID_GARBAGE_SEED = 1337  # the original draws unseeded; we seed for reproducible tables (documented deviation)
 
+def char_level_for_target(target_lang: str | None) -> bool:
+    # Whether a target language is scored per CHARACTER (Uni-Sign `level='char'`) or per WORD.
+    code = str(target_lang or "").split("_")[0].lower()
+    return code in ("zh", "ja", "ko")  # languages scored per CHARACTER, by ISO prefix of `target_lang`
 
 def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizing metrics.
     out: list[str] = []
@@ -245,46 +253,11 @@ def _char_split_cjk(text: str) -> str: # Space CJK chars for whitespace-tokenizi
     return "".join(out).strip()
 
 
-def _rouge_l(hyps: list[str], refs: list[str]) -> float:
-    """ROUGE-L f-score (mean over sentences) via pltrdy `rouge` — Uni-Sign's package (`['rouge-l']['f']`,
-    whitespace-tokenized over the char-split strings), matching SLRT_metrics.translation_performance. HF
-    `evaluate`'s "rouge" is Google's rouge_score, whose ROUGE-L F differs (~1 pt on CJK) and is NOT comparable to
-    their 0.55 — fallback only. Empty hyp/ref scores 0 (pltrdy raises)."""
-    try:
-        from rouge import Rouge as _PltRouge
-        scorer = _PltRouge()
-        fs = []
-        for h, r in zip(hyps, refs):
-            if not h.strip() or not r.strip(): fs.append(0.0)
-            else: fs.append(float(scorer.get_scores(h, r)[0]["rouge-l"]["f"]))
-        return float(sum(fs) / len(fs)) if fs else 0.0
-    except Exception:
-        rouge = _load_evaluate_metric("rouge")
-        if rouge is None: return 0.0
-        try: return float(rouge.compute(predictions=hyps, references=refs, tokenizer=lambda t: t.split())["rougeL"])
-        except Exception: return 0.0
-
-
-def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> list[float]:
-    # Per-example BLEURT on RAW text (BleurtScorer.score is inherently per-example). No checkpoint / failure -> zeros.
-    if not checkpoint or not hyps: return [0.0] * len(hyps)
-    try:
-        from bleurt.score import BleurtScorer
-        return [float(x) for x in BleurtScorer(checkpoint).score(candidates=list(hyps), references=list(refs))]
-    except Exception: return [0.0] * len(hyps)
-
-
-def char_level_for_target(target_lang: str | None) -> bool:
-    # Whether a target language is scored per CHARACTER (Uni-Sign `level='char'`) or per WORD.
-    code = str(target_lang or "").split("_")[0].lower()
-    return code in ("zh", "ja", "ko")  # languages scored per CHARACTER, by ISO prefix of `target_lang`
-
-
 def _uni_sign_preprocess(
     predictions: list[str], references: list[str], char_level: bool | None = None,
 ) -> tuple[list[str], list[str], bool]:
     """Uni-Sign eval preprocessing (fine_tuning.py:284-288 + SLRT_metrics): word-level, or char-split with the
-    full-width→ASCII punctuation fold when `char_level`. Shared by corpus and per-pair scorers so both preprocess identically.
+    full-width→ASCII punctuation fold when `char_level`. Shared by corpus & per-pair scorers so both preprocess identically.
 
     `char_level=None` falls back to detecting CJK in the references — kept only so a caller that genuinely has no
     language context still works on a Chinese corpus. Every caller that knows its target language should PASS the
@@ -301,20 +274,66 @@ def _uni_sign_preprocess(
     return [_proc(p, False) for p in predictions], [_proc(r, True) for r in references], is_cjk
 
 
+def _rouge_l(hyps: list[str], refs: list[str]) -> float:
+    """ROUGE-L f-score (mean over sentences) via pltrdy `rouge` — Uni-Sign's package (`['rouge-l']['f']`, whitespace-tokenized 
+    over char-split strings), matching SLRT_metrics.translation_performance. HF `evaluate`'s "rouge" is Google's rouge_score, 
+    whose ROUGE-L F differs (~1 pt on CJK) and is NOT comparable to their 0.55. Empty hyp/ref scores 0 (pltrdy raises)."""
+    try:
+        from rouge import Rouge as _PltRouge
+        scorer = _PltRouge()
+        fs = []
+        for h, r in zip(hyps, refs):
+            if not h.strip() or not r.strip(): fs.append(0.0)
+            else: fs.append(float(scorer.get_scores(h, r)[0]["rouge-l"]["f"]))
+        return float(sum(fs) / len(fs)) if fs else 0.0
+    except Exception:
+        rouge = _load_evaluate_metric("rouge")
+        if rouge is None: return 0.0
+        try: return float(rouge.compute(predictions=hyps, references=refs, tokenizer=lambda t: t.split())["rougeL"])
+        except Exception: return 0.0
+
+
+def _cider_corpus(hyps: list[str], refs: list[str]) -> float:
+    try: # Official CIDEr-D (pycocoevalcap) over one video's pairs, as densevid_eval calls it; 0.0 with a warning if absent.
+        from pycocoevalcap.cider.cider import Cider
+    except Exception as e:
+        print(f"[metrics] WARNING: pycocoevalcap unavailable ({type(e).__name__}); densevid_cider reads 0.0", flush=True)
+        return 0.0
+    score, _ = Cider().compute_score({i: [r] for i, r in enumerate(refs)}, {i: [h] for i, h in enumerate(hyps)})
+    return float(score)
+
+
+def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> list[float]:
+    # Per-example BLEURT on RAW text (BleurtScorer.score is inherently per-example). No checkpoint / failure -> zeros.
+    if not checkpoint or not hyps: return [0.0] * len(hyps)
+    try:
+        from bleurt.score import BleurtScorer
+        return [float(x) for x in BleurtScorer(checkpoint).score(candidates=list(hyps), references=list(refs))]
+    except Exception: return [0.0] * len(hyps)
+
+
+def sentence_bleu_scores(hyps: list[str], refs: list[str], char_level: bool | None = None) -> list[float]:
+    """Smoothed sentence BLEU per pair under the shared preprocessing — the BLEU column of `_sentence_text_scores` alone.
+    The per-gold deployment score (report.py / analyze.py localized_bleu4) needs only this column."""
+    if not hyps: return []
+    pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs, char_level)
+    return [float(sentence_bleu(h, [r], tokenize="13a").score) for h, r in zip(pred_proc, ref_proc)]
+
+
 def _corpus_metric(name: str, predictions, references, *, key: str, **kw) -> float:
     # Load an `evaluate` metric and score it, returning 0.0 if the metric is unavailable or the compute fails.
     metric = _load_evaluate_metric(name)
     if metric is None: return 0.0
     try: return float(metric.compute(predictions=predictions, references=references, **kw)[key])
     except Exception: return 0.0
-
+    
 
 def _sentence_text_scores(
     hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", 
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", char_level: bool | None = None,
 ) -> list[dict[str, float]]:
-    """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. BLEU
-    here is smoothed sentence-BLEU: corpus BLEU pools across pairs and cannot be split per pair."""
+    """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. 
+    BLEU here is smoothed sentence-BLEU: corpus BLEU pools across pairs and cannot be split per pair."""
     if not hyps: return []
     pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs, char_level)
     bleu = [float(sentence_bleu(h, [r], tokenize=sacrebleu_tokenize).score) for h, r in zip(pred_proc, ref_proc)]
@@ -325,6 +344,55 @@ def _sentence_text_scores(
         float(meteor.compute(predictions=[h], references=[r])["meteor"]) for h, r in zip(pred_proc, ref_proc)
     ] if meteor is not None else [0.0] * len(hyps)
     return [dict(zip(_TEXT_KEYS, vals)) for vals in zip(bleu, bleurt, rouge, met)]
+
+
+def densevid_text_metrics(
+    pairs_by_video: dict[str, list[tuple[str, str | None]]], *, char_level: bool | None = None,
+    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "densevid",
+) -> dict[str, float]:
+    """The ORIGINAL densevid_eval protocol (ranjaykrishna/densevid_eval evaluate.py), mapped onto our metric set.
+
+    Faithful components, per tIoU threshold (the caller builds `pairs_by_video` for one threshold):
+      * MANY-TO-MANY pairing — every (prediction, gt) pair with tIoU >= threshold is ONE single-reference evaluation instance 
+        (a prediction overlapping k gold captions contributes k pairs);
+      * GARBAGE baseline — a prediction with no overlapping gt is scored against a random lowercase string of length 10..20 
+        (their `random_string(random.randint(10, 20))`; ref None in `pairs_by_video` marks these);
+      * PER-VIDEO scoring then MEAN over gold videos — a gold video with no predictions scores 0;
+      * the caller averages thresholds for the headline (our threshold_average does this for every text key).
+
+    Deviations, both deliberate and documented: the garbage rng is SEEDED, and tokenization is our shared Uni-Sign preprocessing + 
+    sacrebleu 13a instead of the PTB tokenizer, so the column is internally comparable with every other table in this codebase. 
+    BLEU-4 is corpus BLEU over the video's pairs (their COCO Bleu semantics); CIDEr-D is the official COCO scorer over the video's 
+    pairs (pycocoevalcap, IDF from that video's references — their Cider semantics); ROUGE-L/METEOR are per-pair means (COCO 
+    semantics); BLEURT is not in the original toolkit and follows the same per-pair mean, zeros without a checkpoint.
+
+    KNOWN PROPERTY, not a bug: the protocol is RECALL-BLIND — a missed gold caption never enters any pair, so it is uncharged. 
+    It is the headline (continuity with the previous paper); the SODA fusion is reported beside it because it charges misses.
+    """
+    rng = random.Random(_DENSEVID_GARBAGE_SEED)
+    _garbage = lambda: "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(10, 20)))
+    per_video: list[dict[str, float]] = []
+    for vid in sorted(pairs_by_video):
+        pairs = pairs_by_video[vid]
+        if not pairs:  # gold video with no predictions: original assigns 0 across scorers
+            per_video.append({k: 0.0 for k in _DVC_KEYS})
+            continue
+        hyps = [h for h, _ in pairs]
+        refs = [r if r is not None else _garbage() for _, r in pairs]
+        hyp_p, ref_p, _ = _uni_sign_preprocess(hyps, refs, char_level)
+        row = {
+            "bleu4": _corpus_metric("sacrebleu", hyp_p, [[r] for r in ref_p], key="score"),
+            "rougeL": float(np.mean([_rouge_l([h], [r]) for h, r in zip(hyp_p, ref_p)])),
+            "bleurt": float(np.mean(_bleurt_scores(hyps, refs, bleurt_checkpoint))),
+            "cider": _cider_corpus(hyp_p, ref_p),
+        }
+        meteor = _load_evaluate_metric("meteor")
+        row["meteor"] = float(np.mean([
+            meteor.compute(predictions=[h], references=[r])["meteor"] for h, r in zip(hyp_p, ref_p)
+        ])) if meteor is not None else 0.0
+        per_video.append(row)
+    if not per_video: return {f"{prefix}_{k}": 0.0 for k in _DVC_KEYS}
+    return {f"{prefix}_{k}": float(np.mean([r[k] for r in per_video])) for k in _DVC_KEYS}
 
 
 def compute_text_metrics(

@@ -96,9 +96,6 @@ membership_gate:
     # train/slt._inject_gate_geometry). A per-language value mirrored into this shared file is a stale-constant
     # hazard — there is deliberately no key to drift.
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    # Rebuild Ω from GT span when predicted target overlaps GT at IoU < this (train-only).
-    # Log gate_veto_rate — it should start near 0 and decay.
-    iou_veto: 0.5
     gt_anchored: false # always-GT ablation row (§3). Leave false for the on-policy method.
     # Gate warmup — hold the gate off for the first `warmup_epochs` so it never couples to an untrained head
     # (garbage conditioning, §1.2). Canonical flow: run `train.py --stage train-bio` FIRST → checkpoint.bio_head_init
@@ -168,7 +165,7 @@ jitter:
     # and sensitivity is MEASURED by the RQ1 sweep, not assumed from a proxy. The segmenter-error taxonomy stays in
     # the paper as evidence that real segmenters produce exactly these event types, inside the designed support.
     # MEASURED ABLATION: point `source` at the INDEPENDENT segmenter's artifact (never an `_s1_` file —
-    # self-calibration): outputs/a_jitter_moryossef_${language}.json. Laplace is the right family either way:
+    # self-calibration): outputs/a_jitter_moryossef_${language}_dev.json. Laplace is the right family either way:
     # measured offsets are leptokurtic (Laplace beats Gaussian in held-out log-lik on both edges).
     source: null
     fallback_laplace:
@@ -186,7 +183,7 @@ num_workers:
     # the per-window jitter/mode draws decorrelate. (configure_worker does NOT partition anchors — the index does.)
 # Uni-Sign initialization is already converged — its own 3e-4 is for fine-tuning from its stage-2 PRETRAIN checkpoint, 
 # and the closest analog to our setting (DMax adding OPUT to a converged model) uses 2e-6.
-learning_rate: 5.0e-5
+learning_rate: 1.0e-4
 weight_decay: 1.0e-4
 epochs: 50
 eval_every_epochs: 1
@@ -196,7 +193,6 @@ early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `che
     min_delta: 0.0
 scheduler:
     type: cosine
-    eta_min: 1.0e-6
     warmup_epochs: 0
 max_grad_norm: 1.0
 # Text canvas ceiling. Measured caption lengths: asf max 62, bfi max 96 tokens (mean ~15), so 128 truncates

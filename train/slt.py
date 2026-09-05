@@ -14,15 +14,17 @@ from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
-from train.helpers import mean_logs, move_to_device, run_epoch_loop
-from infer.duration_decode import duration_decode_params, fit_duration_prior
+from train.helpers import build_optimizer, mean_logs, move_to_device, resolve_lrs, run_epoch_loop
+from infer.duration_decode import STREAM_DECODE_KEY, duration_decode_params, fit_duration_prior, streaming_decode_params
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
-from utils import checkpoint_dir, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
+from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
 
 
 # DEFAULT S1 config. `checkpoint.bio_head_init: auto` resolves the S1 checkpoint through it, and the pool-provenance check reads its 
 # `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
+# The membership_gate keys stage 2 reads; delta / min_span_frames are injected from inference.yaml, never configured.
+GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "gt_anchored", "warmup_epochs"})
 
 
 @dataclass
@@ -35,17 +37,16 @@ class SLTComponents:
     checkpoint_meta: dict
 
 def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
-    """Derive the membership gate's δ/Λ_min from the RESOLVED per-language inference geometry — one source of truth.
+    # Derive the membership gate's δ/Λ_min from the RESOLVED per-language inference geometry — one source of truth.
+    # Injected whether or not the gate is enabled: the dev span metrics decode under the geometry the FSM deploys
+    # (delta, Lambda_min), and Omega reads these keys only when it is on.
+    gate = slt_cfg.setdefault("membership_gate", {})
+    # Every reader below uses .get() defaults, so a removed or misspelled key would silently train a different objective.
+    unknown = set(gate) - GATE_CONFIG_KEYS
+    if unknown: raise ValueError(f"membership_gate: unknown key(s) {sorted(unknown)}; accepted: {sorted(GATE_CONFIG_KEYS)}")
+    gate["delta"] = int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))
+    gate["min_span_frames"] = lambda_min_frames(inference_cfg)
 
-    The gate trains and deploys under the same geometry. It used to be MIRRORED into dlm.yaml and asserted equal,
-    but a mirror of a per-language value in a shared config is exactly the stale-constant hazard the per-language
-    inference schema removes — so the values are injected here at load and dlm.yaml carries none."""
-    gate = slt_cfg.get("membership_gate")
-    if not (gate or {}).get("enabled", False): return
-    delta_i = int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))
-    lam_i = inference_cfg.get("span_selection", {}).get("min_span_frames")
-    gate["delta"] = delta_i
-    gate["min_span_frames"] = delta_i + 1 if lam_i is None else int(lam_i)  # infer/stream.py's derivation
 
 def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
@@ -55,21 +56,47 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     nothing in the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
     """
     gate_cfg = slt_cfg.get("membership_gate", {}) or {}
+    learning_rate, backbone_lr = resolve_lrs(slt_cfg)  # effective rates, whichever key spelling the config used
     return {
         "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
-        "gate": {k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps", "gamma")},
+        "gate": {
+            **{k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps")},
+            # Effective value, as forward_loss reads it: an absent key and an explicit false are the same objective.
+            "gt_anchored": bool(gate_cfg.get("gt_anchored", False)),
+        },
         "buffer_cap_s": inference_cfg.get("buffer_cap_s"), "duration_decode": duration_decode_params(inference_cfg, language),
+        "stream_decode": streaming_decode_params(inference_cfg, language)[0],
         "mode_ratios": slt_cfg.get("mode_ratios"), "jitter": slt_cfg.get("jitter"),
         "bio_class_weights": slt_cfg.get("bio_class_weights"),  # resolved list, not the "balanced" string
         "lambda_bio": float(slt_cfg.get("lambda_bio", 1.0)), "lambda_trans": float(slt_cfg.get("lambda_trans", 1.0)),
-        "batch_size": slt_cfg.get("batch_size"), "learning_rate": slt_cfg.get("learning_rate"),
+        "batch_size": slt_cfg.get("batch_size"), "learning_rate": learning_rate, "backbone_lr": backbone_lr,
     }
+
 
 def _optional_int(value) -> int | None:
     return None if value is None else int(value)
 
 def _optional_float(value) -> float | None:
     return None if value is None else float(value)
+
+def build_slt_optimizer(slt_cfg: dict, model) -> torch.optim.Optimizer:
+    """Stage-2 optimizer: the warm-started pose encoder and, when it was loaded from S1, the BIO head at `backbone_lr`;
+    everything else (a random-init head included) at `learning_rate`.
+
+    Discriminative fine-tuning (same rule as stage 1): the LM-scale rate would overwrite what the segmentation objective
+    already adapted. Frozen parameters (freeze_backbone, lambda_bio 0) are in no group."""
+    head_from_s1 = bool(getattr(model, "bio_head_from_s1", False))
+    mods = [model.front_end.pose_encoder] + ([model.bio_head] if head_from_s1 else [])
+    pretrained = {id(p) for m in mods for p in m.parameters()}
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    backbone = [p for p in trainable if id(p) in pretrained]
+    main = [p for p in trainable if id(p) not in pretrained]
+    lr, backbone_lr = resolve_lrs(slt_cfg)
+    label = "S1-pretrained (pose_encoder+bio_head)" if head_from_s1 else "warm-started pose_encoder (bio_head random init, full lr)"
+    print(f"slt | optimizer: main {sum(p.numel() for p in main) / 1e6:.2f}M @ lr={lr:g} | {label} "
+          f"{sum(p.numel() for p in backbone) / 1e6:.2f}M @ backbone_lr={backbone_lr:g}", flush=True)
+    return build_optimizer(slt_cfg, main, backbone_params=backbone)
+
 
 def build_slt_components(
     data_config: str = "configs/data.yaml", slt_config: str = "configs/dlm.yaml", inference_config: str = "configs/inference.yaml",
@@ -92,9 +119,7 @@ def build_slt_components(
     prompt_lang = prompt_lang_for_target(target_lang)
     if "mbart" in lm_name.lower():
         tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
-        front_end = UniSignMBartFrontEnd(
-            mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer,
-        )
+        front_end = UniSignMBartFrontEnd(mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer)
     else:
         tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
@@ -156,9 +181,9 @@ def build_slt_components(
     # train-bio so S2 trains exactly one new thing — the coupling — and membership_gate.warmup_epochs can be 0.
     bio_init = slt_cfg.get("checkpoint", {}).get("bio_head_init")
     bio_cfg = load_yaml(bio_config, language=language)
-    # `auto` DERIVES the path via the same resolver every other consumer uses, so pooled S1 is found by its pool key instead of 
-    # a literal copied into this config. Hardcoded `checkpoints/bio_s1/multi_<pool>/model.pt` goes stale the moment `pretrain_languages` 
-    # changes, and if the old directory still exists stage 2 silently initialises the gate from the PREVIOUS pool's head.
+    # `auto` DERIVES the path via the same resolver every other consumer uses, so pooled S1 is found by its pool key instead 
+    # of a literal copied into this config. Hardcoded `checkpoints/bio_s1/multi_<pool>/model.pt` goes stale the moment 
+    # `pretrain_languages` changes, and stage 2 would silently initialise the gate from another pool's head.
     if str(bio_init).lower() == "auto": bio_init = str(Path(checkpoint_dir(bio_cfg, default="checkpoints/bio_s1")) / "model.pt")
     if float(slt_cfg.get("lambda_bio", 1.0)) == 0.0:
         if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)): raise SystemExit(
@@ -166,11 +191,11 @@ def build_slt_components(
             "lambda_bio: 0 skips the head's forward and leaves it untrained/frozen. Either train the head (lambda_bio > 0) "
             "or disable the gate (the clean-floor recipe does both)."
         )
-        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip S1 init entirely, head AND its pose encoder, 
-        # and freeze the head so the optimizer never sees it. forward_loss skips its forward, so the branch costs nothing. The floor 
-        # must stay the PRIOR-ART recipe: S1's encoder is adapted by SEGMENTATION objective, and transplanting it into translation-only 
-        # baseline would neither match the arms (which need it only so their BIO head meets the features it trained on) nor keep this 
-        # row a faithful Uni-Sign transfer. The mono-vs-multi S1 ablation is where the pool's contribution is measured.
+        # Clean-floor recipe (lambda_bio: 0 — baseline_train.yaml): no BIO branch. Skip S1 init entirely, head AND its pose 
+        # encoder, and freeze the head so the optimizer never sees it. forward_loss skips its forward, so the branch costs nothing. 
+        # The floor must stay the PRIOR-ART recipe: S1's encoder is adapted by SEGMENTATION objective, and transplanting it into 
+        # translation-only baseline would neither match the arms (which need it only so their BIO head meets features it trained on) 
+        # nor keep this row a faithful Uni-Sign transfer. The mono-vs-multi S1 ablation is where the pool's contribution is measured.
         for p in model.bio_head.parameters(): p.requires_grad_(False)
         # generate_from_poses skips the head's forward too: with the gate off nobody reads frozen-random logits.
         model.bio_branch_off = True
@@ -198,15 +223,26 @@ def build_slt_components(
             f"{bio_init} was trained on pool {_s1_meta.get('pretrain_pool')!r}, but bio_pretrain.yaml now expects "
             f"{_want!r}. Retrain S1 for this pool, or point checkpoint.bio_head_init at the matching model."
         )
+        # Context-coverage guard: this language's deployment cap must not exceed the S1 init's TRAINED RoPE context, 
+        # or every over-context S2 window stretches the pretrained range (the coverage rule pretrain_geometry documents). 
+        # Checked against the CHECKPOINT's stamp, not a config that can drift.
+        _s1_ctx = _s1_meta.get("rope_eval_chunk_s")
+        _cap = float(inference_cfg.get("buffer_cap_s", 0.0) or 0.0)
+        if _s1_ctx and _cap > float(_s1_ctx) + 1e-6: print(
+            f"slt | WARNING: buffer_cap_s {_cap:.2f}s for language {language!r} exceeds S1 init's trained context "
+            f"{float(_s1_ctx):.2f}s — raise pretrain_geometry.buffer_cap_s to cover it & retrain S1, or S2 trains "
+            f"the head beyond its pretrained RoPE range.", flush=True
+        )
         model.bio_head.load_state_dict(head_sd, strict=True)
-        # Carry S1's pose encoder so the head meets the features it trained on. No-op under S1 freeze_backbone:true 
-        # (== the released weights above); under false the head trained on the ADAPTED encoder and would meet features 
-        # it never saw (silent warm-start corruption).
+        model.bio_head_from_s1 = True   # build_slt_optimizer: the head takes backbone_lr only when loaded from S1
+        # Carry S1's pose encoder so the head meets the features it trained on. A no-op only when S1 froze an encoder
+        # warm-started from the SAME checkpoint as this run; with a trained S1 encoder (the shipped pooled recipe) the LM
+        # encoder meets pose features adapted by segmentation, a real init shift — stated in the log line below.
         pose_sd = {k[len("pose_encoder."):]: v for k, v in sd.items() if k.startswith("pose_encoder.")}
         if pose_sd: model.front_end.pose_encoder.load_state_dict(pose_sd, strict=True)
-        enc_note = (f"S1 pose encoder OVERRIDES the released warm-start ({len(pose_sd)} tensors) — deliberate: the head must "
-                    "meet the features it trained on (S1 features == S2 initial features); identical to the released weights "
-                    "when S1 ran freeze_backbone: true") if pose_sd else "S1 checkpoint carries no pose encoder"
+        enc_note = (f"S1 pose encoder OVERRIDES the warm-start ({len(pose_sd)} tensors) — deliberate: the head must meet the "
+                    "features it trained on (S1 features == S2 initial features); the LM encoder starts on these adapted "
+                    "features, not the ones it was fine-tuned on") if pose_sd else "S1 checkpoint carries no pose encoder"
         print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); {enc_note}", flush=True)
     elif bio_init:
         # Fail loud, mirroring the mode_ratios.source guard: bio_head_init is cwd-relative, so a wrong-cwd launch
@@ -225,17 +261,21 @@ def build_slt_components(
     print(f"slt | model: {total_params / 1e6:.2f}M parameters ({trainable_params / 1e6:.2f}M trainable, "
           f"{(total_params - trainable_params) / 1e6:.2f}M frozen)", flush=True)
           
-    # Gate-side duration decode (inference.yaml duration_decode — the switch the streaming FSM reads):
-    # build_gate_omega re-splits merged back-to-back runs, so stage-2 trains on the tag stream deployment gates
-    # on (§1.3 on-policy symmetry). Prior fit on TRAIN captions only; no-op when the gate is off.
-    if bool(slt_cfg.get("membership_gate", {}).get("enabled", False)):
-        params = duration_decode_params(inference_cfg, language)
+    # Gate-side duration decode (inference.yaml duration_decode — the switch the streaming FSM reads): build_gate_omega re-splits 
+    # merged back-to-back runs, so stage-2 trains on the tag stream deployment gates on (§1.3 on-policy symmetry). Prior fit on TRAIN 
+    # captions only. The deployed streaming decode (the FSM's triple) rides on the model for every arm that trains a head: the gate's 
+    # anchor decode reads it (on-policy symmetry, spec §1.3), gate on or off.
+    if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0:
+        params, params_block = streaming_decode_params(inference_cfg, language)
+        if params is not None and params_block != STREAM_DECODE_KEY: 
+            print(f"slt | NOTE: no {STREAM_DECODE_KEY} row — the head decodes under whole-video triple; run tune-stream first", flush=True)
         if params is not None:
             model.duration_prior = fit_duration_prior(train_records, **params)
             if model.duration_prior is not None:
                 p = model.duration_prior
                 print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s "
-                      f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g}", flush=True)
+                      f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g} boundary_logit_weight={p.boundary_logit_weight:g}"
+                      + (" (w=0: text-judged split loss has no seam to train)" if p.boundary_logit_weight == 0.0 else ""), flush=True)
     return SLTComponents(
         model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg,
         checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language),
@@ -257,32 +297,18 @@ def evaluate_slt(
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
 
-    # Score dev under the SAME gate/CB state the epoch trained under: during warmup the decoder has never seen Ω
-    # or the CB self-target, so either one on reports an untrained objective and burns a CB decode on
-    # untrustworthy targets. cb_active=None (standalone eval) = full objective.
+    # Score dev under SAME gate/CB state the epoch trained under: during warmup decoder has never seen Ω or the CB self-target, so either 
+    # one on reports an untrained objective & burns a CB decode on untrustworthy targets. cb_active=None (standalone eval) = full objective.
     gate_on = bool(gate_cfg.get("enabled", False)) if gate_active is None else bool(gate_active)
     cb_on = True if cb_active is None else bool(cb_active)
-    # Every gate knob training passes — otherwise dev loss is computed under forward_loss's DEFAULTS (iou_veto 0.5,
-    # gt_anchored False) while training used the config, so val_loss is not comparable to train_loss and the
-    # gt_anchored ablation's dev numbers are silently ungated.
-    # Split by what the knob NEEDS, not by convenience. `iou_veto` and `gt_anchored` both read bio_labels, so they
-    # exist only where GT exists — the loss. Inference selects the anchor on-policy from the head's own argmax
-    # (bio_labels=None, no veto), so passing them to a generate path is meaningless and lands them in
-    # **decode_kwargs -> generate_from_bio_tap -> TypeError.
     gate_kwargs = dict(
         gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
         gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
     )
-    gate_loss_kwargs = dict(
-        gate_kwargs,
-        gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
-        gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)),
-    )
+    gate_loss_kwargs = dict(gate_kwargs, gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)))
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     validation_cfg = slt_cfg.get("validation", {})
-    # <= 0: translate ALL supervised dev windows (default).
-    max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0)
-
+    max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0) # <= 0: translate ALL supervised dev windows.
     pred_texts: list[str] = []
     ref_texts: list[str] = []
     for batch in loader:
@@ -309,8 +335,7 @@ def evaluate_slt(
             cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
             cb_spd_revision=bool(confidence_cfg.get("revision", spd_cfg.get("revision", True))),
-            cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
-            **gate_loss_kwargs,
+            cb_temperature=float(dcd_cfg.get("temperature", 0.0)), **gate_loss_kwargs,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
         if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0 and output.bio_logits is not None:
@@ -318,9 +343,9 @@ def evaluate_slt(
             # was pure recompute. forward_loss already passes frame_mask, so padded frames never enter conv stem / RoPE as real frames.
             bio_logits = output.bio_logits
             row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
-            # Moryossef-style span metrics (frame + segment F1/IoU) under inference decode (runs split at interior
-            # Bs), so dev tracks span quality — what RQ2 streaming needs — not just per-frame BIO accuracy.
-            # Skipped at lambda_bio=0: the head is frozen at random init, so its metrics are noise.
+            # Moryossef-style span metrics (frame + segment F1/IoU) under infer decode (runs split at interior Bs), so dev tracks span 
+            # quality — what RQ2 streaming needs — not just per-frame BIO accuracy. Skipped at lambda_bio=0: the head is frozen at 
+            # random init, so its metrics are noise.
             row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
         rows.append(row)
 
@@ -435,7 +460,6 @@ def train_slt_epochs(
             gate_delta=int(gate_cfg.get("delta", 3)),
             gate_eps=float(gate_cfg.get("eps", 1e-4)),
             gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
-            gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
             gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)),
         )
         return output.loss, {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}

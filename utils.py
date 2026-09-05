@@ -4,7 +4,19 @@ import yaml, re
 import torch
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
-GEOMETRY_KEY_PATHS = (("buffer_cap_s",), ("boundary_stability", "delta_enc_frames"), ("span_selection", "min_span_frames"))
+GEOMETRY_KEY_PATHS = (
+    ("buffer_cap_s",), ("boundary_stability", "delta_enc_frames"), 
+    ("span_selection", "min_span_frames"), ("boundary_stability", "commit_lag_s")
+)
+# Per-language rows with a valid code default: resolved when present, dropped when missing, so the stage  that writes them 
+# can run first. commit_lag_s = 0.0 means "commit as soon as hysteresis passes".
+SOFT_KEY_PATHS = frozenset({("boundary_stability", "commit_lag_s")})
+
+def lambda_min_frames(inference_cfg: dict) -> int:
+    # Lambda_min: span_selection.min_span_frames, else delta+1 (infer/stream.py's own derivation).
+    ss = (inference_cfg or {}).get("span_selection") or {}
+    bs = (inference_cfg or {}).get("boundary_stability") or {}
+    return int(ss.get("min_span_frames", int(bs.get("delta_enc_frames", 3)) + 1))
 
 def pick_device(preferred: str | None = None):
     # TF32 matmuls for the fp32 residue outside AMP autocast (Ampere+; no-op elsewhere). 
@@ -84,14 +96,14 @@ def resolve_inference(cfg: dict, language: str, strict: bool = True) -> dict:
         if str(language) not in {str(k) for k in leaf}:
             # strict=False: bootstrap/smoke mode — drop the unresolved leaf so flat `.get(..., default)`
             # fallbacks engage (delta-enc's FIRST pass on a new language has no Λ_min row yet, by construction).
-            if not strict:
+            if not strict or key_path in SOFT_KEY_PATHS:
                 node.pop(key_path[-1], None)
                 continue
+            writer = "--stage buffer-cap" if key_path == ("buffer_cap_s",) else "--stage delta-enc"
             raise SystemExit(
                 f"inference config has no {'.'.join(key_path)} entry for language {language!r} (has: "
-                f"{sorted(map(str, leaf))}). Run the B1 MEASURE stages for this language "
-                f"(`analyze.py --stage delta-enc` / `--stage buffer-cap`, with --write-config) — borrowing another "
-                f"language's measured geometry would be silent miscalibration."
+                f"{sorted(map(str, leaf))}). Run `analyze.py {writer} --language {language} --write-config` "
+                f"first — borrowing another language's measured geometry would be silent miscalibration."
             )
         node[key_path[-1]] = {str(k): v for k, v in leaf.items()}[str(language)]
     return out
@@ -124,18 +136,17 @@ def resolve_placeholders(cfg: dict) -> dict:
 def load_yaml(path: str | Path, language: str | None = None) -> dict:
     """Load a YAML config, resolving an optional `extends:` key and `${key}` placeholders.
 
-    `extends` (path or list, relative to the child) is deep-merged under the child by `_load_yaml_raw`: `ar.yaml`
-    inherits the whole `dlm.yaml` recipe and overrides only the decoder + output dir, so the AR-vs-DLM comparison
-    isolates the decoder alone. `${key}` then resolves from the merged config's own top-level scalars.
+    `extends` (path or list, relative to the child) is deep-merged under the child by `_load_yaml_raw`: `ar.yaml` inherits 
+    the whole `dlm.yaml` recipe and overrides only the decoder + output dir, so AR-vs-DLM comparison isolates the decoder 
+    alone. `${key}` then resolves from the merged config's own top-level scalars.
 
-    `language` overrides the config's own `language:` BEFORE resolution, so one `--language asf` re-points BOTH
-    the active dataset AND every `${language}`-templated path without editing the shared configs.
+    `language` overrides the config's own `language:` BEFORE resolution, so one `--language asf` re-points BOTH the active 
+    dataset AND every `${language}`-templated path without editing the shared configs.
 
-    `${corpus}` names the TRAINING CORPUS a checkpoint is a function of: the pool key on a pooled segmentation
-    run (`pretrain_languages` set), else the language. Segmentation-trainer configs template checkpoint/wandb
-    paths with it, so one file is correct for the pooled and the monolingual recipe with no path rewriting in
-    code. Derived before resolution, so it always agrees with the run's actual `pretrain_languages`; with
-    neither a pool nor a language, `${corpus}` stays literal and fails visibly rather than open.
+    `${corpus}` names TRAINING CORPUS a checkpoint is function of: pool key on pooled segmentation run (`pretrain_languages` 
+    set), else the language. Segmentation-trainer configs template checkpoint/wandb paths with it, so 1 file is correct for 
+    the pooled and monolingual recipe without path rewriting in code. Derived before resolution, so it always agrees with 
+    the run's actual `pretrain_languages`; with neither pool nor language, `${corpus}` stays literal and fails visibly.
     """
     merged = _load_yaml_raw(Path(path))
     if language is not None: merged["language"] = str(language)
@@ -164,13 +175,11 @@ def _load_yaml_raw(path: str | Path) -> dict:
 def update_yaml_scalar(path: str | Path, key_path: tuple[str, ...] | list[str], value) -> bool:
     """Replace one scalar in a YAML file in place, preserving layout and comments.
 
-    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml (the spec requires
-    freezing the constant). Line-targeted: walks the indentation stack to `key_path`, rewriting only that
-    value and keeping any inline comment.
+    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml. Line-targeted: walks the indentation 
+    stack to `key_path`, rewriting only that value and keeping any inline comment.
 
-    If the FINAL key is missing but its parent mapping exists, the key is INSERTED as a new child line —
-    this is how a new language gets its per-language geometry row without hand-editing the file. Parents
-    are never created.
+    If the FINAL key is missing but its parent mapping exists, the key is INSERTED as a new child line — this is how a new 
+    language gets its per-language geometry row without hand-editing the file. Parents are never created.
     """
     path = Path(path)
     lines = path.read_text(encoding="utf-8").splitlines()

@@ -15,6 +15,8 @@ from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import build_optimizer, mean_logs, move_to_device, resolve_lrs, run_epoch_loop
+
+from infer.count_split import clean_text, split_sentences
 from infer.duration_decode import STREAM_DECODE_KEY, duration_decode_params, fit_duration_prior, streaming_decode_params
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
 from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
@@ -24,7 +26,7 @@ from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_n
 # `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
 # The membership_gate keys stage 2 reads; delta / min_span_frames are injected from inference.yaml, never configured.
-GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "gt_anchored", "warmup_epochs"})
+GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "iou_veto", "gt_anchored", "warmup_epochs"})
 
 
 @dataclass
@@ -48,7 +50,7 @@ def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
     gate["min_span_frames"] = lambda_min_frames(inference_cfg)
 
 
-def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
+def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str, kd: bool | None = None) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
 
     δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by buffer-cap, the decode triple by tune-decode, and jitter 
@@ -59,8 +61,13 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     learning_rate, backbone_lr = resolve_lrs(slt_cfg)  # effective rates, whichever key spelling the config used
     return {
         "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
+        # KD to the S1 init when one is configured and the head trains; CE + Dice otherwise (no S1 init, or lambda_bio 0).
+        "bio_objective": "kd_s1" if (kd if kd is not None else bool((slt_cfg.get("checkpoint", {}) or {}).get("bio_head_init")) 
+                                     and float(slt_cfg.get("lambda_bio", 1.0)) != 0.0) else "ce_dice",
+        "bio_distill": {k: float((slt_cfg.get("bio_distill", {}) or {}).get(k, d)) for k, d in (("alpha", 0.2), ("temperature", 2.0))},
         "gate": {
             **{k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps")},
+            "iou_veto": float(gate_cfg.get("iou_veto", 0.5)),
             # Effective value, as forward_loss reads it: an absent key and an explicit false are the same objective.
             "gt_anchored": bool(gate_cfg.get("gt_anchored", False)),
         },
@@ -244,6 +251,19 @@ def build_slt_components(
                     "features it trained on (S1 features == S2 initial features); the LM encoder starts on these adapted "
                     "features, not the ones it was fine-tuned on") if pose_sd else "S1 checkpoint carries no pose encoder"
         print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); {enc_note}", flush=True)
+        # Frozen S1 copy = the stage-2 segmentation target (models.streaming_slt.forward_loss -> train.losses.bio_distill_loss).
+        # Non-registered attribute: absent from model.pt, the optimizer and model.train(); moved to the batch device on first use.
+        from train.bio_pretrain import BioS1Model
+        teacher = BioS1Model(   # same shape keys build_bio_s1_model reads; no released-checkpoint read, S1 state fills every tensor
+            pose_hidden_dim=int(bio_cfg.get("pose_hidden_dim", 256)), feat_dim=int(bio_cfg.get("feat_dim", 768)),
+            bio_hidden_dim=int(bio_cfg.get("bio_hidden_dim", 384)), bio_depth=int(bio_cfg.get("bio_depth", 4)),
+            bio_nhead=int(bio_cfg.get("bio_nhead", 8)), bio_dropout=float(bio_cfg.get("bio_dropout", 0.1)),
+            bio_conv_stem_layers=int(bio_cfg.get("bio_conv_stem_layers", 2)), freeze_encoder=True,
+        )
+        teacher.load_state_dict(sd, strict=True); teacher.eval(); teacher.requires_grad_(False)
+        object.__setattr__(model, "bio_teacher", teacher)
+        print(f"slt | stage-2 BIO objective: KL to the frozen S1 posteriors "
+              f"({sum(q.numel() for q in teacher.parameters()) / 1e6:.2f}M teacher params, no grad)", flush=True)
     elif bio_init:
         # Fail loud, mirroring the mode_ratios.source guard: bio_head_init is cwd-relative, so a wrong-cwd launch
         # (Colab default dir) would otherwise silently train the gate against a random-init head.
@@ -273,12 +293,11 @@ def build_slt_components(
             model.duration_prior = fit_duration_prior(train_records, **params)
             if model.duration_prior is not None:
                 p = model.duration_prior
-                print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s "
-                      f"split_bias={p.split_bias:g} snap_radius_s={p.snap_radius_s:g} boundary_logit_weight={p.boundary_logit_weight:g}"
-                      + (" (w=0: text-judged split loss has no seam to train)" if p.boundary_logit_weight == 0.0 else ""), flush=True)
+                print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s split_bias="
+                      f"{p.split_bias:g} snap_radius_s={p.snap_radius_s:g} boundary_logit_weight={p.boundary_logit_weight:g}", flush=True)
     return SLTComponents(
         model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg,
-        checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language),
+        checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language, kd=getattr(model, "bio_teacher", None) is not None),
     )
 
 
@@ -296,6 +315,7 @@ def evaluate_slt(
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
+    distill_cfg = slt_cfg.get("bio_distill", {}) or {}
 
     # Score dev under SAME gate/CB state the epoch trained under: during warmup decoder has never seen Ω or the CB self-target, so either 
     # one on reports an untrained objective & burns a CB decode on untrustworthy targets. cb_active=None (standalone eval) = full objective.
@@ -305,12 +325,17 @@ def evaluate_slt(
         gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
         gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
     )
-    gate_loss_kwargs = dict(gate_kwargs, gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)))
+    gate_loss_kwargs = dict(
+        gate_kwargs, gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)), gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
+        bio_distill_alpha=float(distill_cfg.get("alpha", 0.2)), bio_distill_temperature=float(distill_cfg.get("temperature", 2.0)),
+    )
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     validation_cfg = slt_cfg.get("validation", {})
     max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0) # <= 0: translate ALL supervised dev windows.
     pred_texts: list[str] = []
     ref_texts: list[str] = []
+    count_rows: list[tuple[int, int]] = []   # (sentences in the target, sentences in the decode) per supervised, non-vetoed dev window
+    n_count_vetoed = 0
     for batch in loader:
         batch = move_to_device(batch, device)
         output: SLTLossOutput = model.forward_loss(
@@ -347,6 +372,10 @@ def evaluate_slt(
             # quality — what RQ2 streaming needs — not just per-frame BIO accuracy. Skipped at lambda_bio=0: the head is frozen at 
             # random init, so its metrics are noise.
             row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase"))
+            # Same metrics for the frozen S1 teacher on the same windows: val_phrase_* minus val_teacher_phrase_* is the
+            # measured departure of the trained head from its anchor.
+            if output.teacher_logits is not None:
+                row.update(moryossef_segment_metrics(output.teacher_logits, batch["bio_labels"], prefix="teacher_phrase"))
         rows.append(row)
 
         cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples
@@ -380,18 +409,31 @@ def evaluate_slt(
                         dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
                         **gate_kwargs,
                     )
-                    pred_texts.extend(model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True))
-                    for item_idx in idx.detach().cpu().tolist():
-                        target = targets[int(item_idx)]
-                        if isinstance(target, dict): ref_texts.append(str(target.get("text", "")))
-                        else: ref_texts.append(str(getattr(target, "text", "")))
+                    decoded = model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True)
+                    pred_texts.extend(decoded)
+                    for j, item_idx in enumerate(idx.detach().cpu().tolist()):
+                        if output.target_texts is not None: ref_texts.append(str(output.target_texts[int(item_idx)]))
+                        else:
+                            target = targets[int(item_idx)]
+                            ref_texts.append(str(target.get("text", "")) if isinstance(target, dict) else str(getattr(target, "text", "")))
+                        if output.target_counts is not None:
+                            # The dev decode is on-policy (never vetoed); a vetoed row's target follows the GT mask, so its count says
+                            # nothing about the decoder. Readouts run over rows where decode and target share the mask.
+                            if output.vetoed is not None and bool(output.vetoed[int(item_idx)]): n_count_vetoed += 1
+                            else: count_rows.append((int(output.target_counts[int(item_idx)]), len(split_sentences(decoded[j]))))
 
     if was_training: model.train()
     metrics = mean_logs(rows, prefix="val")
     if pred_texts:
+        pred_texts = [clean_text(t) or "" for t in pred_texts]; ref_texts = [clean_text(t) or "" for t in ref_texts]  # separator never scored
         metrics.update(compute_text_metrics(
             pred_texts, ref_texts, prefix="val_translation", char_level=char_level_for_target(slt_cfg.get("target_lang"))
         ))
+        # Count readouts (the merge alarm): does the decode hold >= 2 sentences exactly when the target does?
+        multi = [pk >= 2 for k, pk in count_rows if k >= 2]; single = [pk >= 2 for k, pk in count_rows if k == 1]
+        if count_rows or n_count_vetoed: metrics["val_count_vetoed_share"] = float(n_count_vetoed / max(1, len(count_rows) + n_count_vetoed))
+        if multi: metrics["val_count_recall"] = float(sum(multi) / len(multi))
+        if single: metrics["val_count_false_alarm"] = float(sum(single) / len(single))
         # Hyp/ref length ratio (BLEU brevity-penalty input, char-level for CJK): early-EOS diagnostic — < 1 and FALLING across epochs 
         # means the decode commits EOS ever earlier (eos_supervision / commit-threshold pressure), which BLEU/CIDEr punish as brevity.
         # WORD tokens, matching BLEU's BP. Characters disagree with it materially, so char ratio reads healthy while BLEU is penalised.
@@ -460,13 +502,14 @@ def train_slt_epochs(
             gate_delta=int(gate_cfg.get("delta", 3)),
             gate_eps=float(gate_cfg.get("eps", 1e-4)),
             gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
-            gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)),
+            gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)), gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
+            bio_distill_alpha=float((slt_cfg.get("bio_distill", {}) or {}).get("alpha", 0.2)),
+            bio_distill_temperature=float((slt_cfg.get("bio_distill", {}) or {}).get("temperature", 2.0)),
         )
         return output.loss, {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
 
     def evaluate_fn(epoch: int): # Same gate/CB warmup state the epoch trained under (see evaluate_slt).
-        return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg,
-                            gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
+        return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg, gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
 
     return run_epoch_loop(
         name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device, epochs=epochs,

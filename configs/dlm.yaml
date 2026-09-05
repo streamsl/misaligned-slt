@@ -6,9 +6,9 @@ language_model:
     name: google/mt5-base
 checkpoint:
     dir: checkpoints/dlm/${language} # best model.pt + best.json saved here
-    # S1 BIO-head init (train.py --stage train-bio): pre-trained on frozen Uni-Sign features with same window sampler. 
-    # With it present, set membership_gate.warmup_epochs: 0 — the gate couples to a competent head from step one 
-    # (docs/membership_gate.md §1.4). Missing file with the gate ENABLED → hard FileNotFoundError (train/slt.py); 
+    # S1 BIO-head init (train.py --stage train-bio): head AND pose encoder pre-trained together (encoder at backbone_lr)
+    # under same window sampler. With it present, set membership_gate.warmup_epochs: 0 — gate couples to competent head 
+    # from step 1 (docs/membership_gate.md §1.4). Missing file with gate ENABLED → hard FileNotFoundError (train/slt.py); 
     # warning + fresh head only with the gate off, or set bio_head_init: null AND membership_gate.warmup_epochs >= 2.
     # Multilingual SEGMENTATION pretraining (configs/bio_pretrain.yaml pretrain_languages) writes ONE
     # language-agnostic checkpoint under checkpoints/bio_s1/multi_<pool>/. Point here for the monolingual
@@ -86,7 +86,8 @@ membership_gate:
     # Condition the DLM decoder on the BIO head's segmentation belief (docs/membership_gate.md): an additive,
     # query-independent bias Ω(t) on cross-attention = γ·ln(m∨ε)+ln(1−χ+ε). This is the ONLY channel by which
     # the segmenter's knowledge reaches the decoder at decode time — without it the two heads are separate models
-    # sharing an encoder (§1.1). Gradient from the translation loss flows back into the BIO logits through Ω.
+    # sharing an encoder (§1.1). Ω is built from DETACHED BIO logits: it conditions the decoder; no translation
+    # gradient reaches the head (trained by alpha*(CE+Dice) + (1-alpha)*KL to frozen S1, see bio loss note below).
     # Applies to BOTH decoder arms: the DLM injects Ω in its manual decode; the AR de-risk arm injects the
     # SAME Ω via HF cross-attention forward-hooks (models.membership_gate.CrossAttnOmegaInjector), so §9.3 is a
     # gated-vs-gated decoder-family contrast. This block is inherited by ar.yaml (extends dlm).
@@ -96,6 +97,13 @@ membership_gate:
     # train/slt._inject_gate_geometry). A per-language value mirrored into this shared file is a stale-constant
     # hazard — there is deliberately no key to drift.
     eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
+    # IoU veto (teacher forcing of the mask, train only): when the head's own closed span neither covers the GT target within
+    # delta nor overlaps it at tIoU >= iou_veto, Omega is rebuilt from the GT span; open spans keep a start within delta of GT.
+    # A span that COVERS the target (a merge) is kept: the decoder sees every sentence inside it and the target text follows
+    # (multi-sentence targets); a kept span that shows ANOTHER whole sentence is a miss and is teacher-forced. gate_veto_rate is
+    # logged. 0 disables only the tIoU test: no-closed-span windows, shown-other-sentence spans and open starts beyond delta
+    # are still forced (the veto has no off switch; the ablation is gt_anchored).
+    iou_veto: 0.5
     gt_anchored: false # always-GT ablation row (§3). Leave false for the on-policy method.
     # Gate warmup — hold the gate off for the first `warmup_epochs` so it never couples to an untrained head
     # (garbage conditioning, §1.2). Canonical flow: run `train.py --stage train-bio` FIRST → checkpoint.bio_head_init
@@ -134,6 +142,10 @@ augmentation:
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
+# Stage 2 with an S1 init trains the head by standard distillation (train.losses.bio_distill_loss)
+bio_distill:    #   L_BIO = alpha * (CE + Dice on GT) + (1 - alpha) * T^2 * KL(S1 || head)
+    alpha: 0.2  # alpha keeps a small GT path (the monolingual GT refit alone is the measured decay driver, so it stays minor)
+    temperature: 2.0
 # BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries the O/I
 # imbalance but gives NO B-vs-I signal; with B at 0.8% of frames, unweighted CE collapsed the class outright
 # (measured: zero B predictions on dev, max P(B) 0.20, mean P(B) 0.015 AT gold boundaries) — the failure

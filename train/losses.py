@@ -1,5 +1,5 @@
-# Stage-2 losses: BIO Dice+CE (Moryossef recipe) and confidence-bound term for right-truncated windows. 
-# OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
+# Stage losses: BIO Dice+CE (S1 and stage 2 without an S1 init), KL to the frozen S1 posteriors (stage 2 with an S1 init),
+# and confidence-bound term for right-truncated windows. OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -134,6 +134,23 @@ def bio_nll_dice_loss(
     ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights) if ce_weight else logits.sum() * 0.0
     dice = binary_sign_dice_loss(logits, targets, ignore_index=ignore_index)
     return ce_weight * ce + dice_weight * dice
+
+
+def bio_distill_loss(
+    student_logits: torch.Tensor, teacher_logits: torch.Tensor, frame_mask: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Distillation term of stage-2 segmentation objective: per-frame KL(teacher || student) at temperature T over real frames, teacher = 
+    frozen S1 model on SAME window; full objective is alpha * (CE + Dice on GT) + (1 - alpha) * this. The target is a function of the input, 
+    not a label realization, so a monolingual stage 2 has nothing to memorize and the head stays at S1's calibration. Bounded per frame, no 
+    class weights, no Dice. Zero at init only with the student in eval mode: in train mode head dropout and the pose encoder's BatchNorm 
+    batch statistics leave a floor (about 0.15 nats at T = 2, i.e. T^2 x 0.04), so departure from S1 is read on val_bio_loss."""
+    valid = frame_mask.to(student_logits.device).bool()
+    if not valid.any(): return student_logits.sum() * 0.0
+    T = max(float(temperature), 1e-6)
+    log_s = F.log_softmax(student_logits.float() / T, dim=-1)
+    p_t = F.softmax(teacher_logits.float().detach() / T, dim=-1)
+    kl = (p_t * (torch.log(p_t.clamp_min(1e-12)) - log_s)).sum(dim=-1)
+    return (T * T) * (kl * valid.float()).sum() / valid.float().sum()   # T^2 keeps the gradient scale of the T=1 loss (Hinton et al.)
 
 
 def confidence_bound_gate(

@@ -140,12 +140,18 @@ class WindowSampler:
             mode_ratios = fallback_ratios
             jitter_cfg["source"] = None  # force the designed fallback_laplace jitter, not the ~0 measured CDF
 
-        if pool:
-            geometry = slt_cfg.get("pretrain_geometry", {}) or {}
-            missing = {"buffer_cap_s", "min_span_frames"} - set(geometry)
-            if missing: raise ValueError(
-                f"pooled run ({pool}) needs pretrain_geometry.{'/'.join(sorted(missing))}; "
-                "target inference geometry must not leak into multilingual pretraining"
+        geometry = slt_cfg.get("pretrain_geometry")
+        missing = {"buffer_cap_s", "min_span_frames"} - set(geometry or {})
+        if pool and (geometry is None or missing): raise ValueError(
+            f"pooled run ({pool}) needs pretrain_geometry.{'/'.join(sorted(missing))}; "
+            "target inference geometry must not leak into multilingual pretraining"
+        )
+        if geometry is not None:
+            # A segmentation-pretraining config (S1, pooled or monolingual) trains at its own label-derived context, never at a
+            # target's deployed cap: that cap is measured AFTER S1 and must fit the context S1 trained with.
+            if missing: raise ValueError(f"pretrain_geometry lacks {'/'.join(sorted(missing))}")
+            if str(geometry.get("buffer_cap_s")).lower() == "auto": raise ValueError(
+                "pretrain_geometry.buffer_cap_s: auto is resolved by train.bio_pretrain.resolve_pretrain_context before the sampler"
             )
             buffer_cap_s, min_span_frames = float(geometry["buffer_cap_s"]), int(geometry["min_span_frames"])
             if buffer_cap_s <= 0 or min_span_frames < 1: raise ValueError(

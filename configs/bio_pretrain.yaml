@@ -55,16 +55,12 @@ pretrain_geometry:
     # Must COVER the pool's sentence durations, or the designed mode mix is unrealizable: a sentence longer than
     # this cap can never appear COMPLETE in pretraining (the sampler clamps every window to the cap), so it is
     # permanently mode-2 and the head never learns to close it — punished at whole-video eval as under-segmentation.
-    # 36 covers every pool language's TRAIN-split sentence p99 (bfi ~34s; asf ~29s, ase ~28s) plus tail-jitter
-    # margin — the training distribution is what pretraining coverage means, and the residual tail is sub-1% per
-    # language. A TARGET's measured deployment cap MAY exceed this (it is dev-p99-based, a noisier tail statistic):
-    # that is fine and forces NO pretrain rerun, because the deployed head is the S2 head, fine-tuned at the
-    # target's own cap (the S2 sampler reads inference.yaml) — the S1 init merely starts slightly out-of-context
-    # on the sub-1% longest windows, which S2 training absorbs. The guarded hazard is unchanged and different:
-    # EVALUATING a FROZEN head beyond its trained context (standalone S1 always chunks at its checkpoint's cap).
-    # A DESIGN constant informed by pool sentence statistics — never a copy of one target's measured buffer_cap_s.
-    # Re-derive if the pool or the GT settings change.
-    buffer_cap_s: 36.0
+    # `auto` = max over the pool of TRAIN-split p99 sentence duration + stride_s + 1 s: the label-only rule the
+    # deployed caps follow (analyze.py --stage buffer-cap --split train writes p99 + stride + δ/fps per language),
+    # with the 1 s margin covering any δ up to fps frames — so every deployed cap fits this context by construction
+    # and no B1 stage has to run before S1. buffer-cap refuses to write a cap above the checkpoint's stamped context.
+    # A number here is an explicit design override. Re-derived automatically if the pool or the GT settings change.
+    buffer_cap_s: auto
     min_span_frames: 1
 
 pretrain_languages: [ase, asf, bfi]
@@ -80,6 +76,7 @@ pretrain_temperature: 0.3
 # overwritten. `bio_head_init` carries this encoder into stage 2, preserving "S1 features == S2 initial features".
 epochs: 50
 batch_size: 32
+# backbone_lr: 1.0e-4  # optional override of default 0.3×learning_rate
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 early_stopping:
@@ -90,4 +87,3 @@ scheduler:
     type: cosine
     warmup_epochs: 2
 freeze_backbone: false
-# backbone_lr: 1.0e-4  # optional override of default 0.3×learning_rate

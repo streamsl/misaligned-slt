@@ -538,6 +538,15 @@ def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[
     return _LANG_RECORDS_CACHE[key]
 
 
+def sentence_p99_s(data_cfg: dict, languages: list[str], split: str = "train") -> dict[str, float]:
+    # Per-language p99 of reliable sentence durations: the label-only cap statistic. Shares the pool's record cache.
+    out: dict[str, float] = {}
+    for lang in languages:
+        d = [sp.duration_s for r in _cached_language_records(data_cfg, lang, split) for sp in r.sentences if getattr(sp, "reliable", True)]
+        out[lang] = float(np.percentile(d, 99)) if d else 0.0
+    return out
+
+
 def load_multilingual_records(
     data_cfg: dict, languages: list[str], split: str, temperature: float = 0.5, seed: int = 42, epoch: int = 0,
 ) -> tuple[list[VideoRecord], dict[str, int]]:

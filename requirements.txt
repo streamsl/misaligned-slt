@@ -19,4 +19,5 @@ sacrebleu>=2.4
 rouge>=1.0             # pltrdy ROUGE-L — the package Uni-Sign reports with (metrics._rouge_l)
 rouge_score>=0.1      # fallback ROUGE if `rouge` is absent
 nltk>=3.8             # meteor
+pycocoevalcap>=1.2    # CIDEr-D, the official COCO scorer densevid_eval uses (metrics._cider_corpus)
 # BLEURT: pip install git+https://github.com/google-research/bleurt.git ; set BLEURT_CHECKPOINT_PATH

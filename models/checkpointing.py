@@ -5,18 +5,20 @@ import torch
 import torch.nn as nn
 
 
-def _load_state(path: str | Path) -> dict:
+def _resolve_checkpoint_file(path: str | Path) -> Path:
+    # A checkpoint argument may be a DIRECTORY (checkpoint_dir output); resolve it to the file inside.
+    # Shared by the state and meta readers so no caller can hit IsADirectoryError on one but not the other.
     path = Path(path)
     if path.is_dir():
-        found = None
         for name in ("pytorch_model.bin", "model.pt", "checkpoint.pt"):
-            candidate = path / name
-            if candidate.exists():
-                found = candidate
-                break
-        if found is None: raise FileNotFoundError(f"No checkpoint file found in {path}")
-        path = found
+            if (path / name).exists(): return path / name
+        raise FileNotFoundError(f"No checkpoint file found in {path}")
     if not path.exists(): raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+    return path
+
+
+def _load_state(path: str | Path) -> dict:
+    path = _resolve_checkpoint_file(path)
     state = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state: state = state["state_dict"]
     if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict): state = state["model"]
@@ -67,7 +69,7 @@ def save_train_state(
     state = {
         "epoch": int(epoch),
         # step > 0 = MID-epoch snapshot: that many batches of `epoch` are applied, resume re-enters the SAME epoch
-        # and fast-forwards; 0 = epoch boundary (the pre-change semantics, and the default for old snapshots).
+        # and fast-forwards; 0 = epoch boundary (the default).
         "step": int(step),
         "epochs": int(epochs),  # schedule horizon: total_steps is baked into the scheduler state, so resume must match
         # The run's training-critical config, compared on resume: analysis stages rewrite those configs between
@@ -94,6 +96,12 @@ def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.
     import numpy as np, random
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
     model.load_state_dict(state["model"])
+    saved_groups, live_groups = len(state["optimizer"]["param_groups"]), len(optimizer.param_groups)
+    if saved_groups != live_groups: raise SystemExit(
+        f"--resume: {path} holds optimizer state for {saved_groups} param group(s) but this run builds {live_groups} "
+        f"(the optimizer layout changed, e.g. the main/backbone_lr split); moments cannot be mapped across layouts. "
+        f"Start a fresh run, or warm-start from model.pt."
+    )
     optimizer.load_state_dict(state["optimizer"])
     rng = state.get("rng") or {}
     if rng.get("torch") is not None: torch.set_rng_state(rng["torch"])
@@ -119,6 +127,20 @@ def save_model_checkpoint(
     return _atomic_torch_save(payload, Path(output_dir) / filename)
 
 
+def s1_layout_state(state: dict) -> dict:
+    """A stage-2 (MisalignedSLTModel) state dict re-keyed to the S1 layout (BioS1Model: pose_encoder.* + bio_head.*).
+
+    The deployed FSM head is the ARM's head after joint training, so post-training FSM constants that are not training
+    inputs (the commit lag) may be re-selected on it: tune-stream --checkpoint checkpoints/{ar,dlm}/<lang>/model.pt.
+    LM and decoder tensors are dropped. An S1-layout dict passes through unchanged."""
+    if not any(k.startswith("front_end.pose_encoder.") for k in state): return state
+    out = {}
+    for k, v in state.items():
+        if k.startswith("front_end.pose_encoder."): out["pose_encoder." + k[len("front_end.pose_encoder."):]] = v
+        elif k.startswith("bio_head."): out[k] = v
+    return out
+
+
 def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: bool = False) -> tuple[list[str], list[str]]:
     raw = _load_state(checkpoint)
     missing, unexpected = module.load_state_dict(raw, strict=strict)
@@ -127,5 +149,5 @@ def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: boo
 
 def load_checkpoint_meta(checkpoint: str | Path) -> dict:
     # `meta` written by save_model_checkpoint; {} for checkpoints saved before it existed.
-    raw = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    raw = torch.load(str(_resolve_checkpoint_file(checkpoint)), map_location="cpu", weights_only=False)
     return dict(raw.get("meta") or {}) if isinstance(raw, dict) else {}

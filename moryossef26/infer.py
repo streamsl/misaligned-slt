@@ -107,8 +107,8 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
 def evaluate_segmenter_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
     trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,),
-    duration_prior: DurationPrior | None = None,
-) -> dict[str, float]:
+    duration_prior: DurationPrior | None = None, return_segments: bool = False,
+) -> dict[str, float] | tuple[dict[str, float], dict[str, list[Segment]]]:
     """Moryossef evaluate.py-style STANDALONE eval: whole videos, GT phrase BIO from caption spans, frame-F1 and
     1-to-1 tIoU segment P/R/F1 averaged. Phrase only, no sign head; for `--segmenter-arch s1` it scores the
     pretrained in-system BIO head before joint fine-tuning.
@@ -124,6 +124,10 @@ def evaluate_segmenter_whole_video(
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []
+    # `return_segments`: the SAME decoded tags, as time-domain spans BEFORE the UNK ignore-region masking —
+    # the caller feeds them to the RQ2 scoring path, whose quarantine rule (drop majority-quarantined events)
+    # replaces the frame-level mask. 1 decode, 2 protocols.
+    segments_by_video: dict[str, list[Segment]] = {}
 
     for record in records:
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
@@ -139,6 +143,9 @@ def evaluate_segmenter_whole_video(
             # are unchanged by construction (splits only relabel I<->B).
             tags = duration_decode_tags(logits, float(record.pose.fps), duration_prior)
             logits = torch.nn.functional.one_hot(tags.long(), num_classes=logits.shape[-1]).float().unsqueeze(0)
+        if return_segments:
+            raw_tags = tags if duration_prior is not None else logits[0].argmax(dim=-1)
+            segments_by_video[record.video_id] = bio_tags_to_segments(raw_tags, timestamps.tolist())
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
         # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right nor
         # wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
@@ -157,5 +164,5 @@ def evaluate_segmenter_whole_video(
         row["bio_iou"] = (_p * _r / (_p + _r - _p * _r)) if (_p + _r - _p * _r) > 0 else 0.0
         row.update(_segment_rows(logits, labels, tiou_thresholds))
         rows.append(row)
-    if not rows: return {}
-    return {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}
+    metrics = {} if not rows else {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}
+    return (metrics, segments_by_video) if return_segments else metrics

@@ -1,21 +1,39 @@
 stride_s: 1.0
-# Semi-Markov duration decode (infer/duration_decode.py). ONE BLOCK PER SEGMENTER, named for its
+# Semi-Markov duration decode (infer/duration_decode.py). One block per (segmenter, regime), named for the
 # `--segmenter-arch` value, so the block a run reads is derivable from its command line:
-#   duration_decode_s1        -> the in-system BIO head. THE DEPLOYED ONE: streaming FSM, membership gate
-#                                (training + inference), RQ1/RQ2, delta-enc, and S1's own segmenter-eval.
+#   duration_decode_s1        -> the in-system head decoding a WHOLE video (offline row 7, the S1 cascade row 6,
+#                                S1's segmenter-eval, tune-stream's snap/w anchor). Selected by tune-decode.
+#   duration_decode_s1_stream -> the same head inside the FSM, where the buffer's last sentence is right-censored:
+#                                the streaming FSM, the membership gate's anchor decode (training + inference), RQ1
+#                                gated windows, delta-enc. Selected by tune-stream. Different estimator, own triple.
 #   duration_decode_moryossef -> the external baseline segmenter. Error calibration, segmenter-eval, and the RQ2
 #                                cascade's upstream segmenter. Nothing deployed reads it.
 duration_decode_s1:
     default: false
-    asf: {split_bias: 8.25, snap_radius_s: 0.0, boundary_logit_weight: 1.5}  # outputs/tune_decode_s1_asf_dev.json
-    bfi: {split_bias: 7.0, snap_radius_s: 1.0, boundary_logit_weight: 0.75}
+    ase: {split_bias: 7.25, snap_radius_s: 0.0, boundary_logit_weight: 0.75}  # outputs/tune_decode_s1_ase_dev.json
+    asf: {split_bias: 10.0, snap_radius_s: 0.5, boundary_logit_weight: 2.0}   # outputs/tune_decode_s1_asf_dev.json
+    bfi: {split_bias: 7.0, snap_radius_s: 1.0, boundary_logit_weight: 0.75}   # outputs/tune_decode_s1_bfi_dev.json
     # Valid at the checkpoint's pinned rope_eval_chunk_s — re-tune if S1 is retrained.
+# The FSM's OWN triple, selected UNDER THE STREAMING DECODE (analyze.py --stage tune-stream): the buffer's last sentence
+# is right-censored, so the same split_bias is far more permissive than in the whole-video decode above. Read by the
+# FSM, the gate's anchor decode (training and eval) and delta-enc; missing row -> the whole-video triple, with a note.
+duration_decode_s1_stream:
+    default: false
+    ase: {split_bias: 0.0, snap_radius_s: 0.0, boundary_logit_weight: 0.0}    # outputs/tune_stream_s1_ase_dev.json
+    asf: {split_bias: 9.0, snap_radius_s: 0.5, boundary_logit_weight: 2.0}    # outputs/tune_stream_s1_asf_dev.json
+    bfi: {split_bias: 0.0, snap_radius_s: 0.0, boundary_logit_weight: 0.0}    # outputs/tune_stream_s1_bfi_dev.json
 duration_decode_moryossef:
     default: false
-    asf: {split_bias: 8.0, snap_radius_s: 1.5, boundary_logit_weight: 2.0}  # outputs/tune_decode_moryossef_asf_dev.json
+    ase: {split_bias: 8.25, snap_radius_s: 1.0, boundary_logit_weight: 2.0}   # outputs/tune_decode_moryossef_ase_dev.json
+    asf: {split_bias: 8.0, snap_radius_s: 1.5, boundary_logit_weight: 2.0}    # outputs/tune_decode_moryossef_asf_dev.json
+    bfi: {split_bias: 7.25, snap_radius_s: 1.5, boundary_logit_weight: 2.0}   # outputs/tune_decode_moryossef_bfi_dev.json
+# Measured on the TRAIN split by `analyze.py --stage buffer-cap --split train --write-config` (p99 train sentence
+# duration + stride_s + δ/fps, reliable sentences only; run after delta-enc). Label-only constants are measured on
+# train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
 buffer_cap_s:
-    asf: 30.26
-    bfi: 42.36
+    ase: 29.08
+    asf: 31.18
+    bfi: 35.72
 boundary_stability:
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
@@ -27,9 +45,18 @@ boundary_stability:
     #      not open a span, and a mislabelled-B leftover is filtered by span_selection.min_span_frames);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
+        ase: 11
         asf: 12
         bfi: 21
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
+    # Fixed commit lag (seconds) for a terminator DECIDED BY DURATION (a B placed by the re-split): the causal split decision
+    # depends on frames not yet seen, so it commits only once the buffer extends this far past it — fixed-lag decoding, as in
+    # streaming ASR. An O terminator (a real pause) commits without lag. Selected on dev by tune-stream together with the
+    # streaming split bias; 0 = commit as soon as hysteresis passes.
+    commit_lag_s:
+        ase: 0.0
+        asf: 5.0
+        bfi: 0.0
 
 span_selection:
     # Λ_min: shortest selectable span, in encoder frames — a pure DURATION NOISE FLOOR (spans shorter than the
@@ -39,6 +66,7 @@ span_selection:
     # which uses the commit log instead of a worst-case length bound. The older "Λ_min > 2δ" coupling is
     # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
     min_span_frames:
+        ase: 12
         asf: 13
         bfi: 22
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
@@ -52,9 +80,9 @@ translation:
     # unused by RQ1 / --method baseline. CALIBRATE THIS to your deployed model: run the clean point
     # (`--rq 1 --method dlm --severity-grid-s 0.0`) and read mean_translation_confidence, then set τ a touch below
     # your model's clean mean so clean sentences commit and genuinely low-confidence decodes defer. It is NOT a
-    # dev-tuned quality knob and it does NOT catch confidently-wrong truncations (Ω does). 0.75 was the old
-    # all-token floor and is far too high for a mean (a label-smoothed AR decode's clean mean is ~0.4); 0.3 is a
-    # permissive placeholder that won't zero streaming recall — tighten it once you've measured your model.
+    # dev-tuned quality knob and it does NOT catch confidently-wrong truncations (Ω does). An all-token floor is
+    # far too high for a mean under label smoothing; 0.3 is a permissive placeholder that won't zero streaming 
+    # recall — tighten it once you've measured your model.
     commit_confidence_tau: 0.3
     # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
     # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the

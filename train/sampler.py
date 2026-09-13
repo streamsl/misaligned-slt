@@ -350,6 +350,10 @@ class WindowSampler:
         self.rng = np.random.default_rng(self.draw_seed + int(index))
         rec, anchor_idx = self._choose_anchor(index)
         mode = self._choose_mode()
+        if mode in ("mode1", "mode3") and rec.sentences[anchor_idx].duration_s + 1.0 / rec.pose.fps > self.buffer_cap_s:
+            # No complete view of this unit exists at this capacity: every jittered mode-1/3 draw would be clamped by
+            # _clip_window and fall back to the zero-jitter clean clip, pinning B at the window edge. Draw a truncation.
+            mode = "mode2"
         if mode == "mode1": spec = self._mode1_spec(rec, anchor_idx)
         elif mode == "mode2": spec = self._mode2_spec(rec, anchor_idx)
         elif mode == "mode3": spec = self._mode3_spec(rec, anchor_idx)

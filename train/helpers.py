@@ -97,16 +97,19 @@ class AmpHelper:
         if self.scaler.is_enabled(): self.scaler.scale(loss).backward()
         else: loss.backward()
 
-    def clip_and_step(self, optimizer: torch.optim.Optimizer, parameters, max_grad_norm: float) -> None:
+    def clip_and_step(self, optimizer: torch.optim.Optimizer, parameters, max_grad_norm: float) -> bool:
         # fp16: unscale before clipping or the norm is measured on scaled values.
         if self.scaler.is_enabled():
+            previous_scale = self.scaler.get_scale()
             self.scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
             self.scaler.step(optimizer)
             self.scaler.update()
+            return self.scaler.get_scale() >= previous_scale
         else:
-            torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
+            torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm), error_if_nonfinite=True)
             optimizer.step()
+            return True
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -433,8 +436,8 @@ def run_epoch_loop(
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
             dist.average_gradients(model.parameters())
             # Clip only trainable params: iterating all ~1B (frozen included) per step is pure overhead.
-            amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
-            scheduler.step_batch()
+            stepped = amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
+            if stepped: scheduler.step_batch()
             row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
             epoch_logs.append(row); logs.append(row)
             logger.log_step(epoch, step, row)

@@ -77,9 +77,14 @@ def average_gradients(params) -> None:
     the correct contribution from a rank whose batch did not exercise that branch.
     """
     if not is_distributed(): return
+    params = [p for p in params if p.requires_grad]
+    if not params: return
+    # None on every rank must stay None: AdamW skips these parameters, including decay and moments.
+    present = torch.tensor([p.grad is not None for p in params], dtype=torch.int32, device=params[0].device)
+    dist.all_reduce(present, op=dist.ReduceOp.MAX)
     grads = []
-    for p in params:
-        if not p.requires_grad: continue
+    for p, active in zip(params, present.tolist()):
+        if not active: continue
         if p.grad is None: p.grad = torch.zeros_like(p)
         grads.append(p.grad)
         

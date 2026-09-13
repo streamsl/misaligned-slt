@@ -89,25 +89,11 @@ def save_train_state(
     return _atomic_torch_save(state, Path(path))
 
 
-def _normalize_checkpoint_meta(meta: dict) -> dict:
-    # Normalize display-name aliases; objective and architecture checks still compare all fields.
-    meta = dict(meta)
-    aliases = {
-        "architecture": {"shared_temporal_first_span_v1": "shared_temporal_slt", "clean_translation_v1": "clean_translation"},
-        "segmentation_decode": {"legal_bio_v1": "bio_viterbi", "renewal_bio_v1": "semi_markov_viterbi", "plain_bio_v1": "bio_argmax"},
-    }
-    for key, values in aliases.items():
-        if key in meta: meta[key] = values.get(meta[key], meta[key])
-    if "rope_eval_chunk_s" in meta and "decoder" not in meta and meta.get("segmentation_decode") == "bio_viterbi":
-        meta["monitor_decode"] = meta.pop("segmentation_decode")
-    return meta
-
-
 def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer) -> dict:
     """Load a latest.pt snapshot into model+optimizer; returns the raw state for the caller to finish
     (scheduler/scaler/control/rng), since those objects live in the training loop."""
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
-    state["meta"] = _normalize_checkpoint_meta(state.get("meta") or {})
+    state["meta"] = dict(state.get("meta") or {})
     model.load_state_dict(state["model"])
     saved_groups, live_groups = len(state["optimizer"]["param_groups"]), len(optimizer.param_groups)
     if saved_groups != live_groups: raise SystemExit(
@@ -161,6 +147,6 @@ def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: boo
 
 
 def load_checkpoint_meta(checkpoint: str | Path) -> dict:
-    # `meta` written by save_model_checkpoint; {} for checkpoints saved before it existed.
+    # `meta` written by save_model_checkpoint; {} when the file carries none.
     raw = torch.load(str(_resolve_checkpoint_file(checkpoint)), map_location="cpu", weights_only=False)
-    return _normalize_checkpoint_meta(raw.get("meta") or {}) if isinstance(raw, dict) else {}
+    return dict(raw.get("meta") or {}) if isinstance(raw, dict) else {}

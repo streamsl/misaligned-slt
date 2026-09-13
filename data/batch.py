@@ -76,8 +76,8 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
     def _tokenize_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
         # Every decoder forward runs over the full canvas, so padding to max_text_tokens costs compute on padding:
-        # captions are ~15 tokens against a 128 canvas. Dynamic padding sizes it to the batch instead, with two
-        # slots of headroom that the DLM path requires and batch-max alone would not leave:
+        # captions are ~15 tokens against a 128 canvas. Dynamic padding sizes it to the batch instead, with 2 slots 
+        # of headroom that the DLM path requires and batch-max alone would not leave:
         #   1. supervise_trailing_eos needs eos_supervision_tokens PAD slots after the longest row's sentence;
         #   2. the confidence-bound reference shift (models/streaming_slt.py) drops the last column, which must be
         #      PAD or the longest row loses its real final token from the gate.
@@ -85,9 +85,13 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         # would change the last positions' logits. With headroom + alignment the result matches the full canvas.
         encoded = self.tokenizer(
             texts, padding="max_length" if self.pad_to_max_length else True,
-            truncation=True, max_length=self.max_text_tokens, return_tensors="pt",
+            truncation=False, max_length=self.max_text_tokens, return_tensors="pt",
         )
         input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
+        if input_ids.shape[1] > self.max_text_tokens: raise ValueError(
+            f"Caption target needs {input_ids.shape[1]} tokens, exceeding max_text_tokens={self.max_text_tokens}; "
+             "increase the text capacity. Complete-caption targets must not be silently truncated."
+        )
         if not self.pad_to_max_length:
             need = input_ids.shape[1] + 1 + self.eos_supervision_tokens
             width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
@@ -111,9 +115,13 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
                 target["text"] if isinstance(target, dict) else (target.text if target is not None else "")
                 for target in out["translation_targets"]
             ]
+            # The reference is read only by the confidence-bound path, and only on rows that carry a full-evidence view
+            # (indexed through full_evidence_indices). Tokenizing every row's anchor would raise on an over-cap anchor
+            # in a truncated window, which never needs its text. Keep a row per item so the indexing stays positional.
             reference_texts = [
-                anchor["text"] if isinstance(anchor, dict) else (anchor.text if anchor is not None else "")
-                for anchor in out["anchor_spans"]
+                (anchor["text"] if isinstance(anchor, dict) else anchor.text)
+                if anchor is not None and item.get("full_evidence") is not None else ""
+                for anchor, item in zip(out["anchor_spans"], batch)
             ]
             target_tokens = self._tokenize_texts(target_texts)
             reference_tokens = self._tokenize_texts(reference_texts)

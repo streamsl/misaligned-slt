@@ -1,5 +1,5 @@
-# Stage losses: BIO Dice+CE (S1 and stage 2 without an S1 init), KL to the frozen S1 posteriors (stage 2 with an S1 init),
-# and confidence-bound term for right-truncated windows. OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
+# Stage losses: BIO Dice+CE (S1 and stage 2 alike) and the confidence-bound term for right-truncated windows.
+# OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -38,7 +38,7 @@ def masked_cross_entropy(
 
 
 def binary_sign_dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = BIO["UNK"], eps: float = 1e-6) -> torch.Tensor:
-    # Moryossef-style Dice over signing vs non-signing, ignoring UNK padding.
+    # Dice over caption-unit foreground (B/I) versus outside (O), ignoring unknown frames.
     if logits.shape[:2] != targets.shape: raise ValueError(f"logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}")
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0

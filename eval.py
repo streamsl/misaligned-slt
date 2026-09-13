@@ -18,7 +18,7 @@ pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blo
 
 from poses import load_pose_window
 from data.windowing import BIO, make_bio_labels
-from data.loader import VideoRecord, load_language_records
+from data.loader import ANNOTATION_PROTOCOL, VideoRecord, annotation_fingerprint, load_language_records
 from data.batch import frame_mask_for, repeat_last_frame
 
 from transformers import T5Tokenizer, AutoTokenizer
@@ -85,9 +85,9 @@ def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
     # Predicted-segments JSON: dict {vid: [{start_s,end_s}]} or list-of-rows form.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "predictions" in raw: raw = raw["predictions"]  # stamped form
+    if isinstance(raw, dict) and "segments" in raw: raw = raw["segments"]  # stamped gold-segments file (write_gold_segments)
     if isinstance(raw, dict) and "events" in raw: raw = raw["events"]  # RQ2 events file: its spans feed the same-span control.
-    if isinstance(raw, dict):
-        return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
+    if isinstance(raw, dict): return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
     predictions: dict[str, list[Segment]] = {}
     for row in raw:
         if "video_id" in row and "segments" in row:
@@ -96,6 +96,21 @@ def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
             predictions.setdefault(str(row["video_id"]), []).append(Segment(float(row["start_s"]), float(row["end_s"])))
         else: raise ValueError(f"Unsupported prediction row format: {row}")
     return predictions
+
+def stamped_annotation(path: str | Path) -> str | None:
+    # The annotation fingerprint an artifact was made under: flat (RQ1, segmenter-eval payloads) or under `provenance`.
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict): return None
+    return raw.get("annotation_fingerprint") or (raw.get("provenance") or {}).get("annotation_fingerprint")
+
+def require_annotation_match(path: str | Path, records: list[VideoRecord], what: str) -> None:
+    # Refuse to score an artifact made under different annotations than the loaded records.
+    # Every writer stamps `annotation_fingerprint` (caption-unit protocol + a hash of every span it produced)
+    stamped, live = stamped_annotation(path), annotation_fingerprint(records)
+    if stamped != live: raise ValueError(
+        f"{what} {path} was made under annotations {stamped or 'UNSTAMPED'}, but the loaded split is {live}. "
+        f"Regenerate it under the current caption-unit protocol before scoring; artifacts do not carry across label changes."
+    )
 
 def load_prediction_rows(path: str | Path) -> dict[str, list[dict]]:
     # The raw rows of an RQ2 events file, aligned with load_prediction_file's order; empty for a plain segments file. Carries
@@ -131,34 +146,17 @@ def _drop_quarantined_predictions(predicted: dict[str, list[PredictionEvent]], r
     return out
 
 def span_ge_lambda(duration_s: float, fps: float, min_span_frames: int) -> bool:
-    # The one Lambda_min predicate: the scoring floor and the offline row's pre-translation drop both use it.
+    # Minimum proposal duration for event generation; it does not filter saved predictions during scoring.
     return float(duration_s) >= float(min_span_frames) / max(float(fps), 1.0) - 1e-9
 
-def _drop_sub_lambda_predictions(
-    predicted: dict[str, list[PredictionEvent]], records: list[VideoRecord], min_span_frames: int,
-) -> dict[str, list[PredictionEvent]]:
-    """Span floor, prediction side: an event shorter than Lambda_min (span_selection.min_span_frames, in that video's frames) is unresolvable 
-    from boundary evidence and the deployed FSM can never commit it, so no row is charged for one. Applied at the scoring boundary to EVERY 
-    system (cascade spans included), else rows 7/8, which drop such spans by policy, and rows 1-6, which don't, are scored under different 
-    floors and  (7-6) stops isolating joint training."""
-    fps = {r.video_id: float(r.pose.fps) for r in records}
-    out: dict[str, list[PredictionEvent]] = {}
-    for vid, events in predicted.items():
-        out[vid] = [ev for ev in events if span_ge_lambda(float(ev.end_s) - float(ev.start_s), fps.get(vid, 24.0), min_span_frames)]
-    return out
-
 def scoreable_predictions(
-    predicted: dict[str, list[PredictionEvent]], records: list[VideoRecord], inference_cfg: dict, tag: str = "rq2",
+    predicted: dict[str, list[PredictionEvent]], records: list[VideoRecord], tag: str = "rq2",
 ) -> dict[str, list[PredictionEvent]]:
-    # RQ2 scoring-boundary policy: quarantine ignore-region + Lambda_min floor, printed so a table's event count is auditable.
+    # Model duration policy belongs to event generation. Evaluation keeps short true and false predictions alike.
     n0 = sum(len(v) for v in predicted.values())
     kept = _drop_quarantined_predictions(predicted, records)
     n1 = sum(len(v) for v in kept.values())
-    lam = lambda_min_frames(inference_cfg)
-    kept = _drop_sub_lambda_predictions(kept, records, lam)
-    n2 = sum(len(v) for v in kept.values())
-    print(f"[{tag}] scoreable events: {n2} of {n0} (dropped {n0 - n1} majority-inside quarantine, {n1 - n2} shorter than "
-          f"Lambda_min={lam} frames)", flush=True)
+    print(f"[{tag}] scoreable events: {n1} of {n0} (dropped {n0 - n1} majority-inside quarantine)", flush=True)
     return kept
 
 def _gold_events(records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]:
@@ -175,7 +173,11 @@ def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
     ] for record in tqdm(records, desc="Extracting gold segments")}
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload = {
+        "provenance": {"annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records)},
+        "segments": rows
+    }
+    out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
 
 def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEvent:
@@ -532,10 +534,9 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         # Membership gate at RQ1: same Ω the decoder trained with (on-policy span, no GT/χ). BOTH arms gated — 
         # DLM injects Ω in its manual decode, AR via HF cross-attention hooks (front_end.ar_generate).
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
-        # Fallbacks mirror the RQ2 runner: delta from the measured noise floor, Lambda_min from it (delta+1),
-        # never 0 — a 0 floor re-admits 1-frame flicker spans in exactly 1 of 2 eval paths.
+        # Same first-eligible-unit rule as the training sampler and streaming runner.
         "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
-        "gate_min_span_frames": int(method_cfg.get("membership_gate", {}).get("min_span_frames", lambda_min_frames(inference_cfg))),
+        "gate_min_span_frames": lambda_min_frames(inference_cfg),
     }
 
 
@@ -717,6 +718,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "rq": "1", "language": args.language, "split": args.split, "method": args.method,
+            "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
             # Per-axis grids as ACTUALLY swept: with head/tail overrides `grid` alone misdescribes the axes.
             "severity_mode": mode, "grid": grid, "grid_head": head_grid, "grid_tail": tail_grid,
             # Decode provenance, mirroring RQ2's events stamp, so 2 sweeps under different flags stay distinguishable
@@ -924,6 +926,7 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
+    require_annotation_match(args.segments, records, "--segments")
     segments = load_prediction_file(args.segments)
     run_cascade.last_checkpoint = str(args.checkpoint or (
         resolve_pretrained(method_cfg, data_cfg, args.language) if args.method == "baseline" else checkpoint_dir(method_cfg)
@@ -1063,10 +1066,6 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     return predicted
 
 
-def _events_provenance(path: str | Path) -> dict:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return dict(payload.get("provenance") or {}) if isinstance(payload, dict) else {}
-
 def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1099,14 +1098,13 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.3, 0.5, 0.7, 0.9]))
     provenance = {
-        "method": args.method, 
+        "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), "method": args.method, 
         "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1))) if args.method == "baseline" else 1,
         "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None),
         "segments": getattr(args, "segments", None), "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
     }
-    # The Lambda_min floor scores under the geometry the emitting arm TRAINED with (checkpoint meta), and travels with the
-    # events file so a later --predictions re-score applies the same floor.
-    score_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
+    # Geometry describes event generation; a saved-event rescore depends only on events and annotations.
+    score_cfg = {} if args.predictions else resolve_inference(load_yaml(args.inference_config), args.language)
     online_arch = _online_segmenter_arch(args) if args.stream else None
     if online_arch is not None:
         provenance.update(method="baseline", segmenter_arch=online_arch, gate=False, num_beams=1)
@@ -1114,7 +1112,9 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         provenance["min_span_frames"] = lambda_min_frames(score_cfg)
     elif not args.predictions:
         score_cfg = _apply_stamped_geometry(score_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
-        provenance["min_span_frames"] = lambda_min_frames(score_cfg)
+        # Λ_min is this arm's GENERATION floor (the FSM cannot commit a shorter span). Scoring applies no floor, and
+        # the offline cascade rows declare none, so the stamp records how the events were made, never how they scored.
+        provenance["generation_min_span_frames"] = lambda_min_frames(score_cfg)
     # A deliberate beam override changes the search budget and cannot enter a main row delta.
     if args.method == "baseline" and int(provenance["num_beams"]) != 1: print(
         f"[rq2] WARNING: baseline decodes with num_beams={provenance['num_beams']} while the ar/dlm arms are greedy — "
@@ -1123,7 +1123,8 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     if args.stream:
         predicted = run_streaming(args)
         tag = online_arch or args.method
-        suffix = ("_segonly" if getattr(args, "no_translate", False) else "") + ("_plain" if getattr(args, "segmenter_decode", None) == "plain" else "")
+        suffix = ("_segonly" if getattr(args, "no_translate", False) else "") + \
+                 ("_plain" if getattr(args, "segmenter_decode", None) == "plain" else "")
         provenance["translate"] = not bool(getattr(args, "no_translate", False))
         provenance["pose_normalization"] = "buffer"
         provenance["duration_model"] = run_streaming.last_duration_model
@@ -1167,6 +1168,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         src = Path(args.segments).stem # Name by span source (--segments stem carries arch+lang+split) AND method, so cascade rows never collide.
         _write_events_json(predicted, f"outputs/rq2_cascade_{src}_{args.method}.json", provenance)
     else:
+        require_annotation_match(args.predictions, records, "--predictions")
         predicted = load_event_predictions(args.predictions)
         gold_ids = {r.video_id for r in records}
         if predicted and not (set(predicted) & gold_ids): raise SystemExit(
@@ -1181,11 +1183,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
                   f"--split {args.split}; scoring only the {len(predicted) - len(foreign)} that match.", flush=True)
             predicted = {vid: evs for vid, evs in predicted.items() if vid in gold_ids}
         
-    if args.predictions or args.segments:
-        stamped_lam = (_events_provenance(args.predictions or args.segments) or {}).get("min_span_frames")
-        if stamped_lam: 
-            score_cfg = {**score_cfg, "span_selection": {**(score_cfg.get("span_selection", {}) or {}), "min_span_frames": int(stamped_lam)}}
-    predicted = scoreable_predictions(predicted, records, score_cfg)
+    predicted = scoreable_predictions(predicted, records)
     gold = _gold_events(records)
     summary = evaluate_predicted_events(
         predicted, gold, thresholds, char_level=char_level_for_target(target_language(data_cfg, args.language)),
@@ -1290,7 +1288,7 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     events = {vid: [
         PredictionEvent(video_id=vid, start_s=float(s.start_s), end_s=float(s.end_s)) for s in segs
     ] for vid, segs in segments_by_video.items()}
-    events = scoreable_predictions(events, records, resolve_inference(load_yaml(args.inference_config), args.language), tag="segmenter-eval")
+    events = scoreable_predictions(events, records, tag="segmenter-eval")
     rq2_rows = evaluate_predicted_events(
         events, _gold_events(records), list(thresholds), char_level=char_level_for_target(target_language(data_cfg, args.language))
     )["thresholds"]
@@ -1303,9 +1301,11 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     rq2_protocol["avg"] = {k: float(np.mean([r["segmentation"][k] for r in rq2_rows])) for k in ("precision", "recall", "f1")}
     print("[segmenter-eval] rq2-protocol avg: " + " ".join(f"{k}={v:.4f}" for k, v in rq2_protocol["avg"].items()), flush=True)
     payload = {
-        "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
-        "frame_metrics_decode": "raw_argmax", "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax", "decode": decode, 
-        "duration_model": duration.to_dict() if duration else None, "tiou_thresholds": list(thresholds), "metrics": metrics, "rq2_protocol": rq2_protocol
+        "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, 
+        "checkpoint": checkpoint, "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), 
+        "frame_metrics_decode": "raw_argmax", "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax", 
+        "decode": decode, "duration_model": duration.to_dict() if duration else None, "tiou_thresholds": list(thresholds), 
+        "metrics": metrics, "rq2_protocol": rq2_protocol
     }
     output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)

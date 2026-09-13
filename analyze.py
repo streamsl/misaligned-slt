@@ -1,30 +1,98 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from statistics import median
+from itertools import islice
 from pathlib import Path
-import json, argparse, math, csv
+import json, argparse, math, os
 
 import torch
 import numpy as np
 from tqdm import tqdm
-from data.loader import load_language_records
+from data.loader import ANNOTATION_PROTOCOL, annotation_fingerprint, load_language_records
 from data.windowing import make_bio_labels, TRUSTED_GAP_S
 from poses import normalize_keypoints_unisign, load_pose_window
-from infer.duration_decode import DurationModel, DurationDecoder
+
+from train import distributed as dist
+from train.slt import build_slt_components, training_loss
+from train.helpers import AmpHelper, move_to_device
 from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
 
 from moryossef26.infer import predict_phrase_segments, whole_video_logits
 from infer.commit_gate import bio_complete_spans, select_target_span
+from infer.duration_decode import DurationModel, DurationDecoder
 from infer.stream import S1RunnerAdapter, StreamingSLTRunner
-from metrics import Segment, char_level_for_target, match_segments, sentence_bleu_scores, moryossef_segment_metrics
+
+from metrics import Segment, match_segments, moryossef_segment_metrics
 from eval import (
-    PredictionEvent, _gold_events, _load_segmenter, evaluate_predicted_events, 
-    load_event_predictions, load_prediction_file, save_prediction_file, scoreable_predictions
+    PredictionEvent, _gold_events, _load_segmenter, evaluate_predicted_events,
+    load_prediction_file, require_annotation_match, save_prediction_file, scoreable_predictions
 )
-from utils import checkpoint_dir, lambda_min_frames, load_yaml, pick_device, pool_key, resolve_inference, target_language, update_yaml_scalar
+from utils import checkpoint_dir, lambda_min_frames, load_yaml, pick_device, pool_key, resolve_inference, update_yaml_scalar
+
 # Low on purpose: near-misses feed the (Δ_head, Δ_tail) jitter CDF as matched pairs, not phantom/skip events;
 # a high bar biases the CDF to zero. Override: --tiou-threshold.
 SEGMENTER_ERROR_MATCH_TIOU = 0.1
+
+
+def task_gradient_stats(bio_loss, translation_loss, parameters):
+    # Unweighted task geometry on coordinates used by both losses; no optimizer update.
+    params = list(dict.fromkeys(p for p in parameters if p.requires_grad))
+    if not params or not bio_loss.requires_grad or not translation_loss.requires_grad: return None
+    a = torch.autograd.grad(bio_loss, params, retain_graph=True, allow_unused=True)
+    b = torch.autograd.grad(translation_loss, params, allow_unused=True)
+    pairs = [(x.float(), y.float()) for x, y in zip(a, b) if x is not None and y is not None]
+    if not pairs: return None
+    aa = sum(float(x.square().sum()) for x, _ in pairs)
+    bb = sum(float(y.square().sum()) for _, y in pairs)
+    ab = sum(float((x * y).sum()) for x, y in pairs)
+    if not all(math.isfinite(v) for v in (aa, bb, ab)):
+        raise ValueError("Non-finite task gradients; no loss-weight recommendation can be made")
+    if aa <= 0 or bb <= 0: return None  # Inactive tasks have no defined cosine or balance ratio.
+    return {"bio_norm": math.sqrt(aa), "translation_norm": math.sqrt(bb), "cosine": max(-1., min(1., ab / math.sqrt(aa * bb)))}
+
+
+def loss_balance(args): # Estimate an initial gradient-scale ratio from 16 train batches, then leave training unchanged.
+    if args.split != 'train': raise ValueError("loss-balance uses the training split only")
+    if args.checkpoint: raise ValueError("loss-balance uses the configured training initialization, not a selected final checkpoint")
+    if args.write_config: raise ValueError("loss-balance reports a proposed ratio; copy it into the run config after review")
+    if dist.is_distributed() or int(os.environ.get('WORLD_SIZE', '1')) > 1: raise ValueError("Run initial loss calibration on 1 process")
+
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    c = build_slt_components(args.data_config, args.slt_config, args.inference_config, language=args.language, bio_config=args.bio_config)
+    if min(float(c.slt_cfg.get(k, 1.)) for k in ('lambda_bio', 'lambda_trans')) <= 0:
+        raise ValueError("Loss balance requires both tasks to be enabled")
+    
+    device = pick_device(args.device)
+    model = c.model.to(device).train()
+    params = list(model.front_end.pose_encoder.parameters()) + list(model.bio_head.parameters())
+    amp = AmpHelper.from_config(c.slt_cfg, device)
+    # Measure the intended joint phase, including gate/CB after any configured warmup.
+    epoch = 1 + max(int(c.slt_cfg.get('membership_gate', {}).get('warmup_epochs', 0)),
+                    int(c.slt_cfg.get('confidence_bound', {}).get('warmup_epochs', 1)))
+    
+    rows, inactive = [], 0
+    for batch in tqdm(islice(c.train_loader, 16), total=min(16, len(c.train_loader)), desc='[loss-balance]'):
+        with amp.autocast(): output = training_loss(model, move_to_device(batch, device), c.slt_cfg, epoch)
+        scale = float(amp.scaler.get_scale()) if amp.scaler.is_enabled() else 1.
+        row = task_gradient_stats(output.bio_loss * scale, output.translation_loss * scale, params)
+        if row is None: inactive += 1; continue
+        row['bio_norm'] /= scale; row['translation_norm'] /= scale
+        rows.append(row)
+
+    if len(rows) < 8: raise ValueError(f"Only {len(rows)} jointly active batches; at least eight are required for this calibration")
+    ratio = math.exp(median([math.log(r['translation_norm'] / r['bio_norm']) for r in rows]))
+    payload = {
+        "language": args.language, "decoder": c.slt_cfg['decoder'], "split": 'train',
+        "annotation_fingerprint": c.checkpoint_meta['annotation_fingerprint'],
+        "active_batches": len(rows), "inactive_batches": inactive, "raw_ratio": ratio,
+        "suggested": {"lambda_bio": ratio, "lambda_trans": 1.0} if .1 <= ratio <= 10. else None,
+        "ratio_in_review_range": .1 <= ratio <= 10., "batches": rows, "interpretation": "Initial shared-gradient scale calibration"
+    }
+    path = Path(args.output or f"outputs/loss_balance_{c.slt_cfg['decoder']}_{args.language}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + '\n')
+    return payload
+
 
 @dataclass(frozen=True)
 class JitterSample:
@@ -223,6 +291,7 @@ def segmenter_infer(args: argparse.Namespace) -> dict: # Upstream segmenter for 
     predictions = predict_phrase_segments(model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, duration=duration)
     output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
     save_prediction_file(predictions, output, provenance={
+        "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
         "segmenter_arch": args.segmenter_arch, "decode": decode, "duration_model": duration.to_dict() if duration else None,
         "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax",
         "pose_normalization": "chunk" if args.segmenter_arch == "s1" else "video",
@@ -257,6 +326,8 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     )
     cfg = load_yaml(args.data_config)
     records, _ = load_language_records(cfg, args.language, split=args.split)
+    require_annotation_match(args.predictions, records, "--predictions")
+
     predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
     _assert_predictions_match_decode(args)
     gold_segments = {record.video_id: [
@@ -297,10 +368,14 @@ def tune_decode(args: argparse.Namespace) -> dict:
     if args.num_videos and args.num_videos < len(records):
         if args.write_config: raise ValueError("A partial-video smoke run cannot write final decoder settings")
         records = records[:args.num_videos]
-    if len(records) < 2: raise ValueError("Decoder selection needs two nonempty dev folds")
+
+    if len(records) < 2: raise ValueError("Decoder selection needs 2 nonempty dev folds")
     train_records, _ = load_language_records(data_cfg, args.language, split="train")
     prior = DurationModel.fit(train_records)
     model, device, velocity, context, checkpoint = _load_segmenter(args)
+    
+    if load_checkpoint_meta(checkpoint).get("annotation_protocol") != ANNOTATION_PROTOCOL:
+        raise ValueError("tune-decode requires segmenter trained on current caption-unit annotations; retrain S1 or external segmenter first.")
     if load_checkpoint_meta(checkpoint).get("decoder") in ("ar", "dlm"):
         raise ValueError("Select duration conditioning on S1 before joint training; only commit lag is re-selected after joint training")
     
@@ -403,7 +478,7 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
                 flagged_partial=bool(e.flagged_partial), commit_time_s=float(e.commit_time_s)
             ) for e in evs]
 
-        events = scoreable_predictions(events, records, inference_cfg, tag=f"tune-stream lag={lag:g}")
+        events = scoreable_predictions(events, records, tag=f"tune-stream lag={lag:g}")
         f1, lat = [], []
         for fold in folds:
             sub_p = {v: events.get(v, []) for v in fold}; sub_g = {v: gold[v] for v in fold}
@@ -669,7 +744,7 @@ def delta_enc(args: argparse.Namespace) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Misaligned-SLT analysis utilities")
     parser.add_argument("--stage", default="dataset-summary", choices=[
-        "dataset-summary", "segmenter-infer", "tune-decode", "tune-stream", "segmenter-errors", "buffer-cap", "delta-enc"
+        "dataset-summary", "segmenter-infer", "tune-decode", "tune-stream", "segmenter-errors", "buffer-cap", "delta-enc", "loss-balance"
     ])
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument(
@@ -712,6 +787,7 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     if args.language is None: args.language = str(load_yaml(args.data_config).get("active_languages", ["asf"])[0])
     if args.stage == "dataset-summary": result = dataset_summary(args)
+    elif args.stage == "loss-balance": result = loss_balance(args)
     elif args.stage == "segmenter-infer": result = segmenter_infer(args)
     elif args.stage == "tune-decode": result = tune_decode(args)
     elif args.stage == "tune-stream": result = tune_stream(args)

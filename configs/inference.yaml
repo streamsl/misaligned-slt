@@ -72,7 +72,9 @@ translation:
     # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces
     # except at the zero-jitter corner; kept as an ablation.
     decode_conditioning: window
-    max_text_tokens: 128
+    # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
+    # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.
+    max_text_tokens: 192
     # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
     # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
     diffusion_steps: 128

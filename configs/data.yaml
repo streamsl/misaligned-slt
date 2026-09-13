@@ -81,6 +81,14 @@ subtitles:
         min_words: 4      # shorter captions are sign-vocabulary labels that match unrelated videos
         min_captions: 10  # below this the cover fraction is quantized to 1/n and unreliable
         cover: 0.5        # flag a pair sharing more than this fraction of the smaller video's identifying captions
+    # Drop video only when BOTH hold: its cues SCROLL (more than half start before the previous ends, so a cue boundary 
+    # is a display event, not an utterance), and under this share of its UNIT boundaries is marked. A boundary is marked 
+    # by terminal punctuation OR by a POSITIONAL capital — a word the train fold lexicon records as ordinarily lowercase, 
+    # so "NDIS" or "Auslan" mid-sentence is not mistaken for a sentence start. Either condition alone removes real data: 
+    # unpunctuated prose still marks clause boundaries (28h of ase news), and a scrolling track that punctuates still 
+    # says where its utterances end. The intersection has no boundary evidence at all: 0 (asf), 3 (ase), 1 (bfi) videos. 
+    # Measured AFTER grouping, because that is where gold boundaries live. Applied to EVERY split.
+    min_marked_boundary_ratio: 0.10
     human_only_splits: [test]
     human_only_exclude_sources: [mt]
     preferred_suffixes:
@@ -99,13 +107,9 @@ subtitles:
     # 2 populations separate cleanly — bilingual videos 0.39-0.48, English-with-quotes below 0.05 — so 0.15 sits in the 
     # empty band between them and drops ~30/10588 videos. Set to 1.0 to disable (required for non-Latin TARGET language).
     max_non_latin_ratio: 0.15
-    # Reconstruct SENTENCE units from display-wrapped caption cues by MERGING whole cues only — never splitting
-    # (docs/data_pipeline.md section 3). Punkt decides which cue junctions fall inside a sentence; each unit is then
-    # judged by the Punkt sentence count k of its own text, under the punctuation-reliability gate (max_tokens):
-    # k=1 punctuated chain -> one merged sentence; k>1 -> QUARANTINE (SentenceSpan.reliable=False: frames UNK,
-    # never an anchor or reference, ignore-region in eval) because its interior boundaries are provably mid-cue and
-    # interior splits are never minted (text-position interpolation is invalid under P1; measured ~35% BLEU deficit).
-    # Unreliable punctuation -> source cues kept. CHANGES the GT spans: re-run everything under one setting.
+    # Group whole cues into timestamp-supported caption units. A unit may contain several linguistic sentences.
+    # Group using original punctuation; render internal sentence-final periods as commas afterward.
+    # This defines the BIO and translation target for every corpus, arm and evaluation split.
     merge_sentences: true
     # Reject VTT variants that flatten the whole transcript into one short cue
     # (common in *.en-en-GB.vtt sidecars) before selecting the subtitle file.
@@ -117,4 +121,3 @@ subtitles:
     # "(gentle piano music)"; keep real sentences that merely mention music/social URLs.
     drop_noise_captions: true
     min_duration_s: 0.20
-    max_duration_s: 60.0

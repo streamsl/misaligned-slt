@@ -21,11 +21,7 @@ checkpoint:
     # language. Uncomment `from_pretrained` below to force 1 checkpoint regardless of language (an ablation override):
     # from_pretrained: checkpoints/openasl_pose_only_slt.pth
     save_best: true # write on every new best dev value (not just end of training)
-    # Best-checkpoint SELECTION (separate from early stopping). Select on dev BLEU, not val_loss: the composite
-    # val_loss (BIO + OPUT + CB) rises from translation-side overfitting on the small corpus while BLEU is still
-    # climbing, so a min-val_loss monitor would restore an early, low-BLEU checkpoint (standard SLT also selects on
-    # dev BLEU). Generation runs every eval anyway (validation.max_translation_samples: 0).
-    monitor: val_translation_bleu4
+    monitor: val_joint_score # Dev-window F1 times translation BLEU: a joint selection surrogate, not DVC.
     mode: max
     restore_best: true
 decoder: dlm
@@ -37,7 +33,7 @@ wandb:
 visual_padding: none # raw windows; the LM encoder masks padding via attention_mask (no boundary halos)
 freeze_backbone: false # Freeze the Uni-Sign pose encoder during SLT training as an overfitting regularizer.
 freeze_projection: false
-lambda_bio: 1.0
+lambda_bio: 2.5
 lambda_trans: 1.0
 oput:
     # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
@@ -183,10 +179,11 @@ scheduler:
     type: cosine
     warmup_epochs: 0
 max_grad_norm: 1.0
-# Text canvas ceiling. Measured caption lengths: asf max 62, bfi max 96 tokens (mean ~15), so 128 truncates
-# nothing and 96 is the lossless floor. The canvas width drives EVERY decoder forward, so most of the compute
-# under a fixed 128 is spent on padding — see pad_text_to_max_length.
-max_text_tokens: 128
+# Text canvas ceiling, sized to the data like buffer_cap_s. A caption unit can hold several sentences, so target length
+# follows the unit distribution: longest unit that fits streaming buffer needs 177 mT5 tokens on asf and 165 on bfi
+# under the caps this protocol implies (37.56 / 41.15 s). `train.slt.assert_targets_fit` refuses to start below the 
+# measured need — collator never truncates complete target, so the alternative is a crash mid-epoch. 192 = 48 blocks of 4.
+max_text_tokens: 192  # Near-free at train: pad_text_to_max_length false sizes the canvas to the batch, not to this ceiling
 # false = size the text canvas to the batch (block-aligned, with the EOS-supervision tail preserved). Equivalent
 # supervision at ~1/3 the canvas width; tests/test_collator_dynamic_padding.py pins the equivalence. false is the
 # DEPLOYED setting; true restores the fixed 128-wide canvas for an equivalence check (cb_active_count / cb_loss

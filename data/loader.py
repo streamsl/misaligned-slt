@@ -6,23 +6,25 @@ from typing import Any, Iterable
 from pathlib import Path
 from tqdm import tqdm
 
-import re, random, csv, html, json, unicodedata, zlib
+import re, random, csv, html, json, unicodedata, zlib, hashlib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
 from train import distributed as dist
 
-from data.windowing import SentenceSpan
+from data.windowing import SentenceSpan, ANNOTATION_PROTOCOL, TRUSTED_GAP_S
 from poses import PoseIndex, build_pose_index
-from poses.pose_io import META_FILENAME, load_video_meta
+from poses.pose_io import META_FILENAME, base_video_id, load_video_meta
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
     r"(?P<end>\d{1,2}:\d{2}:\d{2}[.,]\d{3})"
 )
-TAG_RE = re.compile(r"<[^>]+>")
 WORD_TIMING_RE = re.compile(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>")
-SPEAKER_PREFIX_RE = re.compile(r"^[A-Z][A-Z\s_-]{1,30}:\s*")
+_ASR_WORD_TIMING_RE = re.compile(r"<\d\d:\d\d:\d\d\.\d\d\d>")
+_SENTENCE_FINAL_RE = re.compile(r'[.!?][\"\')\]]*\s*$')  # terminal punctuation, allowing closing quotes and brackets
+_WORD_RE = re.compile(r"[A-Za-z][\w']*")
+
 # Non-verbal annotations / stylistic markers: (laughter), [music], *flush*. 
 # Newline-free and length-bounded so an unclosed bracket cannot swallow the rest of the cue.
 #
@@ -34,8 +36,10 @@ BRACKET_ANNOTATION_RE = re.compile(r"\[[^\[\]\n]{0,80}\]|\*[^*\n]{0,80}\*")
 PAREN_GROUP_RE = re.compile(r"\([^()\n]{0,80}\)")
 LEADING_SYMBOL_RE = re.compile(r"^[\s♪♫•·\-–—>»]+")
 TRAILING_SYMBOL_RE = re.compile(r"[\s♪♫•·]+$")  # a cue often closes with the note it opened with
+TAG_RE = re.compile(r"<[^>]+>")
 # Speaker identifier: ONE word (optionally two, e.g. "MRS SMITH:") then a colon, at the cue start. Bounded to a single token so a genuine 
 # clause like "One thing: ..." keeps its text — that costs recall on rare speaker labels but never deletes signed content.
+SPEAKER_PREFIX_RE = re.compile(r"^[A-Z][A-Z\s_-]{1,30}:\s*")
 SPEAKER_ID_RE = re.compile(r"^[A-Za-z][\w'\-]{0,20}(?:\s+[A-Z][\w'\-]{0,20})?:\s+")
 NOISE_WORD_RE = re.compile(r"[a-z]+")
 NOISE_CAPTION_WORDS = {
@@ -55,9 +59,14 @@ _PUNCT_NORMALISE = {ord(k): v for k, v in {
     "\u2060": "", "\ufeff": "", "\u200c": "", "\u200d": "", "\u00ad": "",
 }.items()}
 _PUNKT = None
-_SENTENCE_FINAL_RE = re.compile(r'[.!?][\"\')\]]*\s*$')  # a unit ending here is a Punkt-confirmed sentence
 _LANG_RECORDS_CACHE: dict[tuple, list[VideoRecord]] = {}
+_FOLD_LEXICON_CACHE: dict[tuple, frozenset[str]] = {}
 
+# Measured on asf/bfi/ase train cues: merged prose signs at 0.70 w/s (asf p1) to 2.2 w/s (p50) with 6-11 words per display cue and 4-22% 
+# capitalised tokens; fingerspelling and vocabulary lists sign at ~0.1 w/s with 1.3-2.2 words per cue and 66-78% capitalised tokens. 
+PROSE_MIN_WORDS_PER_S = 0.3
+GLOSS_MAX_WORDS_PER_CUE = 2.5
+GLOSS_MIN_CAPITALISED_SHARE = 0.6
 
 @dataclass(frozen=True)
 class VideoRecord:
@@ -67,11 +76,129 @@ class VideoRecord:
     subtitle_path: Path
     sentences: tuple[SentenceSpan, ...]
 
+def _is_pronoun_i(word: str) -> bool:
+    return word == "I" or word.startswith("I'")
+
+def _caption_files_key(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> str:
+    # Identity of every caption file the lexicon reads (path, size, mtime), plus the rules that shape the reading.
+    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, bool(subtitle_cfg.get("drop_noise_captions", True))]).encode())
+    for subs, ids in sources:
+        for vid in ids:
+            for path in sorted(Path(subs).glob(f"{vid}.*.vtt")):
+                st = path.stat(); digest.update(f"{path}\t{st.st_size}\t{st.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+def _train_video_ids(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
+    # (subs root, train ids) without loading records: the same id universe `build_pose_index` keys on.
+    root = Path(data_cfg["languages"][language]["root"])
+    ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})
+    return root / "subs", build_splits(ids, data_cfg.get("splits", {})).get("train", []) if ids else []
 
 def timestamp_to_seconds(value: str) -> float:
     value = value.replace(",", ".")
     hours, minutes, seconds = value.split(":")
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict, cache_path: Path | None = None) -> frozenset[str]:
+    """Words safe to lowercase at a comma-joined sentence start, from the TRAIN splits' raw cues.
+
+    Capital at sentence start is positional; after the period becomes comma it is noise decoder must learn ("..., Consequently, this ..."). 
+    But a capital can also be lexical (a name, "Deaf" as identity, "BSL"), and only the corpus can tell: a word is foldable when it occurs 
+    in lowercase more often than it occurs capitalised INSIDE a sentence (Punkt over each raw cue, so sentence-initial capitals are not 
+    counted as name evidence). Built on train only, applied to every split, so dev/test references never shape the rule and an unattested 
+    word simply keeps its case. Measured on asf/bfi alone: folds ~75 % of candidates, wrong folds ~0.5 %, all of them the captioner's own 
+    inconsistency. `sources` pools the corpora that share a target language (see `case_lexicon`); `cache_path` stores the result keyed by 
+    the caption files' identity, because the pooled build reads every train VTT.
+    """
+    key = tuple((str(subs), tuple(sorted(ids))) for subs, ids in sources)
+    if key in _FOLD_LEXICON_CACHE: return _FOLD_LEXICON_CACHE[key]
+    files_key = _caption_files_key(sources, subtitle_cfg) if cache_path is not None else None
+
+    if cache_path is not None and cache_path.exists():
+        try: stored = json.loads(cache_path.read_text(encoding="utf-8"))
+        except ValueError: stored = {}
+        if stored.get("key") == files_key:
+            lexicon = frozenset(stored.get("words", []))
+            _FOLD_LEXICON_CACHE[key] = lexicon
+            return lexicon
+        
+    tok = _punkt_tokenizer()
+    lower: dict[str, int] = {}; cap_inside: dict[str, int] = {}
+    drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
+
+    for subs, ids in sources:
+        for vid in ids:
+            path = best_subtitle(subs, vid, subtitle_cfg)
+            if path is None: continue
+
+            for _, _, text in merge_rolling_captions(parse_vtt(path, drop_noise=drop_noise)):
+                sentences = [text[a:b] for a, b in tok.span_tokenize(text)] if tok is not None else [text]
+                for sentence in sentences:
+                    for i, word in enumerate(_WORD_RE.findall(sentence)):
+                        if word[0].islower(): lower[word.lower()] = lower.get(word.lower(), 0) + 1
+                        elif i > 0: cap_inside[word.lower()] = cap_inside.get(word.lower(), 0) + 1
+
+    lexicon = frozenset(w for w, n in lower.items() if n > cap_inside.get(w, 0))
+    _FOLD_LEXICON_CACHE[key] = lexicon
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"key": files_key, "words": sorted(lexicon)}) + "\n", encoding="utf-8")
+    return lexicon
+
+
+def case_lexicon(data_cfg: dict, language: str) -> frozenset[str]:
+    """The fold lexicon for `language`'s TARGET language, pooled over every configured corpus with that target.
+
+    Capitalisation convention belongs to the target language, not to the sign corpus: asf's train captions never lowercase "consequently", 
+    ase's do. Every corpus sharing the target must be present — a missing one is an error, never a silent change of rendering — so the 
+    rendering is a function of data.yaml alone. The disk cache lives under the shared data root, keyed by the caption files' identity.
+    """
+    langs = data_cfg["languages"]
+    target = str(langs[language].get("target_lang", "en_XX"))
+    sources = []
+    for other in sorted(l for l, c in langs.items() if str(c.get("target_lang", "en_XX")) == target):
+        subs, ids = _train_video_ids(data_cfg, other)
+        if not ids: raise FileNotFoundError(
+            f"[loader] the case lexicon for target {target} needs {other}'s train captions under {subs}: download that corpus "
+            f"(prepare_data.py --languages {other}) or remove it from data.yaml languages."
+        )
+        sources.append((subs, ids))
+    cache = Path(langs[language]["root"]).parent / f"case_lexicon.{target}.json"
+    return fold_lexicon(sources, data_cfg.get("subtitles", {}), cache_path=cache)
+
+
+def _is_prose(cues: list[tuple], joined: str, duration_s: float) -> bool:
+    # Is a multi-cue chain wrapped prose, so that Punkt finding no boundary across its junctions is evidence?
+    words = _WORD_RE.findall(joined)
+    if not words or duration_s <= 0: return False
+    if len(words) / duration_s < PROSE_MIN_WORDS_PER_S: return False
+    words_per_cue = sum(len(_WORD_RE.findall(text)) for _, _, text in cues) / len(cues)
+    capitalised = sum(1 for w in words if w[0].isupper()) / len(words)
+    return not (words_per_cue <= GLOSS_MAX_WORDS_PER_CUE and capitalised >= GLOSS_MIN_CAPITALISED_SHARE)
+
+
+def _fold_sentence_start(part: str, lexicon: frozenset[str] | None) -> str:
+    # Lowercase 1st word of an interior sentence when the corpus says its capital was positional.
+    if not lexicon: return part
+    m = _WORD_RE.search(part)
+    if m is None: return part
+    word = m.group(0)
+    if not word[0].isupper() or len(word) == 1 or _is_pronoun_i(word): return part   # I / I'm; fingerspelled letters
+    nxt = _WORD_RE.search(part, m.end())
+    if nxt and nxt.group(0)[0].isupper() and not _is_pronoun_i(nxt.group(0)): return part   # "New Zealand", "Deaf Youth"
+    if word.lower() not in lexicon: return part
+    return part[:m.start()] + word[0].lower() + part[m.start() + 1:]
+
+
+def annotation_fingerprint(records) -> str: # Identify the actual unit texts, times, reliability and frame geometry used by a dataset.
+    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, TRUSTED_GAP_S]).encode())
+    for r in sorted(records, key=lambda r: (r.language, r.video_id)):
+        row = [
+            r.language, r.video_id, float(r.pose.fps), float(r.pose.duration_s), 
+            [(s.start_s, s.end_s, s.text, s.reliable) for s in r.sentences]
+        ]
+        digest.update(json.dumps(row, ensure_ascii=False, separators=(',', ':')).encode())
+    return ANNOTATION_PROTOCOL + ':' + digest.hexdigest()
 
 
 def clean_caption_text(lines: Iterable[str]) -> str:
@@ -94,7 +221,10 @@ def clean_caption_text(lines: Iterable[str]) -> str:
     raw = SPEAKER_ID_RE.sub("", raw)            # "John:" / "NARRATOR:" at the start of a cue
     raw = re.sub(r"\s+([,.!?;:])", r"\1", raw)  # no space before punctuation
     raw = re.sub(r"\s+", " ", raw).strip()
-    return raw.strip("\"' ").strip()
+    # A quote after final punctuation closes a quotation; an apostrophe inside a word is lexical.
+    # Preserve both leading elisions ('cause) and trailing possessives (students').
+    if len(raw) > 1 and raw[0] == raw[-1] and (raw[0] == '"' or (raw[0] == "'" and raw[-2] in '.!?')): raw = raw[1:-1].strip()
+    return re.sub(r"(?<=[.!?])[\"']+$", "", raw)
 
 
 def is_noise_caption(text: str) -> bool:
@@ -140,9 +270,8 @@ def parse_vtt(path: str | Path, drop_noise: bool = False) -> list[tuple[float, f
 
 
 def _punkt_tokenizer():
-    # Pretrained English Punkt: segments the caption stream into sentences, joining fragments by the ABSENCE of a boundary and 
-    # splitting multi-sentence cues, with an abbreviation model so "Dr." / "U.S." never split. Loaded once; None if unavailable, 
-    # so the caller falls back to the raw cues rather than crashing.
+    # Pretrained English Punkt: segments caption stream into sentences, joining fragments by the ABSENCE of a boundary and 
+    # splitting multi-sentence cues, with an abbreviation model. Loaded once; grouping refuses to proceed if unavailable.
     global _PUNKT
     if _PUNKT is None:
         try:
@@ -153,7 +282,7 @@ def _punkt_tokenizer():
                 nltk.download("punkt_tab", quiet=True)
                 _PUNKT = nltk.data.load("tokenizers/punkt/english.pickle")
         except Exception:
-            print("[loader] WARNING: Punkt unavailable; caption cues are used as-is (no sentence reconstruction).", flush=True)
+            print("[loader] WARNING: Punkt unavailable; caption-unit grouping requires its tokenizer data.", flush=True)
             _PUNKT = False
     return _PUNKT or None
 
@@ -186,7 +315,7 @@ def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> list[tuple[floa
     """
     out: list = []
     prev_end = float("-inf")
-    # Tuples may carry a 4th `reliable` field (quarantined chains) — pass any extra fields through untouched.
+    # Tuples may carry a 4th `reliable` field (unsupported coverage) — pass any extra fields through untouched.
     for c in sorted(captions, key=lambda x: (x[0], x[1])):
         s, e = max(c[0], prev_end), c[1]
         if e <= s: continue  # wholly swallowed by the previous span
@@ -200,9 +329,9 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
     Streams end before the caption timeline (duration = frames/24 underestimates the video), so this straddle is systematic, not an edge 
     case. Dropping caption relabels its visible frames as uncaptioned — and a leftover tail gap of trusted_gap_s or less is then supervised 
     as trusted `O` over frames the caption says are signing. Clipping to `duration_s` as a RELIABLE span would instead mint an end boundary 
-    no cue marks, with text for signing partly outside the poses. Quarantine is the one honest option (same known-wrong-labels-are-excluded 
-    rule reconstruct_sentences applies): frames UNK, never an anchor, reference, or Mode-4 gap. Ends within `slack_s` of the stream end are 
-    left alone — the existing span filter tolerates them, and their label error is below the timestamp noise floor.
+    no cue marks, with text for signing partly outside the poses. Marking the coverage unsupported (reliable=False) is the one honest option: 
+    frames UNK, never an anchor, reference, or Mode-4 gap. Ends within `slack_s` of the stream end are left alone — the existing span filter 
+    tolerates them, and their label error is below the timestamp noise floor.
     """
     return [
         (c[0], float(duration_s), c[2], False) if (c[0] < duration_s and c[1] > duration_s + float(slack_s)) else c
@@ -210,35 +339,21 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
     ]
 
 
-def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: int = 60) -> list[tuple]:
-    """Rebuild sentence units from display-wrapped caption cues; QUARANTINE what cannot be labelled correctly.
+def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: int = 60, fold: frozenset[str] | None = None) -> list[tuple]:
+    """Group whole display cues into timestamp-supported caption units.
 
-    Punkt segments concatenated cue text; a junction that a Punkt sentence straddles is sentence-interior, and junction-joined cues form a 
-    chain. Each candidate unit (chain/single cue) is then judged by Punkt segmentation OF ITS OWN TEXT — k sentences — under 1 precondition:
+    Punkt reads the original text to find cue junctions inside linguistic sentences. Connected cues form 1 unit; a unit can contain several 
+    linguistic sentences. Its BIO labels describe unit membership, not each linguistic sentence. Only after grouping, internal sentence-final 
+    periods become commas, and the sentence that follows a converted period loses its positional capital when the train lexicon `fold` says 
+    the word is ordinarily lowercase (see `fold_lexicon`; names, "I", initialisms and proper-noun compounds keep theirs). Questions and 
+    exclamations are retained, and the sentence after them keeps its capital.
 
-    PUNCTUATION-RELIABILITY GATE (`max_tokens`): if any of a unit's own "sentences" exceeds it, the channel omits terminal punctuation,
-    junction evidence is vacuous, and the source cues are kept as-is. Measured single-cue Punkt-sentence lengths over asf+bfi+ase are
-    p50 7 / p99 21 / max 40 tokens, so the default sits well above any real sentence and fires only on fusion. It is NOT redundant with
-    the k>1 quarantine and quarantine cannot replace it: on an unpunctuated channel a single stray period makes Punkt read the whole run
-    as ONE sentence, so k==1 and the unit would be emitted RELIABLE (measured: 12 unpunctuated cues fuse into one 83-token 36s span with
-    the gate off, 12 preserved cues with it on). Quarantine catches unlocatable boundaries; this gate catches absent evidence.
-
-    For reliable segmentations:
-      single cue, k <= 1           -> kept as-is (the caption author's own sentence hypothesis).
-      chain,      k == 1, punct.   -> merged unit: ONE sentence, outer bounds = real cue timestamps.
-      chain,      k == 1, no punct -> source cues kept (no completion evidence).
-      k > 1                        -> QUARANTINED `(start, end, text, False)`: every interior boundary in a chain is mid-cue by construction 
-                                      (a boundary AT a junction would have broken the chain there), and a multi-sentence single cue likewise. 
-                                      No cue timestamp marks them, and interpolating from character position is invalid under P1 (sign order 
-                                      is not text order; measured ~35% BLEU deficit on interpolated-boundary spans). Known-wrong labels are 
-                                      excluded, not approximated: the region becomes `SentenceSpan(reliable=False)` — frames UNK, never an 
-                                      anchor or reference, never a Mode-4 "gap" (the span still occupies its timeline).
-
-    Cues are never SPLIT: separating back-to-back sentences in TIME is the semi-Markov duration decode's job at inference, not label builder's. 
-    Every emitted timestamp is a source-cue timestamp.
+    Missing punctuation or a sentence above max_tokens leaves the source cues separate. The limit guards unreliable grouping evidence; it does 
+    not clip text or invent timestamps. Cues are never split.
     """
+    if not captions: return []
     tok = _punkt_tokenizer()
-    if tok is None or not captions: return list(captions)
+    if tok is None: raise RuntimeError("Caption-unit grouping requires NLTK Punkt; install punkt_tab before loading annotations.")
     parts: list[str] = []; char_cue: list[int] = []
     for ci, (cs, ce, t) in enumerate(captions):
         if parts: parts.append(" "); char_cue.append(-1)      # junction char between cue ci-1 and ci
@@ -249,19 +364,38 @@ def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: 
     for a, b in tok.span_tokenize(text):
         ids = sorted({c for c in char_cue[a:b] if c != -1})
         for x, y in zip(ids, ids[1:]):
-            if y == x + 1: crossed.add(x)
+            # Text evidence alone is not enough to assert membership: the unit is timestamp-SUPPORTED, so a junction
+            # the labeller distrusts cannot be crossed. `untrusted_o_intervals` calls an uncaptioned stretch longer
+            # than TRUSTED_GAP_S unlocatable and marks it UNK; merging across the same stretch would relabel it I.
+            if y == x + 1 and captions[y][0] - captions[x][1] <= TRUSTED_GAP_S: crossed.add(x)
     out: list[tuple] = []
 
     def emit(run: list[int]) -> None:
         s0, e1 = captions[run[0]][0], captions[run[-1]][1]
         joined = " ".join(captions[c][2] for c in run).strip()
         sents = [joined[a:b] for a, b in tok.span_tokenize(joined)]
-        if any(len(x.split()) > int(max_tokens) for x in sents):   # punctuation-unreliable: evidence is vacuous
-            out.extend(captions[c] for c in run)
-        elif len(sents) > 1: out.append((s0, e1, joined, False))   # interior mid-cue boundaries: quarantine
+        # A multi-cue chain is merged only when Punkt's failure to split it is INFORMATIVE, i.e. the chain is wrapped prose. A gloss list 
+        # ("HOST DOG GARDEN ...") has no boundaries to find, so every junction reads as crossed and the whole list would fuse into one unit 
+        # of minutes. 2 measured signatures of non-prose, either one refusing the merge: language rate under PROSE_MIN_WORDS_PER_S (asf prose 
+        # p1 is 0.70 w/s; lists sign at ~0.1), or display cues that are glosses (<= GLOSS_MAX_WORDS_PER_CUE words each, mostly capitalised).
+        prose = len(run) == 1 or _is_prose([captions[c] for c in run], joined, e1 - s0)
+        if any(len(x.split()) > int(max_tokens) for x in sents): out.extend(captions[c] for c in run) # punctuation-unreliable
+        elif len(sents) > 1 and _SENTENCE_FINAL_RE.search(joined) and prose:   # same completion evidence the k==1 chain needs
+            # Boundaries were obtained from the unchanged text. Commas and case only change the target's rendering.
+            rendered, after_period = [], False
+            for i, part in enumerate(sents):
+                if after_period: part = _fold_sentence_start(part, fold)
+                after_period = False
+                if i < len(sents) - 1 and not re.search(r"(?:[!?]|\.{3})[\"')\]]*$", part):
+                    # A period becomes a comma; an abbreviation ("U.S.") keeps its period and gains one. ?, ! and an ellipsis stay.
+                    joined_part = part + ',' if re.search(r"\b(?:[A-Za-z]\.){2,}$", part) else re.sub(r"\.(?=[\"')\]]*$)", ",", part)
+                    after_period = joined_part != part
+                    part = joined_part
+                rendered.append(part)
+            out.append((s0, e1, " ".join(rendered)))
         elif len(run) == 1: out.append(captions[run[0]])
-        elif _SENTENCE_FINAL_RE.search(joined): out.append((s0, e1, joined))
-        else: out.extend(captions[c] for c in run)                 # unpunctuated remnant: keep the author's cues
+        elif _SENTENCE_FINAL_RE.search(joined) and prose: out.append((s0, e1, joined))
+        else: out.extend(captions[c] for c in run) # unpunctuated remnant or gloss list: keep the author's cues
         
     run = [0]
     for k in range(len(captions) - 1):
@@ -308,6 +442,59 @@ def _subtitle_score(path: Path, preferred_suffixes: list[str], reject_suffixes: 
     return (len(preferred_suffixes) + 100, 0, name)
 
 
+def looks_asr_transcript(path: Path) -> bool:
+    """Heuristic for word-timed tracks; this does not prove automatic-caption provenance.
+
+    Plain WebVTT class tags are formatting and are not a reason to reject a track. Manual karaoke tracks can
+    also contain word timestamps, so this existing exclusion must be reported as a heuristic.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as fh: head = fh.read(20_000)
+    except OSError: return False
+    return bool(_ASR_WORD_TIMING_RE.search(head))
+
+
+def is_scrolling_display(cues) -> bool:
+    """A caption track that scrolls: a new line appears while the previous one is still on screen.
+
+    Overlapping cue times are the signature. On such a track a cue boundary is a DISPLAY event, not an utterance event, so it lands wherever 
+    the line filled up — `hello my name is nikki stratton and my` followed by `company`. Nothing downstream can recover an utterance boundary 
+    from that, because the annotation never encoded one. Measured on the raw cues, before rolling-duplicate merging removes the repeats.
+    """
+    cues = list(cues)
+    if len(cues) < 5: return False
+    overlapping = sum(1 for a, b in zip(cues, cues[1:]) if b[0] < a[1] - 1e-6)
+    return overlapping / (len(cues) - 1) > 0.5
+
+
+def marked_boundary_ratio(units, fold: frozenset[str] | None = None) -> float:
+    """Share of a video's UNIT boundaries the caption author marked, read AFTER grouping.
+
+    A boundary is marked when the unit ends in sentence punctuation, or the next unit opens with a POSITIONAL capital. Terminal punctuation alone 
+    is a punctuation-STYLE test: over the three corpora 37 % (asf), 73 % (ase) and 69 % (bfi) of boundaries carrying no period are followed by a 
+    capital, so a period-only rule rejects song lyrics and capital-marked prose whose boundaries are real.
+
+    A capital is POSITIONAL only when the word is ordinarily lowercase, which is what the train `fold` lexicon records (`fold_lexicon`, the same test 
+    `_fold_sentence_start` applies). "NDIS", "Auslan" and "David" carry a LEXICAL capital and say nothing about a boundary: a wrap that lands before 
+    a proper noun would otherwise read as a sentence start. Without a lexicon only the punctuation half is available, and an all-caps unit is never
+    evidence, because in a gloss list every line opens with a capital.
+
+    Read after grouping since that is where gold boundaries live. On raw cues a continuous unpunctuated narration scores near 0 although grouping 
+    fuses it into 1 unit without internal boundary at all. What this leaves is the channel whose line breaks fall mid-phrase: the annotation marks 
+    no boundary of either kind.
+    """
+    units = list(units)
+    if len(units) < 2: return 1.0
+
+    def positional_capital(text: str) -> bool:
+        word = text.strip().split(" ")[0] if text.strip() else ""
+        if not word[:1].isupper() or word.isupper(): return False
+        return fold is not None and word.strip(".,;:!?\"')]").lower() in fold
+
+    marked = sum(1 for a, b in zip(units, units[1:]) if _SENTENCE_FINAL_RE.search(a[2]) or positional_capital(b[2]))
+    return marked / (len(units) - 1)
+
+
 def looks_flattened_transcript(
     captions: list[tuple[float, float, str]], max_cues: int = 2, min_chars: int = 500, max_chars_per_second: float = 120.0,
 ) -> bool:
@@ -341,6 +528,7 @@ def find_best_subtitle(
     candidates = sorted(subtitle_root.glob(pattern))
     scored: list[tuple[tuple[int, int, str], Path]] = []
     for path in candidates:
+        if looks_asr_transcript(path): continue
         try: parsed = parse_vtt(path, drop_noise=drop_noise)
         except OSError: continue
 
@@ -666,21 +854,26 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
         )
     records: list[VideoRecord] = []
     dropped_no_caption = 0
+    # The case-fold lexicon is a TRAIN-split constant (like the class weights), applied to every split.
+    fold = case_lexicon(data_cfg, language) if subtitle_cfg.get("merge_sentences") else None
     # 1.0 disables the filter (no video can exceed a full share). The key is GLOBAL under `subtitles:`, which is
     # correct while every corpus targets English; a non-Latin-target corpus would need a per-language override, not
     # a global 1.0, which would switch the filter off for the English corpora too.
     max_non_latin = float(subtitle_cfg.get("max_non_latin_ratio", 1.0))
     dropped_non_latin: list[tuple[str, float]] = []
+    min_marked = float(subtitle_cfg.get("min_marked_boundary_ratio", 0.0))
+    dropped_unmarked: list[tuple[str, float]] = []
     for video_id in tqdm(selected_ids, desc=f"[loader] {language}/{split or 'all'}", unit="vid", leave=False, dynamic_ncols=True):
         subtitle_path = best_subtitle(root / "subs", video_id, subtitle_cfg)
         if subtitle_path is None:
             dropped_no_caption += 1
             continue
-        captions = merge_rolling_captions(parse_vtt(subtitle_path, drop_noise=drop_noise))
-        if subtitle_cfg.get("merge_sentences"):  # rebuild sentence units from display-wrapped cues (Punkt over the caption stream)
-            captions = reconstruct_sentences(captions)
+        source_cues = parse_vtt(subtitle_path, drop_noise=drop_noise)
+        raw_cues = merge_rolling_captions(source_cues)
+        captions = raw_cues
+        if subtitle_cfg.get("merge_sentences"):  # group display-wrapped cues into caption units (Punkt over the caption stream)
+            captions = reconstruct_sentences(captions, fold=fold)
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
-        max_dur = float(subtitle_cfg.get("max_duration_s", 60.0))
         # `s < duration`: sentence ONSET must land inside extracted poses, else no visible signing to anchor on. SignVerse streams 
         # end before their caption timeline (duration = pose_frames/24 underestimates the video), so late captions start past the poses; 
         # `e <= duration + 1.0` bounds only the END. Without it, the sampler builds start_s > end_s windows → load_pose_frames raises.
@@ -700,14 +893,25 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             if ratio > max_non_latin:
                 dropped_non_latin.append((video_id, ratio))
                 continue
+        # A scrolling track whose boundaries the author never marked encodes no utterance boundary at all. Both conditions are needed: unpunctuated 
+        # PROSE still carries real clause boundaries (28h of ase news would go), and scrolling track that does mark its boundaries is still usable.
+        if min_marked > 0.0 and is_scrolling_display(source_cues) and marked_boundary_ratio(captions, fold) < min_marked:
+            dropped_unmarked.append((video_id, marked_boundary_ratio(captions, fold)))
+            continue
         spans = tuple(
             SentenceSpan(video_id=video_id, start_s=c[0], end_s=c[1], text=c[2], reliable=bool(c[3]) if len(c) > 3 else True)
-            for c in captions if min_dur <= (c[1] - c[0]) and (len(c) > 3 or (c[1] - c[0]) <= max_dur) 
+            for c in captions if min_dur <= (c[1] - c[0])
             and c[0] < dur and c[1] <= dur + 1.0 and any(ch.isalpha() for ch in c[2])
         )
         # Require >=1 RELIABLE span: an all-quarantined record contributes no anchor, target, or gold event, so
         # keeping it only loads poses nothing uses. Invariant: a record that reaches training/eval is usable.
         if any(sp.reliable for sp in spans): records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
+
+    if dropped_unmarked: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_unmarked)} video(s) dropped as UNMARKED (<{min_marked:.0%} of unit boundaries carry a "
+        f"period or a following capital; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_unmarked, key=lambda x: x[1])[:3])
+        + "); subtitles.min_marked_boundary_ratio.", flush=True
+    )
     if dropped_non_latin: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_non_latin)} video(s) dropped as WRONG-LANGUAGE (>{max_non_latin:.0%} non-Latin "
         f"caption characters; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_non_latin, key=lambda x: -x[1])[:3])

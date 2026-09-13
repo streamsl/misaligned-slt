@@ -10,6 +10,7 @@ import math, hashlib, json
 import numpy as np
 import torch
 from scipy.special import log_ndtr
+from data.loader import annotation_fingerprint
 from data.windowing import BIO
 
 
@@ -20,19 +21,25 @@ class DurationModel:
     tail_start_s: float
     completion_bias: float = 0.0
     boundary_logit_weight: float = 1.0
+    annotation_signature: str | None = None
 
     def __post_init__(self):
+        if self.annotation_signature is not None and not isinstance(self.annotation_signature, str):
+            raise ValueError("annotation_signature must be a string or None")
         for key,value in asdict(self).items():
+            if key == 'annotation_signature': continue
             if isinstance(value, bool): raise ValueError("Duration parameters must be numeric, not boolean")
             object.__setattr__(self, key, float(value))
-        if not all(math.isfinite(x) for x in asdict(self).values()): raise ValueError("Duration parameters must be finite")
+        if not all(math.isfinite(x) for k,x in asdict(self).items() if k != 'annotation_signature'):
+            raise ValueError("Duration parameters must be finite")
         if self.sd_log_s <= 0 or self.tail_start_s <= 0 or self.boundary_logit_weight <= 0:
             raise ValueError("Duration spread, tail time and boundary weight must be positive")
 
-    def to_dict(self): return asdict(self)
+    def to_dict(self): 
+        return asdict(self)
 
     @property
-    def signature(self): # Fingerprint the numerical duration parameters, independent of display names.
+    def signature(self): # Score parameters and the annotations used to fit them.
         return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:16]
 
     @classmethod
@@ -45,8 +52,12 @@ class DurationModel:
         values = np.log(durations)
         return cls(
             float(values.mean()), float(max(values.std(), .001)), float(np.quantile(durations, .99)),
-            float(completion_bias), float(boundary_logit_weight)
+            float(completion_bias), float(boundary_logit_weight), annotation_fingerprint(records)
         )
+
+    def require_annotations(self, records):
+        if self.annotation_signature != annotation_fingerprint(records):
+            raise ValueError("Duration calibration uses different or unstamped annotations; retrain segmenter & rerun tune-decode on dev.")
 
     @classmethod
     def from_config(cls, cfg, language, arch='s1', required=True):

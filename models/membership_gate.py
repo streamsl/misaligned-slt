@@ -2,20 +2,32 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
-import warnings
+
+import math, warnings
 import torch
+import torch.nn.functional as F
 from infer.duration_decode import DurationDecoder
 from infer.commit_gate import open_span_start, select_target_span
-import torch.nn.functional as F
 
 
 def membership_bias(membership, frame_mask, commit_mask=None, eps=1e-4):
-    # Finite log-membership bias; padding and committed frames cannot receive membership.
+    """Normalize the pose PRIOR weights to sum to the valid frame count.
+
+    This preserves pairwise pose bias differences and makes a uniform prior neutral on valid frames.
+    It does not fix the pose/prompt attention share: actual weights also depend on query-key scores.
+    Padding and committed frames receive the finite floor; the encoder mask separately excludes padding.
+    """
     if not 0 < eps < 1: raise ValueError("eps must lie between 0 and 1")
     valid = frame_mask.bool()
     if commit_mask is not None: valid = valid & ~commit_mask.bool()
     m = torch.where(valid, membership.clamp(0., 1.), torch.zeros_like(membership))
-    return torch.log(eps + (1.-eps)*m)
+    omega = torch.log(eps + (1.-eps)*m).masked_fill(~valid, -torch.inf)
+    # `_lse` rather than a plain logsumexp: a row with no attendable frame is all -inf, and logsumexp's backward would
+    # form 0 * NaN there (zeroed downstream, but anomaly mode raises). _lse keeps that row's gradient exactly 0.
+    total = _lse(omega, dim=-1).unsqueeze(-1)
+    # A row with no attendable frame has no mass to redistribute; leave it at the floor rather than dividing by 0.
+    scale = torch.where(total.isfinite(), valid.sum(-1, keepdim=True).clamp(min=1).log() - total, total.new_zeros(()))
+    return (omega + scale).masked_fill(~valid, math.log(eps))
 
 
 class CrossAttnOmegaInjector:

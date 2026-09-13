@@ -62,7 +62,7 @@ augmentation:
 
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
-epochs: 50
+epochs: 100
 eval_every_epochs: 1
 early_stopping:
     enabled: true

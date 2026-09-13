@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from data.windowing import BIO, TRUSTED_GAP_S
-from data.loader import assert_pool_safe, resolve_pretrain_records
+from data.loader import ANNOTATION_PROTOCOL, annotation_fingerprint, assert_pool_safe, resolve_pretrain_records 
 from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
@@ -56,6 +56,7 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
     # Provenance stamp, same keys S1 writes: without it a pooled baseline checkpoint is indistinguishable
     # from a monolingual one at load time and eval.py's pool assertion can never fire for this arm.
     cfg["checkpoint_meta"] = {
+        "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_records),
         "language": cfg.get("language"), "bio_class_weights": cfg.get("bio_class_weights"),
         "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"),
     }

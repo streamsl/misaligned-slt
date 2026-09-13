@@ -19,7 +19,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from data.batch import WindowCollator
-from data.loader import StreamingWindowDataset, assert_pool_safe, resolve_pretrain_records, sentence_p99_s, streaming_loader
+from data.loader import (
+    ANNOTATION_PROTOCOL, StreamingWindowDataset, annotation_fingerprint, 
+    assert_pool_safe, resolve_pretrain_records, sentence_p99_s, streaming_loader
+)
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
@@ -32,7 +35,7 @@ from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio
 from metrics import bio_frame_metrics, CompleteSpanMetrics
 from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference
 
-PRETRAIN_CONTEXT_MARGIN_S = 1.0  # a deployed cap adds delta/fps to p99 + stride; one second covers any delta up to fps frames
+PRETRAIN_CONTEXT_MARGIN_S = 1.0  # floor for the δ/fps term below, so a language with no measured δ still gets headroom
 
 class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
     def __init__(
@@ -72,14 +75,27 @@ class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared 
 
 
 def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, language: str | None = None) -> dict[str, float] | None:
-    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of train p99 + stride_s + 
-    margin: the label-only rule the deployed caps follow, covering deployed caps when delta/fps does not exceed the margin. 
-    Return the per-language terms, or None when the cap is numeric (an explicit design override)."""
+    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of the DEPLOYED cap rule.
+
+    The head is never run beyond its trained RoPE context, and `analyze.py --stage buffer-cap` refuses a cap above it, so this must 
+    compute SAME terms that stage writes: train p99 + stride + δ/fps per language (utils.lambda_min_frames' δ, read from resolved 
+    geometry). A fixed 1s margin silently under-covers any language whose δ exceeds 1s. Return the per-language terms, or None when 
+    the cap is numeric (an explicit design override).
+    """
     geometry = dict(cfg.get("pretrain_geometry") or {})
     langs = cfg.get("pretrain_languages") or ([language] if language else None)
     if not langs or str(geometry.get("buffer_cap_s", "")).lower() != "auto": return None
     stride_s = float(inference_cfg.get("stride_s", 1.0))
-    caps = {lang: round(p99 + stride_s + PRETRAIN_CONTEXT_MARGIN_S, 2)
+    languages = (data_cfg.get("languages") or {})
+    deltas = (inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", {})
+
+    def margin(lang: str) -> float:
+        delta = deltas.get(lang) if isinstance(deltas, dict) else deltas
+        if delta is None: return PRETRAIN_CONTEXT_MARGIN_S  # δ not measured yet: the floor is the only headroom
+        fps = float(((languages.get(lang) or {}).get("pose") or {}).get("fps", 24.0))
+        return max(PRETRAIN_CONTEXT_MARGIN_S, float(delta) / max(fps, 1.0))
+    
+    caps = {lang: round(p99 + stride_s + margin(lang), 2)
             for lang, p99 in sentence_p99_s(data_cfg, [str(x) for x in langs], split="train").items()}
     geometry["buffer_cap_s"] = max(caps.values())
     cfg["pretrain_geometry"] = geometry
@@ -225,11 +241,13 @@ def train_bio_s1_epochs(
 
     # Save the trained context and monitor decode with the S1 weights.
     training_cap_s = float(cfg["training_buffer_cap_s"])
-    meta = {"monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
-            "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s,
-            "initialization": pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth"),
-            "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
-            "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")}
+    meta = {
+        "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_loader.dataset.records),
+        "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", "rope_eval_chunk_s": training_cap_s, 
+        "buffer_cap_s": training_cap_s, "initialization": pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth"),
+        "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
+        "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")
+    }
     # The end-of-training save in train.py reuses THIS dict. A second, independently-built meta drops pretrain_pool/pretrain_mix 
     # (disarming eval.py's provenance assertion) and re-derives rope_eval_chunk_s from the live inference.yaml — which is the value 
     # the stamp exists to override, since `analyze --stage buffer-cap --write-config` rewrites buffer_cap_s after training.

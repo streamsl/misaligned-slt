@@ -11,12 +11,11 @@ GEOMETRY_KEY_PATHS = (
 # Per-language rows with a valid code default: resolved when present, dropped when missing, so the stage  that writes them 
 # can run first. commit_lag_s = 0.0 means "commit as soon as hysteresis passes".
 SOFT_KEY_PATHS = frozenset({("boundary_stability", "commit_lag_s")})
+LAMBDA_MIN_FRAMES = 12  # 0.5s at 24 fps: below the p1 unit duration of every corpus, far above a 1-2 frame flicker
 
 def lambda_min_frames(inference_cfg: dict) -> int:
-    # Lambda_min: span_selection.min_span_frames, else delta+1 (infer/stream.py's own derivation).
-    ss = (inference_cfg or {}).get("span_selection") or {}
-    bs = (inference_cfg or {}).get("boundary_stability") or {}
-    return int(ss.get("min_span_frames", int(bs.get("delta_enc_frames", 3)) + 1))
+    # Lambda_min: the shortest span the FSM may commit. A LABEL-domain floor, so it does not move with a noise measurement.
+    return int(((inference_cfg or {}).get("span_selection") or {}).get("min_span_frames", LAMBDA_MIN_FRAMES))
 
 def pick_device(preferred: str | None = None):
     # TF32 matmuls for the fp32 residue outside AMP autocast (Ampere+; no-op elsewhere). 
@@ -94,8 +93,8 @@ def resolve_inference(cfg: dict, language: str, strict: bool = True) -> dict:
         leaf = node.get(key_path[-1])
         if not isinstance(leaf, dict): continue   # scalar or absent: already resolved / code defaults apply
         if str(language) not in {str(k) for k in leaf}:
-            # strict=False: bootstrap/smoke mode — drop the unresolved leaf so flat `.get(..., default)`
-            # fallbacks engage (delta-enc's FIRST pass on a new language has no Λ_min row yet, by construction).
+            # strict=False: bootstrap/smoke mode — drop the unresolved leaf so flat `.get(..., default)` fallbacks
+            # engage (a stage measuring a NEW language runs before its own row exists, by construction).
             if not strict or key_path in SOFT_KEY_PATHS:
                 node.pop(key_path[-1], None)
                 continue

@@ -7,7 +7,7 @@ import json
 import numpy as np
 from data.jitter import JitterSampler, normalized_mode_ratios
 from data.loader import VideoRecord
-from utils import pool_key
+from utils import lambda_min_frames, pool_key
 from data.windowing import (
     TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
     count_complete_spans, first_complete_span, make_bio_labels,
@@ -159,9 +159,7 @@ class WindowSampler:
             )
         else:
             buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
-            min_span_frames = int((inference_cfg.get("span_selection", {}) or {}).get(
-                "min_span_frames", int((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3)) + 1,
-            ))
+            min_span_frames = lambda_min_frames(inference_cfg)
 
         aug_cfg = slt_cfg.get("augmentation", {})
         fps_cfg = (aug_cfg or {}).get("fps", {})

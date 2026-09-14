@@ -27,8 +27,8 @@ boundary_stability:
     #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
     #      hysteresis_strides strides;
     #   2. post-commit overlap: the buffer is cut at (terminator − δ), so an estimate late by ≤ δ still leaves
-    #      the next sentence's B in the buffer (the ≤2δ leftover tail is never selected: buffer-start I does
-    #      not open a span, and a mislabelled-B leftover is filtered by span_selection.min_span_frames);
+    #      the next sentence's B in the buffer (the leftover tail is not re-emitted: buffer-start I does not open
+    #      a span, and select_target_span skips any span terminating at or before the commit frontier χ);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
         ase: 11
@@ -42,16 +42,13 @@ boundary_stability:
         bfi: 4.0
 
 span_selection:
-    # Λ_min: shortest selectable span, in encoder frames — a pure DURATION NOISE FLOOR (spans shorter than the
-    # terminator noise floor δ are unresolvable from boundary evidence). Λ_min = δ+1, written together with
-    # delta_enc_frames by `analyze.py --stage delta-enc --write-config`; keep them in step.
+    # Λ_min: shortest span the FSM may commit, in encoder frames. A LABEL-domain floor: it answers "what is the
+    # shortest unit we are willing to emit", which is a property of the annotation, not of the head's boundary noise.
+    # 12 frames = 0.5s at 24 fps sits below the p1 annotated unit duration of every corpus (ase 17, asf 26, bfi 22
+    # frames), so no annotated unit is unreachable, and far above the 1-2 frame flicker the floor exists to reject.
     # It is NOT the re-emission guard: that is the commit-frontier filter select_target_span(skip_term_before=χ),
-    # which uses the commit log instead of a worst-case length bound. The older "Λ_min > 2δ" coupling is
-    # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
-    min_span_frames:
-        ase: 12
-        asf: 19
-        bfi: 54
+    # which uses the commit log instead of a worst-case length bound.
+    min_span_frames: 12
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
 # undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.

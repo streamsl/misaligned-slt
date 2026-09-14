@@ -784,11 +784,15 @@ def load_multilingual_records(
     """
     if not languages: raise ValueError("load_multilingual_records needs at least one language")
     per_lang: dict[str, list[VideoRecord]] = {}
-    for lang in languages:
-        recs = _cached_language_records(data_cfg, lang, split)
-        if recs: per_lang[lang] = recs
+    for lang in languages: per_lang[lang] = _cached_language_records(data_cfg, lang, split)
 
-    if not per_lang: raise ValueError(f"no records for any of {languages} on split {split!r}")
+    # A configured language that contributes nothing means this machine lacks that corpus. Skipping it would train a
+    # DIFFERENT model that still stamps the configured pool key, and nothing downstream compares the realised mix.
+    empty = sorted(l for l, recs in per_lang.items() if not recs)
+    if empty: raise FileNotFoundError(
+        f"pretrain_languages lists {list(languages)}, but {', '.join(empty)} has no {split} record on this machine. "
+        f"Fetch the corpus (prepare_data.py --languages {' '.join(empty)}), or drop it from pretrain_languages."
+    )
     if len(per_lang) == 1 or split == "test": # TEST is pooled AS-IS: it is a REPORTING set.
         pooled = [r for recs in per_lang.values() for r in recs]
         return pooled, {k: len(v) for k, v in per_lang.items()}

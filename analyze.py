@@ -522,14 +522,15 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
     return out
 
 
-def _s1_trained_context_s(bio_config: str | None, language: str | None = None) -> float | None:
-    # RoPE context stamped by train-bio (rope_eval_chunk_s); None before S1 exists or when no bio config is given.
+def _s1_trained_context_s(bio_config: str | None, language: str | None = None) -> tuple[Path | None, float | None]:
+    # (checkpoint, RoPE context stamped by train-bio). The PATH is returned so a refusal can name the file that carries
+    # the number — the S1 log prints its own value, and the two disagree whenever the checkpoint predates a delta change.
     # `language` resolves a monolingual S1's ${corpus} dir exactly as train-bio --language does; a pooled config ignores it.
-    if not bio_config: return None
+    if not bio_config: return None, None
     ckpt = Path(checkpoint_dir(load_yaml(bio_config, language=language), default="checkpoints/bio_s1") or "") / "model.pt"
-    if not ckpt.exists(): return None
+    if not ckpt.exists(): return ckpt, None
     ctx = load_checkpoint_meta(ckpt).get("rope_eval_chunk_s")
-    return float(ctx) if ctx else None
+    return ckpt, (float(ctx) if ctx else None)
 
 
 def buffer_cap(args: argparse.Namespace) -> dict:
@@ -561,11 +562,12 @@ def buffer_cap(args: argparse.Namespace) -> dict:
     delta_s = float((inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 0)) / max(fps_hint, 1.0)
     cap = round(p99_duration + stride_s + delta_s, 2)
     # Coverage rule: the FSM must never run the head beyond its trained RoPE context. The writer refuses, not a later warning.
-    s1_ctx = _s1_trained_context_s(getattr(args, "bio_config", None), args.language)
+    s1_ckpt, s1_ctx = _s1_trained_context_s(getattr(args, "bio_config", None), args.language)
     if s1_ctx is not None and cap > s1_ctx + 1e-6: raise SystemExit(
-        f"[buffer-cap] {args.language} cap {cap:.2f}s exceeds the S1 checkpoint's trained context {s1_ctx:.2f}s. Retrain S1 "
-        f"(pretrain_geometry.buffer_cap_s: auto = train p99 + stride + 1 s per pool language; a number there is an explicit override "
-        f"when delta exceeds one second) before pinning this cap."
+        f"[buffer-cap] {args.language} cap {cap:.2f}s exceeds trained context {s1_ctx:.2f}s stamped in {s1_ckpt}. "
+        f"Raise pretrain_geometry.buffer_cap_s above {cap:.2f}s and retrain S1 — that value is fixed, so retraining "
+        f"without raising it reproduces the same stamp and the same refusal. The cap grew because delta-enc rewrote "
+        f"delta_enc_frames after S1, or because a preprocessing change moved the train p99."
     )
     payload = {
         "language": args.language, "split": args.split, "sentences": len(durations),
@@ -706,33 +708,17 @@ def delta_enc(args: argparse.Namespace) -> dict:
     }
     if args.write_config and not any(s["n"] for s in stats.values()):
         raise ValueError("delta-enc has no usable boundary pairs; no geometry was written")
-    # delta is not a standalone constant. On commit the buffer is cut at terminator-delta, so the next buffer opens
-    # with a delta-frame leftover of the sentence just emitted; Lambda_min must exceed delta or that leftover is
-    # selectable as a span (infer/stream.py's own rule and default). dlm.yaml's gate must equal both. Written
-    # together so 4 values cannot drift — a stale pair is exactly what leaves the FSM in an invalid geometry.
-    lam = delta + 1
-    p10_frames = int(np.percentile([
-        s.duration_s for r in records for s in r.sentences if getattr(s, "reliable", True)
-    ], 10) * fps_hint) if records else 0
-    if p10_frames and lam > p10_frames: print(
-        f"[delta-enc] WARNING: Lambda_min={lam} exceeds the p10 sentence ({p10_frames} frames) — >10% of real "
-        f"sentences become unselectable. Inspect usable-pair counts and boundary stability before accepting.", flush=True
-    )
-    payload["min_span_frames"] = lam
     if args.write_config:
         lang = str(args.language)
         written = [
             update_yaml_scalar(args.inference_config, ("boundary_stability", "delta_enc_frames", lang), delta),
-            update_yaml_scalar(args.inference_config, ("span_selection", "min_span_frames", lang), lam),
             update_yaml_scalar(args.inference_config, ("boundary_stability", "duration_model_signature", lang), json.dumps(duration.signature))
         ]
         if not all(written): raise ValueError("Incomplete geometry update; check inference.yaml parent mappings")
-        payload["config_updated"] = [c for c, ok in zip([args.inference_config] * 3, written) if ok]
+        payload["config_updated"] = [c for c, ok in zip([args.inference_config] * 2, written) if ok]
         # Report what update_yaml_scalar actually changed — an unconditional "wrote" here would mask a failed write.
-        if payload["config_updated"]: 
-            print(f"[delta-enc] wrote delta_enc_frames.{lang}={delta}, min_span_frames.{lang}={lam} to {args.inference_config}", flush=True)
-        else: 
-            print(f"[delta-enc] WARNING: write-config changed nothing (key missing / file unwritable): {args.inference_config}", flush=True)
+        if payload["config_updated"]: print(f"[delta-enc] wrote delta_enc_frames.{lang}={delta} to {args.inference_config}", flush=True)
+        else: print(f"[delta-enc] WARNING: write-config changed nothing (key missing / file unwritable): {args.inference_config}", flush=True)
 
     output = Path(args.output or f"outputs/delta_enc_{args.language}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -747,15 +733,11 @@ def build_parser() -> argparse.ArgumentParser:
         "dataset-summary", "segmenter-infer", "tune-decode", "tune-stream", "segmenter-errors", "buffer-cap", "delta-enc", "loss-balance"
     ])
     parser.add_argument("--data-config", default="configs/data.yaml")
-    parser.add_argument(
-        "--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
-        help="segmenter-infer backend: moryossef = external Moryossef segmenter, s1 = in-system BIO head"
-    )
+    parser.add_argument("--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
+                        help="segmenter-infer backend: moryossef = external Moryossef segmenter, s1 = in-system BIO head")
     parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef analysis-segmenter config")
-    parser.add_argument(
-        "--segmenter-decode", choices=["plain", "duration"], default=None,
-        help="Segmenter-infer decoder; defaults to S1 duration or Moryossef plain"
-    )
+    parser.add_argument("--segmenter-decode", choices=["plain", "duration"], default=None,
+                        help="Segmenter-infer decoder; defaults to S1 duration or Moryossef plain")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
     parser.add_argument("--baseline-config", default="configs/baseline_eval.yaml")
@@ -773,11 +755,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-lag", type=float, nargs="+", default=None, help="tune-stream: commit_lag_s values to sweep")
     parser.add_argument("--noise-sigma", type=float, default=0.005, help="delta-enc keypoint-noise std (normalized coords)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--write-config", action="store_true",
-        help="Persist measured constants: tune-decode -> duration_model; buffer-cap -> buffer_cap_s; "
-             "delta-enc -> delta_enc_frames + min_span_frames; tune-stream -> commit_lag_s"
-    )
+    parser.add_argument("--write-config", action="store_true",
+                        help="Persist measured constants: tune-decode -> duration_model; buffer-cap -> buffer_cap_s; "
+                        "delta-enc -> delta_enc_frames; tune-stream -> commit_lag_s")
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")
     return parser

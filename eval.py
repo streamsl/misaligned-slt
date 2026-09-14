@@ -750,8 +750,6 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, transl
         delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
         hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
         token_confidence_tau=float(trans.get("commit_confidence_tau", 0.3)),
-        # None (missing key) → runner derives Λ_min = δ+1; a 0-fallback would re-admit 1-frame flicker spans
-        # (Λ_min is a duration noise floor, NOT the re-emission guard — that is select_target_span's χ filter).
         min_span_frames=lambda_min_frames(inference_cfg),
         forced_tail_policy=str(inference_cfg.get("forced_tail_policy", "skip")),
         # Ω from the method config's membership_gate; χ from the runner's commit log.
@@ -1284,6 +1282,7 @@ def _load_segmenter(args):
         from models.checkpointing import _load_state, s1_layout_state
         model.load_state_dict(s1_layout_state(_load_state(checkpoint)), strict=True)
     else: load_model_checkpoint(model, checkpoint, strict=True)
+    print(f"segmenter | {args.segmenter_arch} weights from {checkpoint}" + (f" (pool {pool_key(cfg)})" if pool_key(cfg) else ""), flush=True)
     # S1's RoPE chunk is the buffer cap the head TRAINED under, which the checkpoint records. It wins over both the
     # config pin and the live buffer_cap_s, because `analyze --stage buffer-cap --write-config` rewrites that cap
     # after training and following it re-chunks a trained head over context it never saw.

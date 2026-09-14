@@ -66,8 +66,8 @@ def select_target_span(
     δ-overlap stops a late terminator estimate eating the successor's onset, and their ≤δ committed prefix is
     attention-floored by Ω's χ term.
 
-    Λ_min is a duration noise floor: spans shorter than δ are unresolvable from boundary evidence (a 1-frame flicker
-    passes stability hysteresis). See StreamingSLTRunner for how it is derived.
+    Λ_min is a LABEL-domain floor: the shortest unit worth emitting, set below the shortest annotated one, so its only
+    job is to reject a 1-2 frame flicker that stability hysteresis alone would pass.
     """
     for start, term in bio_complete_spans(bio_tags):
         if term <= int(skip_term_before): continue  # term == χ: all content frames (< term) are committed

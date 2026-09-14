@@ -21,10 +21,13 @@ pretrain_languages: [ase, asf, bfi]
 # τ=0.0  ase 33% / asf 33% / bfi 33%    (uniform)
 pretrain_temperature: 0.3
 
-# Auto uses the maximum source-train sentence p99 + stride + 1 second.
-# A numeric value fixes a common context for the transfer study; evaluation uses the stamped trained context.
+# A FIXED context, so the trained window never depends on delta_enc_frames: `delta-enc` measures delta only AFTER
+# S1, and a delta that grows later would otherwise lift the deployed cap above the context the head trained on.
+# It must stay at or above every pool language's deployed cap (train p99 + stride + delta/fps) — `analyze --stage
+# buffer-cap` refuses a cap above the stamped context. `auto` re-derives it per run instead, and reintroduces that
+# ordering dependency. Evaluation uses the stamped trained context, not this file.
 pretrain_geometry:
-    buffer_cap_s: auto
+    buffer_cap_s: 40
     min_span_frames: 1
 
 epochs: 100

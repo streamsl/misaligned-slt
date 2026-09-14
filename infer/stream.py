@@ -8,6 +8,7 @@ from poses import normalize_keypoints_unisign
 from infer.duration_decode import DurationDecoder
 from infer.commit_gate import CommitGate, open_span_start, select_target_span
 from infer.stability import display_prefix
+from utils import LAMBDA_MIN_FRAMES
 
 
 def leading_i_run_end(bio_tags: torch.Tensor) -> int | None:
@@ -119,11 +120,9 @@ class StreamingSLTRunner:
         self.diffusion_steps = int(diffusion_steps)
         self.tau_dec = float(tau_dec)
 
-        # Λ_min (min_span_frames): shortest selectable span in encoder frames — a duration noise floor; spans below δ are unresolvable from 
-        # boundary evidence. Default δ+1, else max(δ+1, p1-p2 of dev sentence lengths); 0 re-admits 1-frame flicker. Not the re-emission guard 
-        # (select_target_span(skip_term_before=χ) is), and not a "Λ_min > 2δ" bound: 2δ < Λ_min < shortest real sentence is infeasible on short 
-        # corpora, and the duration re-split only disfavors sub-second seam segments (~4-5 nats).
-        self.min_span_frames = int(min_span_frames) if min_span_frames is not None else int(delta_enc_frames) + 1
+        # Λ_min (min_span_frames): shortest selectable span in encoder frames — a LABEL-domain floor that rejects flicker, set below the
+        # shortest real unit so no annotated unit is unreachable. Not the re-emission guard (select_target_span(skip_term_before=χ) is).
+        self.min_span_frames = int(min_span_frames) if min_span_frames is not None else LAMBDA_MIN_FRAMES
         if self.min_span_frames < 1: raise ValueError(f"min_span_frames ({self.min_span_frames}) must be >= 1")
         # translate=False: segmentation-only dry run — no decoder call, confidence 1.0 so the commit gate reduces to the boundary test. 
         # For tuning the FSM's decode on dev in minutes; events carry empty text.

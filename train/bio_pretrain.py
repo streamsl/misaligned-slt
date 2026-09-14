@@ -35,7 +35,7 @@ from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio
 from metrics import bio_frame_metrics, CompleteSpanMetrics
 from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference
 
-PRETRAIN_CONTEXT_MARGIN_S = 1.0  # floor for the δ/fps term below, so a language with no measured δ still gets headroom
+PRETRAIN_CONTEXT_MARGIN_S = 3.0  # 72 frames at 24 fps
 
 class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
     def __init__(
@@ -75,29 +75,19 @@ class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared 
 
 
 def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, language: str | None = None) -> dict[str, float] | None:
-    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of the DEPLOYED cap rule.
+    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of
+    train p99 + stride + PRETRAIN_CONTEXT_MARGIN_S. Returns the per-language terms, or None when the cap is a number.
 
-    The head is never run beyond its trained RoPE context, and `analyze.py --stage buffer-cap` refuses a cap above it, so this must 
-    compute SAME terms that stage writes: train p99 + stride + δ/fps per language. A fixed 1s margin silently under-covers any language 
-    whose δ exceeds 1s. Return the per-language terms, or None when the cap is numeric (an explicit design override).
-
-    `inference_cfg` must be the UNRESOLVED file: `resolve_inference` flattens `delta_enc_frames` to target language's scalar, which 
-    would apply 1 language's δ to whole pool and make a POOLED cap depend on `--language` (measured: 38.94s for asf vs. 40.14s for bfi).
+    LABEL-ONLY on purpose. The DEPLOYED cap is train p99 + stride + δ/fps, and `analyze.py --stage buffer-cap` refuses a deployed cap 
+    above the head's trained context, so this margin must DOMINATE δ/fps. It must not READ δ: `delta-enc` measures δ after S1 and from 
+    the S1 head, so a δ-derived context would depend on a number that does not exist yet, and every δ that grew afterwards would demand 
+    a new S1. A δ above the margin is still caught — buffer-cap refuses it, loudly. `inference_cfg` supplies stride_s only.
     """
     geometry = dict(cfg.get("pretrain_geometry") or {})
     langs = cfg.get("pretrain_languages") or ([language] if language else None)
     if not langs or str(geometry.get("buffer_cap_s", "")).lower() != "auto": return None
     stride_s = float(inference_cfg.get("stride_s", 1.0))
-    languages = (data_cfg.get("languages") or {})
-    deltas = (inference_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", {})
-
-    def margin(lang: str) -> float:
-        delta = deltas.get(lang) if isinstance(deltas, dict) else deltas
-        if delta is None: return PRETRAIN_CONTEXT_MARGIN_S  # δ not measured yet: the floor is the only headroom
-        fps = float(((languages.get(lang) or {}).get("pose") or {}).get("fps", 24.0))
-        return max(PRETRAIN_CONTEXT_MARGIN_S, float(delta) / max(fps, 1.0))
-    
-    caps = {lang: round(p99 + stride_s + margin(lang), 2)
+    caps = {lang: round(p99 + stride_s + PRETRAIN_CONTEXT_MARGIN_S, 2)
             for lang, p99 in sentence_p99_s(data_cfg, [str(x) for x in langs], split="train").items()}
     geometry["buffer_cap_s"] = max(caps.values())
     cfg["pretrain_geometry"] = geometry
@@ -150,12 +140,11 @@ def build_bio_s1(
         cfg["checkpoint"] = ckpt
         print(f"bio_s1 | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
         
-    # Unresolved on purpose: the pooled cap is a property of the POOL, not of --language (see the docstring).
     context_caps = resolve_pretrain_context(cfg, data_cfg, load_yaml(inference_config), language)
     if context_caps:
         cfg["pretrain_context_caps"] = context_caps   # per-language train p99 + stride + margin, recorded for the paper
         print(f"bio_s1 | pretrain_geometry.buffer_cap_s auto -> {cfg['pretrain_geometry']['buffer_cap_s']:.2f}s "
-              f"(train p99 + stride + {PRETRAIN_CONTEXT_MARGIN_S:g} s per language: {context_caps})", flush=True)
+              f"(per language: train p99 + stride + {PRETRAIN_CONTEXT_MARGIN_S:g}s margin = {context_caps})", flush=True)
     resolve_bio_class_weights(cfg, train_records)
     # A pooled run re-draws its balanced sub-sample each epoch, so the videos a sub-sampled corpus contributes
     # ROTATE and the whole corpus is covered across epochs. Monolingual runs pass no provider and are unchanged.

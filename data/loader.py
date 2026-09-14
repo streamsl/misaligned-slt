@@ -6,7 +6,7 @@ from typing import Any, Iterable
 from pathlib import Path
 from tqdm import tqdm
 
-import re, random, csv, html, json, unicodedata, zlib, hashlib
+import re, os, random, csv, html, json, unicodedata, zlib, hashlib, inspect
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
@@ -79,49 +79,51 @@ class VideoRecord:
 def _is_pronoun_i(word: str) -> bool:
     return word == "I" or word.startswith("I'")
 
-def _caption_files_key(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> str:
-    # Identity of every caption file the lexicon reads (path, size, mtime), plus the rules that shape the reading.
-    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, bool(subtitle_cfg.get("drop_noise_captions", True))]).encode())
+def _caption_video_id(path: Path) -> str: # `<vid>.<target>.vtt` -> vid. `Path.stem` strips 1 suffix only, and video ids never contain a dot.
+    return base_video_id(path.name.split(".", 1)[0])
+
+def _fold_rule_id() -> str: # The counting rule's own identity, so an edited rule invalidates every lexicon built under the old one.
+    return hashlib.sha256(inspect.getsource(fold_lexicon).encode()).hexdigest()
+
+def _lexicon_key(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> str:
+    # Identity of a built lexicon: the caption BYTES it reads, the selection rules, and the counting rule itself.
+    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, subtitle_cfg, _fold_rule_id()], sort_keys=True, default=str).encode())
     for subs, ids in sources:
-        for vid in ids:
-            for path in sorted(Path(subs).glob(f"{vid}.*.vtt")):
-                st = path.stat(); digest.update(f"{path}\t{st.st_size}\t{st.st_mtime_ns}\n".encode())
+        want = set(ids)
+        # 1 directory glob, not 1 per video: `<vid>.*.vtt` per id is ~2850x slower over a 10k-video corpus.
+        for path in sorted(Path(subs).glob("*.vtt")):
+            if _caption_video_id(path) in want: digest.update(f"{path.name}\t".encode() + hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
-def _train_video_ids(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
-    # (subs root, train ids) without loading records: the same id universe `build_pose_index` keys on.
+def _train_captions(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
+    """(subs root, train ids that HAVE a caption file) without loading records — the id universe `build_pose_index` keys on.
+
+    Filtered by caption presence because the lexicon reads captions: a corpus whose poses are unpacked but whose subs are not would otherwise 
+    pass the presence check in `case_lexicon` and contribute nothing, silently changing the rendering it was required for.
+    """
     root = Path(data_cfg["languages"][language]["root"])
     ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})
-    return root / "subs", build_splits(ids, data_cfg.get("splits", {})).get("train", []) if ids else []
+    if not ids: return root / "subs", []
+    captioned = {_caption_video_id(p) for p in (root / "subs").glob("*.vtt")}
+    return root / "subs", [v for v in build_splits(ids, data_cfg.get("splits", {})).get("train", []) if v in captioned]
 
 def timestamp_to_seconds(value: str) -> float:
     value = value.replace(",", ".")
     hours, minutes, seconds = value.split(":")
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
-def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict, cache_path: Path | None = None) -> frozenset[str]:
+def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> frozenset[str]:
     """Words safe to lowercase at a comma-joined sentence start, from the TRAIN splits' raw cues.
 
     Capital at sentence start is positional; after the period becomes comma it is noise decoder must learn ("..., Consequently, this ..."). 
     But a capital can also be lexical (a name, "Deaf" as identity, "BSL"), and only the corpus can tell: a word is foldable when it occurs 
     in lowercase more often than it occurs capitalised INSIDE a sentence (Punkt over each raw cue, so sentence-initial capitals are not 
     counted as name evidence). Built on train only, applied to every split, so dev/test references never shape the rule and an unattested 
-    word simply keeps its case. Measured on asf/bfi alone: folds ~75 % of candidates, wrong folds ~0.5 %, all of them the captioner's own 
-    inconsistency. `sources` pools the corpora that share a target language (see `case_lexicon`); `cache_path` stores the result keyed by 
-    the caption files' identity, because the pooled build reads every train VTT.
+    word simply keeps its case. `sources` pools the corpora that share a target language — see `case_lexicon`, which owns the pool and the
+    released artifact; this builds and nothing else.
     """
     key = tuple((str(subs), tuple(sorted(ids))) for subs, ids in sources)
     if key in _FOLD_LEXICON_CACHE: return _FOLD_LEXICON_CACHE[key]
-    files_key = _caption_files_key(sources, subtitle_cfg) if cache_path is not None else None
-
-    if cache_path is not None and cache_path.exists():
-        try: stored = json.loads(cache_path.read_text(encoding="utf-8"))
-        except ValueError: stored = {}
-        if stored.get("key") == files_key:
-            lexicon = frozenset(stored.get("words", []))
-            _FOLD_LEXICON_CACHE[key] = lexicon
-            return lexicon
-        
     tok = _punkt_tokenizer()
     lower: dict[str, int] = {}; cap_inside: dict[str, int] = {}
     drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
@@ -140,9 +142,6 @@ def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict, cach
 
     lexicon = frozenset(w for w, n in lower.items() if n > cap_inside.get(w, 0))
     _FOLD_LEXICON_CACHE[key] = lexicon
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"key": files_key, "words": sorted(lexicon)}) + "\n", encoding="utf-8")
     return lexicon
 
 
@@ -150,21 +149,39 @@ def case_lexicon(data_cfg: dict, language: str) -> frozenset[str]:
     """The fold lexicon for `language`'s TARGET language, pooled over every configured corpus with that target.
 
     Capitalisation convention belongs to the target language, not to the sign corpus: asf's train captions never lowercase "consequently", 
-    ase's do. Every corpus sharing the target must be present — a missing one is an error, never a silent change of rendering — so the 
-    rendering is a function of data.yaml alone. The disk cache lives under the shared data root, keyed by the caption files' identity.
+    ase's do. Pooling measurably renders better where the corpora disagree, and it is what keeps the small corpora's identity capitals
+    ("Deaf", "God", "Bible"), which a corpus-sized rule folds away.
     """
     langs = data_cfg["languages"]
     target = str(langs[language].get("target_lang", "en_XX"))
-    sources = []
-    for other in sorted(l for l, c in langs.items() if str(c.get("target_lang", "en_XX")) == target):
-        subs, ids = _train_video_ids(data_cfg, other)
-        if not ids: raise FileNotFoundError(
-            f"[loader] the case lexicon for target {target} needs {other}'s train captions under {subs}: download that corpus "
-            f"(prepare_data.py --languages {other}) or remove it from data.yaml languages."
+    pool = sorted(l for l, c in langs.items() if str(c.get("target_lang", "en_XX")) == target)
+    artifact = Path(langs[language]["root"]).parent / f"case_lexicon.{target}.json"
+    try: stored = json.loads(artifact.read_text(encoding="utf-8")) if artifact.exists() else {}
+    except ValueError: stored = {}
+
+    sources, absent = [], []
+    for other in pool:
+        subs, ids = _train_captions(data_cfg, other)
+        if ids: sources.append((subs, ids))
+        else: absent.append(other)
+
+    if absent:
+        if stored.get("pool") == pool and stored.get("rule") == _fold_rule_id(): return frozenset(stored["words"])
+        raise FileNotFoundError(
+            f"[loader] the case lexicon for target {target} pools the train captions of {', '.join(pool)}; this machine has none for "
+            f"{', '.join(absent)}. Copy {artifact} from the machine that holds the whole pool, or fetch the corpus "
+            f"(prepare_data.py --languages {' '.join(absent)}), or drop it from data.yaml languages and re-render everything."
         )
-        sources.append((subs, ids))
-    cache = Path(langs[language]["root"]).parent / f"case_lexicon.{target}.json"
-    return fold_lexicon(sources, data_cfg.get("subtitles", {}), cache_path=cache)
+    key = _lexicon_key(sources, data_cfg.get("subtitles", {}))
+    if stored.get("key") == key: return frozenset(stored["words"])
+    lexicon = fold_lexicon(sources, data_cfg.get("subtitles", {}))
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Atomic: every rank of a distributed run builds this, and a half-written artifact is a rebuild for everyone after.
+    tmp = artifact.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"key": key, "pool": pool, "rule": _fold_rule_id(), "words": sorted(lexicon)}) + "\n", encoding="utf-8")
+    os.replace(tmp, artifact)
+    return lexicon
 
 
 def _is_prose(cues: list[tuple], joined: str, duration_s: float) -> bool:
@@ -183,7 +200,9 @@ def _fold_sentence_start(part: str, lexicon: frozenset[str] | None) -> str:
     m = _WORD_RE.search(part)
     if m is None: return part
     word = m.group(0)
-    if not word[0].isupper() or len(word) == 1 or _is_pronoun_i(word): return part   # I / I'm; fingerspelled letters
+    # An ALL-CAPS token carries no positional capital to remove: it is a gloss or emphasis, and folding only its first
+    # letter renders "BYE" as "bYE". Also skip I / I'm and fingerspelled single letters.
+    if not word[0].isupper() or len(word) == 1 or word.isupper() or _is_pronoun_i(word): return part
     nxt = _WORD_RE.search(part, m.end())
     if nxt and nxt.group(0)[0].isupper() and not _is_pronoun_i(nxt.group(0)): return part   # "New Zealand", "Deaf Youth"
     if word.lower() not in lexicon: return part

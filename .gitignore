@@ -1,10 +1,10 @@
 .ignore/
 .claude/
 .vscode/
+auslan-daily/
+bobsl/
+how2sign/
 youtube-sl-25/
-csl*/
-phoenix/
-PHOENIX-2014-*/
 *.pyc
 __pycache__/
 *.egg-info/
@@ -20,6 +20,7 @@ pytest.ini
 *.zip
 *.pth
 *.pt
+*.vtt
 *.bin
 *.ckpt
 AGENTS.md

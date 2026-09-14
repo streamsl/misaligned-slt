@@ -78,6 +78,10 @@ comma rendering, selective capitalization and the 10% punctuation threshold to t
 lexicon is fitted on train only and reused for dev/test. Record excluded-video counts and annotation fingerprints;
 keep these rules fixed while comparing systems. See [the data protocol](docs/data_pipeline.md#3-caption-unit-construction--reconstruct_sentences).
 
+That lexicon is pooled over every corpus in `data.yaml` sharing the target language, so it is released like the split
+CSV: the first stage run on a machine holding the whole pool writes `data/youtube-sl-25/case_lexicon.en_XX.json`. Copy
+it alongside the corpus to any machine that holds one language, or that machine cannot render the same references.
+
 ```bash
 # ═══ STAGE A — run ONCE. Both segmenters train on the SAME multilingual pool ([ase, asf, bfi]). ═══
 # ── A0. One-time data + checkpoints ──

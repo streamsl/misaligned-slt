@@ -174,7 +174,8 @@ def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "provenance": {"annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records)},
+        "provenance": {"annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
+                       "segmenter_arch": "gold", "decode": "none"},
         "segments": rows
     }
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -618,7 +619,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
     if args.method == "baseline" and _rq1_beams != 1: print(
-        f"[rq1] WARNING: baseline decodes with num_beams={_rq1_beams} while the dlm/ar arms are greedy — "
+        f"[rq1] WARNING: baseline decodes with num_beams={_rq1_beams} while the ar/dlm arms are greedy — "
         f"this run is not search-budget matched.", flush=True
     )
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
@@ -895,7 +896,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             f"{name:<30}{r['first_token_latency_s']:>11.3f}{r['revealed_fraction']:>10.3f}"
             f"{r['frozen_prefix_error']:>12.3f}{r['contradicted_track_rate']:>14.3f}", flush=True
         )
-        Path(f"outputs/stability_{segmenter_arch or args.method}_{args.language}_{args.split}.json").write_text(
+        Path(f"outputs/stability_{segmenter_arch or rq2_translator_token(args)}_{args.language}_{args.split}.json").write_text(
             json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if fsm_bio_rows:
@@ -1066,6 +1067,26 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     return predicted
 
 
+def rq2_translator_token(args: argparse.Namespace) -> str:
+    """The `translator` field: `clean`, `ar`, `dlm`, or an arm running a non-default method config.
+
+    An ablation run is the same method under another config, so without the config stem it writes the main row's
+    events, scores and stability file over the top and prints nothing.
+    """
+    if getattr(args, "no_translate", False): return "none"
+    method = "clean" if args.method == "baseline" else str(args.method)
+    cfg = getattr(args, "method_config", None)
+    if not cfg or str(cfg) == METHOD_CONFIGS[args.method]: return method
+    return f"{method}-{Path(cfg).stem.removeprefix('ablation_').replace('_', '-')}"
+
+
+def rq2_output_stem(when: str, spans: str, decode: str, translator: str, language: str, split: str) -> str:
+    # Name shape for every RQ2 row: `rq2_{when}_{spans}_{decode}_{translator}_{lang}_{split}`.
+    for field, value in (("when", when), ("spans", spans), ("decode", decode), ("translator", translator)):
+        if not value or "_" in str(value): raise ValueError(f"rq2 output {field}={value!r}: one non-empty token, no underscore")
+    return f"rq2_{when}_{spans}_{decode}_{translator}_{language}_{split}"
+
+
 def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1105,6 +1126,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     }
     # Geometry describes event generation; a saved-event rescore depends only on events and annotations.
     score_cfg = {} if args.predictions else resolve_inference(load_yaml(args.inference_config), args.language)
+    stem = None   # set by whichever branch writes events; a --predictions re-score writes no new artifact
     online_arch = _online_segmenter_arch(args) if args.stream else None
     if online_arch is not None:
         provenance.update(method="baseline", segmenter_arch=online_arch, gate=False, num_beams=1)
@@ -1122,9 +1144,10 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     )
     if args.stream:
         predicted = run_streaming(args)
-        tag = online_arch or args.method
-        suffix = ("_segonly" if getattr(args, "no_translate", False) else "") + \
-                 ("_plain" if getattr(args, "segmenter_decode", None) == "plain" else "")
+        spans = online_arch or f"joint-{args.method}"
+        decode = "plain" if getattr(args, "segmenter_decode", None) == "plain" else "duration"
+        translator = "clean" if online_arch and not getattr(args, "no_translate", False) else rq2_translator_token(args)
+        provenance["segmenter_arch"], provenance["decode"] = spans, decode
         provenance["translate"] = not bool(getattr(args, "no_translate", False))
         provenance["pose_normalization"] = "buffer"
         provenance["duration_model"] = run_streaming.last_duration_model
@@ -1152,21 +1175,37 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
             if provenance["translate"]:
                 provenance["translation_checkpoint"] = run_streaming.last_translation_checkpoint
                 provenance["translation_pose_normalization"] = "span"
-        _write_events_json(predicted, f"outputs/rq2_stream_events_{tag}_{args.language}_{args.split}{suffix}.json", provenance)
-        fsm_bio = getattr(run_streaming, "last_fsm_bio", None)
-        if fsm_bio:  # FSM-internal BIO metric, persisted alongside the events
-            path = Path(f"outputs/rq2_fsm_bio_{tag}_{args.language}_{args.split}{suffix}.json")
-            path.write_text(json.dumps(fsm_bio, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        provenance["when"] = "online"
+        stem = rq2_output_stem("online", spans, decode, translator, args.language, args.split)
+        _write_events_json(predicted, f"outputs/{stem}.json", provenance)
     elif args.offline:
         predicted = run_offline(args)
         provenance["caption_context"] = "full_proposal_with_context"
         provenance["pose_normalization"] = "chunk"
-        _write_events_json(predicted, f"outputs/rq2_offline_events_{args.method}_{args.language}_{args.split}.json", provenance)
+        provenance["segmenter_arch"], provenance["decode"], provenance["when"] = f"joint-{args.method}", "duration", "offline"
+        stem = rq2_output_stem("offline", provenance["segmenter_arch"], "duration", rq2_translator_token(args), args.language, args.split)
+        _write_events_json(predicted, f"outputs/{stem}.json", provenance)
     elif args.segments:
+        src = json.loads(Path(args.segments).read_text(encoding="utf-8")).get("provenance") or {}
+        spans, decode = src.get("segmenter_arch"), src.get("decode")
+        if not spans or not decode: raise SystemExit(
+            f"--segments {args.segments} carries no segmenter_arch/decode provenance, so this row cannot name itself. "
+            f"Span files are written by `eval.py --emit-gold-segments` and `analyze.py --stage segmenter-infer`; "
+            f"an RQ2 events file written before this rule carries neither key and must be regenerated."
+        )
+        if src.get("when") == "online": raise SystemExit(
+            f"--segments {args.segments} holds spans an FSM committed online. Re-translating them runs offline, so the pair would move access "
+            f"AND translator together, and the result would take offline control's name. Use offline same-span control for translator contrast."
+        )
+        stem = rq2_output_stem("offline", spans, decode, rq2_translator_token(args), args.language, args.split)
+        if Path(f"outputs/{stem}.json").resolve() == Path(args.segments).resolve(): raise SystemExit(
+            f"--segments {args.segments} would be overwritten by its own row: the spans and the translator are both "
+            f"this file's. The same-span control reads it with --method baseline."
+        )
         predicted = run_cascade(args)
         provenance["checkpoint"] = run_cascade.last_checkpoint
-        src = Path(args.segments).stem # Name by span source (--segments stem carries arch+lang+split) AND method, so cascade rows never collide.
-        _write_events_json(predicted, f"outputs/rq2_cascade_{src}_{args.method}.json", provenance)
+        provenance["segmenter_arch"], provenance["decode"], provenance["when"] = spans, decode, "offline"
+        _write_events_json(predicted, f"outputs/{stem}.json", provenance)
     else:
         require_annotation_match(args.predictions, records, "--predictions")
         predicted = load_event_predictions(args.predictions)
@@ -1185,10 +1224,15 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         
     predicted = scoreable_predictions(predicted, records)
     gold = _gold_events(records)
-    summary = evaluate_predicted_events(
+    scored = evaluate_predicted_events(
         predicted, gold, thresholds, char_level=char_level_for_target(target_language(data_cfg, args.language)),
         densevid=not bool(getattr(args, "no_densevid", False)),
-    ).get("thresholds", [])
+    )
+    summary = scored.get("thresholds", [])
+    if stem is not None: Path(f"outputs/{stem}_scores.json").write_text(json.dumps(
+        {"provenance": provenance, "thresholds": scored.get("thresholds", []), "threshold_average": scored.get("threshold_average", {})}, 
+        indent=2, sort_keys=True, default=float) + "\n", encoding="utf-8"
+    )
     summary = pd.json_normalize(summary, sep=".")  # one row per tIoU threshold
     summary.set_index("tiou_threshold", inplace=True)
     table = summary.T

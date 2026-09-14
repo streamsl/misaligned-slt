@@ -27,6 +27,7 @@ scheduler:
     type: cosine
 max_grad_norm: 1.0
 batch_size: 32
+grad_accum_steps: 1     # Effective batch = batch_size * grad_accum_steps
 freeze_backbone: false  # Uni-Sign transfer recipe: everything trainable, pose encoder included.
 lambda_bio: 0.0         # Uni-Sign SLT loss is a SINGLE label-smoothed CE — no BIO auxiliary. 0 SKIPS the
                         # BIO branch outright (no forward/backward, S1 init ignored, head frozen), not zero-weights it.

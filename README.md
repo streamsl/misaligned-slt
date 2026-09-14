@@ -54,6 +54,7 @@ torchrun --standalone --nproc-per-node=4 train.py --stage train-slt --language "
 ```
 
 - Config `batch_size` is the GLOBAL batch, split across ranks. A non-divisible batch is a hard error.
+- `grad_accum_steps` raises the EFFECTIVE batch to `batch_size * grad_accum_steps` at the activation memory of `batch_size` alone: that many micro-batches make one optimizer step. Each micro-batch is scaled by its group size before backward, so the accumulated gradient is the MEAN over the group and a short final group is a true mean of its own size. That equals one batch of the combined size when the micro-batches hold equally many supervised rows; length bucketing makes the row count vary, so treat it as a close approximation, not an identity. The scheduler counts optimizer steps, so warmup and decay keep the shape they were tuned with.
 - `mixed_precision: auto` picks bf16 on compute capability ≥ 8. Multi-GPU + fp16 is refused (per-rank scaler drift).
 - `latest.pt` is a full resumable snapshot, written every epoch. Continue an interrupted run of the same architecture and settings with `--resume`. Re-running without `--resume` over an existing `latest.pt` is refused.
 - CUDA compiles the membership recurrence on first use. Judge speed after warmup. Before another full run after a slowdown, run `python tests/test_membership_runtime.py` on the training GPU. This data-free check measures gate forward/backward time and checks gradients; it writes `outputs/membership_runtime.json`. It does not estimate total epoch time.
@@ -98,7 +99,9 @@ python train.py --stage train-moryossef        # -> checkpoints/moryossef/multi_
 #   per-epoch rotation — nothing is replicated, nothing is permanently dropped. Dev is a balanced fixed
 #   sub-sample; test is pooled as-is. Every design value (fixed mode mix, designed jitter, uniform cuts,
 #   auto context = pool train p99 + stride + 1 s, legal-BIO monitor) is documented in configs/bio_pretrain.yaml.
-#   Checkpoints stamp their pool (meta.pretrain_pool); every loader refuses a pool mismatch.
+#   Checkpoints stamp their pool (meta.pretrain_pool) and every loader refuses a pool-KEY mismatch. The key alone
+#   does not make A1 and A2 comparable: train them from ONE code state, then check that the two checkpoints
+#   agree on meta.pretrain_mix and meta.annotation_fingerprint before quoting any cascade result.
 #   Monitor = val_mode3_tiou_f1. Compare checkpoints with --segmenter-eval, never by monitor value.
 python train.py --stage train-bio              # -> checkpoints/bio_s1/multi_ase-asf-bfi/model.pt
 
@@ -232,86 +235,100 @@ for M in baseline ar dlm; do python eval.py --rq 1 --method $M --language "$LANG
 #         --split test --allow-test $GRID --output outputs/rq1_dlm_${A}_${LANG}.json
 #     python eval.py --rq 2 --stream --method dlm --method-config configs/ablation_${A}.yaml --language "$LANG" --split test --allow-test
 #   done
-#   Report each vs the full arm at (0,0), the worst evidence-complete cells, and RQ2 rows 7/8. Event/stability
-#   filenames auto-append the method-config stem, so ablation evals never overwrite the main arm's artifacts.
+#   Report each vs the full arm at (0,0), the worst evidence-complete cells, and RQ2 rows 6/10. The method-config
+#   stem enters the translator token (dlm-nocb), so an ablation never overwrites the arm's events, scores or
+#   stability file, and report.py's closed vocabulary keeps ablation rows out of the main results table.
 
-# ── B6. RQ2 — end-to-end DVC (rows 1–8 below) ──
+# ── B6. RQ2 — end-to-end DVC. Table order IS run order: block A decides offline, block B decides online. ──
+#   Inside each block: oracle spans, then the cascades (Moryossef26, then S1), then the joint model.
+#   Every row writes outputs/rq2_{when}_{spans}_{decode}_{translator}_${LANG}_test.json and a _scores.json beside it.
+
+# ── A. OFFLINE — the whole video is available. ──
+#   A0. Span writers. Every offline cascade row reads one of these files, and each one stamps who cut the video.
 python eval.py --emit-gold-segments outputs/gold_${LANG}_test.json --language "$LANG" --split test
 python analyze.py --stage segmenter-infer --segmenter-decode duration --segmenter-arch moryossef --language "$LANG" --split test --allow-test \
     --output outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json
-python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 1
-python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 2 AR
-python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 2 DLM
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 3
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 4 AR
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 4 DLM
-#   Row 5 — the S1-cascade floor (matched-segmenter control): the deployed head's spans, clean AR translator.
-#   There is deliberately no "S1 spans + our DLM" row; every contrast it could carry is covered by (2−1), (4−3), (8−7).
 python analyze.py --stage segmenter-infer --segmenter-arch s1 --language "$LANG" --split test --allow-test \
     --output outputs/segmenter_predictions_s1_duration_${LANG}_test.json
+#   Rows 1-2 — oracle spans. What each translator scores when segmentation is free.
+python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 1
+python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 2 (AR)
+python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 2 (DLM)
+#   Rows 3-4 — the external segmenter's spans.
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 3
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 4 (AR)
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 4 (DLM)
+#   Row 5 — our standalone segmenter's spans, same clean translator: the matched-segmenter cascade floor.
 python eval.py --rq 2 --segments outputs/segmenter_predictions_s1_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 5
-#   Row 6 — online S1 cascade. S1 proposes spans; the clean translator encodes each candidate crop.
-#   The shared FSM checks boundary stability, lag and the translator's confidence before it commits.
-#   --match-geometry reads the comparison arm's saved cap, delta and minimum span.
-#   Run both rows with the same inference.yaml for stride, lag and confidence threshold.
-#   The S1 checkpoint comes from --bio-config. --checkpoint here names the clean translator.
-python eval.py --rq 2 --stream --segmenter-arch s1 --method baseline \
-    --checkpoint checkpoints/baseline_train/"$LANG"/model.pt --match-geometry checkpoints/ar/"$LANG" \
-    --language "$LANG" --split test --allow-test
-#   Output: outputs/rq2_stream_events_s1_${LANG}_test.json. --no-translate is a segmentation diagnostic only.
-#   Row 9 — online Moryossef cascade, under the same comparison arm's streaming policy.
-#   Requires duration_model.moryossef.<language> from its B1a tune-decode run.
-#   --moryossef-config names the segmenter configuration; --checkpoint names the clean translator.
+#   Row 6 — the joint model cuts the video itself. It chunks its head at the TRAINED cap (checkpoint meta),
+#   overlap-stitched, each chunk pose-normalized on its own frames, then translates each span in a buffer-shaped
+#   window. No whole-video pass, no sampling at eval: deterministic.
+python eval.py --rq 2 --offline --method ar  --language "$LANG" --split test --allow-test   # row 6 (AR)
+python eval.py --rq 2 --offline --method dlm --language "$LANG" --split test --allow-test   # row 6 (DLM)
+#   Row 7 — same-span control: row 6's own spans, read by the clean translator. This is the only pair on the
+#   ladder that moves the translator alone at the joint model's spans, so it is what separates the two.
+python eval.py --rq 2 --segments outputs/rq2_offline_joint-ar_duration_ar_${LANG}_test.json   --method baseline --language "$LANG" --split test --allow-test  # row 7 (AR)
+python eval.py --rq 2 --segments outputs/rq2_offline_joint-dlm_duration_dlm_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 7 (DLM)
+
+# ── B. ONLINE — the FSM must decide from the past alone. ──
+#   Rows 8-9 — online cascades under the comparison arm's streaming policy. The segmenter proposes spans; the clean
+#   translator encodes each candidate crop; the shared FSM checks boundary stability, lag and translation confidence
+#   before it commits. --match-geometry reads the arm's saved cap, delta and minimum span, so the policy is matched.
+#   Run both rows with the same inference.yaml. --checkpoint names the clean translator; the segmenter comes from
+#   --moryossef-config (row 8) or --bio-config (row 9). Row 8 needs duration_model.moryossef.<language> from B1a.
 python eval.py --rq 2 --stream --segmenter-arch moryossef --method baseline \
     --checkpoint checkpoints/baseline_train/"$LANG"/model.pt --match-geometry checkpoints/ar/"$LANG" \
-    --language "$LANG" --split test --allow-test
-#   Output: outputs/rq2_stream_events_moryossef_${LANG}_test.json.
-
-#   Rows 7/8: the same trained model, offline (self-segments, one-shot) vs streaming (FSM).
-python eval.py --rq 2 --offline --method ar  --language "$LANG" --split test --allow-test   # row 7'
-python eval.py --rq 2 --offline --method dlm --language "$LANG" --split test --allow-test   # row 7
+    --language "$LANG" --split test --allow-test   # row 8
+python eval.py --rq 2 --stream --segmenter-arch s1 --method baseline \
+    --checkpoint checkpoints/baseline_train/"$LANG"/model.pt --match-geometry checkpoints/ar/"$LANG" \
+    --language "$LANG" --split test --allow-test   # row 9
+#   Row 10 — the deployed system. --stability replays the reveal policies over the same decodes (B6b reads them).
+python eval.py --rq 2 --stream --stability --method ar  --language "$LANG" --split test --allow-test  # row 10 (AR)
+python eval.py --rq 2 --stream --stability --method dlm --language "$LANG" --split test --allow-test  # row 10 (DLM)
 
 # ── B6b. Display stability — how much earlier could text appear, and at what cost? ──
-#   --stability replays stable-prefix policies (commit_only, agreement_nK, confidence_nK, both) over the
-#   per-stride decodes the FSM already computed. No extra decoding; all policies are monotonic, so the trade is
-#   latency vs prematurely-frozen tokens. confidence_n1 is the row that tests the CB claim: run it also against
-#   a CB-off checkpoint — if the policy works only on the CB-trained model, the CB term earns a deployment
-#   metric, not just BLEU. Results: outputs/stability_<method>_<lang>_<split>.json
-#   THE CB PAIRING: rerun --stability with --method-config configs/ablation_nocb.yaml — if confidence_n1 is a
-#   good policy only on the CB-trained model, the confidence-bound term earns its place here.
-python eval.py --rq 2 --stream --stability --method ar  --language "$LANG" --split test --allow-test  # row 8'
-python eval.py --rq 2 --stream --stability --method dlm --language "$LANG" --split test --allow-test  # row 8
+#   Rows 10/10' already wrote outputs/stability_<translator>_<lang>_<split>.json: --stability replays the
+#   stable-prefix policies (commit_only, agreement_nK, confidence_nK, both) over the per-stride decodes the FSM
+#   already computed. No extra decoding; all policies are monotonic, so the trade is latency against prematurely
+#   frozen tokens. THE CB PAIRING is the only run this step adds: repeat row 10 against the CB-off checkpoint. If
+#   confidence_n1 is a good policy only on the CB-trained model, the confidence-bound term earns a deployment
+#   metric, not just BLEU. The method-config stem enters the translator token, so this writes
+#   stability_dlm-nocb_... beside stability_dlm_... instead of over it.
+python eval.py --rq 2 --stream --stability --method dlm --method-config configs/ablation_nocb.yaml \
+    --language "$LANG" --split test --allow-test
 
 # ── B6c. System error report — WHERE the deployed system fails, from the events B6 already wrote ──
 #   Per gold sentence {matched, merged, split, missed} and per event {matched, merger, fragment, phantom}
 #   (mutually exclusive; forced-PARTIAL counted orthogonally), frequencies x mean sentence-BLEU; sentence-BLEU
 #   vs tIoU bins (boundary-induced vs translation-intrinsic loss); duration-binned match rates incl. the
 #   over-cap tail; and AUTO-SELECTED case studies (top-k per failure type by reference length — paper exemplars
-#   are selected by rule, never cherry-picked). Run per events file (rows 7/8 and any cascade row).
+#   are selected by rule, never cherry-picked). Run per events file (rows 6/10 and any cascade row).
 python analyze.py --stage system-errors --language "$LANG" --split test --allow-test \
-    --predictions outputs/rq2_stream_events_dlm_${LANG}_test.json
+    --predictions outputs/rq2_online_joint-dlm_duration_dlm_${LANG}_test.json
 #   Figures (one dashboard per run; --report repeatable to OVERLAY systems — any events file works: stream,
 #   offline, every cascade row — so failure profiles are comparable across pipeline stages; --rq1-file adds the
 #   confidence-calibration panel, --stability-file the reveal-policy trade-off; case timelines are rendered from
 #   the report's rule-selected exemplars):
 python visualize.py --what errors --language "$LANG" --split test \
-    --report outputs/system_errors_rq2_stream_events_dlm_${LANG}_test.json \
+    --report outputs/system_errors_rq2_online_joint-dlm_duration_dlm_${LANG}_test.json \
     --rq1-file outputs/rq1_dlm_${LANG}.json
 #   FIGURES from the report(s): one dashboard (taxonomy shares, BLEU-vs-tIoU, duration-binned match rates,
 #   pair scatter, BLEU-vs-OOV, event taxonomy) + one timeline sheet of the rule-selected case studies.
 #   Repeat --report to overlay systems (e.g. stream vs offline vs cascade) on shared axes.
 python visualize.py --what errors --language "$LANG" \
-    --report outputs/system_errors_rq2_stream_events_dlm_${LANG}_test.json
+    --report outputs/system_errors_rq2_online_joint-dlm_duration_dlm_${LANG}_test.json
 #   STATISTICS LAYER (report.py) — what a dashboard cannot give: every system re-scored under ONE protocol on the
 #   SAME gold index (stable gold_id join), per-system per-gold outcome CSVs (drill into any cell with pandas),
 #   PAIRED-bootstrap significance on the per-gold deployment score vs --reference (mean Δ, 95% CI, p), and the
 #   sentence-level flip table (fixed / broken / better / worse). Any RQ2-schema events file is a system:
 #   streaming, offline, every cascade row, every ablation — a claimed difference without its CI does not go in
 #   the paper. -> outputs/report_<lang>_<split>/{outcomes_*.csv, taxonomy.csv, significance.csv, report.md, *.png}
-python report.py --language "$LANG" --split test --reference stream \
-    --events stream=outputs/rq2_stream_events_dlm_${LANG}_test.json \
-    --events offline=outputs/rq2_offline_events_dlm_${LANG}_test.json \
-    --events cascade=outputs/rq2_cascade_segmenter_predictions_moryossef_duration_${LANG}_test_baseline.json
+python report.py results --language "$LANG" --split test --reference stream \
+    --events stream=outputs/rq2_online_joint-dlm_duration_dlm_${LANG}_test.json \
+    --events offline=outputs/rq2_offline_joint-dlm_duration_dlm_${LANG}_test.json \
+    --events cascade=outputs/rq2_offline_moryossef_duration_clean_${LANG}_test.json
+#   Or, over every finished row in outputs/ at once, with no --events list to keep in sync:
+python report.py progress --language "$LANG"
 ```
 
 **RQ1 design.** One grid, one corpus, three arms. Normalize each curve to its own (0,0) cell; report the intercept separately. Use `--severity-grid-head=…`/`--severity-grid-tail=…` (with `=` for negative-leading lists); the sweep is their full product.
@@ -319,40 +336,57 @@ python report.py --language "$LANG" --split test --reference stream \
 - **Gated arms: read (decoded-only, skip-rate) pairs, not raw corpus BLEU.** A Δ_head > 0 window has no `B`; the FSM skips that state by design, and force-decoding it collapses the cell's corpus BLEU through the brevity penalty. The table therefore reports `gate_skip_rate` and `text_metrics_decoded_only` beside `text_metrics`. Never plot decoded-only alone: it conditions on a shrinking, easier subset.
 - Use full-reference BLEU only for evidence-complete cells (head ≤ 0, tail ≥ 0). Cells that remove target evidence test the skip/confidence policy, not translation quality.
 
-**RQ2 ladder** — conditions over {segmenter source × translator × mode}; each delta varies one axis:
+**RQ2 ladder** — two blocks. Block A decides OFFLINE, with the whole video available; block B decides ONLINE, from
+the past alone. Inside each block the rows run oracle spans, then the cascades (external segmenter, then ours), then
+the joint model. A row is never compared across blocks except through row 10 vs row 6, which is the access delta.
 
-| # | Span source | Translator | Evaluation |
-| --- | --- | --- | --- |
-| 1 | GT | Clean AR | `--segments gold_… --method baseline` |
-| 2 | GT | Joint AR/DLM | `--segments gold_… --method ar/dlm` |
-| 3 | Moryossef26, enhanced BIO | Clean AR | `--segments …moryossef_duration_… --method baseline` |
-| 4 | Moryossef26, enhanced BIO | Joint AR/DLM | `--segments …moryossef_duration_… --method ar/dlm` |
-| 5 | S1, offline duration BIO | Clean AR | `--segments …s1_duration_… --method baseline` |
-| 6 | S1, online FSM | Clean AR | `--stream --segmenter-arch s1 --method baseline --match-geometry <arm>` |
-| 7 | Joint head, offline | Joint AR/DLM | `--offline --method ar/dlm` |
-| 8 | Joint head, online FSM | Joint AR/DLM | `--stream --method ar/dlm` |
-| 9 | Moryossef26, online FSM | Clean AR | `--stream --segmenter-arch moryossef --method baseline --match-geometry <arm>` |
+| # | Spans from | Translator | Command | Artifact |
+| --- | --- | --- | --- | --- |
+| | **A. Offline — the whole video is available** | | | |
+| 1 | oracle (the annotation) | clean AR | `--segments gold_…` `--method baseline` | `rq2_offline_gold_none_clean_…` |
+| 2 | oracle (the annotation) | joint AR, joint DLM | `--segments gold_…` `--method ar/dlm` | `rq2_offline_gold_none_{ar,dlm}_…` |
+| 3 | Moryossef26, duration BIO | clean AR | `--segments …moryossef_duration_…` `--method baseline` | `rq2_offline_moryossef_duration_clean_…` |
+| 4 | Moryossef26, duration BIO | joint AR, joint DLM | `--segments …moryossef_duration_…` `--method ar/dlm` | `rq2_offline_moryossef_duration_{ar,dlm}_…` |
+| 5 | S1, duration BIO | clean AR | `--segments …s1_duration_…` `--method baseline` | `rq2_offline_s1_duration_clean_…` |
+| 6 | the joint head, whole video | joint AR, joint DLM | `--offline --method ar/dlm` | `rq2_offline_joint-ar_duration_ar_…` / `…joint-dlm_duration_dlm_…` |
+| 7 | row 6's own spans | clean AR | `--segments <row 6's events>` `--method baseline` | `rq2_offline_joint-{ar,dlm}_duration_clean_…` |
+| | **B. Online — the FSM decides from the past alone** | | | |
+| 8 | Moryossef26 under the FSM | clean AR | `--stream --segmenter-arch moryossef --method baseline --match-geometry <arm>` | `rq2_online_moryossef_duration_clean_…` |
+| 9 | S1 under the FSM | clean AR | `--stream --segmenter-arch s1 --method baseline --match-geometry <arm>` | `rq2_online_s1_duration_clean_…` |
+| 10 | the joint head under the FSM | joint AR, joint DLM | `--stream --stability --method ar/dlm` | `rq2_online_joint-ar_duration_ar_…` / `…joint-dlm_duration_dlm_…` |
 
-**Required same-span control** — re-translate row 7's saved spans with the clean translator ("clean translator + S2 spans"):
+**How to read the ladder.** Compare the same target language and the same decoder family.
 
-```bash
-python eval.py --rq 2 --segments outputs/rq2_offline_events_dlm_${LANG}_test.json \
-  --method baseline --language "$LANG" --split test --allow-test
-```
-
-**How to read the ladder.** Compare the same target language and decoder family.
-
-- **2 vs 1; 4 vs 3:** translation at fixed oracle or Moryossef spans.
-- **5 vs 3:** segmentation pipelines with the same clean translator; report the input/context differences.
-- **8 vs 6; 8 vs 9:** the joint system against online S1 and Moryossef cascades under matched streaming geometry and policy. Compare localization separately from text scores.
-- **8 vs 7:** the same joint model under online and offline access. This includes the effect of future context.
+- **Span quality at one translator: 1 → 3 → 5 → 7.** Four span sources, one clean translator, one code path, one
+  model, offline throughout. This is the only chain on the ladder in which a single axis moves, so the oracle-to-
+  predicted drop and our-segmenter-against-theirs both come from here.
+- **Translator at fixed spans: 2 − 1, 4 − 3, 7 − 6.** The clean translator and a joint arm read identical spans. The
+  two models differ in more than the joint objective (training windows, epochs, learning rate, selection metric, and
+  the gate), so this delta measures the whole training package at fixed boundaries, not the joint loss alone.
+- **Access at one system: 10 − 6.** The same trained arm, online against offline. Four mechanisms move together:
+  causal against bidirectional segmentation, the live cap against the trained cap, the growing buffer against a
+  buffer-shaped window, and commit policy. Report it as a system-level access delta.
+- **Prior art online: 10 vs 8, 10 vs 9.** For LOCALIZATION this is a single axis — quote `segmentation.f1`, which
+  does not depend on the translator. The text columns also move the translator and the gate, because `eval.py` pins
+  an online cascade to the clean, ungated translator, so quote them as system comparisons and read the translator
+  part from 7 − 6.
 
 Notes that prevent misreading, in brief:
 
-- Every row uses the same annotation-ignore policy (`eval.scoreable_predictions`). Keep all emitted events, including short correct and false predictions. Λ_min is an event-generation rule, not an evaluation filter. Report localization precision and recall beside DVC.
-- Rows 1–5 use supplied spans; row 6 discovers spans online. For rows 1–5, only the span _boundaries_ are external. `run_cascade` still runs the full model (BIO head and gate included) on `--method dlm/ar` rows. Rows with `--method baseline` use the ungated clean floor — deliberately a different model.
-- Row 7 chunks the head at its TRAINED cap (checkpoint meta), overlap-stitched, each chunk pose-normalized on its own frames (the head's training frame), and translates each span in a buffer-shaped window. No whole-video pass, no random sampling at eval; rows 7–8 are deterministic.
-- The misaligned AR twin runs the identical commands with `--method ar` (rows 2′,5′,7′,8′) to isolate the decoder family. The headline table stays DLM.
+- Every row uses the same annotation-ignore policy (`eval.scoreable_predictions`). Keep all emitted events, including
+  short correct and false predictions. Λ_min is an event-generation rule, not an evaluation filter. Report
+  localization precision and recall beside DVC.
+- Rows 1–5 and 7 read supplied spans; only the span _boundaries_ are external. `run_cascade` still runs the full model
+  (BIO head and gate included) on `--method ar/dlm` rows. Rows with `--method baseline` use the ungated clean floor —
+  deliberately a different model.
+- Row 1 is scored inside the clean translator's own training view (it trains on GT caption spans), so it is an oracle
+  reference, not a bound on the joint arms.
+- Rows 6 and 10 are deterministic: no whole-video pass and no sampling at eval.
+- Every joint row runs twice, once per decoder family: `--method ar` first, then `--method dlm`. The two arms share
+  one row id because they are the same condition under two decoders; the pair isolates the decoder family. The
+  headline table stays DLM.
+- There is no "cascade spans + joint translator" online row: `eval.py` pins an online cascade to the clean translator,
+  because the joint arm's commit conditions read its own head. The offline pair 4 vs 3 carries that contrast.
 
 **Metric.** RQ2 uses DVC-style text scoring: every prediction/reference pair above the tIoU threshold is a single-reference instance. Unmatched predictions receive a seeded random garbage reference. Scores are computed per gold video, averaged equally across videos, then averaged over the declared tIoU thresholds. The repository uses SacreBLEU 13a rather than the original toolkit's COCO BLEU/PTB tokenizer; describe this as DVC-style matching and aggregation with the stated text scorers, not a byte-identical reproduction.
 
@@ -448,6 +482,30 @@ One line each; the full argument lives at the pointer.
 - **Text scoring level is declared per language, never sniffed from references** (`char_level_for_target`; `tests/test_scoring_level.py` enforces every call site).
 - **Calibration artifacts are keyed by (segmenter, language)** so an `--segmenter-arch s1` run can never overwrite the independent measurement (`tests/test_calibration_provenance.py`).
 - **Pose timing comes from `video_meta.csv`** (SignVerse resolves to exactly 24 fps). → `docs/run_real_data.md`
+
+## RQ2 artifact names
+
+Every RQ2 row writes one pair of files under `outputs/`, named by the four fields that identify the row
+(`eval.rq2_output_stem`), with every field always present:
+
+```
+rq2_{when}_{spans}_{decode}_{translator}_{language}_{split}.json          the events
+rq2_{when}_{spans}_{decode}_{translator}_{language}_{split}_scores.json   what this run scored on them
+```
+
+| field | values | meaning |
+|---|---|---|
+| `when` | `offline`, `online` | how THIS run decided: `offline` reads the whole video, `online` decides from the past alone. A re-translation of saved spans is `offline`, whatever produced the spans |
+| `spans` | `gold`, `moryossef`, `s1`, `joint-ar`, `joint-dlm` | which model cut the video; the joint head carries its arm, so the same-span controls of the two arms are different files |
+| `decode` | `duration`, `plain`, `none` | the segmentation decode that produced them; `none` is the annotation |
+| `translator` | `clean`, `ar`, `dlm`, `none` | which translator read them; `none` is a segmentation-only run. An ablation appends its config stem (`dlm-nocb`), so it cannot overwrite the arm it is compared with |
+
+So `rq2_offline_moryossef_duration_clean_asf_test.json` is the external segmenter's spans, duration-decoded, read by
+the clean translator, offline. A cascade row takes `spans` and `decode` from the span file's own provenance, never
+from its filename, so an output name cannot drift from what produced it.
+
+`segmenter_eval_*` files stay separate: they score spans ALONE, with no translator, and carry both the
+Moryossef-comparable block and `rq2_protocol` in one payload.
 
 ## Repository map
 

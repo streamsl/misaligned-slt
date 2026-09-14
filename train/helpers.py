@@ -351,10 +351,14 @@ def run_epoch_loop(
     model.to(device)
     model.train()
     logs: list[dict[str, float]] = []
-
-    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=len(loader))
+    accum = int(cfg.get("grad_accum_steps", 1) or 1)
+    if accum < 1: raise ValueError(f"grad_accum_steps must be >= 1, got {accum}")
+    # CEILING, not floor: the loop also steps on a short final group (`step != n_micro` below), and the loader does
+    # not drop a partial batch. A floor here leaves the schedule one step short per epoch, so cosine runs past T_max.
+    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=max(1, -(-len(loader) // accum)))
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
+    
     # Side effects (checkpoint writes, wandb, history.csv, progress bars) are rank 0's alone: concurrent writers
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
     # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
@@ -425,21 +429,27 @@ def run_epoch_loop(
             if hasattr(ds, "set_epoch"): ds.set_epoch(epoch)
             
         epoch_logs: list[dict[str, float]] = []
+        n_micro = len(loader)
         for step, batch in enumerate(loader, start=1):
             batch = move_to_device(batch, device)
-            optimizer.zero_grad(set_to_none=True)
+            if (step - 1) % accum == 0: optimizer.zero_grad(set_to_none=True)
             with amp.autocast():
                 loss, step_logs = step_fn(batch, epoch)
 
-            amp.backward(loss)
+            # Scale so the accumulated gradient is the MEAN over the group, matching one batch of accum*batch_size.
+            # The final group of an epoch can be short; it is scaled by its own size, so it is a true mean too.
+            group = min(accum, n_micro - (step - 1) // accum * accum)
+            amp.backward(loss / group)
+            # Every micro-batch's metrics enter the epoch mean; only the optimizer step is grouped.
+            row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
+            epoch_logs.append(row); logs.append(row)
+            if step % accum and step != n_micro: continue    # keep accumulating; no step, no scheduler tick
             # Average gradients BEFORE clipping so every rank clips the same (global) gradient and therefore
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
             dist.average_gradients(model.parameters())
             # Clip only trainable params: iterating all ~1B (frozen included) per step is pure overhead.
             stepped = amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
             if stepped: scheduler.step_batch()
-            row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
-            epoch_logs.append(row); logs.append(row)
             logger.log_step(epoch, step, row)
 
         scheduler.step_epoch()

@@ -29,6 +29,7 @@ pretrain_geometry:
 
 epochs: 100
 batch_size: 32
+grad_accum_steps: 1    # Effective batch = batch_size * grad_accum_steps
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 early_stopping:

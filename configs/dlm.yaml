@@ -160,6 +160,7 @@ jitter:
     fallback_cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off edges so mode2 stays distinct from mode1/4
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
+grad_accum_steps: 1   # Effective batch = batch_size * grad_accum_steps
 num_workers:
     4 # DataLoader workers (throughput knob; parallel pose-load + window-sample + tokenize). Safe at any value:
     # exact per-epoch coverage comes from the INDEX-driven anchor (sampler.sample(index) -> anchors[index % N], and

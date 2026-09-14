@@ -78,9 +78,11 @@ def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, lan
     """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of the DEPLOYED cap rule.
 
     The head is never run beyond its trained RoPE context, and `analyze.py --stage buffer-cap` refuses a cap above it, so this must 
-    compute SAME terms that stage writes: train p99 + stride + δ/fps per language (utils.lambda_min_frames' δ, read from resolved 
-    geometry). A fixed 1s margin silently under-covers any language whose δ exceeds 1s. Return the per-language terms, or None when 
-    the cap is numeric (an explicit design override).
+    compute SAME terms that stage writes: train p99 + stride + δ/fps per language. A fixed 1s margin silently under-covers any language 
+    whose δ exceeds 1s. Return the per-language terms, or None when the cap is numeric (an explicit design override).
+
+    `inference_cfg` must be the UNRESOLVED file: `resolve_inference` flattens `delta_enc_frames` to target language's scalar, which 
+    would apply 1 language's δ to whole pool and make a POOLED cap depend on `--language` (measured: 38.94s for asf vs. 40.14s for bfi).
     """
     geometry = dict(cfg.get("pretrain_geometry") or {})
     langs = cfg.get("pretrain_languages") or ([language] if language else None)
@@ -148,7 +150,8 @@ def build_bio_s1(
         cfg["checkpoint"] = ckpt
         print(f"bio_s1 | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
         
-    context_caps = resolve_pretrain_context(cfg, data_cfg, inference_cfg, language)
+    # Unresolved on purpose: the pooled cap is a property of the POOL, not of --language (see the docstring).
+    context_caps = resolve_pretrain_context(cfg, data_cfg, load_yaml(inference_config), language)
     if context_caps:
         cfg["pretrain_context_caps"] = context_caps   # per-language train p99 + stride + margin, recorded for the paper
         print(f"bio_s1 | pretrain_geometry.buffer_cap_s auto -> {cfg['pretrain_geometry']['buffer_cap_s']:.2f}s "
@@ -212,7 +215,9 @@ def evaluate_bio_s1( # Evaluate frame losses and the untuned legal-path monitor 
             rows.append(row)
             spans.update(tags, labels, lengths)
             modes = batch.get("mode_names") or []
-            for mode in set(modes) - {"mode4"}:
+            # mode2 joins mode4 here: both are truncated by construction, so they hold no COMPLETE span and
+            # `CompleteSpanMetrics` scores a PERFECT tagger 0 on them. A logged near-zero column reads as failure.
+            for mode in set(modes) - {"mode2", "mode4"}:
                 idx = [i for i, m in enumerate(modes) if m == mode]
                 per_mode.setdefault(mode, CompleteSpanMetrics()).update(tags[idx], labels[idx], lengths[idx])
     result = mean_logs(rows, prefix="val")

@@ -71,29 +71,32 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         # Dynamic padding (pad_to_max_length=False) needs the DLM's canvas geometry to stay equivalent to a
         # full-width canvas: see _tokenize_texts.
         self.block_size = max(1, int(block_size))
+        # The dynamic canvas is block-aligned but capped at max_text_tokens, so a cap that is not a whole number of
+        # blocks silently hands the longest rows a canvas ending mid-block — the one geometry the alignment prevents.
+        if not self.pad_to_max_length and self.max_text_tokens % self.block_size: raise ValueError(
+            f"max_text_tokens={self.max_text_tokens} is not a multiple of block_size={self.block_size}; the dynamic "
+            f"canvas would cap mid-block. Use {-(-self.max_text_tokens // self.block_size) * self.block_size}."
+        )
         self.eos_supervision_tokens = max(0, int(eos_supervision_tokens))
 
     def _tokenize_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
-        # Every decoder forward runs over the full canvas, so padding to max_text_tokens costs compute on padding:
-        # captions are ~15 tokens against a 128 canvas. Dynamic padding sizes it to the batch instead, with 2 slots 
-        # of headroom that the DLM path requires and batch-max alone would not leave:
-        #   1. supervise_trailing_eos needs eos_supervision_tokens PAD slots after the longest row's sentence;
-        #   2. the confidence-bound reference shift (models/streaming_slt.py) drops the last column, which must be
-        #      PAD or the longest row loses its real final token from the gate.
-        # Block alignment matters too — BD3LM attends bidirectionally WITHIN a block, so a canvas ending mid-block
-        # would change the last positions' logits. With headroom + alignment the result matches the full canvas.
-        encoded = self.tokenizer(
-            texts, padding="max_length" if self.pad_to_max_length else True,
-            truncation=False, max_length=self.max_text_tokens, return_tensors="pt",
-        )
+        # TRAINING forward runs over whole canvas (block decode's block-local forwards are inference only), so padding to 
+        # max_text_tokens costs compute on padding: captions are ~15 tokens against a 320 canvas. Dynamic padding sizes it 
+        # to the batch instead, with 1 slot of headroom the DLM path requires and batch-max would not: the confidence-bound 
+        # reference shift (models/streaming_slt.py) drops last column, which must be PAD or longest row loses its real final 
+        # token from the gate. EOS tail needs no reservation here — target builder (models/block_diffusion.py _prepare_x0) 
+        # pads its own canvas to block boundary. Block alignment matters too — BD3LM attends bidirectionally WITHIN a block, 
+        # so canvas ending mid-block change last positions' logits. With headroom + alignment the result matches full canvas.
+        pad = {"padding": "max_length", "max_length": self.max_text_tokens} if self.pad_to_max_length else {"padding": True}
+        encoded = self.tokenizer(texts, truncation=False, return_tensors="pt", **pad)
         input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
         if input_ids.shape[1] > self.max_text_tokens: raise ValueError(
             f"Caption target needs {input_ids.shape[1]} tokens, exceeding max_text_tokens={self.max_text_tokens}; "
              "increase the text capacity. Complete-caption targets must not be silently truncated."
         )
         if not self.pad_to_max_length:
-            need = input_ids.shape[1] + 1 + self.eos_supervision_tokens
+            need = input_ids.shape[1] + 1
             width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
             if width > input_ids.shape[1]:
                 grow = width - input_ids.shape[1]

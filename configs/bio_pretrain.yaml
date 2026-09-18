@@ -27,7 +27,7 @@ pretrain_temperature: 0.3
 # buffer-cap` refuses a cap above the stamped context. `auto` re-derives it per run instead, and reintroduces that
 # ordering dependency. Evaluation uses the stamped trained context, not this file.
 pretrain_geometry:
-    buffer_cap_s: 40
+    buffer_cap_s: 40   # auto
     min_span_frames: 1
 
 epochs: 100
@@ -41,7 +41,7 @@ early_stopping:
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 2
+    warmup_epochs: 4
 # The pose encoder and BIO head both train; the encoder uses backbone_lr (default 0.3 × learning_rate).
 freeze_backbone: false
 # backbone_lr: 1.0e-4  # optional override of default 0.3×learning_rate

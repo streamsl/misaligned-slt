@@ -76,24 +76,24 @@ if __name__ == "__main__":
         )
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
-        logs = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
+        log_rows = train_bio_s1_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
         path = save_model_checkpoint(
             model, checkpoint_dir(cfg, default="checkpoints/bio_s1"), meta=cfg.get("checkpoint_meta")
         ) if dist.is_main() else None
-        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-moryossef":
-        # Faithful Moryossef external segmenter for error calibration + RQ2 cascade: raw keypoints + UNet.
+        # Faithful Moryossef external segmenter for error calibration + RQ2 cascade: their landmarks + UNet.
         # from the FSM head. Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
-        from moryossef26.trainer import build_segmenter, build_segmenter_loaders, train_segmenter_epochs
-        train_loader, dev_loader, cfg = build_segmenter_loaders(args.data_config, args.moryossef_config, language=args.language)
-        model = build_segmenter(args.moryossef_config)
+        from moryossef26.trainer import build_moryossef, build_moryossef_loaders, train_moryossef_epochs
+        train_loader, dev_loader, cfg = build_moryossef_loaders(args.data_config, args.moryossef_config, language=args.language)
+        model = build_moryossef(args.moryossef_config)
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
-        logs = train_segmenter_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
+        log_rows = train_moryossef_epochs(model, train_loader, dev_loader, device, epochs=epochs, cfg=cfg, resume=args.resume)
         path = save_model_checkpoint(
             model, checkpoint_dir(cfg, default="checkpoints/moryossef"), meta=cfg.get("checkpoint_meta")
         ) if dist.is_main() else None
-        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-slt":
         from train.slt import build_slt_components, build_slt_optimizer, train_slt_epochs
         # --language re-points ${language} in checkpoint.dir for training and the save below.
@@ -105,14 +105,14 @@ if __name__ == "__main__":
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         device = dist_device or pick_device(args.device)
         optimizer = build_slt_optimizer(slt_cfg, components.model)
-        logs = train_slt_epochs(
+        log_rows = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
             dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,
         )
         path = save_model_checkpoint(
             components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"), meta=components.checkpoint_meta,
         ) if dist.is_main() else None
-        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": len(logs)}
+        result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     else: raise ValueError(f"Unsupported stage: {args.stage}")
 
     if dist.is_main():

@@ -1,16 +1,17 @@
 """Stable-prefix policies for the streaming display, scored offline from recorded stride hypotheses.
 
-The FSM re-decodes its candidate span every stride and shows nothing until the commit gate fires, so today the displayed 
-text never changes — normalised erasure is 0 by construction and the open question is LATENCY, not flicker. A stable-prefix 
-policy trades that: show a prefix earlier, at the risk of revealing a token later evidence would have changed. Every policy 
-is monotone in prefix LENGTH — the revealed prefix only ever grows. It is NOT monotone in CONTENT: these traces come from 
-unforced re-translation, so a later stride may return a different token at an already-revealed position, and the display 
-would visibly rewrite. `frozen_prefix_error` is exactly that rate, and it is the measurement that says whether prefix-FORCED 
-decoding (constraining the decoder to continue from what was shown) is worth building. Forcing cannot be simulated from 
-these traces: it changes the decode, so it needs a re-run, not a replay.
+FSM decodes its candidate span only on strides where commit gate can still act, and shows nothing until the gate fires, 
+so the displayed text never changes — normalised erasure is 0 by construction and the open question is LATENCY, not flicker. 
+A stable-prefix policy trades that: show a prefix earlier, at the risk of revealing a token later evidence would have changed. 
+Every policy is monotone in prefix LENGTH — the revealed prefix only ever grows. It is NOT monotone in CONTENT: these traces 
+come from unforced re-translation, so a later stride may return a different token at an already-revealed position, and the 
+display would visibly rewrite. `frozen_prefix_error` is exactly that rate, and it is the measurement that says whether 
+prefix-FORCED decoding (constraining the decoder to continue from what was shown) is worth building. Forcing cannot be 
+simulated from these traces: it changes the decode, so it needs a re-run, not a replay.
 
-Policies replay `StreamingSLTRunner(record_trace=True).trace`, so they cost no extra decoding and every policy sees exactly 
-the same hypotheses. 2 signal families, each parameterised by how many strides of evidence it demands:
+Policies replay `StreamingSLTRunner(record_trace=True).trace`: recording turns FSM's decode skip off, so the analysis pays for 
+deferred strides' decodes once, and every policy then replays exactly same hypotheses. 2 signal families, each parameterised 
+by how many strides of evidence it demands:
 
   reveal_on_agreement(n)             the token at each position must be IDENTICAL across the last n strides
                                      (Local Agreement). Purely a string test; no training counterpart.
@@ -250,3 +251,21 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
         "contradicted_track_rate": float(np.mean(contradicted)) if contradicted else 0.0,
         "vanished_track_rate": float(np.mean(vanished)) if vanished else 0.0,
     }
+
+
+def accumulate_policy(totals: dict, name: str, row: dict) -> None:
+    """Fold 1 video's `score_policy` row into a running (sum, count) so the caller never holds every Track.
+
+    Every field but `n_tracks` is an unweighted mean over that call's tracks, so weighting by `n_tracks` and
+    dividing at the end reproduces scoring the whole split at once exactly.
+    """
+    acc = totals.setdefault(name, {})
+    n = int(row["n_tracks"])
+    acc["n_tracks"] = acc.get("n_tracks", 0.0) + n
+    for key, value in row.items():
+        if key != "n_tracks": acc[key] = acc.get(key, 0.0) + float(value) * n
+
+
+def merged_policy(totals: dict) -> dict:
+    n = int(totals.get("n_tracks", 0))
+    return {"n_tracks": n, **{k: (v / n if n else 0.0) for k, v in totals.items() if k != "n_tracks"}}

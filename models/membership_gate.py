@@ -52,6 +52,18 @@ class CrossAttnOmegaInjector:
         if not self.handles:
             raise ValueError(f"CrossAttnOmegaInjector found no cross-attention modules on {type(lm_model).__name__}")
 
+    @classmethod
+    def attach(cls, lm_model: torch.nn.Module) -> "CrossAttnOmegaInjector":
+        # ONE injector per decoder stack. The AR arm hooks the whole seq2seq model and the DLM decoder hooks the bare stack; 
+        # both resolve to the same cross-attention modules, and two hook sets would add Ω twice.
+        modules = cls._cross_attn_modules(lm_model)
+        if not modules: raise ValueError(f"CrossAttnOmegaInjector found no cross-attention modules on {type(lm_model).__name__}")
+        injector = getattr(modules[0], "_omega_injector", None)
+        if injector is None:
+            injector = cls(lm_model)
+            modules[0]._omega_injector = injector
+        return injector
+
     @staticmethod
     def _cross_attn_modules(lm_model: torch.nn.Module) -> list[torch.nn.Module]:
         # Accepts a full HF encoder-decoder OR a bare decoder stack (T5Stack / MBartDecoder) — the DLM's
@@ -81,15 +93,13 @@ class CrossAttnOmegaInjector:
         return args, kwargs
 
     def with_omega(self, omega_bias: torch.Tensor | None):
+        # Restores the value active on entry: the DLM's cached forwards wrap each pass in this context, so a decode
+        # nested in an outer AR context must hand the outer Ω back instead of switching the gate off for its rest.
         injector = self
         class _Ctx:
-            def __enter__(self): injector._omega = omega_bias
-            def __exit__(self, *exc): injector._omega = None
+            def __enter__(self): self.prev, injector._omega = injector._omega, omega_bias
+            def __exit__(self, *exc): injector._omega = self.prev
         return _Ctx()
-
-    def remove(self):
-        for h in self.handles: h.remove()
-        self.handles = []
 
 
 def omega_cross_bias(omega: torch.Tensor, memory_len: int, dtype: torch.dtype) -> torch.Tensor:

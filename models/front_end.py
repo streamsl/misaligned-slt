@@ -59,11 +59,7 @@ class SLTFrontEnd(nn.Module):
     def _omega_injector(self) -> CrossAttnOmegaInjector:
         # Lazily attach cross-attention Ω hooks to the AR language model (once). The DLM arm gates in its own
         # manual decode loop; the AR arm reuses HF forward/generate, so the gate rides in on these hooks.
-        inj = getattr(self, "_xattn_omega", None)
-        if inj is None:
-            inj = CrossAttnOmegaInjector(self.lm_model)
-            object.__setattr__(self, "_xattn_omega", inj)  # not an nn.Module param; keep off the module tree
-        return inj
+        return CrossAttnOmegaInjector.attach(self.lm_model)  # 1 per stack; DLM decoder shares it
 
     def ar_omega_context(self, omega_bias):
         # Context manager: within it, every AR cross-attention adds Ω (None → identity). Wraps ar_loss /

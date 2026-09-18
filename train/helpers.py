@@ -70,7 +70,7 @@ class AmpHelper:
 
     `mixed_precision:` "auto" (default — bf16 if supported, else fp16), "bf16", "fp16", "none". CPU always fp32. bf16 needs no 
     GradScaler (same exponent range as fp32); fp16 uses one against gradient underflow. F.cross_entropy / softmax run fp32 under 
-    autocast (PyTorch promote list), so the 1/t-weighted BD3LM loss and SPD/DCD confidences keep full precision.
+    autocast (PyTorch promote list), so the 1/t-weighted BD3LM loss and the block decode's confidences keep full precision.
     """
     def __init__(self, mode: str = "auto", device: torch.device | str = "cpu"):
         device_type = torch.device(device).type
@@ -140,11 +140,11 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         self.enabled = bool(enabled)
         self.stage = str(stage)
         self.epochs = int(epochs)
-        self.steps_per_epoch = int(steps_per_epoch)
+        self.steps_per_epoch = int(steps_per_epoch)  # OPTIMIZER steps: the unit the scheduler, `step` and wandb share
         cfg = dict(cfg or {}) if self.enabled else {}
         wandb_cfg = dict(cfg.get("wandb", {}) or {})
 
-        self.monitor = str(monitor)  # surfaced first among the val columns
+        self.monitor = str(monitor)    # surfaced first among the val columns
         self._global_step = 0
         self._epoch: int | None = None
         self._epoch_t0 = 0.0
@@ -337,7 +337,7 @@ def run_epoch_loop(
     evaluate_fn: Callable[[int], dict[str, float]] | None = None,
     default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min",
     dev_loader: DataLoader | None = None, resume: bool = False, checkpoint_meta: dict | None = None,
-) -> list[dict[str, float]]:
+) -> int:
     """The one training loop every trainer shares (slt / bio_s1).
 
     Owns scheduler, AMP, best-checkpoint selection, early stop, logging, restore; a stage supplies only:
@@ -350,12 +350,14 @@ def run_epoch_loop(
     """
     model.to(device)
     model.train()
-    logs: list[dict[str, float]] = []
+    log_rows = 0
     accum = int(cfg.get("grad_accum_steps", 1) or 1)
     if accum < 1: raise ValueError(f"grad_accum_steps must be >= 1, got {accum}")
+
     # CEILING, not floor: the loop also steps on a short final group (`step != n_micro` below), and the loader does
     # not drop a partial batch. A floor here leaves the schedule one step short per epoch, so cosine runs past T_max.
-    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=max(1, -(-len(loader) // accum)))
+    opt_steps_per_epoch = max(1, -(-len(loader) // accum))
+    scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=opt_steps_per_epoch)
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
     
@@ -363,8 +365,14 @@ def run_epoch_loop(
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
     # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
     if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint, meta=checkpoint_meta)
-    logger = TrainLogger(name, cfg, epochs=int(epochs), steps_per_epoch=len(loader), monitor=control.monitor,
-                         enabled=dist.is_main(), resumed=bool(resume))
+    logger = TrainLogger(
+        name, cfg, epochs=int(epochs), steps_per_epoch=opt_steps_per_epoch, 
+        monitor=control.monitor, enabled=dist.is_main(), resumed=bool(resume)
+    )
+    if dist.is_main(): print(
+        f"{name} | {int(cfg.get('batch_size', 0))} batch x {accum} grad_accum_steps = {int(cfg.get('batch_size', 0)) * accum} "
+        f"effective batch: {len(loader)} micro-batches/epoch -> {opt_steps_per_epoch} optimizer steps/epoch", flush=True
+    )
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
         "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about "
@@ -440,9 +448,11 @@ def run_epoch_loop(
             # The final group of an epoch can be short; it is scaled by its own size, so it is a true mean too.
             group = min(accum, n_micro - (step - 1) // accum * accum)
             amp.backward(loss / group)
-            # Every micro-batch's metrics enter the epoch mean; only the optimizer step is grouped.
-            row = {"epoch": float(epoch), "step": float(step), "lr": scheduler.lr(optimizer), **step_logs}
-            epoch_logs.append(row); logs.append(row)
+            # Every micro-batch's metrics enter epoch mean; only optimizer step is grouped. `step` names the optimizer step 
+            # the micro-batch belongs to, so a group shares 1 index and runs at different `accum` are comparable on it.
+            opt_step = (step - 1) // accum + 1
+            row = {"epoch": float(epoch), "step": float(opt_step), "lr": scheduler.lr(optimizer), **step_logs}
+            epoch_logs.append(row); log_rows += 1
             if step % accum and step != n_micro: continue    # keep accumulating; no step, no scheduler tick
             # Average gradients BEFORE clipping so every rank clips the same (global) gradient and therefore
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
@@ -450,7 +460,7 @@ def run_epoch_loop(
             # Clip only trainable params: iterating all ~1B (frozen included) per step is pure overhead.
             stepped = amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
             if stepped: scheduler.step_batch()
-            logger.log_step(epoch, step, row)
+            logger.log_step(epoch, opt_step, row)
 
         scheduler.step_epoch()
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
@@ -460,7 +470,6 @@ def run_epoch_loop(
             metrics = dist.reduce_metrics(eval_metrics)
             control.update(model, metrics, epoch)
             logger.epoch_summary(epoch, train=train_means, val=metrics, saved_path=control.last_saved_path)
-            logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 if dist.is_main(): print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
                 break
@@ -473,7 +482,7 @@ def run_epoch_loop(
         )
     control.restore(model)
     logger.finish()
-    return logs
+    return log_rows
 
 
 def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, float]:

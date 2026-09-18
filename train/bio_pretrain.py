@@ -218,7 +218,7 @@ def evaluate_bio_s1( # Evaluate frame losses and the untuned legal-path monitor 
 def train_bio_s1_epochs(
     model: BioS1Model, train_loader: DataLoader, dev_loader: DataLoader, 
     device: torch.device, epochs: int, cfg: dict, resume: bool = False,
-) -> list[dict[str, float]]:
+) -> int:
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)

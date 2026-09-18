@@ -4,23 +4,26 @@ stride_s: 1.0
 # duration + stride_s + δ/fps, reliable sentences only; run after delta-enc). Label-only constants are measured on
 # train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
 buffer_cap_s:
-    ase: 29.08
-    asf: 31.43
-    bfi: 35.72
+    ase: 34.67
+    asf: 36.66
+    bfi: 38.27
 # Shared hard/soft duration scores. tune-decode writes each complete per-language model.
 # Untuned languages stay absent; joint training refuses to borrow another language's settings.
 duration_model:
     moryossef:
-        bfi: {"mu_log_s": 1.5802147573680898, "sd_log_s": 0.8158729306212167, "tail_start_s": 33.84935999999997, "completion_bias": 1.0, "boundary_logit_weight": 1.5}
-        asf: {"mu_log_s": 1.7800481900540717, "sd_log_s": 0.7644972669361924, "tail_start_s": 29.679959999999955, "completion_bias": 2.0, "boundary_logit_weight": 1.5}
+        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
+        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
+        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 1.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
     s1:
-        bfi: {"mu_log_s": 1.5802147573680898, "sd_log_s": 0.8158729306212167, "tail_start_s": 33.84935999999997, "completion_bias": 3.0, "boundary_logit_weight": 1.0}
-        asf: {"mu_log_s": 1.7800481900540717, "sd_log_s": 0.7644972669361924, "tail_start_s": 29.679959999999955, "completion_bias": 5.0, "boundary_logit_weight": 2.0}
+        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 0.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
+        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
+        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
 boundary_stability:
     # delta-enc records which duration model was measured; stage 2 refuses a stale tolerance.
     duration_model_signature:
-        bfi: "1abd7dde201bb3a3"
-        asf: "4903adf7a2db07d8"
+        ase: "7bc4201972c87f37"
+        bfi: "c25dd7e1709d0065"
+        asf: "5317eb577c6811c6"
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
     #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
@@ -31,13 +34,13 @@ boundary_stability:
     #      a span, and select_target_span skips any span terminating at or before the commit frontier χ);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
-        ase: 11
-        asf: 18
-        bfi: 53
+        ase: 12
+        asf: 9
+        bfi: 8
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
     # Fixed lag for B terminators. O terminators need no extra lag. Selected on dev by the lag-only tune-stream stage.
     commit_lag_s:
-        ase: 0.0
+        ase: 4.0
         asf: 4.0
         bfi: 4.0
 
@@ -71,17 +74,8 @@ translation:
     decode_conditioning: window
     # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
     # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.
-    max_text_tokens: 192
-    # Dynamic termination (DCD/DMax): the commit phase runs until no mask remains; diffusion_steps bounds only
-    # the DMax convergence-settle phase (decode.py), not a fixed denoising-step count.
-    diffusion_steps: 128
-    dcd:
-        window_type: sliding
-        # DCD commit threshold = 0.9 (decode_algorithm.py / run_all.sh). decode_param is operative; tau_dec is its
-        # fallback (keep equal). Use ~0.5 only with decode_algo: dmax_prefix (the longest-confident-prefix selector).
-        tau_dec: 0.9
-        initial_window_length: 4
-        max_window_length: 64
-        decode_algo: threshold # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
-        decode_param: 0.9
-        cache_type: none # prefix cache is available only with window_type: static.
+    # The block decode walks blocks until every row has emitted EOS, so an unreached slot costs nothing.
+    max_text_tokens: 320
+    # Block-decode commit threshold (configs/dlm.yaml spd.tau_dec explains the dial and the reachable range under
+    # label smoothing). Overrides dlm.yaml as read at eval time; the value stamped in the checkpoint is not consulted.
+    tau_dec: 0.5

@@ -11,7 +11,7 @@ rq1:
     severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0] # used only when severity_mode: absolute
     smoke_grid_s: [-1.0, 0.0, 1.0]
     smoke_num_sentences: 10
-    batch_size: 64 # RQ1 windows are translated in length-sorted batches (padding masked → identical results)
+    batch_size: 64 # RQ1 windows are translated in length-sorted batches (padding masked → identical text and confidence).
     # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction + 
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
 rq2:

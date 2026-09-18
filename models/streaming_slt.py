@@ -36,7 +36,7 @@ class MisalignedSLTModel(nn.Module):
       buffer's variable length never hits the seq2seq encoder's positions.
     - encoder memory (`enc_hidden`/`enc_mask`): cross-attended by the translation decoder.
 
-    `decoder="dlm"` → block-diffusion decoder (OPUT training / SPD+DCD inference), `"ar"` → AR seq2seq. Nothing else
+    `decoder="dlm"` → block-diffusion decoder (OPUT training / block decode with SPD), `"ar"` → AR seq2seq. Nothing else
     differs — front end, BIO head, sampler, FSM, commit gate identical — which is what makes AR-vs-DLM a clean test.
     """
     def __init__(
@@ -117,22 +117,19 @@ class MisalignedSLTModel(nn.Module):
 
     @torch.no_grad()
     def generate_from_bio_tap(
-        self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, max_text_tokens: int = 128, diffusion_steps: int = 64,
-        tau_dec: float = 0.75, spd_top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
-        dcd_window_length: int | None = None, dcd_max_window_length: int | None = None, dcd_window_type: str = "sliding",
-        dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
-        dcd_top_p: float | None = None, dcd_cache_type: str = "none", decoder_start_token_id: int | None = None, 
+        self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, max_text_tokens: int = 128, tau_dec: float = 0.5,
+        spd_top_k: int = 1, spd_renormalize: bool = True, decoder_start_token_id: int | None = None,
         num_beams: int = 1, omega_bias: torch.Tensor | None = None, temporal_features=None, timestamps_s=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         enc_hidden, enc_mask = self.encode_memory(bio_tap, frame_mask, temporal_features, timestamps_s)
         if self.decoder_type == "dlm":
-            result = self.dlm_decoder.generate_spd_dcd(
-                enc_hidden=enc_hidden, enc_mask=enc_mask, max_length=max_text_tokens, diffusion_steps=diffusion_steps,
-                tau_dec=tau_dec, top_k=spd_top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision, temperature=temperature,
-                window_length=dcd_window_length, max_window_length=dcd_max_window_length, window_type=dcd_window_type,
-                decode_algo=dcd_decode_algo, decode_param=dcd_decode_param, sample_top_k=dcd_sample_top_k, top_p=dcd_top_p,
-                cache_type=dcd_cache_type, omega_bias=omega_bias,
+            result = self.dlm_decoder.generate(
+                enc_hidden, enc_mask, max_length=max_text_tokens, threshold=tau_dec, spd_top_k=spd_top_k,
+                spd_renormalize=spd_renormalize, omega_bias=omega_bias,
             )
+            # Sequential decoder passes of this decode (a batch's count: rows decode together). The AR arm's is
+            # its generated length: 1 cached step per token plus the confidence pass. RQ1 reports the mean.
+            self.last_decode_passes = int(result.forwards + result.cache_appends)
             # Slice to PRODUCED tokens (AR-arm parity): slot 0 (synthetic BOS) and everything past the first EOS are
             # 1.0 pad bookkeeping, so an unsliced mean pins the commit gate near 1 (~10 tokens on a 128 canvas → ≥
             # 0.92 regardless of quality; `translation_confident` always fires).
@@ -144,10 +141,12 @@ class MisalignedSLTModel(nn.Module):
 
         # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns REAL
         # per-token confidence. `num_beams>1` is the clean baseline's beam search; the SLT AR arm stays greedy.
-        return self.front_end.ar_generate(
+        generated, confidence = self.front_end.ar_generate(
             enc_hidden, enc_mask, max_new_tokens=max_text_tokens, num_beams=num_beams,
             decoder_start_id=decoder_start_token_id, omega_bias=omega_bias,
         )
+        self.last_decode_passes = int(generated.shape[1])  # start slot + N tokens = N cached steps + 1 confidence pass
+        return generated, confidence
 
     def _ar_confidence_bound_logits( # Gradient-carrying AR logits on the truncated path
         self, bio_tap: torch.Tensor, frame_mask: torch.Tensor, max_len: int, omega_bias=None, timestamps_s=None,
@@ -177,8 +176,8 @@ class MisalignedSLTModel(nn.Module):
         gate_stream_start: bool = False, gate_anchor: torch.Tensor | None = None, **decode_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Poses → (bio_logits, tokens, confidence, gate_skip). Owns the BIO tap + membership gate; decode knobs (max_text_tokens /
-        diffusion_steps / tau_dec / spd_* / dcd_* / num_beams / decoder_start_token_id) pass through to `generate_from_bio_tap`,
-        declared once there. `gate_skip` (B, bool) marks windows the deployed FSM would never decode; all-False when gate is off."""
+        tau_dec / spd_* / num_beams / decoder_start_token_id) pass via to `generate_from_bio_tap`, declared once there. `gate_skip` 
+        (B, bool) marks windows the deployed FSM would never decode; all-False when gate is off."""
         bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
         if getattr(self, "bio_branch_off", False) and not gate_enabled:
             # Clean-floor recipe: head frozen at random init and, gate off, unread — zeros fill the contract slot.
@@ -244,12 +243,8 @@ class MisalignedSLTModel(nn.Module):
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_sample_rollout: bool = False,
         oput_label_smoothing: float = 0.0, oput_rollout_eval_mode: bool = True, oput_eos_supervision: int | None = None,
-        cb_enabled: bool = True, cb_active: bool = True, cb_tau: float = 0.75, cb_lambda: float = 0.3, 
-        cb_verified_gate: bool = True, cb_decode_steps: int = 64, cb_belief_gap: bool = True,
-        cb_dcd_window_length: int | None = None, cb_dcd_max_window_length: int | None = None, cb_dcd_window_type: str = "sliding",
-        cb_dcd_decode_algo: str = "threshold", cb_dcd_decode_param: int | float | None = None, cb_dcd_sample_top_k: int | None = None,
-        cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, 
-        cb_spd_revision: bool = True, cb_temperature: float = 0.0, 
+        cb_enabled: bool = True, cb_active: bool = True, cb_tau: float = 0.75, cb_lambda: float = 0.3, cb_verified_gate: bool = True, 
+        cb_belief_gap: bool = True, cb_tau_dec: float = 0.5, cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True,
         gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int = 0,
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
@@ -400,25 +395,18 @@ class MisalignedSLTModel(nn.Module):
                 # the grad path (trunc encode above, remasked_logits below) stays in train mode so dropout regularizes only what trains.
                 with torch.no_grad(), eval_mode(self):
                     full_enc_hidden, full_enc_mask = self.encode_memory(full_bio_tap, full_mask, timestamps_s=full_timestamps)
-                    full_decode = self.dlm_decoder.generate_spd_dcd(
-                        enc_hidden=full_enc_hidden, enc_mask=full_enc_mask, max_length=max_len,
-                        diffusion_steps=cb_decode_steps, tau_dec=cb_tau, top_k=cb_spd_top_k,
-                        spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
-                        window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
-                        decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_full,
+                    # Same decode as inference (`cb_tau_dec` = tau_dec): the self-target is what the deployed decode would emit.
+                    full_decode = self.dlm_decoder.generate(
+                        full_enc_hidden, full_enc_mask, max_length=max_len, threshold=cb_tau_dec, spd_top_k=cb_spd_top_k,
+                        spd_renormalize=cb_spd_renormalize, omega_bias=cb_omega_full,
                     )
                     full_tokens, full_conf = full_decode.sequences, full_decode.confidence
 
-                    # Decode ONLY to pick which slots to defer-counterfactual (where the truncated decode disagrees
+                    # Decode ONLY to pick which slots to re-mask (where the truncated decode disagrees
                     # with the full-evidence one) — its confidence does NOT gate the loss (see below).
-                    trunc_decode = self.dlm_decoder.decode_spd_dcd(
-                        enc_hidden=trunc_enc_hidden, enc_mask=trunc_enc_mask, max_length=max_len,
-                        diffusion_steps=cb_decode_steps, tau_dec=cb_tau, top_k=cb_spd_top_k,
-                        spd_renormalize=cb_spd_renormalize, spd_revision=cb_spd_revision, temperature=cb_temperature,
-                        window_length=cb_dcd_window_length, max_window_length=cb_dcd_max_window_length, window_type=cb_dcd_window_type,
-                        decode_algo=cb_dcd_decode_algo, decode_param=cb_dcd_decode_param, sample_top_k=cb_dcd_sample_top_k,
-                        top_p=cb_dcd_top_p, cache_type=cb_dcd_cache_type, omega_bias=cb_omega_trunc,
+                    trunc_decode = self.dlm_decoder.generate(
+                        trunc_enc_hidden, trunc_enc_mask, max_length=max_len, threshold=cb_tau_dec, spd_top_k=cb_spd_top_k,
+                        spd_renormalize=cb_spd_renormalize, omega_bias=cb_omega_trunc,
                     )
                 trunc_decoded = trunc_decode.sequences
 

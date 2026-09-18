@@ -1,460 +1,174 @@
-"""SPD + DCD within-decode machinery (DMax §3.2 / DCD §4–5). `spd_dcd_decode` runs one cold-start decode 
-under fixed conditioning: SPD carries the renormalized soft mask/token embedding state across steps, 
-DCD's sliding window selects commits. No state crosses streaming strides."""
+"""Block-diffusion decoding with DMax's soft parallel decoding (SPD) and self-revision.
+
+`block_diffusion_decode` runs 1 cold-start decode under fixed conditioning. Blocks are decoded left to right. Inside a block, 
+the masked slots are unmasked by DMax's rule (longest confident prefix, the leftmost mask as fallback), every committed slot 
+of the block is re-predicted on each pass, and a soft mask/token embedding mixture carries the pass's belief into next forward. 
+A row's block is final once no mask remains and every active slot is settled, or a pass changes nothing; the caller's `finalize` 
+hook then extends its KV cache by that block. No state crosses streaming strides.
+
+Reference: DMax dInfer `ThresholdParallelDecoder.decode_uniform` + `get_transfer_index_uniform` (parallel_strategy.py) and 
+`BlockDiffusionRunner.decode_uniform` (generate_uniform.py). Greedy (temperature 0) only: dInfer's Gumbel sampling path isn't 
+reproduced, and every dInfer evaluation runs temperature 0. 5 deviations are marked inline, each for its own reason: 
+row-independent stopping (DMax stops a block batch-globally), a -inf MASK logit (a progress guarantee dInfer's uniform path 
+lacks), a revision-pass budget in place of dInfer's whole-block step cap, padding from 1st EOS, and a separate cache-append pass. 
+The last 3 change what the decode costs; docs/implementation_notes.md records each with its measurement.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal
-import inspect
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-@dataclass
-class DecodeStep:
-    token_ids: torch.Tensor
-    confidence: torch.Tensor
-    selected: torch.Tensor
-    predicted: torch.Tensor | None = None  # raw per-position prediction (DMax self-revision)
+# DMax Breakflag: a block is final once every active slot's max-prob reaches this. 0.8 is where label smoothing 0.2
+# (configs/dlm.yaml) puts the per-token loss MINIMISER, not a ceiling — exceeding it costs 0.044 nats against a
+# 2.99-nat floor — so this test does fire, and how often is a property of the trained model. It is a live part of the
+# pass budget, not a dead constant: measured 466 passes against 488 with it disabled on the tiny fixture at block 16.
+SETTLE_CONFIDENCE = 0.9
 
 
 @dataclass
-class SPDDecodeResult:
+class DecodeResult:
     sequences: torch.Tensor
     confidence: torch.Tensor
-    steps: int
-
-
-def sample_tokens(
-    logits: torch.Tensor, temperature: float = 0.0,
-    top_k: int | None = None, top_p: float | None = None,
-    margin_confidence: bool = False, neg_entropy: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return token confidence and sampled/argmax token ids.
-
-    Order matches DCD sample_tokens: temperature, then top-p, then top-k, so cutoffs are computed on the tempered
-    distribution. Identical at temperature=0 with no filters (our defaults).
-    """
-    if temperature and temperature > 0: logits = logits / float(temperature)
-    if top_p is not None and float(top_p) < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        cumulative = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        remove_sorted = cumulative > float(top_p)
-        remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
-        remove_sorted[..., 0] = False
-        remove = torch.zeros_like(logits, dtype=torch.bool)
-        remove.scatter_(-1, sorted_indices, remove_sorted)
-        logits = logits.masked_fill(remove, torch.finfo(logits.dtype).min)
-
-    if top_k is not None:
-        kth = torch.topk(logits, min(int(top_k), logits.shape[-1]), dim=-1).values[..., -1:]
-        logits = logits.masked_fill(logits < kth, torch.finfo(logits.dtype).min)
-
-    probs = F.softmax(logits, dim=-1)
-    if temperature and temperature > 0:
-        token_ids = torch.distributions.Categorical(probs=probs).sample()
-        confidence = probs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
-    else: confidence, token_ids = probs.max(dim=-1)
-
-    if margin_confidence:
-        top2 = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1).values
-        if top2.shape[-1] == 1: confidence = top2[..., 0]
-        else: confidence = top2[..., 0] - top2[..., 1]
-
-    if neg_entropy: confidence = torch.sum(probs * torch.log(probs.clamp_min(1e-10)), dim=-1)
-    return confidence, token_ids
-
-
-def dcd_decode_num(
-    confidence: torch.Tensor, candidates: torch.Tensor,
-    algo: Literal["threshold", "fixed"] = "threshold", algo_param: int | float = 0.9,
-) -> torch.Tensor: # DCD token count with the paper/code at-least-one fallback.
-    candidates = candidates.to(dtype=torch.bool, device=confidence.device)
-    if algo.endswith("fixed"):
-        fixed = torch.full((confidence.shape[0],), int(algo_param), dtype=torch.long, device=confidence.device)
-        return torch.minimum(candidates.sum(dim=1), fixed)
-    if algo.endswith("threshold"):
-        above = candidates & (confidence >= float(algo_param))
-        return torch.maximum(above.sum(dim=1), candidates.any(dim=1).long())
-    raise ValueError(f"Unsupported DCD decode algorithm: {algo}")
-
-
-def dcd_select_indices(
-    confidence: torch.Tensor,
-    candidates: torch.Tensor,
-    num_decode: torch.Tensor,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]: # Select highest-confidence candidate indices per batch row.
-    masked_conf = torch.where(candidates.bool(), confidence, torch.full_like(confidence, -torch.inf))
-    confs: list[torch.Tensor] = []
-    indices: list[torch.Tensor] = []
-
-    for row in range(masked_conf.shape[0]):
-        k = int(num_decode[row].item())
-        if k <= 0:
-            confs.append(masked_conf.new_zeros((0,)))
-            indices.append(torch.empty((0,), dtype=torch.long, device=masked_conf.device))
-            continue
-
-        top = torch.topk(masked_conf[row], k)
-        confs.append(top.values)
-        indices.append(top.indices)
-    return confs, indices
+    forwards: int       # denoising passes over the batch
+    cache_appends: int  # hard passes that append a finished block to the KV cache (no LM head); 1 per non-final block
 
 
 def longest_confident_prefix_mask(confidence: torch.Tensor, mask_index: torch.Tensor, threshold: float) -> torch.Tensor:
-    # DMax longest-contiguous-prefix promotion with leftmost-mask fallback.
+    # DMax dInfer parallel_strategy.py get_transfer_index_uniform (steps 2-5): the masked slots before the first
+    # masked slot below `threshold`; the leftmost mask when there is none, so every pass commits at least 1 slot.
     mask_index = mask_index.bool()
-    is_low_conf = mask_index & (confidence < float(threshold))
-    after_first_failure = torch.cumsum(is_low_conf.long(), dim=1) > 0
-    candidates = mask_index & (~after_first_failure)
-    has_selection = candidates.any(dim=1, keepdim=True)
+    low = mask_index & (confidence < float(threshold))
+    after_failure = torch.cumsum(low.long(), dim=1) > 0
+    candidates = mask_index & ~after_failure
     first_mask = (torch.cumsum(mask_index.long(), dim=1) == 1) & mask_index
-    return torch.where(has_selection, candidates, first_mask)
+    return torch.where(candidates.any(dim=1, keepdim=True), candidates, first_mask)
 
 
 def spd_hybrid_embeddings(
-    embedding_layer: nn.Embedding, token_ids: torch.Tensor,
-    logits: torch.Tensor, active_mask: torch.Tensor, mask_token_id: int,
-    top_k: int = 1, renormalize: bool = True, eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """DMax SPD hybrid embeddings with Eq. 10 norm restoration.
-
-    Active non-mask positions receive a soft state: sum_k p_k e(y_k) + (1 - sum_k p_k) e(MASK)
-    rescaled to the probability-weighted target norm. Other positions use hard token embeddings.
+    embedding_layer: nn.Embedding, token_ids: torch.Tensor, logits: torch.Tensor, active_mask: torch.Tensor,
+    mask_token_id: int, top_k: int = 1, renormalize: bool = True, eps: float = 1e-6,
+) -> torch.Tensor:
+    """DMax SPD embeddings for one block (parallel_strategy.py decode_uniform, soft-embedding part). Active non-mask
+    slots get sum_k p_k e(y_k) + (1 - sum_k p_k) e(MASK), rescaled to the probability-weighted target norm (DMax Eq. 10); 
+    every other slot keeps its hard embedding. DMax patches its previous embeddings in place and hard-refreshes changed slots; 
+    rebuilding from the current ids gives the same tensor because here a committed slot never re-masks (the -inf MASK logit 
+    below removes the re-mask case dInfer's hard refresh handles).
     """
     base = embedding_layer(token_ids).clone()
     active = active_mask.bool() & (token_ids != int(mask_token_id))
-    if not active.any():
-        probs = F.softmax(logits.float(), dim=-1)
-        return base, probs.max(dim=-1).values
+    if not active.any(): return base
 
     probs = F.softmax(logits.float(), dim=-1)
     k = min(int(top_k), probs.shape[-1])
-    if k == 1: topk_probs, topk_indices = probs.max(dim=-1, keepdim=True) # max() is cheaper than topk(k=1) for same result
+    if k == 1: topk_probs, topk_indices = probs.max(dim=-1, keepdim=True)
     else: topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
     residual = torch.clamp(1.0 - topk_probs.sum(dim=-1, keepdim=True), min=0.0)
 
     topk_embeds = embedding_layer(topk_indices)
-    mask_ids = torch.full((1,), int(mask_token_id), dtype=torch.long, device=token_ids.device)
-    mask_embed = embedding_layer(mask_ids).view(1, 1, -1)
-
+    mask_embed = embedding_layer(torch.full((1,), int(mask_token_id), dtype=torch.long, device=token_ids.device)).view(1, 1, -1)
     mixed = (topk_embeds * topk_probs.unsqueeze(-1)).sum(dim=2) + mask_embed * residual
     if renormalize:
         current_norm = torch.linalg.vector_norm(mixed, dim=-1, keepdim=True)
-        topk_norms = torch.linalg.vector_norm(topk_embeds, dim=-1)
-        expected_topk_norm = (topk_norms * topk_probs).sum(dim=-1, keepdim=True)
-        mask_norm = torch.linalg.vector_norm(mask_embed, dim=-1, keepdim=True)
-        target_norm = expected_topk_norm + mask_norm * residual
+        expected_topk_norm = (torch.linalg.vector_norm(topk_embeds, dim=-1) * topk_probs).sum(dim=-1, keepdim=True)
+        target_norm = expected_topk_norm + torch.linalg.vector_norm(mask_embed, dim=-1, keepdim=True) * residual
         mixed = mixed * (target_norm / (current_norm + eps))
     base[active] = mixed.to(base.dtype)[active]
-    return base, topk_probs[..., 0]
+    return base
 
 
-def dcd_threshold_step(
-    logits: torch.Tensor, token_ids: torch.Tensor, candidate_mask: torch.Tensor,
-    threshold: float, temperature: float = 0.0, top_k: int | None = None, top_p: float | None = None,
-    decode_algo: str = "threshold", decode_param: int | float | None = None,
-) -> DecodeStep: # One DCD selection step over an existing masked-text window.
-    confidence, predicted = sample_tokens(
-        logits, temperature=temperature, top_k=top_k, top_p=top_p,
-        margin_confidence=decode_algo.startswith("topk_margin"),
-        neg_entropy=decode_algo.startswith("entropy"),
-    )
-    algo_param = threshold if decode_param is None else decode_param
-    selected = torch.zeros_like(candidate_mask, dtype=torch.bool)
+def block_diffusion_decode(
+    forward: Callable[[torch.Tensor, torch.Tensor | None, int, int], torch.Tensor],
+    finalize: Callable[[torch.Tensor, int, int], None] | None, embedding_layer: nn.Embedding, initial_token_ids: torch.Tensor, 
+    mask_token_id: int, block_size: int, threshold: float, eos_token_id: int | None = None, pad_token_id: int | None = None,
+    spd_top_k: int = 1, spd_renormalize: bool = True,
+) -> DecodeResult:
+    """Cold-start block decode under fixed conditioning.
 
-    if decode_algo in {"dmax_prefix", "longest_prefix", "prefix_threshold"}:
-        selected = longest_confident_prefix_mask(confidence, candidate_mask, float(algo_param))
-    else:
-        num_decode = dcd_decode_num(confidence, candidate_mask, decode_algo, algo_param)
-        _, selected_indices = dcd_select_indices(confidence, candidate_mask, num_decode)
-        for row, indices in enumerate(selected_indices): selected[row, indices] = True
-    updated = torch.where(selected, predicted, token_ids)
-    return DecodeStep(token_ids=updated, confidence=confidence, selected=selected, predicted=predicted)
+    `forward(ids, soft, lo, hi)` returns logits of slots [lo, hi) given the final prefix [0, lo); `soft` is SPD embedding of 
+    those slots or None for hard ids. `finalize(ids, lo, hi)` is called once block [lo, hi) is final and later block follows, 
+    so a cached `forward` can extend its prefix. Slots past `hi` never enter a forward: under block-causal attention they 
+    cannot influence the block.
 
-
-def _truncate_rows_after_eos(
-    token_ids: torch.Tensor, confidence_out: torch.Tensor,
-    eos_pos: torch.Tensor, changed_mask: torch.Tensor,
-    eos_token_id: int | None, pad_id: int | None,
-) -> torch.Tensor: # Scan changed positions for a (possibly new, earlier) EOS and pad after it.
-    if eos_token_id is None or not changed_mask.any(): return eos_pos
-    for row in range(token_ids.shape[0]):
-        changed_indices = changed_mask[row].nonzero(as_tuple=False).flatten()
-        if changed_indices.numel() == 0: continue
-        eos_hits = changed_indices[token_ids[row, changed_indices] == int(eos_token_id)]
-        if eos_hits.numel() == 0: continue
-
-        first_eos = int(eos_hits.min().item())
-        previous_eos = int(eos_pos[row].item())
-        eos_pos[row] = min(previous_eos, first_eos)
-        if first_eos + 1 < previous_eos and pad_id is not None:
-            after = slice(first_eos + 1, previous_eos)
-            token_ids[row, after] = int(pad_id)
-            confidence_out[row, after] = 1.0
-    return eos_pos
-
-
-def spd_dcd_decode(
-    logits_fn, embedding_layer: nn.Embedding, initial_token_ids: torch.Tensor, mask_token_id: int, 
-    steps: int, threshold: float, eos_token_id: int | None = None, pad_token_id: int | None = None, 
-    temperature: float = 0.0, top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True,
-    window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
-    decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
-    top_p: float | None = None, cache_type: str = "none", block_size: int | None = None, 
-    settle_confidence: float = 0.9, fill_leftover_masks: bool = True,
-) -> SPDDecodeResult:
-    """Cold-start SPD + DCD decode under a fixed-conditioning logits function.
-
-    `logits_fn(token_ids, soft_embeds)` must hold its visual conditioning fixed across iterations; `soft_embeds` is 
-    SPD state local to this call. DCD sliding window: decode confident masked positions in [window_left, window_right), 
-    advance the left edge past decoded positions, extend the right edge by the remaining masks.
-
-    Termination is DYNAMIC, as in DMax/DCD (`window_*_decode` loops `while (tokens == mask).any()`), bounded only
-    by a safety cap. `steps` (a.k.a. diffusion_steps) is NOT the commit budget — it bounds only the settle phase.
-
-    `block_size` clips the window to `window_left`'s attention block: under block-causal (BD3LM) attention a deferred 
-    token never sees later blocks, so waiting on them is informationless (DCD `window_causal_decode`, DMax per-block 
-    SPD). DCD's Dynamic Block Extension is not ported — this mBART-BD3LM decoder trains at a fixed block size, so 
-    variable-size expansion would be a separate experiment. `None` only for fully bidirectional decoders or ablations.
-
-    Once all masks commit, `spd_revision` spends `steps` on DMax settle passes (`_settle`): re-argmax committed tokens 
-    until stable or all confidences reach `settle_confidence` (dInfer parallel_strategy.py decode_uniform Breakflag: 0.9).
-
-    Settle ORDER follows DMax: settle PER BLOCK to convergence BEFORE advancing, so block b+1 is denoised against a 
-    SETTLED block b — `_settle` at each block crossing plus a final settle. Per-block settles are bounded by the block 
-    size (DMax's `while step < block_length`), the final one by `steps`.
+    Per block and per row: commit the longest run of masked slots whose max-prob clears `threshold` (at least 1), re-predict 
+    every committed slot of the block, and stop when no mask remains and every active slot's max-prob reaches SETTLE_CONFIDENCE 
+    or the pass changed nothing. At most 1 revision-only pass per active slot follows last commit. A row that has stopped is 
+    frozen while its batch-mates finish, so a row decodes exactly as it would alone. EOS is an ordinary slot until its block is 
+    final; the row then ends and the rest of its canvas is padding.
     """
-    cache_type = str(cache_type)
-    cache_aware = bool(getattr(logits_fn, "supports_dcd_cache", False))
-    if cache_type != "none" and not cache_aware:
-        raise NotImplementedError(
-            "This logits_fn does not expose DCD KV-cache support; use cache_type='none' or a cache-aware decoder."
-        )
-    if window_type not in {"sliding", "static"}: raise ValueError(f"Unsupported DCD window_type: {window_type}")
-    block = int(block_size) if block_size else None
-
-    def _suppress_mask(logits: torch.Tensor) -> torch.Tensor:
-        # Never let [MASK] win argmax/selection (DMax rm_mask, parallel_strategy.get_transfer_index_threshold:
-        # `mask_index & (x0 != mask_id)`): a high-confidence MASK wastes a decode slot (the write keeps it masked)
-        # and pollutes the confidence the commit gate reads. In-place is safe — logits are fresh per call.
-        # Divergence: DMax keeps MASK in the softmax DENOMINATOR, -inf drops it, so our confidence is fractionally
-        # higher — excluded mass ~0 at the trained vocab (1732, MASK never a CE target), visible only at toy vocabs.
-        logits[..., int(mask_token_id)] = torch.finfo(logits.dtype).min
-        return logits
-
-    def _block_end(left: int) -> int: # End of the attention block containing `left` (exclusive).
-        if block is None: return 1 << 30
-        return (left // block + 1) * block
-
-    token_ids = initial_token_ids.clone()
-    batch, full_length = token_ids.shape
-    device = token_ids.device
-    prompt_length = 0
-    for pos in range(full_length):
-        if (token_ids[:, pos] == int(mask_token_id)).any(): break
-        prompt_length += 1
-    if prompt_length >= full_length:
-        return SPDDecodeResult(sequences=token_ids, confidence=torch.ones_like(token_ids, dtype=torch.float32), steps=0)
-
-    # DCD has no step budget (decode_algorithm.py window_*_decode): the threshold rule commits >=1 token/step, so
-    # a decode ends in <= (#generated slots) forwards and capping by `steps` would force-fill the tail of any
-    # sequence needing more. Cap scales with BATCH: the window tracks the min first-mask over rows, so >=1 commit
-    # is guaranteed GLOBALLY, not per row — desynchronized rows approach batch * (#generated slots).
-    commit_cap = 2 * batch * (full_length - prompt_length) + int(window_length or full_length) + 1
-    win_len = int(window_length or (full_length - prompt_length))
-    win_len = max(1, min(win_len, full_length - prompt_length))
-    max_win = int(max_window_length or full_length)
-    max_win = max(win_len, max_win)
+    ids = initial_token_ids.clone()
+    batch, length = ids.shape
+    mask_id, block = int(mask_token_id), int(block_size)
     pad_id = int(eos_token_id if pad_token_id is None else pad_token_id) if eos_token_id is not None else pad_token_id
+    confidence = torch.zeros_like(ids, dtype=torch.float32)
+    confidence[ids != mask_id] = 1.0
+    finished = torch.zeros(batch, dtype=torch.bool, device=ids.device)
+    forwards = appends = 0
 
-    confidence_out = torch.zeros_like(token_ids, dtype=torch.float32)
-    confidence_out[token_ids != int(mask_token_id)] = 1.0
-    soft_embeds, used_steps = None, 0
-    window_left = prompt_length
-    window_right = min(full_length, prompt_length + win_len)
-    eos_pos = torch.full((batch,), full_length, dtype=torch.long, device=device)
-    try:
-        logits_fn_params = inspect.signature(logits_fn).parameters
-        accepts_window = len(logits_fn_params) >= 3
-    except (TypeError, ValueError): accepts_window = cache_aware
+    for lo in range(0, length, block):
+        hi = min(lo + block, length)
+        active = ids[:, lo:hi] == mask_id  # the block's generated slots; a finished row has none
+        if active.any():
+            soft = None
+            done = ~active.any(dim=1)
+            revisions = torch.zeros(batch, dtype=torch.long, device=ids.device)
+            for _ in range(2 * (hi - lo)):  # tight: >= 1 commit per pass and <= 1 revision pass per slot, so a
+                # block of 16 can reach exactly 32 passes. Any third stop condition must re-derive this bound.
+                logits = forward(ids, soft, lo, hi).to(torch.float32, copy=True)
 
-    generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
-    positions_row = torch.arange(full_length, device=device).unsqueeze(0)
-    _block_start = (lambda p: (p // block) * block) if block is not None else (lambda p: prompt_length)
+                # DMax's threshold decoder keeps a MASK-predicting slot masked for another pass (get_transfer_index_threshold, 
+                # rm_mask); its uniform decoder has no guard and can strand a MASK. A -inf MASK logit commits the runner-up 
+                # instead, so every pass makes progress. It also drops MASK from the softmax, so every max-prob below 
+                # (commit test, settle test, recorded confidence) is DMax's divided by 1 - p(MASK) and SPD residual is 
+                # (DMax's - p(MASK)) / (1 - p(MASK)); the MASK head row starts at 0 and is never a target.
+                logits[..., mask_id] = torch.finfo(logits.dtype).min
+                forwards += 1
+                maxp, x0 = logits.softmax(dim=-1).max(dim=-1)  # greedy x0 and its probability (_get_prob_stats, T = 0)
+                slots = ids[:, lo:hi]
+                masked = slots == mask_id
+                had_mask = masked.any(dim=1)
 
-    def _full_forward(ids: torch.Tensor, embeds: torch.Tensor | None) -> torch.Tensor:
-        if cache_type != "none" and accepts_window: return logits_fn(ids, embeds, None)
-        return logits_fn(ids, embeds)
+                # decode_uniform: update_mask = high_conf_index | (active_index & ~mask_index). DMax reduces its
+                # stopping tests over the whole batch (Breakflag after select_undecoded, a no-op without writeback),
+                # so a row keeps being re-predicted while a batch-mate needs passes; here a stopped row is frozen.
+                update = (longest_confident_prefix_mask(maxp, masked, threshold) | (active & ~masked)) & ~done.unsqueeze(1)
+                changed = update & (x0 != slots)
+                slots = torch.where(update, x0, slots)
+                ids[:, lo:hi] = slots
+                confidence[:, lo:hi] = torch.where(update, maxp, confidence[:, lo:hi])
 
-    def _settle(budget: int, soft: torch.Tensor | None, lo: int, hi: int) -> None:
-        """DMax `decode_uniform` Breakflag revision of [lo, hi) to self-consistency (stop when all active max-probs
-        clear settle_confidence=0.9, or nothing changes). Only committed (non-mask, pre-EOS) tokens in [lo, hi) are
-        revisable — DMax never re-enters a FINISHED block (`decode_uniform` writes only `x[:, block_start:block_end]`): 
-        later blocks were committed against it."""
-        nonlocal token_ids, eos_pos, used_steps
-        if not spd_revision: return
-        for _ in range(max(1, int(budget))):
-            revisable = (token_ids != int(mask_token_id)) & generated_region
-            revisable &= (positions_row >= int(lo)) & (positions_row < int(hi))
-            revisable &= positions_row < eos_pos.unsqueeze(1)
-            if pad_id is not None: revisable &= token_ids != int(pad_id)
-            if not revisable.any(): return
-            full_logits = _suppress_mask(_full_forward(token_ids, soft))
-            conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
-            changed = revisable & (pred != token_ids)
-            token_ids = torch.where(revisable, pred, token_ids)
-            confidence_out[revisable] = conf[revisable]
-            if changed.any():
-                eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, changed, eos_token_id, pad_id)
-                if soft is not None:
-                    # `inputs_embeds` REPLACES ids, so hard-refresh revised positions (DMax parallel_strategy
-                    # does this every iteration) or later passes re-score pre-settle tokens and multi-pass
-                    # settling collapses to one effective pass.
-                    soft = torch.where(changed.unsqueeze(-1), embedding_layer(token_ids), soft)
-            used_steps += 1
-            # Breakflag on the ARGMAX max-prob (DMax `max_probs >= 0.9`), not the sampled token's prob: 
-            # identical at temperature=0, but at temperature>0 the sampled prob would gate on noise.
-            maxp = full_logits.softmax(dim=-1).max(dim=-1).values
-            if not changed.any() or bool((maxp[revisable] >= float(settle_confidence)).all().item()): return
+                # decode_uniform's Breakflag per row: every active slot at max-prob >= SETTLE_CONFIDENCE, or nothing changed. 
+                # DMax tests it before checking for masks; with a threshold above 0.9 that could end a block with a mask left, 
+                # so here a row must be mask-free first.
+                no_mask = ~(slots == mask_id).any(dim=1)
+                settled = ((maxp >= SETTLE_CONFIDENCE) | ~active).all(dim=1)
+                stable = ~changed.any(dim=1)
 
-    settled_block_start = _block_start(prompt_length)  # blocks already settled-before-advance
-    for step in range(commit_cap):
-        generated_region = torch.arange(full_length, device=device).unsqueeze(0) >= prompt_length
-        if not ((token_ids == int(mask_token_id)) & generated_region).any(): break
-
-        if window_type == "sliding":
-            while window_left < full_length and (token_ids[:, window_left] != int(mask_token_id)).all():
-                window_left += 1
-
-        # Settle-before-advance: once the window enters a NEW block, the block(s) it left are fully committed —
-        # settle them now, so the block about to be committed (and any EOS in it, which eos_pos freezes
-        # irreversibly) conditions on a settled prefix, not a half-decoded one.
-        if block is not None and _block_start(window_left) > settled_block_start:
-            # Only the block(s) just left: earlier ones are frozen, the new one is incomplete. HARD embeds (None).
-            _settle(block, None, settled_block_start, _block_start(window_left))
-            settled_block_start = _block_start(window_left)
-            # Settle may have revised the prefix while the soft state still embeds the PRE-settle one, so rebuild
-            # it HARD (DMax resets embeddings each block). Rebuild rather than None: the prefix-cache window
-            # forward needs inputs_embeds, and its native embedding has no [MASK] row.
-            soft_embeds = embedding_layer(token_ids)
-
-        if window_left >= full_length: break
-        window_right = max(window_right, window_left + 1)
-        # Clip to window_left's block (DCD window_causal_decode clips to block_right likewise).
-        window_right = min(window_right, full_length, int(eos_pos.max().item()), window_left + max_win, _block_end(window_left))
-        if window_right <= window_left: break
-        if cache_type != "none" and accepts_window: full_logits = logits_fn(token_ids, soft_embeds, (window_left, window_right))
-        else: full_logits = logits_fn(token_ids, soft_embeds)
-        full_logits = _suppress_mask(full_logits)
-
-        logits = full_logits[:, window_left:window_right]
-        candidate = token_ids[:, window_left:window_right] == int(mask_token_id)
-        if not candidate.any():
-            # Static-window jump (DCD static advance); sliding mode never lands here (left-edge advance stops at
-            # the 1st mask). Without it a block-clipped static window stalls on a finished block.
-            window_left = window_right
-            window_right = min(full_length, int(eos_pos.max().item()), window_left + win_len, _block_end(window_left))
-            if window_right <= window_left: break
-            continue
-
-        decoded = dcd_threshold_step(
-            logits=logits, token_ids=token_ids[:, window_left:window_right],
-            candidate_mask=candidate, threshold=threshold,
-            temperature=temperature, top_k=sample_top_k, top_p=top_p,
-            decode_algo=decode_algo, decode_param=decode_param,
-        )
-        newly_selected = decoded.selected & candidate
-        selected_global = torch.zeros_like(token_ids, dtype=torch.bool)
-        selected_global[:, window_left:window_right] = newly_selected
-
-        token_ids[:, window_left:window_right] = decoded.token_ids
-        confidence_window = confidence_out[:, window_left:window_right]
-        confidence_window[newly_selected] = decoded.confidence[newly_selected]
-
-        if spd_revision and decoded.predicted is not None:
-            # DMax self-revision (decode_uniform: update_mask = high_conf | (active & ~mask)): refresh every committed token 
-            # in the window with this step's prediction, so later siblings overturn early errors — the recovery OPUT's L_pred 
-            # trains. Frozen: prefix left of window_left (DCD deferred commitment), pad fills, anything at/after EOS.
-            window_tokens = token_ids[:, window_left:window_right]
-            revisable = (~candidate) & (window_tokens != int(mask_token_id))
-            if pad_id is not None: revisable &= window_tokens != int(pad_id)
-
-            positions = torch.arange(window_left, window_right, device=device).unsqueeze(0)
-            revisable &= positions < eos_pos.unsqueeze(1)
-            if revisable.any():
-                revised_changed = revisable & (decoded.predicted != window_tokens)
-                token_ids[:, window_left:window_right] = torch.where(revisable, decoded.predicted, window_tokens)
-                confidence_window[revisable] = decoded.confidence[revisable]
-                rev_global = torch.zeros_like(token_ids, dtype=torch.bool)
-                rev_global[:, window_left:window_right] = revisable
-                # Revised positions join the EOS scan: a revision into EOS truncates like a fresh EOS commit.
-                changed_global = torch.zeros_like(token_ids, dtype=torch.bool)
-                changed_global[:, window_left:window_right] = revised_changed
-                selected_global = selected_global | changed_global
-                newly_selected = newly_selected | revised_changed
-
-        if eos_token_id is not None and newly_selected.any():
-            for row in range(batch):
-                selected_indices = selected_global[row].nonzero(as_tuple=False).flatten()
-                if selected_indices.numel() == 0: continue
-                selected_tokens = token_ids[row, selected_indices]
-                eos_selected = selected_indices[selected_tokens == int(eos_token_id)]
-
-                if eos_selected.numel() == 0: continue
-                first_eos = int(eos_selected.min().item())
-                previous_eos = int(eos_pos[row].item())
-                eos_pos[row] = min(eos_pos[row], first_eos)
-
-                if first_eos + 1 < previous_eos and pad_id is not None:
-                    after = slice(first_eos + 1, previous_eos)
-                    token_ids[row, after] = int(pad_id)
-                    confidence_out[row, after] = 1.0
-
-        if window_type == "sliding":
-            old_window_right = window_right
-            remaining_masks = (token_ids[:, window_left:window_right] == int(mask_token_id)).sum(dim=1)
-            window_right = min(
-                full_length, int(eos_pos.max().item()),
-                window_left + max_win, window_right + win_len - int(remaining_masks.max().item()),
-            )
-            if window_right < old_window_right: window_right = old_window_right
-        elif (token_ids[:, window_left:window_right] != int(mask_token_id)).all():
-            window_left = window_right
-            window_right = min(full_length, int(eos_pos.max().item()), window_left + win_len)
-
-        active = (token_ids != int(mask_token_id)) & generated_region
-        # DMax scopes SPD soft state to current block (decode_uniform builds soft embeds for the block only). Mapped to DCD: 
-        # only [window_left, window_right) stays soft, the committed prefix is hard — deferred commitment, in all cache modes.
-        window_active = torch.zeros_like(active)
-        window_active[:, window_left:window_right] = True
-        active = active & window_active
-        if pad_id is not None: active = active & (token_ids != int(pad_id))
-        soft_embeds, _ = spd_hybrid_embeddings(
-            embedding_layer=embedding_layer, token_ids=token_ids,
-            logits=full_logits, active_mask=active, mask_token_id=mask_token_id,
-            top_k=top_k, renormalize=spd_renormalize,
-        )
-        used_steps += 1  # accumulate: `= step + 1` wiped the settle passes _settle() counts at block crossings
-
-    # Masks left: fill in 1 forced pass so no [MASK] id reaches the tokenizer or commit gate.
-    leftover = (token_ids == int(mask_token_id)) & generated_region
-    if fill_leftover_masks and leftover.any():
-        # Unreachable normally (the cap covers the batch worst case); if it fires, the decode was force-terminated early.
-        print(f"[decode] WARNING: commit loop hit its safety cap with {int(leftover.sum())} masked slots left; "
-              f"force-filling in one pass (premature termination — investigate confidence/threshold settings)", flush=True)
-        full_logits = _suppress_mask(_full_forward(token_ids, soft_embeds))
-        conf, pred = sample_tokens(full_logits, temperature=temperature, top_k=sample_top_k, top_p=top_p)
-        token_ids = torch.where(leftover, pred, token_ids)
-        confidence_out[leftover] = conf[leftover]
-
-        eos_pos = _truncate_rows_after_eos(token_ids, confidence_out, eos_pos, leftover, eos_token_id, pad_id)
-        used_steps += 1
-
-    # Last block only — earlier ones settled at their boundary crossings and are frozen. `steps` bounds 
-    # ONLY this phase, counted separately so a long commit never starves it; converges in 1-3 passes.
-    if not ((token_ids == int(mask_token_id)) & generated_region).any():
-        _settle(max(1, int(steps)), soft_embeds, settled_block_start, full_length)
-
-    return SPDDecodeResult(sequences=token_ids, confidence=confidence_out, steps=used_steps)
+                # DMax caps whole loop at block_length passes (generate_uniform.py decode_uniform, `while step < block_length`) 
+                # with 32-slot blocks. At 1 commit per pass the commits alone exhaust that cap and no pass is left for revision, 
+                # so the cap here is 1 revision-only pass per active slot (<= 2 x active slots per block, the loop bound above) 
+                # — DOUBLE dInfer's ceiling, which a pass-count comparison against a published DMax number has to account for.
+                revisions += (~had_mask & ~done).long()
+                done |= no_mask & (stable | settled | (revisions >= active.sum(dim=1)))
+                if bool(done.all()): break
+                soft = spd_hybrid_embeddings(
+                    embedding_layer, slots, logits, active & (slots != mask_id) & ~done.unsqueeze(1), mask_id,
+                    top_k=spd_top_k, renormalize=spd_renormalize,
+                )
+            if eos_token_id is not None:
+                # DMax early stop (decode_uniform end: `orig_x[eos_idx, block_loc.end:] = eos_id`): a final block holding EOS 
+                # ends its row. Padding starts at 1st EOS rather than at block end as callers read sequence up to its 1st EOS.
+                is_eos = (ids[:, lo:hi] == int(eos_token_id)) & active
+                for row in is_eos.any(dim=1).nonzero(as_tuple=False).flatten().tolist():
+                    first = lo + int(is_eos[row].nonzero(as_tuple=False)[0])
+                    if pad_id is not None: ids[row, first + 1:] = pad_id
+                    confidence[row, first + 1:] = 1.0
+                    finished[row] = True
+                    
+        if hi >= length or bool(finished.all()): break
+        if finalize is not None:
+            finalize(ids, lo, hi)
+            appends += 1
+    return DecodeResult(sequences=ids, confidence=confidence, forwards=forwards, cache_appends=appends)

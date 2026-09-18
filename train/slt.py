@@ -25,6 +25,7 @@ from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_n
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
 # Gate options; delta and minimum eligible length come from resolved inference geometry.
 GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "warmup_epochs"})
+SPD_CONFIG_KEYS = frozenset({"tau_dec", "top_k", "renormalize"})
 
 
 @dataclass
@@ -36,12 +37,6 @@ class SLTComponents:
     slt_cfg: dict
     checkpoint_meta: dict
 
-def _optional_int(value) -> int | None:
-    return None if value is None else int(value)
-
-def _optional_float(value) -> float | None:
-    return None if value is None else float(value)
-
 def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
     # Match the sampler and FSM's first eligible target. Short units remain legal paths;
     # they are skipped by this target-selection rule, not removed from the path distribution.
@@ -49,6 +44,8 @@ def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
     # Every reader below uses .get() defaults, so a removed or misspelled key would silently train a different objective.
     unknown = set(gate) - GATE_CONFIG_KEYS
     if unknown: raise ValueError(f"membership_gate: unknown key(s) {sorted(unknown)}; accepted: {sorted(GATE_CONFIG_KEYS)}")
+    unknown = set(slt_cfg.get("spd", {}) or {}) - SPD_CONFIG_KEYS  # same reason: a misspelled tau_dec would decode at default
+    if unknown: raise ValueError(f"spd: unknown key(s) {sorted(unknown)}; accepted: {sorted(SPD_CONFIG_KEYS)}")
     gate["delta"] = int(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))
     gate["min_span_frames"] = lambda_min_frames(inference_cfg)
 
@@ -73,7 +70,10 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
         "buffer_cap_s": inference_cfg.get("buffer_cap_s"), 
         "segmentation_decode": "semi_markov_viterbi" if slt_cfg.get("duration_model") else "none",
         "duration_model": slt_cfg.get("duration_model"), "confidence_bound": slt_cfg.get("confidence_bound", {}), 
-        "oput": slt_cfg.get("oput", {}), "spd": slt_cfg.get("spd", {}), "dcd": slt_cfg.get("dcd", {}), 
+        "oput": slt_cfg.get("oput", {}), "spd": slt_cfg.get("spd", {}), 
+        # Training geometry of the text canvas: the block-causal mask and the OPUT corruption read block_size, so eval
+        # refuses a decoder built at another block (eval.py _build_eval_model), and the decode canvas must not shrink.
+        "block_size": int(slt_cfg.get("block_size", 16)), "max_text_tokens": int(slt_cfg.get("max_text_tokens", 320)),
         "gate_warmup_epochs": int(gate_cfg.get("warmup_epochs", 0)),
         "mode_ratios": slt_cfg.get("mode_ratios"), "jitter": slt_cfg.get("jitter"),
         "bio_class_weights": slt_cfg.get("bio_class_weights"),  # resolved list, not the "balanced" string
@@ -114,10 +114,12 @@ def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: f
             if not getattr(span, "reliable", True) or span.duration_s + 1.0 / record.pose.fps > float(buffer_cap_s): continue
             n = len(tokenizer(span.text)["input_ids"])
             if n > longest: longest, culprit = n, span
-    if longest > int(max_text_tokens): raise ValueError(
-        f"{split}: a complete caption target needs {longest} tokens but max_text_tokens is {max_text_tokens} "
-        f"({culprit.video_id} {culprit.start_s:.1f}-{culprit.end_s:.1f}s). Set max_text_tokens >= {longest}: the collator refuses "
-        f"to truncate a complete target, and would raise on this unit the first time it is sampled."
+    # +1: decode canvas holds BOS in slot 0, so a target of exactly max_text_tokens could be trained on but never emitted, 
+    # and the collator's confidence-bound shift column would drop its last token.
+    if longest + 1 > int(max_text_tokens): raise ValueError(
+        f"{split}: a complete caption target needs {longest} tokens plus the BOS slot but max_text_tokens is {max_text_tokens} "
+        f"({culprit.video_id} {culprit.start_s:.1f}-{culprit.end_s:.1f}s). Set max_text_tokens >= {longest + 1}: the collator "
+        f"refuses to truncate a complete target, and would raise on this unit the first time it is sampled."
     )
 
 
@@ -163,14 +165,14 @@ def build_slt_components(
         inference_cfg=inference_cfg, pose_augment_cfg=pose_augment_cfg
     )
     collator = WindowCollator(
-        tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)), visual_padding=str(slt_cfg.get("visual_padding", "none")),
-        # `pad_text_to_max_length: false` sizes the text canvas to the batch instead of max_text_tokens. Captions
-        # are ~15 tokens against a 128 canvas and every decoder forward runs the whole width, so this is the
-        # largest single throughput lever; the collator keeps the EOS-supervision tail and block alignment intact.
-        pad_to_max_length=bool(slt_cfg.get("pad_text_to_max_length", True)), block_size=int(slt_cfg.get("block_size", 8)),
+        tokenizer, max_text_tokens=int(slt_cfg.get("max_text_tokens", 320)), visual_padding=str(slt_cfg.get("visual_padding", "none")),
+        # `pad_text_to_max_length: false` sizes text canvas to the batch instead of max_text_tokens. Captions are ~15 tokens against 
+        # a 320 canvas and every decoder forward runs the whole width, so this is largest single throughput lever; the collator keeps 
+        # the EOS-supervision tail and block alignment intact.
+        pad_to_max_length=bool(slt_cfg.get("pad_text_to_max_length", True)), block_size=int(slt_cfg.get("block_size", 16)),
         # Default must MATCH the loss path's (block_size, see forward_loss kwargs below): the collator reserves the canvas tail 
         # the EOS supervision writes into — a 0 default here with block_size there starves that tail under dynamic padding.
-        eos_supervision_tokens=int((slt_cfg.get("oput", {}) or {}).get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
+        eos_supervision_tokens=int((slt_cfg.get("oput", {}) or {}).get("eos_supervision_tokens", slt_cfg.get("block_size", 16))),
     )
     assert_targets_fit(train_records, tokenizer, collator.max_text_tokens, inference_cfg["buffer_cap_s"], f"{language}/train")
     # num_workers is pure throughput: anchors are index-driven (each realized once per epoch regardless of worker
@@ -198,15 +200,10 @@ def build_slt_components(
     # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
     # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).
     model = MisalignedSLTModel(
-        front_end=front_end,
-        decoder=decoder or str(slt_cfg.get("decoder", "dlm")),
-        block_size=int(slt_cfg.get("block_size", 8)),
-        # Shape MUST match S1 (train/bio_pretrain.py) or `bio_head_init` fails to strict-load — 
-        # same keys build_bio_s1 reads (bio_pretrain.yaml `extends` this file).
-        bio_hidden_dim=int(slt_cfg.get("bio_hidden_dim", 384)),
-        bio_depth=int(slt_cfg.get("bio_depth", 4)),
-        bio_nhead=int(slt_cfg.get("bio_nhead", 8)),
-        bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
+        front_end=front_end, decoder=decoder or str(slt_cfg.get("decoder", "dlm")), block_size=int(slt_cfg.get("block_size", 16)),
+        # Shape MUST match S1 (train/bio_pretrain.py) or `bio_head_init` fails to strict-load — same keys build_bio_s1 reads.
+        bio_hidden_dim=int(slt_cfg.get("bio_hidden_dim", 384)), bio_depth=int(slt_cfg.get("bio_depth", 4)),
+        bio_nhead=int(slt_cfg.get("bio_nhead", 8)), bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(slt_cfg.get("bio_conv_stem_layers", 2)),
         pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth"),
         shared_temporal=float(slt_cfg.get("lambda_bio", 1.0)) != 0.,
@@ -313,7 +310,6 @@ def evaluate_slt(
     spans = CompleteSpanMetrics()
 
     confidence_cfg = slt_cfg.get("confidence_bound", {})
-    dcd_cfg = slt_cfg.get("dcd", {})
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
@@ -340,22 +336,13 @@ def evaluate_slt(
             oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
             oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.0)),
             oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
-            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
+            oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 16))),
             cb_enabled=bool(confidence_cfg.get("enabled", True)), cb_active=cb_on,
             cb_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_lambda=float(confidence_cfg.get("lambda", 1.0)),
             cb_verified_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
-            cb_belief_gap=bool(confidence_cfg.get("belief_gap", True)),
-            cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
-            cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", slt_cfg.get("block_size", 8))),
-            cb_dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-            cb_dcd_window_type=str(confidence_cfg.get("window_type", dcd_cfg.get("window_type", "sliding"))),
-            cb_dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
-            cb_dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
-            cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")), cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
-            cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
+            cb_belief_gap=bool(confidence_cfg.get("belief_gap", True)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
             cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-            cb_spd_revision=bool(confidence_cfg.get("revision", spd_cfg.get("revision", True))),
-            cb_temperature=float(dcd_cfg.get("temperature", 0.0)), **gate_loss_kwargs,
+            **gate_loss_kwargs,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
         if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0 and output.bio_logits is not None:
@@ -381,21 +368,8 @@ def evaluate_slt(
                     _, tokens, _, _ = model.generate_from_poses(
                         poses=batch["poses"][idx], frame_mask=batch["frame_mask"][idx],
                         timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
-                        max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
-                        diffusion_steps=int(validation_cfg.get("diffusion_steps", slt_cfg.get("diffusion_steps", 64))),
-                        tau_dec=float(dcd_cfg.get("tau_dec", 0.9)),  # same fallback as eval.py
-                        spd_top_k=int(spd_cfg.get("top_k", 1)),
-                        spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-                        spd_revision=bool(spd_cfg.get("revision", True)),
-                        temperature=float(dcd_cfg.get("temperature", 0.0)),
-                        dcd_window_length=int(dcd_cfg.get("initial_window_length", slt_cfg.get("block_size", 8))),
-                        dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-                        dcd_window_type=str(dcd_cfg.get("window_type", "sliding")),
-                        dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
-                        dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
-                        dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
-                        dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
-                        dcd_cache_type=str(dcd_cfg.get("cache_type", "none")),
+                        max_text_tokens=int(slt_cfg.get("max_text_tokens", 320)), tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
+                        spd_top_k=int(spd_cfg.get("top_k", 1)), spd_renormalize=bool(spd_cfg.get("renormalize", True)),
                         **gate_kwargs,
                     )
                     pred_texts.extend(model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True))
@@ -424,7 +398,6 @@ def evaluate_slt(
 def training_loss(model, batch: dict, slt_cfg: dict, epoch: int) -> SLTLossOutput:
     # The actual AR/DLM training objective, shared with initial loss-scale calibration.
     confidence_cfg = slt_cfg.get("confidence_bound", {})
-    dcd_cfg = slt_cfg.get("dcd", {})
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
@@ -438,37 +411,22 @@ def training_loss(model, batch: dict, slt_cfg: dict, epoch: int) -> SLTLossOutpu
         oput_sample_rollout=bool(oput_cfg.get("sample_rollout", False)),
         oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.0)),
         oput_rollout_eval_mode=bool(oput_cfg.get("rollout_eval_mode", True)),
-        oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 8))),
+        oput_eos_supervision=int(oput_cfg.get("eos_supervision_tokens", slt_cfg.get("block_size", 16))),
         cb_enabled=bool(confidence_cfg.get("enabled", True)),
-        cb_active=epoch > cb_warmup_epochs,
-        cb_tau=float(confidence_cfg.get("tau_cb", 0.75)),
-        cb_lambda=cb_lambda,
-        cb_verified_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
-        cb_belief_gap=bool(confidence_cfg.get("belief_gap", True)),
-        cb_decode_steps=int(confidence_cfg.get("decode_steps", 16)),
-        cb_dcd_window_length=int(dcd_cfg.get("initial_window_length", slt_cfg.get("block_size", 8))),
-        cb_dcd_max_window_length=int(dcd_cfg.get("max_window_length", 64)),
-        cb_dcd_window_type=str(confidence_cfg.get("window_type", dcd_cfg.get("window_type", "sliding"))),
-        cb_dcd_decode_algo=str(dcd_cfg.get("decode_algo", "threshold")),
-        cb_dcd_decode_param=dcd_cfg.get("decode_param", confidence_cfg.get("tau_cb", 0.75)),
-        cb_dcd_sample_top_k=_optional_int(dcd_cfg.get("top_k")),
-        cb_dcd_top_p=_optional_float(dcd_cfg.get("top_p")),
-        cb_dcd_cache_type=str(confidence_cfg.get("cache_type", dcd_cfg.get("cache_type", "none"))),
-        cb_spd_top_k=int(spd_cfg.get("top_k", 1)),
-        cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-        cb_spd_revision=bool(confidence_cfg.get("revision", spd_cfg.get("revision", True))),
-        cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
+        cb_active=epoch > cb_warmup_epochs, cb_tau=float(confidence_cfg.get("tau_cb", 0.75)),
+        cb_lambda=cb_lambda, cb_verified_gate=bool(confidence_cfg.get("verified_full_evidence_gate", True)),
+        cb_belief_gap=bool(confidence_cfg.get("belief_gap", True)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
+        cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
         gate_enabled=bool(gate_cfg.get("enabled", False)) and epoch > int(gate_cfg.get("warmup_epochs", 0)),
         # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml).
-        gate_eps=float(gate_cfg.get("eps", 1e-4)),
-        gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
+        gate_eps=float(gate_cfg.get("eps", 1e-4)), gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
     )
 
 
 def train_slt_epochs(
     model: MisalignedSLTModel, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, epochs: int,
     slt_cfg: dict, dev_loader: DataLoader | None = None, resume: bool = False, checkpoint_meta: dict | None = None,
-) -> list[dict[str, float]]:
+) -> int:
     confidence_cfg = slt_cfg.get("confidence_bound", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
     decoder_name = getattr(model, "decoder_type", "dlm")

@@ -47,16 +47,13 @@ oput:
     # the distribution inference sees. true = faithful (1 extra no-grad decoder forward PLUS 1 full LM-encoder forward
     # per mode group on Mode 1/3 batches); false = reuse the dropout-noised L_mask logits (cheaper approximation).
     rollout_eval_mode: true
-    # Maximum EOS padding. The target stops at the next block boundary, as in dLLM's AppendEOSBlockWrapper.
-    # This prevents an unsupervised canvas tail without adding one full EOS block to every short sentence.
-    eos_supervision_tokens: 4
     # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss). 
     # Without it the DLM is the only arm with an unsmoothed CE.
     label_smoothing: 0.2
 confidence_bound:
-    # Right-truncated (Mode 2a) term. The full-evidence decode is a no-grad stop-grad self-target; the gate reads the real
-    # SPD+DCD decode's confidence; the CE gradient flows through ONE cheap forward on the decoded sequence with the gated slots
-    # re-masked (DCD deferral counterfactual), not ~64-step decode. See models/streaming_slt.py + dlm_decoder.remasked_logits.
+    # Right-truncated (Mode 2a) term. Full-evidence decode is a no-grad stop-grad self-target; the gate reads the block
+    # decode's confidence; CE gradient flows via 1 cheap forward on decoded sequence with gated slots re-masked, not via 
+    # the block decode. See models/streaming_slt.py + dlm_decoder.remasked_logits.
     enabled: true
     verified_full_evidence_gate: true # penalize only where full-evidence decode == reference
     # Weight each corrected slot by the BELIEF GAP (teacher confidence - student's probability on that token) instead
@@ -67,18 +64,8 @@ confidence_bound:
     # The verified gate rejects wrong full-evidence tokens, so the S1/baseline warm start needs no CB warmup.
     # cb_active_count can rise as teacher coverage grows or fall as errors lose confidence. It is not a quality metric.
     warmup_epochs: 0
-    # SPEED: the Mode-2a self-target runs TWO full SPD/DCD decodes per batch (full-evidence + truncated) — the
-    # dominant DLM training cost. It is internal (it only picks 'confidently wrong' slots), so it decodes FAST and
-    # need NOT match the inference decode: few settle steps + the (verified-exact) static-window prefix KV-cache.
-    # The membership gate rides the cache too: Ω biases cross-attention SCORES (cached K/V are Ω-independent), so
-    # the gated cached decode is numerically identical to the gated no-cache decode (CrossAttnOmegaInjector on the
-    # native forward — the same KV-cache-safe mechanism the AR arm uses; test_block_diffusion asserts equality).
-    # decode_steps bounds only the FINAL settle pass; the per-block settles (bounded by block_size) dominate the
-    # settle cost, so lowering this trims little — `revision: false` is the knob that removes the settle phase.
-    # Set cache_type: none + window_type: sliding to make CB decode exactly like inference at the cost of speed.
-    decode_steps: 32
-    cache_type: prefix
-    window_type: static
+    # The Mode-2a self-target runs 2 block decodes per batch (full-evidence + truncated) under the SAME
+    # `tau_dec` and block KV cache as inference, so the self-target is what the deployed decode would emit.
 membership_gate: # Exact first-complete-span membership from legal BIO paths. Live logits carry caption gradients.
     enabled: true
     eps: 1.0e-4 # finite floor for the log-membership bias
@@ -105,8 +92,8 @@ mode2_subcase_weights:
     right: 0.45
     left: 0.45
     both: 0.10
-# Mode-3 span count {k: weight}: how many complete sentences a mode-3 window spans (k >= 2). Unset = always 2. The FSM reaches k>=3 
-# buffers (a commit retires 1 sentence per >=hysteresis strides while the buffer grows every stride), so a tail here trains that regime.
+# Mode-3 span count {k: weight}: how many complete sentences a mode-3 window spans (k>=2). Unset = always 2. FSM reaches k>=3 
+# buffers (commit retires 1 sentence per >=hysteresis strides while buffer grows every stride), so a tail here trains that regime.
 # mode3_span_counts: {2: 0.6, 3: 0.3, 4: 0.1}
 # Pose augmentation — TRAIN windows only (the Mode-2a full-evidence view and dev are never augmented).
 # SPATIAL ops (centroid rotation + affine/spatial_mask jitter) — schema + defaults in poses/augmentation.py.
@@ -119,13 +106,11 @@ augmentation:
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-# BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries the O/I
-# imbalance but gives NO B-vs-I signal; with B at 0.8% of frames, unweighted CE collapsed the class outright
-# (measured: zero B predictions on dev, max P(B) 0.20, mean P(B) 0.015 AT gold boundaries) — the failure
-# train/losses.py predicts in its docstring. Inverse frequency is far too hot on B and over-segments; `balanced`
-# uses the inverse-sqrt compromise, MEASURED on the corpus being trained (train.losses.resolve_bio_class_weights)
-# instead of pinning one dataset's constants — B's share is set by that corpus's sentence rate, so no fixed
-# vector ports. The resolved 4-list is logged and saved with the run; an explicit {O,B,I} dict overrides it.
+# BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries the O/I imbalance but 
+# gives NO B-vs-I signal; with B at 0.8% of frames, unweighted CE collapsed the class outright. Inverse frequency is far 
+# too hot on B and over-segments; `balanced` uses the inverse-sqrt compromise, MEASURED on the corpus being trained 
+# (train.losses.resolve_bio_class_weights) instead of pinning 1 dataset's constants — B's share is set by that corpus's 
+# sentence rate, so no fixed vector ports. The resolved 4-list is saved with the run; an explicit {O,B,I} dict overrides it.
 bio_class_weights: balanced
 dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
 # In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
@@ -181,49 +166,47 @@ scheduler:
     warmup_epochs: 0
 max_grad_norm: 1.0
 # Text canvas ceiling, sized to the data like buffer_cap_s. A caption unit can hold several sentences, so target length
-# follows the unit distribution: longest unit that fits streaming buffer needs 177 mT5 tokens on asf and 165 on bfi
-# under the caps this protocol implies (37.56 / 41.15 s). `train.slt.assert_targets_fit` refuses to start below the 
-# measured need — collator never truncates complete target, so the alternative is a crash mid-epoch. 192 = 48 blocks of 4.
-max_text_tokens: 192  # Near-free at train: pad_text_to_max_length false sizes the canvas to the batch, not to this ceiling
-# false = size the text canvas to the batch (block-aligned, with the EOS-supervision tail preserved). Equivalent
-# supervision at ~1/3 the canvas width; tests/test_collator_dynamic_padding.py pins the equivalence. false is the
-# DEPLOYED setting; true restores the fixed 128-wide canvas for an equivalence check (cb_active_count / cb_loss
-# should match over the first epoch).
+# follows the unit distribution: longest unit that fits streaming buffer needs 281 mT5 tokens on ase, 177 on asf and 143 
+# on bfi. The pool sets it, so one value covers every target. Block alignment is required (BD3LM attends bidirectionally 
+# within a block, and `data.batch` refuses a canvas that would cap mid-block): 320 = 2^6 x 5 divides by every block size 
+# worth running (4, 8, 16, 32, 64), so block-size dial below moves without a 2nd canvas. `train.slt.assert_targets_fit` 
+# refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash 
+# mid-epoch; when a new language or protocol moves the maximum, that guard reports the value to put here.
+max_text_tokens: 320
+# false = size the text canvas to the batch (block-aligned, 1 PAD column for the confidence-bound shift; EOS tail is 
+# added by the target builder). Equivalent supervision at a fraction of canvas width; the supervised set is pinned against 
+# the dLLM rule in tests/test_design_regressions.py. false is the DEPLOYED setting; true restores fixed full-width canvas 
+# for an equivalence check (cb_active_count / cb_loss should match over 1st epoch).
 pad_text_to_max_length: false
 validation:
     max_translation_samples: 0 # 0 = score translation on ALL dev windows
-    # No separate validation diffusion_steps: dev decoding uses the single top-level `diffusion_steps`
-    # below (one key for all components — train CB decode, dev eval, and inference all read it).
-block_size: 4
-# diffusion_steps is NOT a fixed denoising-step count: DCD/DMax terminate dynamically (commit until no mask
-# remains, then settle until convergence). infer/decode.py runs the COMMIT phase to completion regardless of
-# this value; diffusion_steps bounds only the DMax convergence-settle phase (Breakflag at 0.9 / no-change),
-# which normally finishes in 1-3 passes. Kept generous purely as a settle safety cap.
-diffusion_steps: 128
-dcd:
-    window_type: sliding
-    # DCD within-decode commit threshold. DCD's released runs (decode_algorithm.py DecodeConfig + run_all.sh)
-    # use decode_param=0.9 with the `threshold` selector everywhere; we match it. (DMax-SPD's 0.3-0.5 goes with
-    # the longest-confident-prefix selector = decode_algo: dmax_prefix, so only use ~0.5 if you switch to that.)
-    # decode_param is the operative selector threshold; tau_dec is its fallback — keep them equal.
-    tau_dec: 0.9
-    initial_window_length: 8
-    max_window_length: 64
-    temperature: 0.0
-    top_k:
-    top_p:
-    decode_algo: threshold # DCD: threshold/fixed. DMax-only selector ablation: dmax_prefix.
-    decode_param: 0.9
-    cache_type: none # none is exact; prefix is implemented only when window_type: static.
-    # NOTE: the DCD window is automatically clipped to the BD3LM attention block (DCD decode_algorithm.py::window_causal_decode
-    # semantics for block-causal models). DCD's optional Dynamic Block Extension is not enabled here as this mBART-BD3LM substrate
-    # is trained with fixed block_size.
-spd:
+# Block size: BD3LM's interpolation dial between autoregression (block 1: 1 slot/block — AR order, with at most 1 soft-state 
+# revision pass/slot) and full diffusion (block = canvas). It bounds DLM arm's parallelism and is a TRAINING parameter — the 
+# block-causal mask, OPUT corruption and canvas alignment all read it — so it is stamped in the checkpoint and eval refuses 
+# a decoder built at another block. A forward costs the block's slots against a KV cache of the finished blocks, so per-pass 
+# cost grows with the block; whether NUMBER of passes falls with it doesn't follow, because a block ends only when all of its 
+# slots have committed and settled — that is a property of the trained model's confidence, not of the block. 16 keeps blocks 
+# inside the range BD3LM reports (4-16) while quadrupling the slots a single forward can commit; DMax runs block 32 at every 
+# published point. No pass-count or latency number belongs here: measure it on dev at the RQ1 clean point with eval.yaml
+# rq1.batch_size 1 and read `mean_decoder_passes` beside `text_metrics` (AR arm's count in that field is its generate() length: 
+# N cached steps + the confidence pass).
+block_size: 16
+spd: # Block decode (infer/decode.py, DMax decode_uniform) — design spec §7.2.
+    # Commit threshold: a pass commits longest run of masked slots whose max-prob clears it (>= 1) and re-predicts every 
+    # committed slot of the block. Block ends once no mask remains and every generated slot's max-prob is >= 0.9 (infer/decode.py 
+    # SETTLE_CONFIDENCE, fixed, independent of tau_dec) or a pass changes nothing, with at most 1 revision-only pass per slot 
+    # after last commit. tau_dec is the inference-time dial inside the block: lower commits more slots per forward and leans on 
+    # SPD + OPUT self-revision to repair them; a value the model cannot reach commits one slot per forward. 1 value for Mode-2a 
+    # self-target, dev decoding and inference (inference.yaml translation.tau_dec overrides at eval time; trained value is stamped).
+    # Reachable range is shaped by `oput.label_smoothing`: under smoothing 0.2 the per-token loss MINIMISER sits at max-prob 0.8, 
+    # so a threshold at or above it makes most slots wait and the decode approaches 1 commit per pass. 0.8 is not a ceiling, so the 
+    # settle test at 0.9 does fire and how often is a property of the trained model. DMax's published points are 0.65 on code, 0.5 
+    # on math, 0.3 on LLaDA2-mini (dInfer/evaluations/eval_llada_dmax_{code,math}.sh, eval_llada_mini.sh, all at block_length 32, 
+    # all via decode_uniform) and 0.0 in chat.py. 0.5 is their math point and is reachable here; it is a starting value, not a 
+    # selected one: run the RQ1 clean point (`--rq 1 --method dlm --severity-grid-s 0.0`, eval.yaml rq1.batch_size 1) at a few 
+    # values and pick on dev BLEU against `mean_decoder_passes`; the AR arm's count in the same field is its generate() length.
+    tau_dec: 0.5
     top_k: 1 # DMax SPD top-k token/mask embedding mixture.
     renormalize: true # DMax Eq. 10 norm restoration.
-    # DMax self-revision (decode_uniform update_mask): committed tokens inside the
-    # current DCD window are refreshed with each step's prediction — the recovery
-    # behaviour OPUT's L_pred trains. false = commit-only ablation (pure DCD).
-    revision: true
 # NB: cross-stride inference caching is intentionally NOT implemented (forbidden by spec — the buffer is
-# re-decoded from scratch each stride; see infer/stream.py). Any in-decode caching is controlled by dcd.cache_type.
+# re-decoded from scratch each stride; see infer/stream.py). Inside one decode the final blocks are KV-cached.

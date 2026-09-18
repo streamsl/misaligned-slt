@@ -1,8 +1,8 @@
 # AR variant must share EVERYTHING with our DLM except the decoder family: same Uni-Sign pose -> prompt ->
 # LM-encoder -> BIO front end, same window sampler (`mode_ratios` + measured `jitter` + `mode2_subcase_weights`),
 # same confidence-bound term (AR-adapted), same optimization. Otherwise the result conflates "diffusion vs AR"
-# with "robust-window vs clean-window training". This file only overrides the decoder + outputs
-# and inherits the rest from dlm.yaml (OPUT/SPD/DCD blocks it inherits are simply unused by the AR path).
+# with "robust-window vs clean-window training". This file only overrides the decoder + outputs and inherits 
+# the rest from dlm.yaml (OPUT/SPD blocks it inherits are simply unused by the AR path).
 extends: dlm.yaml
 decoder: ar
 checkpoint:

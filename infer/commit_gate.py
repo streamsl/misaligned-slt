@@ -142,9 +142,9 @@ class CommitGate:
        SAME span (identity by start index; `BoundaryHistory` clears on a target change, so one stride's vote — or one
        inherited from another span — never commits).
     2. **Translation-hardened** — MEAN per-token confidence of the *current* stride's decode ≥ `token_confidence_tau`.
-       Not edit-distance to previous strides: that rewards the warm-started state the design forbids. Mean, not
-       `all(≥τ)`: function words sit at 0.2–0.5, so `all(≥0.75)` never commits on the AR arm (mean ~0.4), zeroing its
-       §9.3 streaming recall while the DLM arm's DCD-committed tokens pass — the arms become incomparable.
+       Not edit-distance to previous strides: that rewards the warm-started state the design forbids. Mean, not `all(≥τ)`: 
+       function words sit at 0.2–0.5, so `all(≥0.75)` never commits on AR arm, zeroing its streaming recall while DLM 
+       arm's block-committed tokens pass — the arms become incomparable.
 
     τ must be CALIBRATED to the model's clean-input confidence (like δ_enc / buffer_cap), see configs/inference.yaml.
     It floors low-confidence junk only; "confidently wrong" truncated decodes stay high-confidence and are Ω's job.
@@ -153,14 +153,19 @@ class CommitGate:
         self.history = BoundaryHistory(hysteresis_strides=int(hysteresis_strides), delta_enc_frames=int(delta_enc_frames))
         self.token_confidence_tau = float(token_confidence_tau)
 
+    def confident(self, token_confidence: torch.Tensor | None) -> bool:
+        # Signal 2 alone, so a caller can take the boundary vote — which never reads the decoder — 
+        # and decode only when the answer can still change (infer/stream.py).
+        if token_confidence is None or token_confidence.numel() == 0: return False
+        return bool((token_confidence.float().mean() >= self.token_confidence_tau).item())
+    
     def update(self, span: tuple[int, int] | None, token_confidence: torch.Tensor | None = None) -> CommitDecision:
         # `span` must be the one the caller decoded, never recomputed here — the gate scores exactly what is emitted.
+        # 1 call = 1 stride's vote: signal 1 needs the history pushed exactly once per stride.
         self.history.push(span)
-        if token_confidence is None or token_confidence.numel() == 0: trans_ok = False
-        else: trans_ok = bool((token_confidence.float().mean() >= self.token_confidence_tau).item())
         latest = self.history.latest()
         return CommitDecision(
-            boundary_stable=self.history.stable(), translation_confident=trans_ok,
+            boundary_stable=self.history.stable(), translation_confident=self.confident(token_confidence),
             terminator_index=None if latest is None else int(latest[1]),
         )
 

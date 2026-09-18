@@ -1,8 +1,8 @@
 """Uni-Sign backbone stack (Path A), arXiv 2501.15187: pose encoder + mT5 (default) / mBART (ablation).
 
 Everything Uni-Sign lives here:
-  - `MT5BlockDiffusionDecoder` / `MBartBlockDiffusionDecoder` — per-LM block-diffusion (BD3LM/OPUT/SPD-DCD)
-    decoder bindings (each implements only `_decode`).
+  - `MT5BlockDiffusionDecoder` / `MBartBlockDiffusionDecoder` — per-LM block-diffusion (BD3LM/OPUT/SPD block decode)
+    decoder bindings (each implements `_decode`, `_decode_with_decoder_forward`, `_decoder_stack`).
   - `UniSignMT5FrontEnd` / `UniSignMBartFrontEnd` — pose encoder + task prompt + LM encoder; the SAME front end
     serves the AR baseline and the AR/DLM SLT model via `MisalignedSLTModel`.
   - `load_unisign_pretrained` — load a released `*_pose_only_slt.pth` into a model carrying the front end.
@@ -59,9 +59,8 @@ def resolve_decoder_start_id(tokenizer) -> int | None:
 
 
 class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
-    '''BD3LM/OPUT decoder on the pretrained mBART decoder (learned absolute positions, layernorm_embedding,
-    sqrt(d_model) embed scale), plus the DCD prefix-KV-cache decode (block-boundary exact). `decoder_start_id` (the DLM 
-    canvas BOS) is mBART's target LANGUAGE CODE, not `<s>` — see `resolve_decoder_start_id`.'''
+    '''BD3LM/OPUT decoder on pretrained mBART decoder (learned absolute positions, layernorm_embedding, sqrt(d_model) embed scale). 
+    `decoder_start_id` (DLM canvas BOS) is mBART's target LANGUAGE CODE, not `<s>` — see `resolve_decoder_start_id`.'''
     def __init__(self, mbart_model, pad_index: int, decoder_start_id: int, eos_id: int, block_size: int = 4, **kw):
         super().__init__()
         self.mbart_decoder = mbart_model.model.decoder  # MBartDecoder layers + norms
@@ -74,17 +73,14 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
             block_size=block_size, **kw,
         )
         # The canvas needs vocab+1 (MASK row) AND mBART's INTERNAL sqrt(d_model) scale, so `_decode` and the HF
-        # `decoder.forward` behind the prefix KV-cache embed identically. Plain embedding + external scale made
-        # them disagree (the cache != no-cache Δ≈0.5 bug).
+        # `decoder.forward` behind the block KV cache embed identically.
         scaled = MBartScaledWordEmbedding(self.vocab_size + 1, self.d_model, self.pad_index, embed_scale=embed_scale)
         with torch.no_grad(): scaled.weight.copy_(self.embed_tokens.weight)
         self.embed_tokens = scaled
         self.embed_scale = 1.0  # scale lives inside embed_tokens now; never apply it twice
         self.mbart_decoder.embed_tokens = self.embed_tokens  # avoids a duplicate parameter
-        print(
-            f"MBartBlockDiffusionDecoder (mBART A2D): d_model={self.d_model}, vocab={self.vocab_size}+1(MASK), "
-            f"block_size={self.block_size}, remasking={self.remasking}, temperature={self.temperature}"
-        )
+        print(f"MBartBlockDiffusionDecoder (mBART A2D): d_model={self.d_model}, "
+              f"vocab={self.vocab_size}+1(MASK), block_size={self.block_size}")
 
 
     def _decode(
@@ -127,18 +123,17 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
 
     def _decode_with_decoder_forward(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
-        past_key_values=None, use_cache=False, cache_position=None,
+        past_key_values=None, use_cache=False, cache_position=None, logits=True,
     ):
-        # DCD prefix KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). 
-        # MBartDecoder takes the 4D mask verbatim and embeds via the MBartScaledWordEmbedding, so the cache matches the 
-        # no-cache `_decode` (verified ~1e-7).
+        # Block KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). MBartDecoder 
+        # takes 4D mask verbatim and embeds via MBartScaledWordEmbedding, so the cached path matches the no-cache `_decode`.
         out = self.mbart_decoder(
             input_ids=None if inputs_embeds is not None else decoder_input_ids,
             inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
             encoder_hidden_states=enc_hidden, encoder_attention_mask=enc_mask,
             past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position, return_dict=True,
         )
-        return self.lm_head(out.last_hidden_state), out.past_key_values
+        return (self.lm_head(out.last_hidden_state) if logits else None), out.past_key_values
 
     def _decoder_stack(self):
         return self.mbart_decoder  # MBartDecoder — the stack the Ω injector hooks (layers[i].encoder_attn)
@@ -166,13 +161,14 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
             lm_source_weight=mt5_model.lm_head.weight, pad_index=pad_index, eos_index=eos_id, bos_index=decoder_start_id, 
             embed_scale=1.0, block_size=block_size, **kw,
         )
-        print(
-            f"MT5BlockDiffusionDecoder (mT5 A2D): d_model={self.d_model}, vocab={self.vocab_size}+1(MASK), "
-            f"block_size={self.block_size}, remasking={self.remasking}, temperature={self.temperature}"
-        )
+        print(f"MT5BlockDiffusionDecoder (mT5 A2D): d_model={self.d_model}, "
+              f"vocab={self.vocab_size}+1(MASK), block_size={self.block_size}")
 
     def _rel_bias(self, eff_pos: torch.Tensor) -> torch.Tensor:
-        # T5Attention.compute_bias with caller-supplied positions: [xt|x0] = [0..L-1, 0..L-1] needs that geometry.
+        # T5Attention.compute_bias with caller-supplied positions: [xt|x0] = [0..L-1, 0..L-1] needs that geometry. The decoder's 
+        # buckets are causal (bidirectional=False): every key to the RIGHT of a query shares 1 bucket, so inside a block the right 
+        # context is attended by content, with no positional order among its slots. The same bias is used in training and inference, 
+        # so the 2 agree; it is a property of reusing the mT5 decoder table, not of the block mask.
         sa = self.decoder.block[0].layer[0].SelfAttention
         rel = eff_pos[None, :] - eff_pos[:, None]
         bucket = sa._relative_position_bucket(
@@ -224,18 +220,17 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
 
     def _decode_with_decoder_forward(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
-        past_key_values=None, use_cache=False, cache_position=None,
+        past_key_values=None, use_cache=False, cache_position=None, logits=True,
     ):
-        # DCD prefix KV-cache hook. T5Stack.forward computes its own relative position bias (standard positions,
-        # cache_position-aware) and ADDS the supplied 4D mask — at a block boundary with the all-attend window
-        # mask this equals the no-cache `_decode` (verified numerically).
+        # Block KV-cache hook. T5Stack.forward computes its own relative position bias (standard positions,
+        # cache_position-aware) and ADDS the supplied 4D mask, so the cached path equals the no-cache `_decode`.
         out = self.decoder(
             input_ids=None if inputs_embeds is not None else decoder_input_ids,
             inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
             encoder_hidden_states=enc_hidden, encoder_attention_mask=enc_mask,
             past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position, return_dict=True,
         )
-        return self.lm_head(out.last_hidden_state * self.lm_head_scale), out.past_key_values
+        return (self.lm_head(out.last_hidden_state * self.lm_head_scale) if logits else None), out.past_key_values
 
     def _decoder_stack(self):
         return self.decoder  # T5Stack — the stack the Ω injector hooks (block[i].layer[1])

@@ -1,15 +1,15 @@
-'''DMax extension to the BD3LM substrate: OPUT training + SPD/DCD inference + the confidence-bound surrogates.
+'''DMax extension to the BD3LM substrate: OPUT training, block decoding with SPD, and the confidence-bound surrogate.
 
-`OPUTBlockDiffusionDecoder` adds DMax's 3 mechanisms on top of `block_diffusion.BlockDiffusionDecoder`, over a
-precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, so the mBART / mT5 bindings
-(models/unisign.py) supply only the backbone decode.
+`OPUTBlockDiffusionDecoder` adds DMax's mechanisms on top of `block_diffusion.BlockDiffusionDecoder`, over a
+precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, `_decode_with_decoder_forward`
+and `_decoder_stack`, so the mBART / mT5 bindings (models/unisign.py) supply only the backbone forwards.
 
-  - `oput_forward`   — OPUT two-pass training (mask + on-policy argmax corruption); trains self-correction.
-  - `decode_spd_dcd` / `generate_spd_dcd` — SPD (renormalized soft state across denoising steps) + DCD (sliding
-    window choosing which masked slots to commit vs defer).
-  - `remasked_logits` — grad-bearing surrogate for the confidence-bound term.
+  - `oput_forward`     — OPUT two-pass training (mask + on-policy argmax corruption); trains self-correction.
+  - `generate`         — block decode (infer/decode.py): DMax's confident-prefix commits, SPD soft state and
+                         self-revision inside a block, over a KV cache of the final blocks.
+  - `remasked_logits`  — grad-bearing surrogate for the confidence-bound term.
 
-References: DMax OPUT + SPD/DCD (train_llada2_bd_oput.py); dLLM A2D (arXiv 2602.22661).
+References: DMax (arXiv 2604.08302; dInfer decode_uniform, train_llada2_bd_oput.py); dLLM A2D (arXiv 2602.22661).
 '''
 from __future__ import annotations
 from dataclasses import dataclass
@@ -17,9 +17,8 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
-from transformers.cache_utils import EncoderDecoderCache
-from models.block_diffusion import BlockDiffusionDecoder, build_block_causal_mask
-from infer.decode import SPDDecodeResult, spd_dcd_decode
+from models.block_diffusion import BlockDiffusionDecoder
+from infer.decode import DecodeResult, block_diffusion_decode
 from train.losses import masked_cross_entropy
 
 
@@ -68,8 +67,8 @@ def oput_two_pass_loss(
     DMax rolls out under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450-472): dropout OFF, matching inference. 
     Pass `rollout_decode_fn` to rerun whole conditioning+decode path in eval; without it rollout reuses masked-pass logits.
 
-    Unlike DMax (per-example mask-vs-pred `flag`, one grad pass), this sums L_mask + L_pred: equivalent in expectation up 
-    to a scale the LR absorbs, trading 2x decoder cost for lower gradient variance.
+    Unlike DMax (per-example mask-vs-pred `flag`, one grad pass), this takes the MEAN of L_mask and L_pred: a sum would
+    double the DLM's per-token translation scale against the AR arm's single-pass CE. 2x decoder cost buys lower variance.
     """
     valid_mask = valid_mask.bool()
     replay_pred = None
@@ -110,21 +109,15 @@ def oput_two_pass_loss(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Abstract DMax decoder: OPUT training + SPD/DCD inference
+# Abstract DMax decoder: OPUT training + block decode
 # ════════════════════════════════════════════════════════════════════════════
 
 class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
-    '''BD3LM decoder with DMax's OPUT training and SPD+DCD inference, over fixed encoder conditioning.
+    '''BD3LM decoder with DMax's OPUT training and block decoding, over fixed encoder conditioning.
 
-    Still abstract on `_decode`; the `MBart`/`MT5` bindings supply it. The DCD prefix KV-cache is shared here; only
-    `_decode_with_decoder_forward` is backbone-specific (MBartDecoder vs T5Stack). Both backbones implement it and
-    are verified cached == no-cache at a block boundary (Δ<1e-4, `test_prefix_cache_matches_no_cache`): mT5's T5Stack
-    is cache_position-aware, and mBART's `MBartScaledWordEmbedding` makes the cached path scale token embeddings
-    identically to `_decode` (a plain embedding caused the Δ≈0.5 cache bug, now fixed). `cache_type='none'` is the
-    default everywhere; `cache_type='prefix'` + `window_type='static'` turns the cache on.
-
-    SPD/DCD decoding is cold-start per call — no state crosses streaming strides. `[xt|x0]` concatenation and the
-    block-diff mask match DMax's own training loop (`train_llada2_bd_oput.py`).
+    Abstract on `_decode` (the custom-mask forward that training needs), `_decode_with_decoder_forward` (native HF forward 
+    that carries a KV cache) and `_decoder_stack` (the stack the Ω injector hooks); the `MBart`/`MT5` bindings supply all 3. 
+    Block decode is cold-start per call — no state crosses streaming strides.
     '''
     def oput_forward(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
@@ -187,9 +180,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         '''Grad-bearing forward on a committed sequence with the gated slots re-masked (confidence-bound surrogate).
 
         Gated slots (confident-disagreement under the no-grad truncated decode) become `[MASK]`, every other committed token 
-        stays in context; 1 block-causal forward gives each gated slot's live conditional belief — what DCD would read had 
-        it deferred them. Closer to commit-time than an all-`[MASK]` marginal (t = 1, outside OPUT's t ∈ [t_low, t_high]), 
-        and costs 1 forward, not back-prop through ~128-step decode. No reference text enters the input, so P1 is preserved.
+        stays in context; 1 block-causal forward gives each gated slot's live conditional belief with the slot still open. 
+        Closer to commit-time than an all-`[MASK]` marginal (t = 1, outside OPUT's t ∈ [t_low, t_high]), and costs 1 forward, 
+        not back-prop through the decode. No reference text enters the input, so P1 is preserved.
         '''
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
         remask[:, 0] = False  # BOS fixed
@@ -197,149 +190,85 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)
 
 
-    # ── DCD prefix KV-cache (backbone-agnostic; block-boundary exact) ─────────
+    # ── Block decode over a KV cache of the final blocks (backbone-agnostic) ──
     def _decode_with_decoder_forward(
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
-        past_key_values=None, use_cache=False, cache_position=None,
+        past_key_values=None, use_cache=False, cache_position=None, logits=True,
     ):
-        # Backbone hook: run the native HF decoder.forward (KV-cache capable) with a 4D self-attention mask; 
-        # return (logits, past_key_values). A backbone that does not implement this disables the prefix cache.
-        raise NotImplementedError(f"{type(self).__name__} has no cache-capable decoder.forward; use cache_type='none'.")
+        # Backbone hook: the native HF decoder.forward (KV-cache capable) under a 4D self-attention mask;
+        # returns (logits, past_key_values). `logits=False` skips the |V| head (a cache append reads no logits).
+        raise NotImplementedError(f"{type(self).__name__} has no cache-capable decoder.forward")
 
     def _decoder_stack(self) -> torch.nn.Module:
-        # Backbone hook: the HF decoder stack (T5Stack / MBartDecoder) `_decode_with_decoder_forward` runs — 
-        # also the module the Ω cross-attention injector hooks into.
-        raise NotImplementedError(f"{type(self).__name__} exposes no decoder stack; the gated prefix cache is unavailable.")
+        # Backbone hook: the HF decoder stack (T5Stack / MBartDecoder) the Ω cross-attention injector hooks into.
+        raise NotImplementedError(f"{type(self).__name__} exposes no decoder stack")
 
     def _omega_injector(self):
-        # Lazy CrossAttnOmegaInjector, shared by every gated cached decode. Pre-hooks are inert outside `with_omega`,
-        # so the custom `_decode` path (which adds Ω itself) is untouched; tight scoping avoids double application.
-        inj = getattr(self, "_omega_injector_obj", None)
-        if inj is None:
-            from models.membership_gate import CrossAttnOmegaInjector
-            inj = CrossAttnOmegaInjector(self._decoder_stack())
-            self._omega_injector_obj = inj
-        return inj
+        # The one injector of this decoder stack (shared with AR arm's hooks on same modules). Pre-hooks
+        # are inert outside `with_omega`, so the custom `_decode` path (which adds Ω itself) is untouched.
+        from models.membership_gate import CrossAttnOmegaInjector
+        return CrossAttnOmegaInjector.attach(self._decoder_stack())
 
+    def _block_decoder(self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, omega_bias: torch.Tensor | None = None):
+        '''`forward` / `finalize` for `block_diffusion_decode`, over a KV cache of the final blocks.
 
-    def _prefix_static_window_mask(self, batch_size, prefix_len, window_len, dtype, device):
-        # All-attend mask: inside one block, after a block-boundary prefix, this IS the block-causal view.
-        mask = torch.zeros((window_len, prefix_len + window_len), dtype=dtype, device=device)
-        return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, window_len, prefix_len + window_len)
-
-
-    def _clone_encoder_decoder_cache(self, cache):
-        legacy = cache.to_legacy_cache()
-        cloned = tuple(tuple(t.detach().clone() for t in layer) for layer in legacy)
-        return EncoderDecoderCache.from_legacy_cache(cloned)
-
-
-    def _make_static_prefix_cache_logits_fn(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, omega_bias: torch.Tensor | None = None,
-    ):
-        '''A DCD `logits_fn(ids, soft_embeds, window)` that caches the committed prefix's K/V and forwards only the
-        active window against it. Exact ONLY when (a) the prefix ends on a block boundary, (b) the window lies inside
-        one block, AND (c) the window reaches that block's end — BD3LM is bidirectional within a block, so a prefix or
-        window stopping mid-block lacks K/V the full forward exposes. All three are checked, falling back to the exact
-        full `_decode` otherwise (mirrors DCD window_causal_decode). A final partial block (window at the sequence
-        end) is exact too: no keys exist past the sequence in either path.
-
-        Ω-compatible: `omega_bias` biases cross-attn SCORES only, so cached K/V are reusable as-is; it rides the native 
-        forward via CrossAttnOmegaInjector, the KV-cache-safe mechanism the AR arm uses. Prefix build AND window pass both 
-        run under Ω (prefix hiddens depend on Ω via their own cross-attention), matching the gated no-cache `_decode`.'''
-        state: dict[str, object] = {"prefix_len": None, "prefix_tokens": None, "past": None}
+        Exact under block-causal attention, to floating-point accumulation order: Slots of block b see blocks <= b only, so the 
+        cached K/V of final blocks + a forward over the block's own slots reproduce full-canvas forward, and slots past the block 
+        never influence it. The memory's cross-attention K/V live in same cache and are projected ONCE, on 1st pass of block 0; 
+        every later pass reads them back. Ω rides native forward via CrossAttnOmegaInjector — a score-time bias, so cached K/V 
+        stay valid — and prefix is built under Ω too, as its hidden states depend on it. Exactness needs eval mode: in train mode, 
+        2 paths would draw different dropout masks.
+        '''
+        assert not self.training, "the block decode is an eval-mode operation (dropout would break cache exactness)"
+        state = {"past": None, "length": 0}
         injector = self._omega_injector() if omega_bias is not None else None
 
-        def _native_forward(**kw): # Fallback `_decode` calls run outside it and take omega_bias explicitly.
+        def native(**kw):
             if injector is None: return self._decode_with_decoder_forward(**kw)
-            with injector.with_omega(omega_bias): # Tight with_omega scope: hooks bias ONLY this native forward. 
-                return self._decode_with_decoder_forward(**kw)
+            with injector.with_omega(omega_bias): return self._decode_with_decoder_forward(**kw)
 
-        def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None, window: tuple[int, int] | None = None) -> torch.Tensor:
-            if window is None: return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
-            left, right = int(window[0]), int(window[1])
-            if left <= 0: return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
-            if left % self.block_size != 0:
-                # (a) A prefix ending inside a block has K/V computed without the later same-block tokens the full
-                # forward exposes. Ref: DCD window_causal_decode block-local cache split.
-                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
-
-            prefix_tokens = ids[:, :left].detach()
-            cached_tokens = state.get("prefix_tokens")
-            needs_refresh = (
-                state.get("past") is None or state.get("prefix_len") != left
-                or not torch.equal(cached_tokens, prefix_tokens.cpu())
+        def call(ids, soft, lo, hi, past, use_cache, logits):
+            assert state["length"] == lo, "the block decode extends its cache in order"
+            # All-attend over [final prefix | block]: bidirectional inside the block, causal across blocks.
+            mask = torch.zeros((ids.shape[0], 1, hi - lo, hi), dtype=enc_hidden.dtype, device=ids.device)
+            # Always embed here: the canvas embedding carries the [MASK] row (and mBART's scale) the backbone's own does not.
+            embeds = self.embed_tokens(ids[:, lo:hi]) if soft is None else soft
+            return native(
+                decoder_input_ids=ids[:, lo:hi], inputs_embeds=embeds, enc_hidden=enc_hidden, 
+                enc_mask=enc_mask, self_attn_mask=mask, past_key_values=past, use_cache=use_cache, 
+                cache_position=torch.arange(lo, hi, dtype=torch.long, device=ids.device), logits=logits,
             )
-            if needs_refresh:
-                prefix_mask = build_block_causal_mask(ids.shape[0], left, self.block_size, enc_hidden.dtype, ids.device)
-                with torch.no_grad():
-                    _, past = _native_forward(
-                        decoder_input_ids=prefix_tokens, enc_hidden=enc_hidden, enc_mask=enc_mask, self_attn_mask=prefix_mask, 
-                        use_cache=True, cache_position=torch.arange(left, dtype=torch.long, device=ids.device),
-                    )
-                state["prefix_len"] = left
-                state["prefix_tokens"] = prefix_tokens.cpu().clone()
-                state["past"] = past
 
-            if left // self.block_size != (right - 1) // self.block_size:
-                # (b) A window spanning blocks would let an earlier block attend into a later one.
-                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
+        def forward(ids, soft, lo, hi):
+            # HF attention writes a pass's keys into whichever cache it is handed, even at use_cache=False. So write into the 
+            # real cache and crop provisional block's self-attention keys back off, rather than copying the prefix per pass. 
+            # The memory's cross-attention K/V survive the crop (they are written once and then read-only via `is_updated`), 
+            # so block 0's passes stop re-projecting the whole memory.
+            logits, past = call(ids, soft, lo, hi, state["past"], use_cache=True, logits=True)
+            past.self_attention_cache.crop(lo)
+            state["past"] = past
+            return logits
 
-            if right % self.block_size != 0 and right != ids.shape[1]:
-                # (c) The cached pass exposes keys only up to `right`, so a window short of its block's end omits the
-                # [right, block_end) keys the no-cache forward includes. Exact iff `right` is a boundary or seq end.
-                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
+        def finalize(ids, lo, hi):
+            # 1 hard pass over the finished block appends its final K/V. dInfer instead widens NEXT block's 1st forward to span 
+            # [block b | block b+1] and writes block b's K/V from it (generate_uniform.py decode_uniform, need_cross_block_update), 
+            # so upstream pays no separate pass and this port trades 1 sequential pass per block for a narrower 1st forward. Its 
+            # logits are never read, so the |V| head is skipped.
+            _, past = call(ids, None, lo, hi, state["past"], use_cache=True, logits=False)
+            state["past"], state["length"] = past, hi
 
-            window_ids = ids[:, left:right]
-            window_embeds = soft_embeds[:, left:right] if soft_embeds is not None else None
-            window_mask = self._prefix_static_window_mask(ids.shape[0], left, right - left, enc_hidden.dtype, ids.device)
-            logits_window, _ = _native_forward(
-                decoder_input_ids=window_ids, inputs_embeds=window_embeds, enc_hidden=enc_hidden, enc_mask=enc_mask,
-                self_attn_mask=window_mask, past_key_values=self._clone_encoder_decoder_cache(state["past"]),
-                use_cache=False, cache_position=torch.arange(left, right, dtype=torch.long, device=ids.device),
-            )
-            full_logits = torch.zeros((*ids.shape, logits_window.shape[-1]), dtype=logits_window.dtype, device=ids.device)
-            full_logits[:, left:right] = logits_window
-            return full_logits
-
-        logits_fn.supports_dcd_cache = True  # type: ignore[attr-defined]
-        return logits_fn
-
-
-    def decode_spd_dcd(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, max_length: int = 128, diffusion_steps: int = 64, 
-        tau_dec: float = 0.75, top_k: int = 1, spd_renormalize: bool = True, spd_revision: bool = True, temperature: float = 0.0,
-        window_length: int | None = None, max_window_length: int | None = None, window_type: str = "sliding",
-        decode_algo: str = "threshold", decode_param: int | float | None = None, sample_top_k: int | None = None,
-        top_p: float | None = None, cache_type: str = "none", omega_bias: torch.Tensor | None = None,
-    ) -> SPDDecodeResult:
-        batch = enc_hidden.shape[0]
-        token_ids = torch.full((batch, int(max_length)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)
-        token_ids[:, 0] = int(self.bos_index)
-
-        if cache_type == "prefix" and window_type == "static":
-            # Ω rides the cached native forward via CrossAttnOmegaInjector (score-time bias; cached K/V are
-            # Ω-independent) — same conditioning as the no-cache `_decode`, verified numerically.
-            logits_fn = self._make_static_prefix_cache_logits_fn(enc_hidden, enc_mask, omega_bias=omega_bias)
-        elif cache_type == "none":
-            def logits_fn(ids: torch.Tensor, soft_embeds: torch.Tensor | None) -> torch.Tensor:
-                # inputs_embeds=None -> _decode embeds `ids` itself; else it uses the SPD soft-embedding mixture.
-                # omega_bias is fixed conditioning: identical across every denoising step of this decode.
-                return self._decode(ids, enc_hidden, enc_mask, inputs_embeds=soft_embeds, omega_bias=omega_bias)
-        else: raise NotImplementedError(
-            "Only cache_type='none' or cache_type='prefix'+window_type='static' are implemented (both verified "
-            "for the mT5 and mBART decoders); sliding/dual cache requires a separate verified port."
-        )
-        return spd_dcd_decode(
-            logits_fn=logits_fn, embedding_layer=self.embed_tokens, initial_token_ids=token_ids, mask_token_id=self.mask_token_id, 
-            steps=diffusion_steps, threshold=tau_dec, eos_token_id=self.eos_index, pad_token_id=self.pad_index, 
-            temperature=temperature, top_k=top_k, spd_renormalize=spd_renormalize, spd_revision=spd_revision,
-            window_length=window_length or self.block_size, max_window_length=max_window_length, window_type=window_type, 
-            decode_algo=decode_algo, decode_param=decode_param, sample_top_k=sample_top_k, top_p=top_p, cache_type=cache_type,
-            block_size=self.block_size # Block-causal decoder: DCD window must not span attention blocks (see spd_dcd_decode).
-        )
-
+        return forward, finalize
 
     @torch.no_grad()
-    def generate_spd_dcd(self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, **kwargs) -> SPDDecodeResult:
-        return self.decode_spd_dcd(enc_hidden=enc_hidden, enc_mask=enc_mask, **kwargs)
+    def generate(
+        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, max_length: int = 128, threshold: float = 0.5,
+        spd_top_k: int = 1, spd_renormalize: bool = True, omega_bias: torch.Tensor | None = None,
+    ) -> DecodeResult:
+        # `omega_bias` is fixed conditioning: identical across every pass of this decode.
+        ids = torch.full((enc_hidden.shape[0], int(max_length)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)
+        ids[:, 0] = int(self.bos_index)
+        forward, finalize = self._block_decoder(enc_hidden, enc_mask, omega_bias=omega_bias)
+        return block_diffusion_decode(
+            forward, finalize, self.embed_tokens, ids, self.mask_token_id, self.block_size, threshold,
+            eos_token_id=self.eos_index, pad_token_id=self.pad_index, spd_top_k=spd_top_k, spd_renormalize=spd_renormalize,
+        )

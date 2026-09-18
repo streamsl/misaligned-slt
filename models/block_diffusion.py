@@ -2,10 +2,10 @@
 
 Layering (so each concept has one home):
   models/block_diffusion.py  (this file)  BD3LM core: the abstract `BlockDiffusionDecoder` (masked-diffusion
-                                          training over [xt|x0] + block-by-block confidence-remask generation)
-                                          and the attention-mask builders.
-  models/dmax.py                          DMax extension: `OPUTBlockDiffusionDecoder` (OPUT training + SPD/DCD
-                                          inference + confidence-bound surrogates) and the OPUT loss helpers.
+                                          training over [xt|x0]) and the attention-mask builders.
+  models/dmax.py                          DMax extension: `OPUTBlockDiffusionDecoder` (OPUT training + the block
+                                          decode with SPD + confidence-bound surrogates) and the OPUT loss helpers.
+  infer/decode.py                         the block decode itself (DMax decode_uniform semantics).
   models/unisign.py                       mBART binding: `MBartBlockDiffusionDecoder` (concrete `_decode`).
   models/unisign.py                   mT5 binding:  `MT5BlockDiffusionDecoder` (concrete `_decode`).
 
@@ -13,39 +13,31 @@ A decoder is built per language-model family by subclassing `dmax.OPUTBlockDiffu
 ONLY `_decode` / `__init__`. Conditioning is uniform: every decoder consumes a precomputed encoder memory 
 (`enc_hidden`/`enc_mask`); encoding is the front end's job (models/front_end.py).
 
-Implements BD3LM (block diffusion) adapted to mBART via A2D recipe from dLLM, with full bd3lms fidelity:
-  - Architecture: pretrained mBART decoder with block-causal self-attention.
-  - Training: BD3LM masked diffusion loss with [xt | x0] concatenation,
-              BD3LM attention mask (M_BD + M_OBC + M_BC), repeated position IDs,
-              and cross-entropy weighted by 1/t at masked positions.
-  - Inference: dLLM-style BD3LM semi-AR sampling with confidence-based remasking,
-               temperature-controlled Gumbel-max, block-by-block denoising.
+Implements BD3LM (block diffusion) adapted to mBART / mT5 via the A2D recipe from dLLM:
+  - Architecture: the pretrained decoder with block-causal self-attention.
+  - Training: the [xt | x0] forward with the BD3LM attention mask (M_BD + M_OBC + M_BC) and repeated
+              position IDs. The OBJECTIVE over it is DMax's OPUT (models/dmax.py), not the BD3LM ELBO.
+  - Inference: block-by-block denoising over a KV cache of the final blocks (models/dmax.py, infer/decode.py).
 
 Key insight (dLLM A2D, arXiv 2602.22661 takeaway box p.8): AR and diffusion models differ only in training 
 objective and attention mask, NOT in architecture. Converting a pretrained decoder to BD3LM requires: 
   1. Replace causal self-attention mask with BD3LM mask during training.
   2. Concatenate noised tokens xt with clean tokens x0 as model input.
   3. Use repeated position IDs [0..L-1, 0..L-1] for both halves.
-  4. Compute MDLM masked diffusion loss on only the xt-half logits.
+  4. Read only the xt-half logits; the loss over them is OPUT (models/dmax.py).
 
 BD3LM training mask (2L x 2L) over concatenated [xt | x0] input:
   M_BD:  Block diagonal — within-block self-attention (xt<->xt, x0<->x0).
   M_OBC: Offset block causal — xt attends to x0 from *previous* blocks.
   M_BC:  Block causal — x0 attends to x0 from same and previous blocks.
 
-Inference (dLLM BD3LMSampler) uses block-causal mask with confidence-based remasking:
-  - Block-by-block: committed prefix (clean) + current block (all MASK initially).
-  - Inner loop per block: predict tokens, score by confidence, commit top-k, repeat.
-  - Linear unmasking schedule: ~(remaining / steps_left) tokens per step.
-  - Temperature-controlled Gumbel-max for diverse sampling.
-  - No sigma/time conditioning (A2D: model is not time-aware).
+Inference is block-causal: a committed prefix (clean, cached) and the current block (all MASK initially),
+denoised by the DMax rule in infer/decode.py. No sigma/time conditioning (A2D: the model is not time-aware).
 
 References:
   - dLLM paper + A2D recipe: https://arxiv.org/pdf/2602.22661
   - dLLM BD3LMTrainer: dllm/core/trainers/bd3lm.py (BD3LMTrainer.compute_loss)
-  - dLLM BD3LMSampler: dllm/core/samplers/bd3lm.py
   - BD3LM paper: https://arxiv.org/pdf/2503.09573
-  - LogLinearNoise: bd3lms/noise_schedule.py
 '''
 from __future__ import annotations
 import math
@@ -70,7 +62,10 @@ def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, block_size=None
     Returns (x0, valid_mask) with the tail slots replaced by `eos_index` and marked valid.
     '''
     if max_tokens <= 0 or eos_index is None: return x0, valid_mask
-    n_content = (x0 != pad_index).long().sum(dim=1)  # includes BOS; right-padding assumed
+    # Slot 0 is the canvas BOS and counts as content unconditionally: on mT5 the decoder start id IS the pad id, 
+    # so a pad test would drop it, start the tail one slot early and stop it one slot short of the boundary — 
+    # leaving the final block's last slot unsupervised whenever the label count is a multiple of the block.
+    n_content = 1 + (x0[:, 1:] != pad_index).long().sum(dim=1)  # right-padding assumed
     if block_size is not None:
         to_boundary = (-n_content) % int(block_size)
         tail_count = torch.minimum(to_boundary, torch.full_like(to_boundary, int(max_tokens)))
@@ -145,39 +140,28 @@ def build_block_causal_mask(batch_size, tgt_len, block_size, dtype, device):
 class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     '''BD3LM decoder built on the pretrained AR decoder backbone.
 
-    Replaces AR decoder with a block diffusion decoder that:
-      - Shares the same mBART pretrained weights (encoder + decoder layers).
+    Replaces the AR decoder with a block diffusion decoder that:
+      - Shares the pretrained weights (encoder + decoder layers).
       - Replaces the causal decoder self-attention mask with a block-causal mask.
-      - Trains with MDLM masked diffusion loss (loglinear noise schedule).
-      - Generates via iterative denoising block-by-block at inference time.
+      - Trains under DMax OPUT (models/dmax.py) over the BD3LM `[xt|x0]` forward; no MDLM ELBO, no noise schedule.
 
-    Subclasses provide ONLY the architecture-specific decode (`_decode`) and call `_init_block_diffusion(...)` from 
-    their `__init__` to build the shared vocab+1 `[MASK]` embedding / LM head and store the hyper-parameters. 
-    Everything else (target prep, noise schedule, BD3LM `[xt|x0]` forward, MDLM loss, and block-by-block sampler) is 
-    shared here. DMax (OPUT + SPD/DCD) lives in `models.dmax`.
+    Subclasses provide `_decode`, `_decode_with_decoder_forward` and `_decoder_stack` and call
+    `_init_block_diffusion(...)` from their `__init__` to build the shared vocab+1 `[MASK]` embedding / LM head and
+    store the hyper-parameters. Target prep and the BD3LM `[xt|x0]` forward are shared here; the OPUT loss and the 
+    block decode live in `models.dmax` + `infer/decode.py`.
     '''
     def _init_block_diffusion(
         self, *, d_model: int, vocab_size: int, embed_source_weight: torch.Tensor, lm_source_weight: torch.Tensor,
-        pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0,
-        block_size: int = 4, sampling_eps_min: float = 1e-3, sampling_eps_max: float = 1.0,
-        antithetic_sampling: bool = True, ignore_bos: bool = True, temperature: float = 0.0,
-        remasking: str = "low_confidence", steps_per_block: int | None = None, eos_supervision_tokens: int | None = None,
+        pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0, block_size: int = 4, 
+        ignore_bos: bool = True, eos_supervision_tokens: int | None = None,
     ) -> None:
         self.d_model = d_model
         self.embed_scale = float(embed_scale)
         self.block_size = block_size
-        self.sampling_eps_min = sampling_eps_min
-        self.sampling_eps_max = sampling_eps_max
-        self.antithetic_sampling = antithetic_sampling
         self.ignore_bos = ignore_bos
         # Cap for EOS padding to the next block boundary. The default matches dLLM's AppendEOSBlockWrapper.
         self.eos_supervision_tokens = int(eos_supervision_tokens) if eos_supervision_tokens is not None else int(block_size)
         self.neg_infinity = -1e9
-
-        # ── Inference params (dLLM-style) ─────────────────────────────────────
-        self.temperature = temperature      # Gumbel noise temperature (0 = greedy argmax)
-        self.remasking = remasking          # 'low_confidence' or 'random'
-        self.steps_per_block = steps_per_block  # None = auto from diffusion_steps
 
         # ── Tokenizer info ───────────────────────────────────────────────────
         self.pad_index = int(pad_index)
@@ -187,10 +171,11 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
 
         # ── Extend vocabulary with a MASK token ─────────────────────────────
         self.mask_token_id = vocab_size # Append [MASK] at index vocab_size so existing token IDs are unchanged
-        self.mask_index = self.mask_token_id  # Backward-compat alias (SPD/DCD decode)
 
         # ── Extend embedding and language model heads ───────────────────────
-        self.embed_tokens = nn.Embedding(vocab_size + 1, d_model, padding_idx=self.pad_index)
+        # No padding_idx: on mT5, pad id is also the canvas BOS, and padding_idx would freeze the BOS row the AR arm trains. 
+        # A pad slot never reaches a supervised slot under block-causal attention, so its gradient is zero anyway.
+        self.embed_tokens = nn.Embedding(vocab_size + 1, d_model)
         self.lm_head = nn.Linear(d_model, vocab_size + 1, bias=False)
         with torch.no_grad():
             self.embed_tokens.weight[:vocab_size].copy_(embed_source_weight)
@@ -253,17 +238,6 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         )
 
 
-    def _sample_t(self, batch_size: int, num_blocks: int, device: torch.device) -> torch.Tensor:
-        # Antithetic per-block timestep sampling; mask x0 -> xt (bd3lms diffusion.py _sample_t).
-        t = torch.rand((batch_size, num_blocks), device=device)
-        if self.antithetic_sampling:
-            offset = torch.arange(batch_size * num_blocks, device=device).float()
-            offset = (offset / (batch_size * num_blocks)).view(batch_size, num_blocks)
-            t = (t / (batch_size * num_blocks) + offset) % 1.0
-        t = t.repeat_interleave(self.block_size, dim=-1)
-        return t * (self.sampling_eps_max - self.sampling_eps_min) + self.sampling_eps_min
-
-
     def _bd3lm_logits( # BD3LM [xt|x0] forward with repeated effective positions; return xt-half logits (first L).
         self, noisy_ids: torch.Tensor, clean_ids: torch.Tensor, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
         omega_bias: torch.Tensor | None = None,
@@ -287,216 +261,3 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
             self_attn_mask=bd3lm_mask, position_ids=position_ids, omega_bias=omega_bias, logits_len=length,
         )  # (B, L, V+1) — xt half
 
-
-    # ── BD3LM training forward (MDLM loglinear loss on the xt half) ────────────
-    def forward(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
-        decoder_input_ids: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        '''BD3LM training forward (dLLM A2D) over precomputed encoder conditioning.
-
-        Implements the BD3LM training from dLLM (arxiv.org/abs/2602.22661):
-          1. Build x0 (clean target), pad to multiple of block_size.
-          2. Sample per-block noise and create xt (noised tokens).
-          3. Concatenate [xt | x0] → (B, 2L) with BD3LM attention mask.
-          4. Repeated position IDs: [0..L-1, 0..L-1].
-          5. Take first L logits (xt positions) for loss computation.
-          6. Cross-entropy weighted by 1/t at masked positions only.
-
-        Returns: dict with 'translation_loss' (scalar).
-        '''
-        device = enc_hidden.device
-        B = enc_hidden.shape[0]
-
-        # ── 1. Build x0 (clean target): [BOS, label_tokens...] ───────────────
-        x0, text_mask = self._prepare_x0(labels.to(device), decoder_input_ids)
-        num_blocks = x0.shape[1] // self.block_size
-
-        # ── 2. Sample noise and create xt (noised tokens) ────────────────────
-        t = self._sample_t(B, num_blocks, device) # (B, L) per-block t; mask x0 → xt
-        p = t # loglinear schedule: p=t (mask probability)
-        rand = torch.rand_like(x0.float())
-        masked_mask = (rand < p) & text_mask      # (B, L) bool, True = masked AND valid text position
-        xt = torch.where(masked_mask, self.mask_token_id, x0)
-
-        # ── 3. Decoder forward with BD3LM mask ───────────────────────────────
-        logits = self._bd3lm_logits(xt, x0, enc_hidden, enc_mask)  # (B, L, V+1)
-
-        # ── 4. Compute weighted cross-entropy loss ────────────────────────────
-        loss_weights = 1.0 / t.clamp(min=1e-6)  # (B, L), 1/t per block (MDLM loglinear schedule)
-        
-        # Substitution parameterization is simply equivalent to cross-entropy
-        # with targets = x0 and logits masked to force MASK prediction at masked positions.
-        token_nll = F.cross_entropy( 
-            logits.transpose(1, 2),             # (B, V+1, L)
-            x0,                                 # (B, L) — targets
-            reduction='none',                   # (B, L)
-        )
-        # Mask: only count loss at masked & maskable positions
-        loss_mask = masked_mask.float()         # (B, L)
-        weighted_nll = token_nll * loss_weights * loss_mask  # Zero out unmasked positions
-
-        # Normalize by total MASKABLE tokens (label != -100), matching dLLM "token" norm.
-        # FIX (verified vs dllm/core/trainers/mdlm.py:200-202 & bd3lm.py:230, arXiv 2602.22661):
-        # dllm divides by maskable_mask.sum() (all non-pad/non-BOS target positions), NOT by the
-        # masked-count. Using loss_mask.sum() (masked only) over-scales the loss and adds per-batch
-        # variance. text_mask is the maskable set (valid, non-BOS) defined above.
-        translation_loss = weighted_nll.sum() / text_mask.float().sum().clamp(min=1)
-        return {'translation_loss': translation_loss}
-
-
-    # ── Inference (dLLM BD3LMSampler) ───────────────────────────────────────
-    @staticmethod
-    def _add_gumbel_noise(logits, temperature):
-        '''Temperature-controlled Gumbel-max (dLLM samplers/utils.py add_gumbel_noise).
-        temperature=0: greedy argmax. Higher temperature: more diverse samples.
-        '''
-        if temperature == 0: return logits
-        logits = logits.to(torch.float64)
-        noise = torch.rand_like(logits, dtype=torch.float64)
-        gumbel_noise = (-torch.log(noise)) ** temperature
-        return logits.exp() / gumbel_noise
-
-
-    @staticmethod
-    def _get_num_transfer_tokens(mask_index, steps):
-        '''Per-step unmasking schedule (dLLM core/samplers/utils.py).
-
-        Use linear alpha schedule: at each step unmask ~(remaining/steps_left) tokens. 
-        Distribute unmasking evenly across steps.
-
-        Args:
-            mask_index: (B, L) bool, True at masked positions.
-            steps: int, diffusion steps for this block.
-        Returns: (B, effective_steps) int64 tensor, tokens to unmask per step.
-        '''
-        mask_num = mask_index.sum(dim=1, keepdim=True)  # (B, 1)
-        B = mask_num.size(0)
-        device = mask_index.device
-        num_transfer = torch.zeros(B, steps, dtype=torch.int64, device=device)
-        
-        for i in range(B):
-            remaining = mask_num[i, 0].clone()
-            for j in range(steps):
-                t = (steps - j) / steps
-                s = (steps - j - 1) / steps
-                if t <= 0: break
-                reverse_transfer_prob = 1.0 - (s / t)  # linear: 1 / (steps - j)
-                k = torch.round(remaining.float() * reverse_transfer_prob).to(torch.int64)
-                k = torch.clamp(k, min=0, max=remaining)
-                num_transfer[i, j] = k
-                remaining -= k
-                if remaining <= 0: break
-                
-        # Note: because llada is not conditioned on time, this allows us to skip steps with no unmasking (i.e. transfer).
-        # Clear all zeros per row (compact) and right-pad with zeros
-        # Remove zeros per row, then pad only up to the max length across rows
-        rows, max_len = [], 0
-        for i in range(B):
-            nonzero = num_transfer[i][num_transfer[i] > 0]
-            rows.append(nonzero)
-            max_len = max(max_len, nonzero.numel())
-        return torch.stack([
-            torch.cat([r, torch.zeros(max_len - r.numel(), dtype=r.dtype, device=r.device)]) 
-            if r.numel() < max_len else r for r in rows
-        ], dim=0)
-
-
-    def _diffusion_step_block(self, logits, x_block, mask_block, num_transfer_step):
-        '''One confidence-remask step (dLLM core/samplers/bd3lm.py _diffusion_step_block).
-
-        1. Gumbel-max sample x0 from logits.
-        2. Score by confidence (softmax prob or random).
-        3. Commit top-k most confident tokens; rest stay MASK.
-        '''
-        B, L, _ = logits.shape
-        device = logits.device
-        if not mask_block.any(): return x_block
-
-        logits_noisy = self._add_gumbel_noise(logits, self.temperature)
-        x0 = torch.argmax(logits_noisy, dim=-1)  # (B, L)
-
-        if self.remasking == 'low_confidence':
-            p = F.softmax(logits.float(), dim=-1)
-            x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-        elif self.remasking == 'random': x0_p = torch.rand((B, L), device=device)
-        else: raise ValueError(f'Unknown remasking: {self.remasking}')
-
-        # Only masked positions can change
-        x0 = torch.where(mask_block, x0, x_block)
-        neg_inf = torch.full_like(x0_p, -float('inf'))
-        confidence = torch.where(mask_block, x0_p, neg_inf)
-
-        transfer = torch.zeros_like(x0, dtype=torch.bool)
-        for j in range(B):
-            k = int(num_transfer_step[j].item())
-            if k <= 0: continue
-            
-            valid_count = (confidence[j] > -float('inf')).sum().item()
-            if valid_count == 0: continue
-            k = min(k, valid_count)
-            _, sel = torch.topk(confidence[j], k)
-            transfer[j, sel] = True
-
-        x_new = x_block.clone()
-        x_new[transfer] = x0[transfer]
-        return x_new
-
-
-    @torch.no_grad()
-    def generate(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, max_length: int = 100, diffusion_steps: int = 128,
-    ) -> dict[str, torch.Tensor]:
-        '''Vanilla BD3LM block diffusion generation over precomputed encoder conditioning (dLLM BD3LMSampler for A2D).
-
-        Generates text block-by-block with confidence-based remasking:
-          1. For each new block: append block_size MASK tokens.
-          2. Inner diffusion loop: predict, score confidence, commit top-k,
-             re-mask the rest, repeat for steps_per_block iterations.
-          3. Move to next block once current is fully denoised.
-
-        Matches dLLM core/samplers/bd3lm.py BD3LMSampler.sample().
-        '''
-        B = enc_hidden.shape[0]
-        device = enc_hidden.device
-        num_blocks = max(1, max_length // self.block_size)
-        spb = self.steps_per_block or max(1, diffusion_steps // num_blocks)
-
-        # Start with BOS + (block_size-1) MASK tokens
-        x = torch.full((B, self.block_size), self.mask_token_id, dtype=torch.long, device=device)
-        x[:, 0] = self.bos_index
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for b_idx in range(num_blocks):
-            if finished.all(): break
-
-            # Append new MASK block (except first iteration — already initialized)
-            if b_idx > 0:
-                new_block = torch.full((B, self.block_size), self.mask_token_id, dtype=torch.long, device=device)
-                x = torch.cat([x, new_block], dim=1)
-            cur_len = self.block_size
-
-            # Compute unmasking schedule for this block
-            block_mask = (x[:, -cur_len:] == self.mask_token_id)  # (B, block_size)
-            num_transfer = self._get_num_transfer_tokens(block_mask, spb)
-            effective_steps = num_transfer.shape[1]
-
-            # Inner diffusion loop
-            for i_step in range(effective_steps):
-                x_block = x[:, -cur_len:]
-                mask_block = (x_block == self.mask_token_id)
-                if not mask_block.any(): break
-
-                # Full forward with block-causal mask (no KV cache)
-                logits = self._decode(x, enc_hidden, enc_mask)  # (B, T_total, V+1)
-                logits_block = logits[:, -cur_len:]             # (B, block_size, V+1)
-
-                # Remasking step
-                x_block_new = self._diffusion_step_block(logits_block, x_block, mask_block, num_transfer[:, i_step])
-                x[:, -cur_len:] = x_block_new
-
-            # EOS stopping
-            if self.eos_index is not None:
-                eos_in_block = (x[:, -cur_len:] == self.eos_index).any(dim=1)
-                finished = finished | eos_in_block
-        return {'sequences': x}

@@ -2,8 +2,8 @@
 #
 # `extends: dlm.yaml` so the ~15 shared scalars (seed, language, language_model, checkpoint.*, wandb.*, visual_padding,
 # freeze_*, bio_* head shape, max_text_tokens, ...) live in 1 place and never drift. This file keeps only what makes it
-# the baseline: AR decoder, the gate/CB turned off, and its own output dir. The inherited streaming blocks (oput / dcd /
-# spd / mode_ratios / jitter / augmentation) are inert on the eval-only AR path — same tolerated pattern as bio_pretrain.yaml.
+# the baseline: AR decoder, the gate/CB turned off, and its own output dir. The inherited streaming blocks (oput / spd / 
+# mode_ratios / jitter / augmentation) are inert on the eval-only AR path — same tolerated pattern as bio_pretrain.yaml.
 extends: dlm.yaml
 
 decoder: ar

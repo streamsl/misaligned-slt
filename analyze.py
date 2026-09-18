@@ -360,7 +360,9 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
 
 
 def tune_decode(args: argparse.Namespace) -> dict:
-    # Fit durations on train; select 2 score weights on dev from 1 forward per video.
+    # Fit durations on train; select 2 score weights on dev from 1 forward per video, under SAME statistic the paper reports: F1 averaged over 
+    # `eval.yaml rq2.tiou_thresholds`. Selecting on tIoU 0.5 alone rewarded a prior that completes spans at the cost of their edges, which is 
+    # the part 0.7 and 0.9 measure.
     if args.split != "dev": raise ValueError("tune-decode selects on dev only")
     data_cfg = load_yaml(args.data_config)
     records, _ = load_language_records(data_cfg, args.language, split="dev")
@@ -380,6 +382,7 @@ def tune_decode(args: argparse.Namespace) -> dict:
         raise ValueError("Select duration conditioning on S1 before joint training; only commit lag is re-selected after joint training")
     
     model.eval().to(device)
+    thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     grid = [replace(prior, completion_bias=float(b), boundary_logit_weight=w) for b in range(7) for w in (.5, 1., 1.5, 2.)]
     scores = [[], []]
     plain, legal = [], []
@@ -395,7 +398,9 @@ def tune_decode(args: argparse.Namespace) -> dict:
             n = torch.tensor([logits.shape[1]])
             # Reuse the exact same max-product routine for all candidates; no separate grid decoder.
             tags = DurationDecoder(grid).decode(logits.expand(len(grid), -1, -1), n.expand(len(grid)), timestamps_s=ts.expand(len(grid), -1))
-            score = lambda t: moryossef_segment_metrics(logits, gold, pred_tags=t, tiou_threshold=.5)["phrase_tiou_f1"]
+            score = lambda t: float(np.mean([
+                moryossef_segment_metrics(logits, gold, pred_tags=t, tiou_threshold=th)["phrase_tiou_f1"] for th in thresholds
+            ]))
             scores[index % 2].append([score(t[None]) for t in tags])
             plain.append(score(logits.argmax(-1)))
             legal.append(score(DurationDecoder().decode(logits, n)))
@@ -409,8 +414,9 @@ def tune_decode(args: argparse.Namespace) -> dict:
     payload = {
         "language": args.language, "split": "dev", "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint, 
         "videos": sum(map(len, scores)), "segmentation_decode": "semi_markov_viterbi", "fit_split": "train", "selected": selected.to_dict(),
-        "heldout_f1@0.5": float(np.mean(heldout)), "plain_f1@0.5": float(np.mean(plain)), "legal_f1@0.5": float(np.mean(legal)),
-        "grid": [{**m.to_dict(), "foldA_f1@0.5": float(folds[0][i]), "foldB_f1@0.5": float(folds[1][i])} for i,m in enumerate(grid)]
+        "tiou_thresholds": list(thresholds), "heldout_f1_avg": float(np.mean(heldout)), 
+        "plain_f1_avg": float(np.mean(plain)), "legal_f1_avg": float(np.mean(legal)),
+        "grid": [{**m.to_dict(), "foldA_f1_avg": float(folds[0][i]), "foldB_f1_avg": float(folds[1][i])} for i,m in enumerate(grid)]
     }
     output = Path(args.output or f"outputs/tune_decode_{args.segmenter_arch}_{args.language}_dev.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -424,7 +430,8 @@ def tune_decode(args: argparse.Namespace) -> dict:
 
 
 def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --write-config.
-    # Select commit lag on dev under duration-aware BIO decoding; ties prefer lower lag.
+    # Select commit lag on dev under duration-aware BIO decoding, under SAME statistic the paper reports (F1 averaged over `eval.yaml 
+    # rq2.tiou_thresholds`, as tune_decode does); ties prefer lower lag.
     if args.split != "dev": raise SystemExit("tune-stream selects on dev only")
     if args.segmenter_arch != "s1": raise SystemExit("tune-stream selects lag for the in-system head (--segmenter-arch s1)")
     data_cfg = load_yaml(args.data_config)
@@ -450,6 +457,7 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
         min_span_frames=(inference_cfg.get("span_selection", {}) or {}).get("min_span_frames"),
         forced_tail_policy=str(inference_cfg.get("forced_tail_policy", "skip")), gate_enabled=False, translate=False,
     )
+    thresholds = [float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5])]
     grid_lag = [float(l) for l in args.grid_lag] if args.grid_lag else [0., 1., 2., 3., 4.]
     if not grid_lag or any(not math.isfinite(l) or l < 0 for l in grid_lag):
         raise ValueError("Commit lag candidates must be finite and nonnegative")
@@ -458,57 +466,56 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
     gold = _gold_events(records)
     ids = sorted(gold)
     folds = (set(ids[::2]), set(ids[1::2]))
-    poses_cache: dict[str, tuple[np.ndarray, float]] = {}
     rows, best = [], None
+    # VIDEO outer, lag inner: each video's raw frames are read once, run at every lag, then released. Caching them across the lag 
+    # grid instead holds whole split's frames at once — ase dev is about 7 GiB of raw poses, and that is ANON memory, the kind an 
+    # OOM killer acts on. Events are spans; keeping every lag's is free.
+    by_lag: dict[float, dict[str, list[PredictionEvent]]] = {float(lag): {} for lag in grid_lag}
+    for rec in tqdm(records, desc="[tune-stream] videos x lag grid"):
+        poses, _ = load_pose_window(rec.pose, 0.0, rec.pose.duration_s, normalize=False)
+        frames = torch.as_tensor(poses, dtype=torch.float32) if poses.shape[0] else None
+
+        for lag in grid_lag:
+            if frames is None: by_lag[float(lag)][rec.video_id] = []; continue
+            runner.commit_lag_s = float(lag)  # `run` resets every per-stream state, so 1 runner serves the grid
+            by_lag[float(lag)][rec.video_id] = [PredictionEvent(
+                video_id=rec.video_id, start_s=float(e.start_s), end_s=float(e.end_s), text="",
+                flagged_partial=bool(e.flagged_partial), commit_time_s=float(e.commit_time_s)
+            ) for e in runner.run(frames, fps=float(rec.pose.fps))]
+        del poses, frames
 
     for lag in grid_lag:
-        runner.commit_lag_s = float(lag)
-        events: dict[str, list[PredictionEvent]] = {}
-
-        for rec in tqdm(records, desc=f"[tune-stream] lag={lag:g}"):
-            if rec.video_id not in poses_cache:
-                poses, _ = load_pose_window(rec.pose, 0.0, rec.pose.duration_s, normalize=False)
-                poses_cache[rec.video_id] = (poses, float(rec.pose.fps))
-
-            poses, fps = poses_cache[rec.video_id]
-            if poses.shape[0] == 0: events[rec.video_id] = []; continue
-            evs = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=fps)
-            events[rec.video_id] = [PredictionEvent(
-                video_id=rec.video_id, start_s=float(e.start_s), end_s=float(e.end_s), text="", 
-                flagged_partial=bool(e.flagged_partial), commit_time_s=float(e.commit_time_s)
-            ) for e in evs]
-
-        events = scoreable_predictions(events, records, tag=f"tune-stream lag={lag:g}")
+        events = scoreable_predictions(by_lag[float(lag)], records, tag=f"tune-stream lag={lag:g}")
         f1, lat = [], []
         for fold in folds:
             sub_p = {v: events.get(v, []) for v in fold}; sub_g = {v: gold[v] for v in fold}
-            row = evaluate_predicted_events(sub_p, sub_g, [0.5])["thresholds"][0]
-            f1.append(float(row["segmentation"]["f1"]))
-            lat.append(float((row.get("emission_latency") or {}).get("median_latency_s", float("nan"))))
+            per_threshold = evaluate_predicted_events(sub_p, sub_g, thresholds)["thresholds"]
+            f1.append(float(np.mean([float(row["segmentation"]["f1"]) for row in per_threshold])))
+            lat.append(float((per_threshold[0].get("emission_latency") or {}).get("median_latency_s", float("nan"))))
 
         n_events = sum(len(v) for v in events.values())
         rows.append({
-            "commit_lag_s": lag, "foldA_f1@0.5": round(f1[0], 4), "foldB_f1@0.5": round(f1[1], 4), 
+            "commit_lag_s": lag, "foldA_f1_avg": round(f1[0], 4), "foldB_f1_avg": round(f1[1], 4), 
             "median_latency_s": round(float(np.nanmean(lat)), 3), "events": n_events, "gold": sum(len(v) for v in gold.values())
         })
         key = (min(f1), sum(f1) / 2, -float(lag))
         if best is None or key > best[0]: best = (key, rows[-1])
-        print(f"[tune-stream] lag={lag:g}: F1@0.5 {f1[0]:.3f}/{f1[1]:.3f} events {n_events} vs "
+        print(f"[tune-stream] lag={lag:g}: F1 avg {f1[0]:.3f}/{f1[1]:.3f} events {n_events} vs "
               f"gold {rows[-1]['gold']} latency {rows[-1]['median_latency_s']:.2f} s", flush=True)
 
     selected = dict(best[1])
     heldout = []
     for sel_i, eval_i in ((0, 1), (1, 0)):
-        by_sel = max(rows, key=lambda r: (r[f"fold{'AB'[sel_i]}_f1@0.5"], -r["commit_lag_s"]))
-        heldout.append(by_sel[f"fold{'AB'[eval_i]}_f1@0.5"])
+        by_sel = max(rows, key=lambda r: (r[f"fold{'AB'[sel_i]}_f1_avg"], -r["commit_lag_s"]))
+        heldout.append(by_sel[f"fold{'AB'[eval_i]}_f1_avg"])
 
     heldout_f1 = round(sum(heldout) / 2, 4)
     payload = {
-        "language": args.language, "split": args.split, "segmenter_arch": "s1", "checkpoint": checkpoint, 
-        "videos": len(records), "segmentation_decode": "semi_markov_viterbi", "duration_model": adapter.duration_model.to_dict(),
-        "pose_normalization": "buffer", "delta_enc_frames": int(boundary.get("delta_enc_frames", 0)),
-        "min_span_frames": lambda_min_frames(inference_cfg), "selected": selected, "heldout_f1@0.5": heldout_f1, 
-        "grid": rows, "pin_as": {"boundary_stability": {"commit_lag_s": {args.language: selected["commit_lag_s"]}}}
+        "language": args.language, "split": args.split, "segmenter_arch": "s1", "checkpoint": checkpoint, "videos": len(records), 
+        "segmentation_decode": "semi_markov_viterbi", "duration_model": adapter.duration_model.to_dict(), "pose_normalization": "buffer", 
+        "delta_enc_frames": int(boundary.get("delta_enc_frames", 0)), "min_span_frames": lambda_min_frames(inference_cfg), 
+        "selected": selected, "tiou_thresholds": thresholds, "heldout_f1_avg": heldout_f1, "grid": rows, 
+        "pin_as": {"boundary_stability": {"commit_lag_s": {args.language: selected["commit_lag_s"]}}}
     }
     output = Path(args.output or f"outputs/tune_stream_s1_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -517,7 +524,7 @@ def tune_stream(args: argparse.Namespace) -> dict: # Never applied without --wri
         if update_yaml_scalar(args.inference_config, ("boundary_stability", "commit_lag_s", args.language), selected["commit_lag_s"]):
             payload["config_updated"] = args.inference_config
         else: raise ValueError("Could not write the selected commit lag")
-    print(f"[tune-stream] selected lag={selected['commit_lag_s']} s; held-out F1@0.5={heldout_f1}", flush=True)
+    print(f"[tune-stream] selected lag={selected['commit_lag_s']}s; held-out F1 avg={heldout_f1}", flush=True)
     out = dict(payload); out.pop("grid"); out["output"] = str(output)
     return out
 
@@ -629,7 +636,6 @@ def delta_enc(args: argparse.Namespace) -> dict:
     duration = DurationModel.from_config(inference_cfg, args.language)
     print(f"[delta-enc] terminator decode: duration BIO; Lambda_min={min_span} frames", flush=True)
 
-    fps_hint = float(np.median([r.pose.fps for r in records])) if records else 24.0
     sentences = [(rec, span) for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
     if args.num_sentences and int(args.num_sentences) < len(sentences):
         # delta is a p90 over sentences, so a seeded random subset estimates it; first N would be first videos only.

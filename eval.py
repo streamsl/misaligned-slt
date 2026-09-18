@@ -26,11 +26,11 @@ from models.bio_head import chunk_normalized_logits
 from infer.duration_decode import DurationModel, DurationDecoder
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
-from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
+from models.checkpointing import _load_state, s1_layout_state, load_checkpoint_meta, load_model_checkpoint
 
-from moryossef26.infer import evaluate_segmenter_whole_video
+from moryossef26.infer import evaluate_moryossef_whole_video
 from infer.stream import MoryossefRunnerAdapter, S1RunnerAdapter, StreamingSLTRunner
-from infer.stability import TAU_GRID, group_tracks, build_policies, score_policy
+from infer.stability import TAU_GRID, accumulate_policy, group_tracks, build_policies, merged_policy, score_policy
 from metrics import (
     Segment, densevid_text_metrics, match_segments, temporal_iou, 
     moryossef_segment_metrics, segmentation_prf, compute_text_metrics, char_level_for_target
@@ -223,10 +223,10 @@ def controlled_windows(
     tail_grid: list[float] | None = None, drop_counts: dict[tuple[float, float], int] | None = None,
 ) -> list[ControlledWindow]:
     """RQ1 signed-offset boundaries: start = gt_start + delta_head, end = gt_end + delta_tail. The loaded input
-    includes one frame after the requested end so a zero-offset target contains its terminator.
+    includes 1 frame after the requested end so a zero-offset target contains its terminator.
 
     `relative=True` (default): grid values are FRACTIONS of sentence duration — absolute seconds mix regimes (0.3s
-    destroys a 1s sentence, not a 10s one) at one x-point.
+    destroys a 1s sentence, not a 10s one) at 1 x-point.
 
     `tail_grid` (default `grid`) decouples the axes: extension (head < 0 / tail > 0) needs a continuous timeline
     and clamps on pre-trimmed clips; truncation (head ≥ 0, tail ≤ 0) does not.
@@ -256,8 +256,7 @@ def controlled_windows(
                         continue
                     windows.append(ControlledWindow(
                         video_id=record.video_id, reference=span.text,
-                        gt_start_s=float(span.start_s), gt_end_s=float(span.end_s),
-                        window_start_s=start_s, window_end_s=end_s,
+                        gt_start_s=float(span.start_s), gt_end_s=float(span.end_s), window_start_s=start_s, window_end_s=end_s,
                         # REALIZED offsets, not requested dh/dt: the request overstates severity where pre-trimmed
                         # data clamps. grid_head/grid_tail keep the request, for grouping.
                         delta_head_s=start_s - float(span.start_s), delta_tail_s=boundary_end_s - float(span.end_s),
@@ -381,11 +380,7 @@ def _parse_grid(value: str | None, fallback: list[float]) -> list[float]:
     if not value: return [float(x) for x in fallback]
     return [float(x.strip()) for x in value.split(",") if x.strip()]
 
-METHOD_CONFIGS = { # method -> default config; shared with visualize.
-    "baseline": "configs/baseline_eval.yaml",
-    "ar": "configs/ar.yaml",
-    "dlm": "configs/dlm.yaml",
-}
+METHOD_CONFIGS = {"baseline": "configs/baseline_eval.yaml", "ar": "configs/ar.yaml", "dlm": "configs/dlm.yaml"}
 def _method_config_path(args: argparse.Namespace) -> str:
     return str(args.method_config) if args.method_config else METHOD_CONFIGS[args.method]
 
@@ -396,6 +391,10 @@ def _apply_stamped_geometry(inference_cfg: dict, checkpoint: str | Path | None) 
     """Deploy a trained arm under the gate geometry it TRAINED with (train/slt._training_meta: delta, Lambda_min, buffer capacity). 
     A later delta-enc / tune-stream rewrite of inference.yaml must not silently change how a finished arm is gated."""
     meta = load_checkpoint_meta(checkpoint) if checkpoint and Path(str(checkpoint)).exists() else {}
+    if meta and meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
+        f"{checkpoint} stamps annotation_protocol={meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}, so its "
+        f"gate geometry (delta / minimum span / capacity) predates the current labels and calibration chain. Retrain that arm."
+    )
     gate = (meta or {}).get("gate") or {}
     out, notes = dict(inference_cfg), []
     if meta.get("buffer_cap_s") is not None:
@@ -440,6 +439,8 @@ def _build_eval_model(method: str, checkpoint: str | None, language: str, data_c
         meta = load_checkpoint_meta(ckpt)
         expected = {"architecture": "shared_temporal_slt", "decoder": method,
                     "language": language, "segmentation_decode": "semi_markov_viterbi"}
+        # The block-causal mask is a training choice: a DLM decoded at another block runs under a mask it never saw.
+        if method == "dlm" and "block_size" in meta: expected["block_size"] = int(method_cfg.get("block_size", 16))
         for key, value in expected.items():
             if meta.get(key) != value: raise ValueError(f"{ckpt}: expected {key}={value!r}, found {meta.get(key)!r}")
         duration = DurationModel(**meta["duration_model"])
@@ -477,9 +478,6 @@ def _build_eval_model(method: str, checkpoint: str | None, language: str, data_c
     else:
         tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
-    # EVERY head knob from config, exactly as train/slt.py builds it. Passing only bio_hidden_dim left the other
-    # four at code defaults, so any config change silently gives eval a different architecture than training —
-    # and the strict=False load below would absorb the mismatch as "missing keys" without a word.
     model = MisalignedSLTModel(
         front_end=front_end, decoder="ar" if method == "ar" else "dlm",
         bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
@@ -487,7 +485,7 @@ def _build_eval_model(method: str, checkpoint: str | None, language: str, data_c
         bio_nhead=int(method_cfg.get("bio_nhead", 8)),
         bio_dropout=float(method_cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(method_cfg.get("bio_conv_stem_layers", 2)),
-        block_size=int(method_cfg.get("block_size", 8)),
+        block_size=int(method_cfg.get("block_size", 16)),
     )
     load_model_checkpoint(model, ckpt, strict=True)
     model.duration_model = duration
@@ -504,34 +502,27 @@ def _prep_window(
     return poses, timestamps, frame_mask_for(poses.shape[0], visual_padding)
 
 
+def _decode_provenance(method: str, inference_cfg: dict, method_cfg: dict) -> dict:
+    # The DLM's decode dial as run, so two sweeps at different thresholds never write indistinguishable payloads.
+    if method != "dlm": return {}
+    spd_cfg = method_cfg.get("spd", {})
+    return {"tau_dec": float(inference_cfg.get("translation", {}).get("tau_dec", spd_cfg.get("tau_dec", 0.5))),
+            "spd_top_k": int(spd_cfg.get("top_k", 1)), "spd_renormalize": bool(spd_cfg.get("renormalize", True))}
+
+
 def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int) -> dict:
-    # Main AR rows are greedy; only DLM uses SPD/DCD params.
+    # Main AR rows are greedy; only DLM uses the block-decode params.
     if method == "baseline":
         num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
         return {"max_text_tokens": max_tokens, "num_beams": num_beams}
 
     trans_cfg = inference_cfg.get("translation", {})
-    # PER-KEY merge, not whole-block fallback: method config supplies the trained defaults, inference.yaml
-    # overrides per key at deployment. Block-level fallback shadowed dlm.yaml's entire dcd block the moment
-    # inference.yaml defined one — setting dcd.temperature in dlm.yaml then silently did nothing at eval.
-    dcd_cfg = {**method_cfg.get("dcd", {}), **trans_cfg.get("dcd", {})}
     spd_cfg = method_cfg.get("spd", {})
     return {
         "max_text_tokens": max_tokens, "num_beams": 1,
-        "diffusion_steps": int(trans_cfg.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-        "tau_dec": float(dcd_cfg.get("tau_dec", 0.9)),  # DCD default; commit_confidence_tau is FSM gate's knob, not a decode threshold
-        "spd_top_k": int(spd_cfg.get("top_k", 1)),
-        "spd_renormalize": bool(spd_cfg.get("renormalize", True)),
-        "spd_revision": bool(spd_cfg.get("revision", True)),
-        "temperature": float(dcd_cfg.get("temperature", 0.0)),
-        "dcd_window_length": int(dcd_cfg.get("initial_window_length", method_cfg.get("block_size", 8))),
-        "dcd_max_window_length": int(dcd_cfg.get("max_window_length", 64)),
-        "dcd_window_type": str(dcd_cfg.get("window_type", "sliding")),
-        "dcd_decode_algo": str(dcd_cfg.get("decode_algo", "threshold")),
-        "dcd_decode_param": dcd_cfg.get("decode_param", 0.9),
-        "dcd_sample_top_k": None if dcd_cfg.get("top_k") is None else int(dcd_cfg.get("top_k")),
-        "dcd_top_p": None if dcd_cfg.get("top_p") is None else float(dcd_cfg.get("top_p")),
-        "dcd_cache_type": str(dcd_cfg.get("cache_type", "none")),
+        # inference.yaml overrides the trained default; commit_confidence_tau is FSM gate's knob, not a decode threshold.
+        "tau_dec": float(trans_cfg.get("tau_dec", spd_cfg.get("tau_dec", 0.5))),
+        "spd_top_k": int(spd_cfg.get("top_k", 1)), "spd_renormalize": bool(spd_cfg.get("renormalize", True)),
         # Membership gate at RQ1: same Ω the decoder trained with (on-policy span, no GT/χ). BOTH arms gated — 
         # DLM injects Ω in its manual decode, AR via HF cross-attention hooks (front_end.ar_generate).
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
@@ -571,8 +562,8 @@ def _translate_windows(
     timestamps = torch.stack([torch.nn.functional.pad(ts, (0, max_t - int(ts.shape[0]))) for _, ts, _ in prepped]).to(device)
     frame_mask = torch.stack([torch.nn.functional.pad(m, (0, max_t - int(m.shape[0]))) for _, _, m in prepped]).to(device)
 
-    # inference.yaml overrides the method default — the same per-key precedence as the dcd block and the RQ2 runner.
-    max_tokens = int(inference_cfg.get("translation", {}).get("max_text_tokens", method_cfg.get("max_text_tokens", 128)))
+    # inference.yaml overrides the method default — the same precedence as tau_dec and the RQ2 runner.
+    max_tokens = int(inference_cfg.get("translation", {}).get("max_text_tokens", method_cfg.get("max_text_tokens", 320)))
     gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
     # Whether frame 0 is a genuine sentence ONSET is a property of how the caller cut this window, not a constant:
     # a window that starts BEFORE the sentence opens inside the predecessor, and minting a B there would anchor Ω
@@ -630,6 +621,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     if relative: default_key = "smoke_grid_rel" if args.smoke else "severity_grid_rel"
     else: default_key = "smoke_grid_s" if args.smoke else "severity_grid_s"
     grid = _parse_grid(args.severity_grid_s, rq_cfg.get(default_key, [0.0]))
+    
     # Per-axis grids, falling back to the shared one (controlled_windows: which signs a corpus supports).
     head_grid = _parse_grid(args.severity_grid_head, grid)
     tail_grid = _parse_grid(args.severity_grid_tail, grid)
@@ -645,31 +637,45 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
     model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     
-    # Length-sorted batches keep padding minimal.
-    materialized: list[tuple[ControlledWindow, np.ndarray, np.ndarray]] = []
-    for window in windows:
-        record = records_by_id[window.video_id]
-        poses, timestamps = load_pose_window(record.pose, window.window_start_s, window.window_end_s, normalize=True)
-        if poses.shape[0] == 0: continue
-        materialized.append((window, poses, timestamps))
-
     batch_size = max(1, int(rq_cfg.get("batch_size", 16)))
     grouped: dict[tuple[float, float], dict[str, list]] = {}
     rows = []
 
+    # Length-sorted batches keep padding minimal, but the sort key is PREDICTED from window's own floor/ceil framing (train/sampler.spec_frames) 
+    # rather than from a loaded array: severity grid emits 1 window/sentence per grid point, so materialising all of them before 1st translation 
+    # holds the whole split's poses in ANONYMOUS memory (measured 13.1 GiB on asf/dev at the 9x9 grid, 18.5 GiB on bfi/dev) and ase is an order 
+    # of magnitude larger again. Loading inside the batch loop caps it at 1 batch. Same loop inversion analyze.py's tune-stream already carries, 
+    # and no extra I/O: every window is still read exactly once.
+    def _predicted_frames(w: ControlledWindow) -> int:
+        pose = records_by_id[w.video_id].pose
+        fps = float(pose.fps)
+        start_f = int(np.floor(max(0.0, w.window_start_s) * fps))
+        end_f = int(np.ceil(min(w.window_end_s, pose.duration_s) * fps))
+        return max(1, end_f - start_f + 1)
+
+    ordered = sorted(windows, key=_predicted_frames)
+    chunks = [ordered[s:s + batch_size] for s in range(0, len(ordered), batch_size)]
     # GT constructs and scores the controlled windows; the decoder receives no reference-derived frontier or onset flag.
-    materialized.sort(key=lambda wp: int(wp[1].shape[0]))
-    chunks = [materialized[s:s + batch_size] for s in range(0, len(materialized), batch_size)]
-    for chunk in tqdm(chunks, desc="Translating windows"):
+    for spec_chunk in tqdm(chunks, desc="Translating windows"):
+        chunk = []
+        for window in spec_chunk:
+            record = records_by_id[window.video_id]
+            poses, timestamps = load_pose_window(record.pose, window.window_start_s, window.window_end_s, normalize=True)
+            if poses.shape[0] == 0: continue
+            chunk.append((window, poses, timestamps))
+        if not chunk: continue
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
             inference_cfg=inference_cfg, method_cfg=method_cfg,
         )
+        # Sequential decoder passes of the chunk's decode (one decode per chunk). Rows decode together, so at
+        # batch_size > 1 this is the chunk's count; measure latency at rq1.batch_size 1, where it is per window.
+        passes = getattr(model, "last_decode_passes", None)
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
             grouped.setdefault(key, {
-                "predictions": [], "references": [], "confidences": [], "gate_skips": [],
+                "predictions": [], "references": [], "confidences": [], "gate_skips": [], "passes": [],
                 "head_s": [], "tail_s": [], "req_head_s": [], "req_tail_s": [],
             })
             duration = window.gt_end_s - window.gt_start_s
@@ -677,11 +683,16 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             grouped[key]["references"].append(window.reference)
             grouped[key]["confidences"].append(confidence)
             grouped[key]["gate_skips"].append(bool(gate_skip))
+            # A window the deployed FSM would skip is decoded here only to report pessimistic text bound.
+            if passes is not None and not gate_skip: grouped[key]["passes"].append(int(passes)) # its passes aren't a cost the system pays
             grouped[key]["head_s"].append(window.delta_head_s)
             grouped[key]["tail_s"].append(window.delta_tail_s)
             grouped[key]["req_head_s"].append(window.grid_head * duration if relative else window.grid_head)
             grouped[key]["req_tail_s"].append(window.grid_tail * duration if relative else window.grid_tail)
-            rows.append({**asdict(window), "prediction": prediction, "mean_confidence": confidence, "gate_would_skip": bool(gate_skip)})
+            rows.append({
+                **asdict(window), "prediction": prediction, "mean_confidence": confidence, 
+                "gate_would_skip": bool(gate_skip), "decoder_passes": passes
+            })
 
     severity = []
     _char_level = char_level_for_target(target_language(data_cfg, args.language))
@@ -701,6 +712,9 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             # High -> this row averages over a longer-sentence subset.
             "dropped_fraction": float(dropped) / max(1, dropped + len(values["predictions"])),
             "mean_translation_confidence": float(sum(confs) / len(confs)) if confs else 0.0,
+            # DLM's parallelism as run: sequential decoder passes per decode (see the chunk loop). Clean point at batch_size 1 gives BLEU 
+            # against passes per sentence for `tau_dec` sweep; AR arm's count is its generate() length (N cached steps + confidence pass).
+            "mean_decoder_passes": float(sum(values["passes"]) / len(values["passes"])) if values["passes"] else None,
             "text_metrics": compute_text_metrics(values["predictions"], values["references"], char_level=_char_level),
             # GATED methods only (baseline skip rate 0). The FSM SKIPS no-span windows by design; force-decoding
             # them against the inert Ω gives near-empty hallucinations whose brevity penalty tanks the cell's
@@ -727,10 +741,12 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             "provenance": {
                 "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
                              if args.method == "baseline" else 1,
+                **_decode_provenance(args.method, inference_cfg, method_cfg),
                 "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
                 "checkpoint": getattr(args, "checkpoint", None),
                 "segmentation_decode": "none" if args.method == "baseline" else "semi_markov_viterbi",
                 "conditioning_state": "predicted_from_window",
+                "batch_size": batch_size,  # the unit of mean_decoder_passes: per window at 1, per chunk above
             },
             "windows": len(rows), "severity": severity, "rows": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -740,7 +756,6 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
 
 def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, translate: bool = True, cascade_model=None):
     trans = inference_cfg.get("translation", {})
-    dcd = {**method_cfg.get("dcd", {}), **trans.get("dcd", {})}  # same per-key merge as _generation_kwargs
     spd = method_cfg.get("spd", {})
     boundary = inference_cfg.get("boundary_stability", {})
 
@@ -755,25 +770,9 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, transl
         # Ω from the method config's membership_gate; χ from the runner's commit log.
         gate_enabled=bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
         gate_eps=float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
-        max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 128))),
-        diffusion_steps=int(trans.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
-        tau_dec=float(dcd.get("tau_dec", 0.9)),
-        spd_top_k=int(spd.get("top_k", 1)),
-        spd_renormalize=bool(spd.get("renormalize", True)),
-        spd_revision=bool(spd.get("revision", True)),
-        temperature=float(dcd.get("temperature", 0.0)),
-        # block_size is a MODEL property -> METHOD config (same source as _generation_kwargs). inference.yaml.translation 
-        # has no block_size; a trans fallback would force 8 when initial_window_length is unset.
-        dcd_window_length=int(dcd.get("initial_window_length", method_cfg.get("block_size", 8))),
-        dcd_max_window_length=int(dcd.get("max_window_length", 64)),
-        dcd_window_type=str(dcd.get("window_type", "sliding")),
-        dcd_decode_algo=str(dcd.get("decode_algo", "threshold")),
-        dcd_decode_param=dcd.get("decode_param", 0.9),
-        dcd_cache_type=str(dcd.get("cache_type", "none")),
-        # Same two sampling knobs the RQ1 path reads (_generation_kwargs); omitting them here left the FSM at
-        # None while single-window RQ1 honoured the config — the two rows would decode under different policies.
-        dcd_sample_top_k=None if dcd.get("top_k") is None else int(dcd.get("top_k")),
-        dcd_top_p=None if dcd.get("top_p") is None else float(dcd.get("top_p")),
+        max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 320))),
+        tau_dec=float(trans.get("tau_dec", spd.get("tau_dec", 0.9))),  # same precedence as _generation_kwargs
+        spd_top_k=int(spd.get("top_k", 1)), spd_renormalize=bool(spd.get("renormalize", True)),
         decode_conditioning=str(trans.get("decode_conditioning", "window")),
         translate=bool(translate), cascade_model=cascade_model, commit_lag_s=float(boundary.get("commit_lag_s", 0.0) or 0.0)
     )
@@ -817,6 +816,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             method_cfg = {**method_cfg, "membership_gate": {"enabled": False}}
             cascade_model, tokenizer = _build_eval_model("baseline", args.checkpoint, args.language, data_cfg, method_cfg, device)
             run_streaming.last_translation_checkpoint = args.checkpoint or resolve_pretrained(method_cfg, data_cfg, args.language)
+
         model = (S1RunnerAdapter(model) if segmenter_arch == "s1" else MoryossefRunnerAdapter(model, velocity)).eval().to(device)
         model.duration_model = None if plain else DurationModel.from_config(inference_cfg, args.language, segmenter_arch)
         if model.duration_model is not None and segmenter_arch == "s1": model.duration_model.require_calibration(inference_cfg, args.language)
@@ -834,10 +834,14 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     run_streaming.last_velocity = bool(velocity) if segmenter_arch == "moryossef" else False
     if no_translate: print("[streaming] Segmentation only: translation confidence is not evaluated.", flush=True)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg, translate=not no_translate, cascade_model=cascade_model)
-    print(f"[streaming] commit lag {runner.commit_lag_s:g} s", flush=True)
+    print(f"[streaming] commit lag {runner.commit_lag_s:g}s", flush=True)
     if getattr(args, "stability", False): runner.trace = []
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
-    stability_tracks: list = []
+    # Scored per video and accumulated as (sum, count), not held as Track objects: a Track carries one cloned token
+    # tensor per stride, so keeping the whole split pinned every hypothesis of every video (ase is 11,939 of them).
+    # Every field score_policy returns is an unweighted mean over same track set, so a count-weighted merge is exact.
+    stability_totals: dict[str, dict[str, float]] = {}
+    stability_policies = build_policies()
 
     predicted: dict[str, list[PredictionEvent]] = {}
     fsm_bio_rows: list[dict[str, float]] = []
@@ -848,10 +852,17 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             continue
 
         if runner.trace is not None: runner.trace.clear()
+        # The released contract is isotropic and our poses are stored per-axis, so the external adapter needs THIS
+        # video's width/height (moryossef26.dataset.pose_aspect); it is a per-video constant, unlike release_stats.
+        adapter = getattr(runner, "model", None)
+        if hasattr(adapter, "aspect"):
+            from moryossef26.dataset import pose_aspect
+            adapter.aspect = pose_aspect(record.pose)
+
         events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps))
-        if runner.trace: stability_tracks.extend(
-            group_tracks(runner.trace, delta_s=runner.commit_gate.history.delta_enc_frames / max(1.0, float(record.pose.fps)))
-        )
+        if runner.trace:
+            tracks = group_tracks(runner.trace, delta_s=runner.commit_gate.history.delta_enc_frames / max(1.0, float(record.pose.fps)))
+            for name, policy in stability_policies.items(): accumulate_policy(stability_totals, name, score_policy(tracks, policy))
         predicted[record.video_id] = [PredictionEvent(
             video_id=record.video_id, start_s=float(ev.start_s), end_s=float(ev.end_s),
             text=None if no_translate else tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True).strip(),
@@ -871,19 +882,20 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             fsm_bio_rows.append(moryossef_segment_metrics(logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio"))
 
     # Why-did-it-(not)-commit: low streaming recall with near-perfect frame BIO = the gate suppressed emission;
-    # boundary_ok / translation_ok (of spans_seen, complete spans) say which signal blocks.
+    # boundary_ok (of spans_seen) and translation_ok (of decoded — signal 2 is read only where it can decide) say which signal blocks.
     s = runner.gate_stats
     seen = s.get("spans_seen", 0)
     if seen: print(
-        f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} translation_ok={s.get('translation_ok',0)} "
-        f"committed={s.get('committed',0)} forced={s.get('forced_commit',0)} | translation_ok rate={s.get('translation_ok',0)/seen:.2f} "
+        f"[stream] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} gated_decoded={s.get('gated_decoded',0)} "
+        f"translation_ok={s.get('translation_ok',0)} committed={s.get('committed',0)} forced={s.get('forced_commit',0)} | "
+        f"translation_ok rate={s.get('translation_ok',0)/max(1,s.get('gated_decoded',0)):.2f} of gated decodes "
         f"(if this is low, the commit gate's token-confidence floor is suppressing a weak decoder, not an eval bug)", flush=True
     )
-    if stability_tracks:
+    if stability_totals:
         # Stable-prefix comparison on the SAME decodes the FSM already produced: how much earlier could text appear,
-        # and what does freezing it early cost? commit_only is what ships today (latency ceiling, zero error).
-        rows = {name: score_policy(stability_tracks, pol) for name, pol in build_policies().items()}
-        print(f"[stability] {len(stability_tracks)} tracks | tau grid {TAU_GRID}", flush=True)
+        # and what does freezing it early cost? commit_only is what ships today (latency ceiling, 0 error).
+        rows = {name: merged_policy(totals) for name, totals in stability_totals.items()}
+        print(f"[stability] {max(r['n_tracks'] for r in rows.values())} tracks | tau grid {TAU_GRID}", flush=True)
         # ANCHORS DIFFER, deliberately. RQ2 `emission_latency` = commit_time - GOLD SENTENCE END: when the SCORED translation is complete, 
         # under commit_only, the only policy the FSM actually runs. `latency_s` here is first_reveal - COMMIT: how much earlier a policy would 
         # put text on screen. Latency to first text = emission_latency + latency_s (negative). Keep them separate — quoting a prefix's latency 
@@ -912,7 +924,7 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
     The prior-art FLOOR is an independent (Moryossef) segmenter's spans translated by the CLEAN baseline, so pass `--method baseline`.
     Translation uses `args.method` (NOT pinned), so `--method dlm` here is a DIFFERENT row (Moryossef spans + our DLM, offline) — legitimate,
-    but not the floor. The method is encoded in the output filename so the two never collide; pass the --method for the row you want.
+    but not the floor. The method is encoded in the output filename so the 2 never collide; pass the --method for the row you want.
     """
     data_cfg = load_yaml(args.data_config)
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
@@ -930,7 +942,6 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     run_cascade.last_checkpoint = str(args.checkpoint or (
         resolve_pretrained(method_cfg, data_cfg, args.language) if args.method == "baseline" else checkpoint_dir(method_cfg)
     ))
-
     # Split comes from --split, NOT the JSON filename; mismatched video_ids translate nothing and score all-zero,
     # so fail loud ("gold_*_test.json but forgot --split test").
     matched = set(segments) & set(records_by_id)
@@ -1035,15 +1046,28 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         n_sub_lambda += len(segments) - len(kept)
         segments = kept
 
-        items, bounds, frontiers, anchors = [], [], [], []
+        # Every window is widened to at least buffer_cap_s, so holding 1 per span is (n_spans x cap) frames of normalised poses, not (video) 
+        # frames: 1.6 GB on ase's worst video. Load and translate in batches instead, same inversion run_rq1 and analyze tune-stream already use.
+        bounds, frontiers, anchors, results = [], [], [], []
+        pending: list = []
         delta_lead_s = float(inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3)) / float(record.pose.fps)
+
+        def _drain():
+            if not pending: return
+            batch, done = list(pending), len(results)  # hand over a copy: the batch is released when it returns
+            pending.clear()
+            results.extend(_translate_windows(  # windows are extended by delta_lead_s, so frame 0 precedes the sentence
+                model, tokenizer, args.method, batch, device, inference_cfg, method_cfg, batch_size=int(args.batch_size), 
+                stream_start=False, commit_frontier_s=frontiers[done:], anchor_frames=anchors[done:],
+            ))
+
         for span in segments:
             # Offline context must contain the whole proposal. The streaming cap cannot repair an offline segmentation error.
             w_start = max(0.0, float(span.start_s) - delta_lead_s)
             w_end = min(float(record.pose.duration_s), max(w_start + buffer_cap_s, float(span.end_s) + 1.0 / float(record.pose.fps)))
             span_poses, span_ts = load_pose_window(record.pose, w_start, w_end, normalize=True)
             if span_poses.shape[0] == 0: continue
-            items.append((span_poses, span_ts, w_start))
+            pending.append((span_poses, span_ts, w_start))
             bounds.append((float(span.start_s), float(span.end_s)))
             # χ for this window: the δ lead is the PREDECESSOR's tail — already handled, exactly the FSM's post-commit leftover. Without it, 
             # a back-to-back lead is mid-signing, the merged I-run cannot open a span, and Ω anchors on the NEXT sentence.
@@ -1054,11 +1078,8 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             s_idx = min(int(np.searchsorted(span_ts, float(span.start_s))), n_frames - 1)
             e_idx = int(np.searchsorted(span_ts, float(span.end_s)))
             anchors.append((s_idx, e_idx if e_idx < n_frames else -1))
-            
-        results = _translate_windows( # Offline windows are extended by delta_lead_s before the span, so frame 0 precedes the sentence.
-            model, tokenizer, args.method, items, device, inference_cfg, method_cfg,
-            batch_size=int(args.batch_size), stream_start=False, commit_frontier_s=frontiers, anchor_frames=anchors,
-        )
+            if len(pending) >= int(args.batch_size): _drain()
+        _drain()
         predicted[record.video_id] = _translated_events(record.video_id, [Segment(s0, s1) for s0, s1 in bounds], results)
     if n_sub_lambda: print(f"[offline] dropped {n_sub_lambda} sub-Λ_min span(s) (< {min_span_frames} frames) — "
                            f"parity with the FSM's span selection, which can never commit them.", flush=True)
@@ -1083,7 +1104,6 @@ def rq2_output_stem(when: str, spans: str, decode: str, translator: str, languag
     for field, value in (("when", when), ("spans", spans), ("decode", decode), ("translator", translator)):
         if not value or "_" in str(value): raise ValueError(f"rq2 output {field}={value!r}: one non-empty token, no underscore")
     return f"rq2_{when}_{spans}_{decode}_{translator}_{language}_{split}"
-
 
 def _write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
     out = Path(path)
@@ -1130,6 +1150,9 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         provenance.update(method="baseline", segmenter_arch=online_arch, gate=False, num_beams=1)
         score_cfg = _streaming_geometry(args, score_cfg, method_cfg)
         provenance["min_span_frames"] = lambda_min_frames(score_cfg)
+    # The decode stamp follows the EFFECTIVE translator (an online cascade translates with the clean AR baseline
+    # whatever --method says); a saved-event rescore reads no model geometry, the events carry their own.
+    if not args.predictions: provenance.update(_decode_provenance(provenance["method"], load_yaml(args.inference_config), method_cfg))
     elif not args.predictions:
         score_cfg = _apply_stamped_geometry(score_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
         # Λ_min is this arm's GENERATION floor (the FSM cannot commit a shorter span). Scoring applies no floor, and
@@ -1158,10 +1181,8 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         provenance["commit_conditions"] = ["boundary_stability"] if not provenance["translate"] \
                                                                  else ["boundary_stability", "translation_confidence"]
         provenance["stream_geometry"] = {
-            "buffer_cap_s": score_cfg.get("buffer_cap_s"), 
-            "stride_s": score_cfg.get("stride_s", 1.0),
-            "boundary_stability": score_cfg.get("boundary_stability", {}),
-            "min_span_frames": lambda_min_frames(score_cfg),
+            "buffer_cap_s": score_cfg.get("buffer_cap_s"), "stride_s": score_cfg.get("stride_s", 1.0),
+            "boundary_stability": score_cfg.get("boundary_stability", {}), "min_span_frames": lambda_min_frames(score_cfg),
             "segmentation_decode": run_streaming.last_segmentation_decode,
             "commit_confidence_tau": score_cfg.get("translation", {}).get("commit_confidence_tau", 0.3),
             "forced_tail_policy": score_cfg.get("forced_tail_policy", "skip"),
@@ -1246,11 +1267,16 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
 def _load_segmenter(args):
     """Trained segmenter by --segmenter-arch (shared by eval --segmenter-eval and analyze --stage segmenter-infer).
 
-    moryossef (default): faithful Moryossef segmenter (UNet) — a DIFFERENT input space from FSM head. It supplies calibration and RQ2 cascade 
-    spans. s1 is the in-system BIO head, isolating system design from segmentation competence. rope_chunk_s is SECONDS (s1) or None (moryossef).
+    moryossef (default): faithful Moryossef segmenter (UNet) on THEIR input contract — no preprocessing shared with the FSM head. 
+    It supplies calibration and RQ2 cascade spans. s1 is the in-system BIO head, isolating system design from segmentation competence. 
+    rope_chunk_s is SECONDS (s1) or None (moryossef).
     """
     args.segmenter_arch = args.segmenter_arch or "moryossef"
     device = pick_device(args.device)
+    # The untrained controls exist only for the arm whose input contract is a reconstruction of a RELEASED model's.
+    if getattr(args, "segmenter_init", "finetuned") != "finetuned" and args.segmenter_arch != "moryossef": raise SystemExit(
+        f"--segmenter-init {args.segmenter_init} is moryossef-only; --segmenter-arch {args.segmenter_arch} has no untrained control."
+    )
     if args.segmenter_arch == "s1":
         from train.bio_pretrain import build_bio_s1_model
         cfg = load_yaml(args.bio_config, language=args.language)
@@ -1262,10 +1288,30 @@ def _load_segmenter(args):
         # too (wrapper converts to frames per stream fps). Larger chunks would attend over untrained context.
         buffer_cap_s = float(resolve_inference(load_yaml(args.inference_config), args.language, strict=False).get("buffer_cap_s", 30.0))
         velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s") or buffer_cap_s)
-    else:
-        from moryossef26.trainer import build_segmenter
+    elif getattr(args, "segmenter_init", "finetuned") in ("released", "random"):
+        # 2 untrained controls on same geometry and same input contract the arm trains under (moryossef26.dataset.to_release_coords), so both 
+        # isolate training from representation. `released` scores DGS weights with nothing trained; `random` is the range it has to be read 
+        # against — a released score means nothing on its own, because an untrained network of this shape is not at 0.
+        from moryossef26.trainer import build_moryossef
         cfg = load_yaml(args.moryossef_config, language=args.language)
-        model = build_segmenter(args.moryossef_config)
+        init = args.segmenter_init
+        released = (cfg.get("checkpoint", {}) or {}).get("from_pretrained")
+        if init == "released" and (not released or not Path(released).exists()):
+            raise SystemExit(f"--segmenter-init released needs checkpoint.from_pretrained; {released!r} is missing.")
+        model = build_moryossef(args.moryossef_config, pretrained=init == "released", seed=None if init == "released" else int(args.seed))
+        stats_from = Path(args.checkpoint or Path(checkpoint_dir(cfg, default=f"checkpoints/moryossef/{args.language}")) / "model.pt")
+        model.release_stats = (load_checkpoint_meta(str(stats_from)) or {}).get("release_stats")
+        if model.release_stats is None: raise SystemExit(
+            f"--segmenter-init {init} needs the arm's fitted release_stats, absent from {stats_from}. Train the "
+            f"Moryossef arm first: a control must read the same coordinates as the arm it controls for."
+        )
+        model.eval().to(device)
+        source = f"{released} (released weights, no fine-tune)" if init == "released" else f"random init (seed {args.seed})"
+        return model, device, bool(cfg.get("velocity", True)), None, f"{source}; release_stats from {stats_from}"
+    else:
+        from moryossef26.trainer import build_moryossef
+        cfg = load_yaml(args.moryossef_config, language=args.language)
+        model = build_moryossef(args.moryossef_config)
         ckpt_default = f"checkpoints/moryossef/{args.language}"
         velocity, rope_chunk_s = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
 
@@ -1279,7 +1325,6 @@ def _load_segmenter(args):
     if args.segmenter_arch == "s1":
         # A stage-2 checkpoint (the deployed arm) is accepted for the S1 arch: its pose encoder + head are re-keyed to the
         # S1 layout (models.checkpointing.s1_layout_state), so FSM constants can be re-selected on the head the FSM runs.
-        from models.checkpointing import _load_state, s1_layout_state
         model.load_state_dict(s1_layout_state(_load_state(checkpoint)), strict=True)
     else: load_model_checkpoint(model, checkpoint, strict=True)
     print(f"segmenter | {args.segmenter_arch} weights from {checkpoint}" + (f" (pool {pool_key(cfg)})" if pool_key(cfg) else ""), flush=True)
@@ -1294,12 +1339,19 @@ def _load_segmenter(args):
         f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --checkpoint "
         f"at the matching model, or align `pretrain_languages` (a pooled checkpoint is a DIFFERENT model from a monolingual one)."
     )
+    if args.segmenter_arch == "moryossef":
+        model.release_stats = _meta.get("release_stats")
+        if model.release_stats is None: print(
+            "segmenter | WARNING: no release_stats in the checkpoint; falling back to per-clip moments, which do "
+            "NOT reproduce the training coordinates. Retrain to stamp the table.", flush=True
+        )
     if args.segmenter_arch == "s1": # S1 stamps rope_eval_chunk_s; an arm stamps the cap it trained under (its head's context) as buffer_cap_s.
         trained_chunk = _meta.get("rope_eval_chunk_s") or _meta.get("buffer_cap_s")
         if trained_chunk:
             if abs(float(trained_chunk) - float(rope_chunk_s)) > 1e-6: print(
                 f"segmenter | rope_eval_chunk_s {float(trained_chunk):.2f}s from the checkpoint (config/buffer_cap_s "
-                f"says {float(rope_chunk_s):.2f}s); using the trained value.", flush=True)
+                f"says {float(rope_chunk_s):.2f}s); using the trained value.", flush=True
+            )
             rope_chunk_s = float(trained_chunk)
     return model, device, velocity, rope_chunk_s, checkpoint
 
@@ -1320,7 +1372,7 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={decode})", flush=True)
 
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
-    metrics, segments_by_video = evaluate_segmenter_whole_video(
+    metrics, segments_by_video = evaluate_moryossef_whole_video(
         model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, 
         tiou_thresholds=thresholds, return_segments=True, duration=duration
     )
@@ -1348,9 +1400,16 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": checkpoint, "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), 
         "frame_metrics_decode": "raw_argmax", "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax", 
         "decode": decode, "duration_model": duration.to_dict() if duration else None, "tiou_thresholds": list(thresholds), 
-        "metrics": metrics, "rq2_protocol": rq2_protocol
+        "metrics": metrics, "rq2_protocol": rq2_protocol, "segmenter_init": getattr(args, "segmenter_init", "finetuned"),
     }
-    output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
+    if payload["segmenter_init"] != "finetuned": payload["seed"] = int(args.seed)
+    init = "" if payload["segmenter_init"] == "finetuned" \
+              else f"_{payload['segmenter_init']}{args.seed if payload['segmenter_init'] == 'random' else ''}"
+    output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}{init}_{args.language}_{args.split}.json")
+    if init and init not in output.name: raise SystemExit(
+        f"--segmenter-init {payload['segmenter_init']} must not overwrite a fine-tuned artifact: {output.name} "
+        f"carries no '{init}' token. Drop --output, or put the token in the name."
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     payload["output"] = str(output)
@@ -1393,6 +1452,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "omit for a joint AR/DLM head")
     parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
     parser.add_argument("--bio-config", default="configs/bio_pretrain.yaml", help="S1 (in-system head) config for --segmenter-arch s1")
+    parser.add_argument("--segmenter-init", default="finetuned", choices=["finetuned", "released", "random"],
+                        help="moryossef only: 'released' evaluates the untrained released weights under their own input contract "
+                             "(moryossef26/dataset.py), 'random' same architecture untrained at --seed. Diagnostics read as a PAIR, "
+                             " not a baseline: quote released against the spread of several random seeds.")
+    parser.add_argument("--seed", type=int, default=42, 
+                        help="--segmenter-init random only: init seed, stamped in the payload and artifact name (run several to get the range)")
     parser.add_argument("--num-sentences", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16, help="windows per translate/forward batch in loop-decode paths")
     parser.add_argument("--smoke", action="store_true")

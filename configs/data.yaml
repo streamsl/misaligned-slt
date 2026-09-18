@@ -65,6 +65,21 @@ splits:
     fallback_dev: 0.1
     # test split is the remainder (1 - train - dev), computed by build_splits.
 
+poses:
+    # 1 rule for every split and language. Exclude when 2+ bodies are detected in more than configured frame 
+    # share AND the extra slots' shoulder-normalized arm variation exceeds the motion threshold. Missing shape 
+    # measurements use count rule alone. Low variation exempts many pictures of people. This is a detector-based 
+    # filter: noise and changing detection slots can also raise the score. Sequential signers are allowed. No 
+    # video or channel exceptions. Motion is in shoulder widths, not a fraction capped at 1.
+    max_multi_person_ratio: 0.5 # 1.0 disables this rule
+    min_extra_person_motion: 0.7
+    # Exclude videos with too many frames where no body is detected. Detection failure does not prove that
+    # signing is absent. This threshold is applied to train, dev and test.
+    max_undetected_ratio: 0.35
+    # Exclude when fewer than this share of grouped caption intervals fits inside the supplied pose timeline
+    # (1s end tolerance). This doesn't infer the cause, clip offset, or caption source. 0.0 disables it.
+    min_unit_coverage: 0.5
+    
 subtitles:
     # Caption resolution per video: pick the best usable .vtt in <root>/subs/ (suffix priority below). subs/ is
     # delivered COMPLETE at prep time by `prepare_data.py --stage subs` (curated SignVerse English, provenance in
@@ -81,14 +96,12 @@ subtitles:
         min_words: 4      # shorter captions are sign-vocabulary labels that match unrelated videos
         min_captions: 10  # below this the cover fraction is quantized to 1/n and unreliable
         cover: 0.5        # flag a pair sharing more than this fraction of the smaller video's identifying captions
-    # Drop video only when BOTH hold: its cues SCROLL (more than half start before the previous ends, so a cue boundary 
-    # is a display event, not an utterance), and under this share of its UNIT boundaries is marked. A boundary is marked 
-    # by terminal punctuation OR by a POSITIONAL capital — a word the train fold lexicon records as ordinarily lowercase, 
-    # so "NDIS" or "Auslan" mid-sentence is not mistaken for a sentence start. Either condition alone removes real data: 
-    # unpunctuated prose still marks clause boundaries (28h of ase news), and a scrolling track that punctuates still 
-    # says where its utterances end. The intersection has no boundary evidence at all: 0 (asf), 3 (ase), 1 (bfi) videos. 
-    # Measured AFTER grouping, because that is where gold boundaries live. Applied to EVERY split.
-    min_marked_boundary_ratio: 0.10
+    # SCROLLING caption tracks (YouTube's rolling two-line auto-captions: more than half the cues start before previous 
+    # one ends). Every cue time on such a track is a DISPLAY event: a line leaves the screen when line 2 later arrives, 
+    # so its end runs a median 1.9-2.6 s (p90 3.0-3.9 s) past the next cue's start — 5-10x delta_enc — and clamping the 
+    # overlap would only move the next unit's start late by the same amount. Punctuation fixes the grouping of such cues, 
+    # so the track is dropped whole rather than repaired: 0 asf, 4 ase, 1 bfi videos.
+    drop_scrolling_tracks: true
     human_only_splits: [test]
     human_only_exclude_sources: [mt]
     preferred_suffixes:

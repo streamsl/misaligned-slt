@@ -12,18 +12,8 @@ def _body_box(body: np.ndarray, thr: float):
     return ((xmin + xmax - scale) / 2, (ymin + ymax - scale) / 2, scale)
 
 
-def unisign_body_box(keypoints: np.ndarray, thr: float = 0.3) -> tuple[float, float, float] | None:
-    # Crop box for these raw frames. An offline training chunk can reuse its video's box.
-    kp = np.asarray(keypoints, dtype=np.float32)
-    if kp.ndim != 3 or kp.shape[1:] != (133, 3):
-        raise ValueError(f"Expected raw (T,133,3) poses, got {kp.shape}")
-    body = np.nan_to_num(kp[:, UNISIGN_BODY_IDX, :], nan=0.0, posinf=0.0, neginf=0.0)
-    return _body_box(body, thr)
-
-
-def _unisign_crop_scale_body(body, thr, box=None):
-    # Normalize body points with a supplied box, or the box of the supplied frames.
-    if box is None: box = _body_box(body, thr)
+def _unisign_crop_scale_body(body, thr):
+    box = _body_box(body, thr)
     if box is None: return np.zeros_like(body), 0.0
     xs, ys, scale = (float(v) for v in box)
     if not np.isfinite([xs, ys, scale]).all() or scale <= 0:
@@ -37,7 +27,7 @@ def _unisign_crop_scale_body(body, thr, box=None):
     return result, scale
 
 
-def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3, box=None) -> np.ndarray:
+def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.ndarray:
     """Uni-Sign pose normalisation (ZechengLi19/Uni-Sign datasets.py load_part_kp + crop_scale).
 
     Body is bbox-normalised to [-1,1]; hands are re-centred on the wrist (joint 0) and the face on the nose
@@ -58,7 +48,7 @@ def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3, box=Non
         raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')
     kp = np.asarray(keypoints, dtype=np.float32, order='C').copy()
     np.nan_to_num(kp, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    body_norm, scale = _unisign_crop_scale_body(kp[:, UNISIGN_BODY_IDX, :].copy(), thr, box=box)
+    body_norm, scale = _unisign_crop_scale_body(kp[:, UNISIGN_BODY_IDX, :].copy(), thr)
 
     def _recentered_part(idx_list, anchor):
         part = kp[:, idx_list, :].copy()                       # (T, V, 3)

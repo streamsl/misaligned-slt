@@ -18,7 +18,7 @@ ON-DISK LAYOUT (root = data/youtube-sl-25):
     <root>/signverse_shards/*.tar                 # shard-tar CACHE ONLY (transient; --delete-tars frees it)
     <root>/{asf,bfi}/poses/<vid>.npy , subs/<vid>.<target>.vtt , video_meta.csv
 
-CAPTIONS — one `<vid>.<target>.vtt` per video, one selection rule (data.loader.best_subtitle), two paths:
+CAPTIONS — one `<vid>.<target>.vtt` per video, 1 selection rule (data.loader.best_subtitle), 2 paths:
 `--stage convert` harvests the best shard-bundled track (caption_source=shard, no extra download); `--stage subs`
 gap-fills the rest from the curated subtitles tar in the target language (`configs/data.yaml` target_lang),
 HUMAN over NLLB machine-English (see `_pick_caption`). No gaps → the 700 MB tar is never fetched. Provenance →
@@ -31,13 +31,13 @@ upload frontier, no failure markers), a few are indexed but absent from their sh
 both are reported and reconciled, not errors.
 """
 from __future__ import annotations
-import argparse, csv, json, shutil, sys, tarfile, urllib.request, zipfile
+import argparse, io, csv, json, shutil, sys, tarfile, urllib.request, zipfile
 import numpy as np
 
 from pathlib import Path
 from data.loader import best_subtitle
-from poses.pose_io import META_FILENAME, load_video_meta, save_video_meta
-from poses.signverse import SIGNVERSE_DEFAULT_FPS, convert_video
+from poses.pose_io import META_FILENAME, drop_from_page_cache, load_video_meta, save_video_meta
+from poses.signverse import SIGNVERSE_DEFAULT_FPS, convert_video, sidecar_stats_from_npz
 from utils import load_yaml
 
 HF_BASE = "https://huggingface.co/datasets/SignerX/SignVerse-2M/resolve/main"
@@ -234,11 +234,12 @@ def stage_convert(args, plan: dict) -> None:
     subtitle_cfg = data_cfg.get("subtitles", {}) or {}
     targets = _lang_targets(data_cfg, {v["language"] for v in plan["videos"].values()})
     per_lang_meta: dict[str, dict[str, dict]] = {}
-    report = {"converted": 0, "skipped_existing": 0, "empty_heavy": [], 
+    report = {"converted": 0, "skipped_existing": 0, "empty_heavy": [],
               "npz_missing": [], "npz_corrupt": [], "not_downloaded": 0, "no_caption": 0}
 
     def _meta_for(lang: str) -> dict:
-        return per_lang_meta.setdefault(lang, load_video_meta(root / lang / META_FILENAME))
+        if lang not in per_lang_meta: per_lang_meta[lang] = load_video_meta(root / lang / META_FILENAME)
+        return per_lang_meta[lang]
 
     for shard in sorted(plan["shards"]):
         tar_path = cache / shard
@@ -258,8 +259,9 @@ def stage_convert(args, plan: dict) -> None:
 
         in_shard = plan["shards"][shard]
         wanted = [v for v in in_shard if args.overwrite or not (root / plan["videos"][v]["language"] / "poses" / f"{v}.npy").exists()]
-        # Even for fully-converted shards: backfill meta rows a prior crash lost, then honor --delete-tars (the
-        # "re-run convert --delete-tars to free disk" flow must delete these too).
+        # Even for fully-converted shards: backfill meta rows a prior crash lost, then honor --delete-tars ("re-run convert --delete-tars 
+        # to free disk" flow must delete these too). A backfilled row carries the duration only: the frame size and the person counts live 
+        # in the shard, never in the `.npy`, so `--stage person-counts` fills those and it needs the shard tars.
         touched_langs = set()
         for vid in in_shard:
             if vid not in wanted:
@@ -299,10 +301,12 @@ def stage_convert(args, plan: dict) -> None:
                         report["npz_missing"].append(vid)
                         print(f"convert |   {vid}: npz absent from {shard} (upstream index/packaging gap) — skipped", flush=True)
                         continue
+                    frames = max(1, int(stats["frames"]))
                     _meta_for(lang)[vid] = {
                         "video_id": vid, "duration_s": f"{stats['duration_s']:.3f}",
                         "width": str(stats["width"] or ""), "height": str(stats["height"] or ""), 
-                        "caption_source": stats["caption_source"]
+                        "caption_source": stats["caption_source"], "multi_person_ratio": stats["multi_person_ratio"], 
+                        "undetected_ratio": stats["empty_frames"] / frames, "extra_person_motion": stats["extra_person_motion"],
                     }
                     touched_langs.add(lang)
                     report["converted"] += 1
@@ -335,11 +339,84 @@ def stage_convert(args, plan: dict) -> None:
                                        f"run `--stage download` (or `--stage all` without --limit) to fetch them.")
     print(f"convert | {report['converted'] - report['no_caption']} video(s) captioned from their shard track (caption_source=shard); "
           f"{report['no_caption']} without a usable shard caption → `--stage subs` gap-fills from subtitles tar (else the loader drops them)")
-    if report["empty_heavy"]: print(f"convert | {len(report['empty_heavy'])} converted video(s) have >50% undetected-signer frames.")
+    if report["empty_heavy"]: print(f"convert | {len(report['empty_heavy'])} converted video(s) have >50% frames with no detected body.")
     if report["npz_missing"]: print("convert | npz absent from shard (upstream gap, unrecoverable here): " + ", ".join(report["npz_missing"]))
     if report["npz_corrupt"]: print(
         f"convert | {len(report['npz_corrupt'])} videos had unreadable npz data and were skipped: " + ", ".join(report["npz_corrupt"]) +
         "\nconvert | these are excluded from video_meta.csv. Re-download affected shards and re-run --stage convert to recover them."
+    )
+
+
+def stage_person_counts(args, plan: dict) -> None:
+    """Fill person counts, extra-slot shape variation and frame size in video_meta.csv from source archives.
+
+    Reads the counts and keypoints 1 video at a time. Pose files and caption_source are preserved. Complete
+    rows are skipped. Missing shape data cannot exempt a video from the multi-person count rule.
+    """
+    cache, root = Path(args.cache), Path(args.root)
+    per_lang_meta: dict[str, dict[str, dict]] = {}
+    filled = skipped = 0
+    missing_shards: list[str] = []
+
+    def _meta_for(lang: str) -> dict:
+        if lang not in per_lang_meta: per_lang_meta[lang] = load_video_meta(root / lang / META_FILENAME)
+        return per_lang_meta[lang]
+
+    def _needs(vid: str) -> bool:
+        lang = plan["videos"][vid]["language"]
+        row = _meta_for(lang).get(vid)
+        if row is None or not (root / lang / "poses" / f"{vid}.npy").exists(): return False
+        return any(row.get(key) is None for key in ("multi_person_ratio", "undetected_ratio", "extra_person_motion", "width", "height"))
+
+    for shard in sorted(plan["shards"]):
+        wanted = {v for v in plan["shards"][shard] if _needs(v)}
+        skipped += sum(1 for v in plan["shards"][shard] if v in plan["videos"] and not _needs(v)
+                         and (root / plan["videos"][v]["language"] / "poses" / f"{v}.npy").exists())
+        if not wanted: continue
+        tar_path = cache / shard
+        if not tar_path.exists():
+            missing_shards.append(shard)
+            continue
+
+        with tarfile.open(tar_path, "r|") as tar:   # stream: 1 sequential pass, nothing seeks back
+            for member in tar:
+                vid = member.name.split("/")[0]
+                if vid not in wanted or not member.name.endswith("/npz/poses.npz"): continue
+                z = np.load(io.BytesIO(tar.extractfile(member).read()), allow_pickle=True)
+                stats = sidecar_stats_from_npz(z)
+                frames = stats["frames"]
+                lang = plan["videos"][vid]["language"]
+                row = _meta_for(lang)[vid]
+                row.update({
+                    "multi_person_ratio": stats["multi"] / frames if frames else 0.0,
+                    "undetected_ratio": 1.0 - stats["detected"] / frames if frames else 1.0,
+                    "extra_person_motion": stats["extra_motion"],
+                })
+                # Only when the shard knows it: a blank stays blank rather than becoming a wrong 0, because the
+                # spatial augmentations and the segmenter's aspect correction both read these.
+                if stats["width"] and stats["height"]: row.update({"width": stats["width"], "height": stats["height"]})
+                filled += 1
+                wanted.discard(vid)
+
+        drop_from_page_cache(tar_path)
+        for lang in per_lang_meta: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
+        print(f"person-counts | {shard}: filled {len(plan['shards'][shard]) - len(wanted)}, "
+              f"per-frame layout left unknown {len(wanted)}", flush=True)
+
+    print(f"person-counts | filled {filled}, already known {skipped}, shards not in cache {len(missing_shards)}", flush=True)
+    # Name what is still blank. `poses.max_multi_person_ratio` and the segmenter's aspect correction both read these
+    # columns. Report missing values so the user can distinguish unmeasured videos from measured absences.
+    for lang, meta in sorted(per_lang_meta.items()):
+        blank_counts = sum(1 for row in meta.values() if row.get("multi_person_ratio") is None)
+        blank_motion = sum(1 for row in meta.values() if row.get("extra_person_motion") is None)
+        blank_size = sum(1 for row in meta.values() if row.get("width") is None or row.get("height") is None)
+        if blank_counts or blank_size or blank_motion: print(
+            f"person-counts | {lang}: {blank_counts}/{len(meta)} rows still have no person count, "
+            f"{blank_size}/{len(meta)} no frame size, {blank_motion}/{len(meta)} no shape measurement", flush=True
+        )
+    if missing_shards: print(
+        f"person-counts | {len(missing_shards)} shard(s) absent from {cache}; their videos stay UNKNOWN and data/loader.py "
+        f"doesn't filter an unknown row. Download them (`--stage download`) or copy a video_meta.csv measured elsewhere.", flush=True
     )
 
 
@@ -355,16 +432,26 @@ def stage_subs(args, plan: dict) -> None:
     # A GAP = a video with a POSE but no `<vid>.<target>.vtt`. Gating on the .npy avoids orphan captions for
     # unconverted videos and lets the "no gaps → skip the tar" fast path fire on partial runs. Filesystem-based, so
     # deleting subs/ & re-running re-fills from the tar even when video_meta still says shard.
-    gaps: dict[str, str] = {}  # vid -> language
+    meta_by_lang: dict[str, dict] = {}
+    def _meta_for(lang: str) -> dict:
+        if lang not in meta_by_lang: meta_by_lang[lang] = load_video_meta(root / lang / META_FILENAME)
+        return meta_by_lang[lang]
+
+    gaps: dict[str, str] = {}      # vid -> language: a pose but no caption file, so the tar supplies one
+    unknown: dict[str, str] = {}   # vid -> language: a caption file whose provenance the meta row does not carry
     for vid, info in plan["videos"].items():
         lang = info["language"]
         if not (root / lang / "poses" / f"{vid}.npy").exists(): continue
-        if not (root / lang / "subs" / f"{vid}.{lang_target[lang]}.vtt").exists():
-            gaps[vid] = lang
-    if not gaps:
+        if not (root / lang / "subs" / f"{vid}.{lang_target[lang]}.vtt").exists(): gaps[vid] = lang
+        elif (_meta_for(lang).get(vid, {}).get("caption_source") or "none") == "none": unknown[vid] = lang
+    if not gaps and not unknown:
         print("subs | every converted video already has a `<vid>.<target>.vtt` (convert harvested the shard tracks) "
               "— no gaps, subtitles tar not needed.", flush=True)
         return
+    # `caption_source` decides which videos the human-only test rule excludes (subtitles.human_only_splits), and a row rebuilt from `.npy` 
+    # alone carries "none". Recover it from tar by BYTES: caption file identical to NLLB track is machine translation whatever row says.
+    if unknown: print(f"subs | {len(unknown)} caption file(s) with no provenance in {META_FILENAME}; "
+                      f"re-deriving `caption_source` from the tar", flush=True)
 
     # Reuse an already-downloaded tar (--subs-tar, else root/) before fetching 700 MB.
     candidates = [Path(args.subs_tar)] if getattr(args, "subs_tar", None) else [root / SUBTITLES_TAR]
@@ -380,12 +467,19 @@ def stage_subs(args, plan: dict) -> None:
         for m in tar:  # stream: subtitles/<vid>/<file>
             if not m.isfile(): continue
             parts = m.name.split("/")
-            if len(parts) != 3 or parts[0] != "subtitles" or parts[1] not in gaps: continue
+            if len(parts) != 3 or parts[0] != "subtitles" or (parts[1] not in gaps and parts[1] not in unknown): continue
             if not _is_caption_file(parts[2]): continue  # buffer all originals; _pick_caption chooses by target
             f = tar.extractfile(m)
             if f is not None: buf.setdefault(parts[1], {})[parts[2]] = f.read()
 
     source_by_lang: dict[str, dict[str, str]] = {}  # lang -> {vid: human|mt|none}
+    for vid, lang in unknown.items(): # File on disk is the reference, so match on its bytes rather than re-picking a track.
+        on_disk = (root / lang / "subs" / f"{vid}.{lang_target[lang]}.vtt").read_bytes()
+        match = next((name for name, content in (buf.get(vid) or {}).items() if content == on_disk), None)
+        # The only 2 writers are this stage (tar bytes, copied verbatim) and convert (a shard track), so a file
+        # that matches no tar track came from the shard.
+        source_by_lang.setdefault(lang, {})[vid] = ("shard" if match is None else "mt" if match.endswith(".nllb.vtt") else "human")
+
     for vid, lang in gaps.items():
         tcode = lang_target[lang]
         picked = _pick_caption(buf.get(vid, {}), tcode)
@@ -406,17 +500,17 @@ def stage_subs(args, plan: dict) -> None:
             _backfill_meta(vid, root / lang, meta)
             meta.setdefault(vid, {"video_id": vid})["caption_source"] = source
         save_video_meta(root / lang / META_FILENAME, meta)
-        c = {s: sum(v == s for v in by_vid.values()) for s in ("human", "mt", "none")}
+        c = {s: sum(v == s for v in by_vid.values()) for s in ("human", "mt", "none", "shard")}
         total_mt += c["mt"]
-        print(f"subs | {lang}: filled {c['human']} human + {c['mt']} NLLB-MT; {c['none']} still caption-less "
-              f"(dropped by loader). Provenance → {root / lang / META_FILENAME} caption_source.", flush=True)
+        print(f"subs | {lang}: filled {c['human']} human + {c['mt']} NLLB-MT + {c['shard']} from the shard; {c['none']} still "
+              f"caption-less (dropped by loader). Provenance → {root / lang / META_FILENAME} caption_source.", flush=True)
     if total_mt: print("subs | NLLB-machine-translated captions are noisy SLT targets — the loader scores the TEST split "
                        "against human references only (subtitles.human_only_splits + caption_source in video_meta.csv).")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SignVerse-2M → repo language layout (poses/ + subs/ + video_meta.csv)")
-    parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "subs", "all"])
+    parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "person-counts", "subs", "all"])
     parser.add_argument("--languages", nargs="+", default=["asf", "bfi"])
     parser.add_argument("--split-csv", default=DEFAULT_SPLIT_CSV)
     parser.add_argument("--data-config", default="configs/data.yaml", help="reads languages[lang].target_lang for the caption language")
@@ -440,4 +534,5 @@ if __name__ == "__main__":
     if args.stage in ("download", "all"): stage_download(args, plan)
     if args.stage == "verify": stage_verify(args, plan)
     if args.stage in ("convert", "all"): stage_convert(args, plan)
+    if args.stage in ("person-counts", "all"): stage_person_counts(args, plan)
     if args.stage in ("subs", "all"): stage_subs(args, plan)

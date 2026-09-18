@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import re, csv
+import os, re, csv
 import numpy as np
 from .preprocessing import normalize_keypoints_unisign
 
@@ -11,7 +11,14 @@ SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
 # caption_source: caption provenance — human | mt (NLLB machine-translation) | shard (raw bundled YouTube track)
 # | none. Blank for the own-extraction (ase) path, which does not resolve captions here.
-META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source")
+# extra_person_motion: shoulder-normalized arm variation in extra detector slots (poses.signverse.extra_person_motion).
+# Low values can exempt artwork; detector errors and changing slot assignments can also raise this measure.
+# multi_person_ratio / undetected_ratio: share of frames with 2+ people ON SCREEN AT ONCE / share with nobody detected,
+# both from the SignVerse payload's per-frame `num_persons` (the .npy keeps person_000 only, so neither can be recovered
+# from it later). `--stage convert` writes them for a video it converts; `--stage person-counts` backfills a row left
+# blank by a corpus converted before the columns existed, from the shard, without re-converting. Blank means UNKNOWN.
+META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source", 
+               "multi_person_ratio", "undetected_ratio", "extra_person_motion")
 # Default --format for the metadata fetch. Must match the yt-dlp --format the videos were 
 # downloaded with, so metadata width/height describe the downloaded stream; override per language via 
 # `python -m poses <lang_root> --format SEL` when a language was downloaded at a different (e.g. higher) 
@@ -61,6 +68,10 @@ def load_video_meta(path: str | Path) -> dict[str, dict]:
         value = (value or "").strip()
         return int(float(value)) if value else None
 
+    def _opt_float(value: str | None) -> float | None:
+        value = (value or "").strip()
+        return float(value) if value else None
+
     meta: dict[str, dict] = {}
     with path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
@@ -71,8 +82,27 @@ def load_video_meta(path: str | Path) -> dict[str, dict]:
                 "duration_s": float(duration),
                 "width": _opt_int(row.get("width")), "height": _opt_int(row.get("height")),
                 "caption_source": (row.get("caption_source") or "").strip() or None,
+                "multi_person_ratio": _opt_float(row.get("multi_person_ratio")),
+                "undetected_ratio": _opt_float(row.get("undetected_ratio")),
+                "extra_person_motion": _opt_float(row.get("extra_person_motion")),
             }
     return meta
+
+
+def drop_from_page_cache(path: str | Path) -> None:
+    """Tell the kernel this file is no longer needed, after a one-shot sequential read.
+
+    A full-corpus measurement pass otherwise leaves the whole corpus in the page cache (138 GiB on ase). The cache is
+    reclaimable, so this is not a correctness fix; it keeps a maintenance pass from evicting everything else the box
+    was holding. Best-effort: platforms without `posix_fadvise` simply skip it.
+    """
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None: return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try: advise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally: os.close(fd)
+    except OSError: pass
 
 
 def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
@@ -86,21 +116,16 @@ def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
                 "" if m.get("width") is None else m["width"],
                 "" if m.get("height") is None else m["height"],
                 m.get("caption_source") or "",
+                "" if m.get("multi_person_ratio") is None else f"{float(m['multi_person_ratio']):.4f}",
+                "" if m.get("undetected_ratio") is None else f"{float(m['undetected_ratio']):.4f}",
+                "" if m.get("extra_person_motion") is None else repr(float(m['extra_person_motion'])),
             ])
 
 
-def build_pose_index(
+def build_pose_index( # Index pose .npy files; fps is resolved PER VIDEO when `video_meta` covers it
     pose_root: str | Path, fps: float, width: int | None = None, height: int | None = None,
     video_meta: dict[str, dict] | None = None,
 ) -> dict[str, PoseIndex]:
-    """Index pose .npy files; fps is resolved PER VIDEO when `video_meta` covers it.
-
-    Per-video fps = total_pose_frames / real_video_duration. Extraction kept every 2nd frame, so pose fps is
-    native/2 and the NATIVE rate varies per video (Auslan: 12.0/12.5/~15.0, a few full-rate 25.0). A single config
-    constant (fallback only) misplaces timestamps: 25.0 drifted ~2x (BIO labels on the wrong frames — label-motion
-    correlation 0.10 vs 0.26 corrected — and ~44% of captions dropped by the loader duration filter); a hand-set
-    12.5 still leaves 37.7% of videos with >5% error (median 26s end-of-video misalignment vs ~3s sentences).
-    """
     pose_root = Path(pose_root)
     grouped: dict[str, list[Path]] = {}
     for path in sorted(pose_root.glob("*.npy")):
@@ -129,10 +154,9 @@ def fetch_youtube_meta(
 ) -> dict[str, dict]:
     """yt-dlp METADATA-ONLY fetch -> {video_id: {duration_s, width, height}}. No video download.
 
-    Raw videos are never needed (too heavy for large languages, e.g. ase): duration — the only fps-calibration
-    input — comes from YouTube metadata in WHOLE SECONDS (<=0.5s error ~ 0.3% fps drift, far below sentence
-    length). width/height resolve via `ytdlp_format`; pass the SAME --format the videos were downloaded with, 
-    and treat them as advisory (yt-dlp may resolve fewer formats than a browser: JS-runtime/PO-token limits).
+    Raw videos are never needed (too heavy for large languages, e.g. ase): duration — the only fps-calibration input — comes 
+    from YouTube metadata in WHOLE SECONDS. width/height resolve via `ytdlp_format`; pass the SAME --format the videos were 
+    downloaded with, and treat them as advisory (yt-dlp may resolve fewer formats than a browser: JS-runtime/PO-token limits). 
     Removed/private videos are skipped → config pose_fps fallback with a loud loader warning.
     """
     import subprocess
@@ -220,7 +244,7 @@ def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) ->
 
 
 def load_pose_window(
-    pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True, augment=None, box=None,
+    pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True, augment=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     # Load a real-timeline pose window + relative timestamps. `normalize` converts raw (T,133,3) DWPose to Uni-Sign 69-kp 
     # representation (poses.normalize_keypoints_unisign). `augment` (train only) is a callable (raw_poses, width, height) 
@@ -231,7 +255,7 @@ def load_pose_window(
     end_frame = int(np.ceil(end_s * pose_index.fps))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
     if augment is not None and poses.shape[1:] == (133, 3): poses = augment(poses, pose_index.width, pose_index.height)
-    if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses, box=box)
+    if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses)
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)
     return poses.astype(np.float32, copy=False), timestamps
     

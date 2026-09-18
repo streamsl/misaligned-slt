@@ -325,21 +325,29 @@ def non_latin_ratio(texts: Iterable[str]) -> float:
     return non_latin / total if total else 0.0
 
 
-def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
-    """Force a strictly non-overlapping, time-ordered span sequence.
+def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> tuple[list[tuple[float, float, str]], int, int]:
+    """Force a strictly non-overlapping, time-ordered span sequence. Returns (spans, clamped, swallowed).
 
     Applied to the FINAL caption stream (after rolling-duplicate merging and sentence reconstruction), so it is the
     1 place that guarantees the invariant every downstream consumer assumes. A span left fully inside its predecessor 
     after clamping is dropped: it carries no exclusive frames, so it can never be selected or scored.
+
+    Both counts are per UNIT and disjoint — 1 unit is either moved or deleted — so neither can go negative and their
+    sum is the number of units an overlap touched. A count derived instead from ADJACENT-PAIR overlaps is not on this
+    basis: 1 malformed cue containing 5 short ones is a single adjacent pair and five deletions.
     """
     out: list = []
+    clamped = swallowed = 0
     prev_end = float("-inf")
     # Tuples may carry a 4th `reliable` field (unsupported coverage) — pass any extra fields through untouched.
     for c in sorted(captions, key=lambda x: (x[0], x[1])):
         s, e = max(c[0], prev_end), c[1]
-        if e <= s: continue  # wholly swallowed by the previous span
+        if e <= s:
+            swallowed += 1  # wholly swallowed by the previous span; its TEXT leaves the reference with it
+            continue
+        clamped += s > c[0]
         out.append((s, e, *c[2:])); prev_end = e
-    return out
+    return out, clamped, swallowed
 
 
 def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s: float = 1.0) -> list[tuple]:
@@ -352,10 +360,7 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
     frames UNK, never an anchor, reference, or Mode-4 gap. Ends within `slack_s` of the stream end are left alone — the existing span filter 
     tolerates them, and their label error is below the timestamp noise floor.
     """
-    return [
-        (c[0], float(duration_s), c[2], False) if (c[0] < duration_s and c[1] > duration_s + float(slack_s)) else c
-        for c in captions
-    ]
+    return [(c[0], float(duration_s), c[2], False) if (c[0] < duration_s and c[1] > duration_s + float(slack_s)) else c for c in captions]
 
 
 def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: int = 60, fold: frozenset[str] | None = None) -> list[tuple]:
@@ -493,7 +498,7 @@ def marked_boundary_ratio(units, fold: frozenset[str] | None = None) -> float:
     is a punctuation-STYLE test: over the three corpora 37 % (asf), 73 % (ase) and 69 % (bfi) of boundaries carrying no period are followed by a 
     capital, so a period-only rule rejects song lyrics and capital-marked prose whose boundaries are real.
 
-    A capital is POSITIONAL only when the word is ordinarily lowercase, which is what the train `fold` lexicon records (`fold_lexicon`, the same test 
+    A capital is POSITIONAL only when the word is ordinarily lowercase, which is what the train `fold` lexicon records (`fold_lexicon`, same test 
     `_fold_sentence_start` applies). "NDIS", "Auslan" and "David" carry a LEXICAL capital and say nothing about a boundary: a wrap that lands before 
     a proper noun would otherwise read as a sentence start. Without a lexicon only the punctuation half is available, and an all-caps unit is never
     evidence, because in a gloss list every line opens with a capital.
@@ -740,7 +745,8 @@ def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[
     downstream (the pool copies before shuffling), so sharing one list across epochs is safe.
     """
     lang_fingerprint = json.dumps(
-        {"lang": (data_cfg.get("languages") or {}).get(language), "subtitles": data_cfg.get("subtitles"), "splits": data_cfg.get("splits")},
+        {"lang": (data_cfg.get("languages") or {}).get(language), "subtitles": data_cfg.get("subtitles"),
+         "splits": data_cfg.get("splits"), "poses": data_cfg.get("poses")},
         sort_keys=True, default=str,
     )
     # The active loader function is part of the key: tests monkeypatch `load_language_records`, and a key of
@@ -800,12 +806,11 @@ def load_multilingual_records(
     counts = {k: len(v) for k, v in per_lang.items()}
     weights = {k: n ** float(temperature) for k, n in counts.items()}
     total_w = sum(weights.values())
-    # SUB-sample to the target shares: pick the pool size that the most over-represented language can support
-    # WITHOUT replication, i.e. the largest total for which every target <= that language's real video count.
-    # Upsampling instead (scaling up to the biggest corpus) repeats the small corpora several times inside ONE
-    # epoch, so the model sees many epochs' worth of a language before the first checkpoint and overfits during
-    # epoch 1 — the failure this bound exists to prevent. Temperature then only sets the SHARES, never the
-    # repetition, so lowering it rebalances instead of inflating the epoch.
+    # SUB-sample to target shares: pick the pool size that the most over-represented language can support WITHOUT replication, i.e. largest 
+    # total for which every target <= that language's real video count. Upsampling instead (scaling up to biggest corpus) repeats the small 
+    # corpora several times inside ONE epoch, so the model sees many epochs' worth of a language before the first checkpoint and overfits 
+    # during epoch 1 — the failure this bound exists to prevent. Temperature then only sets the SHARES, never the repetition, so lowering 
+    # it rebalances instead of inflating the epoch.
     scale = min(counts[k] * total_w / weights[k] for k in counts)
     rng = random.Random(int(seed))
     pooled: list[VideoRecord] = []
@@ -831,7 +836,11 @@ def load_multilingual_records(
     return pooled, realised
 
 
-def load_language_records(data_cfg: dict, language: str, split: str | None = None) -> tuple[list[VideoRecord], dict[str, list[str]]]:
+def load_language_records(
+    data_cfg: dict, language: str, split: str | None = None, report: dict | None = None,
+) -> tuple[list[VideoRecord], dict[str, list[str]]]:
+    """`report`, when given, is filled with the per-rule tallies of this load (videos and cues kept or dropped by
+    each pipeline rule) — the corpus audit `report.py data` prints. Every consumer of the records is unaffected."""
     lang_cfg = data_cfg["languages"][language]
     root = Path(lang_cfg["root"])
     # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
@@ -867,45 +876,102 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     # sources default to just "mt" (raw-shard captions are kept — usually human uploads). Absent → nothing excluded.
     human_only = set(subtitle_cfg.get("human_only_splits", ["test"]) or [])
     exclude_sources = set(subtitle_cfg.get("human_only_exclude_sources", ["mt"]) or [])
+    dropped_mt_caption = 0
     if split in human_only:
         drop_ids = {vid for vid, m in video_meta.items() if (m.get("caption_source") in exclude_sources)}
         before = len(selected_ids)
         selected_ids = [v for v in selected_ids if v not in drop_ids]
+        dropped_mt_caption = before - len(selected_ids)
         if before != len(selected_ids): print(
             f"[loader] {language}/{split}: excluded {before - len(selected_ids)} video(s) with "
             f"{'/'.join(sorted(exclude_sources))} captions (human references only; subtitles.human_only_splits).", flush=True
         )
+    # MULTI-PERSON videos: 2+ people on screen AT SAME TIME. Converter keeps person_000 = largest body per frame, so the caption may follow 
+    # a person the stored pose is not, and 2nd body on screen is exactly what the detector can lose track between. Signers appearing 1 AFTER 
+    # the other are not this. BOTH conditions must hold. Low measured shape variation exempts those extra detections.
+    max_multi = float((data_cfg.get("poses", {}) or {}).get("max_multi_person_ratio", 1.0))
+    min_motion = float((data_cfg.get("poses", {}) or {}).get("min_extra_person_motion", 0.0))
+    # A high undetected share means little pose evidence is available for the captions. It can reflect a screen
+    # recording, or a detector missing a real signer; the filter does not distinguish these causes.
+    max_undetected = float((data_cfg.get("poses", {}) or {}).get("max_undetected_ratio", 1.0))
+    min_covered = float((data_cfg.get("poses", {}) or {}).get("min_unit_coverage", 0.0))
+    dropped_multi_person: list[tuple[str, float]] = []
+    dropped_undetected: list[tuple[str, float]] = []
+    dropped_uncovered: list[tuple[str, float]] = []
+    if max_multi < 1.0:
+        considered = len(selected_ids)
+        unknown = [v for v in selected_ids if (video_meta.get(v) or {}).get("multi_person_ratio") is None]
+        over = {v for v in selected_ids if ((video_meta.get(v) or {}).get("multi_person_ratio") or 0.0) > max_multi
+                                        and ((video_meta.get(v) or {}).get("extra_person_motion") is None
+                                        or video_meta[v]["extra_person_motion"] > min_motion)}
+        unmeasured = sum(video_meta[v].get("extra_person_motion") is None for v in over)
+        dropped_multi_person.extend((v, float(video_meta[v]["multi_person_ratio"])) for v in selected_ids if v in over)
+        selected_ids = [v for v in selected_ids if v not in over]
+        if unmeasured: print(
+            f"[loader] {language}/{split or 'all'}: {unmeasured} multi-person exclusions have no measurable extra-person "
+            f"shape; the count rule applies. Run `prepare_data.py --stage person-counts` if that column is missing.", flush=True
+        )
+        if unknown: print(
+            f"[loader] {language}/{split or 'all'}: WARNING the multi-person rule is on but {len(unknown)}/{considered} "
+            f"videos lack multi_person_ratio in video_meta.csv; run `prepare_data.py --stage person-counts` "
+            f"to measure them. Those videos are NOT filtered.", flush=True
+        )
+    for key, limit, dropped in (("undetected_ratio", max_undetected, dropped_undetected),):
+        if limit >= 1.0: continue
+        considered = len(selected_ids)   # the denominator: an unknown video stays in selected_ids, so adding 2 double-counts it
+        unknown = [v for v in selected_ids if (video_meta.get(v) or {}).get(key) is None]
+        over = {v for v in selected_ids if ((video_meta.get(v) or {}).get(key) or 0.0) > limit}
+        dropped.extend((v, float(video_meta[v][key])) for v in selected_ids if v in over)
+        selected_ids = [v for v in selected_ids if v not in over]
+        if unknown: print(
+            f"[loader] {language}/{split or 'all'}: WARNING poses.max_{key.replace('_ratio', '')}_ratio is set but "
+            f"{len(unknown)}/{considered} videos have no {key} in video_meta.csv; run `prepare_data.py --stage person-counts` "
+            f"to measure it. Those videos are NOT filtered.", flush=True
+        )
     records: list[VideoRecord] = []
-    dropped_no_caption = 0
-    # The case-fold lexicon is a TRAIN-split constant (like the class weights), applied to every split.
+    dropped_no_caption, dropped_all_quarantined = 0, 0
+    per_video: dict[str, dict[str, int]] = {}
     fold = case_lexicon(data_cfg, language) if subtitle_cfg.get("merge_sentences") else None
-    # 1.0 disables the filter (no video can exceed a full share). The key is GLOBAL under `subtitles:`, which is
-    # correct while every corpus targets English; a non-Latin-target corpus would need a per-language override, not
-    # a global 1.0, which would switch the filter off for the English corpora too.
+
+    # 1.0 disables the filter (no video can exceed a full share). The key is GLOBAL under `subtitles:`, which is correct while every 
+    # corpus targets English; non-Latin-target corpus need a per-language override which would switch the filter off for English corpora.
     max_non_latin = float(subtitle_cfg.get("max_non_latin_ratio", 1.0))
     dropped_non_latin: list[tuple[str, float]] = []
-    min_marked = float(subtitle_cfg.get("min_marked_boundary_ratio", 0.0))
-    dropped_unmarked: list[tuple[str, float]] = []
+    drop_scrolling = bool(subtitle_cfg.get("drop_scrolling_tracks", True))
+    dropped_scrolling: list[tuple[str, float]] = []
     for video_id in tqdm(selected_ids, desc=f"[loader] {language}/{split or 'all'}", unit="vid", leave=False, dynamic_ncols=True):
         subtitle_path = best_subtitle(root / "subs", video_id, subtitle_cfg)
         if subtitle_path is None:
             dropped_no_caption += 1
             continue
         source_cues = parse_vtt(subtitle_path, drop_noise=drop_noise)
+        # A SCROLLING display (more than half the cues start before previous one ends: YouTube's rolling two-line auto-captions) encodes 
+        # DISPLAY times at both ends of every cue: a cue leaves the screen when line 2 later arrives, so its end runs a median 1.9-2.6 s 
+        # (p90 3.0-3.9 s) past the next cue's start — 5-10x delta_enc. Punctuation can fix the grouping of such cues into units; it cannot 
+        # move their timestamps, so the whole track is dropped, not repaired (bfi/0cw4rELLAtc, ase/T9C4QbZ7qOs).
+        if drop_scrolling and is_scrolling_display(source_cues):
+            n = len(source_cues)
+            dropped_scrolling.append((video_id, sum(1 for a, b in zip(source_cues, source_cues[1:]) if b[0] < a[1] - 1e-6) / max(1, n - 1)))
+            continue
         raw_cues = merge_rolling_captions(source_cues)
         captions = raw_cues
         if subtitle_cfg.get("merge_sentences"):  # group display-wrapped cues into caption units (Punkt over the caption stream)
             captions = reconstruct_sentences(captions, fold=fold)
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
-        # `s < duration`: sentence ONSET must land inside extracted poses, else no visible signing to anchor on. SignVerse streams 
-        # end before their caption timeline (duration = pose_frames/24 underestimates the video), so late captions start past the poses; 
-        # `e <= duration + 1.0` bounds only the END. Without it, the sampler builds start_s > end_s windows → load_pose_frames raises.
+        # Caption times refer to the source video. The supplied pose timeline can be shorter; a caption onset
+        # outside it has no pose evidence. This comparison does not identify why the source poses stop.
         dur = pose_index[video_id].duration_s
         # Some source VTTs ship genuinely OVERLAPPING cues with distinct text. merge_rolling_captions only fuses overlapping DUPLICATES, 
         # so these survive, and overlapping SentenceSpans corrupt BIO labels — a neighbour's `I` overwrites the closing `O`, and 
         # first_complete_span becomes ill-defined. Clamp each start to the previous end: it trims the disputed frames from the LATER
         # sentence (whose onset is the less certain of the two) and never invents a boundary.
-        captions = _quarantine_end_straddlers(_clamp_overlaps(captions), dur)  # Dropped straddlers become trusted-O over signing
+        ordered = sorted(captions, key=lambda c: (c[0], c[1]))
+        # Measure temporal coverage before any text removal or overlap repair. Otherwise a short or textless
+        # unit would count as missing pose data. Use the same one-second end tolerance as the span filter.
+        covered = sum(0 <= c[0] < dur and c[1] <= dur + 1.0 for c in ordered) / max(1, len(ordered))
+        # Quarantine unsupported ends before overlap repair so they remain untrusted supervision.
+        captions = _quarantine_end_straddlers(captions, dur)
+        captions, clamped, swallowed = _clamp_overlaps(captions)
         # WRONG-LANGUAGE videos. `.en` track is not a guarantee: ASE pool carries Japanese Sign Language and Chinese-teaching content whose 
         # captions are largely Japanese/Chinese. As TRANSLATION TARGETS those are unusable — the model is asked to emit non-English from ASL 
         # — and they also corrupt any batch they land in. Judged per VIDEO on script share, never per cue: an English sentence quoting a 
@@ -916,24 +982,53 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             if ratio > max_non_latin:
                 dropped_non_latin.append((video_id, ratio))
                 continue
-        # A scrolling track whose boundaries the author never marked encodes no utterance boundary at all. Both conditions are needed: unpunctuated 
-        # PROSE still carries real clause boundaries (28h of ase news would go), and scrolling track that does mark its boundaries is still usable.
-        if min_marked > 0.0 and is_scrolling_display(source_cues) and marked_boundary_ratio(captions, fold) < min_marked:
-            dropped_unmarked.append((video_id, marked_boundary_ratio(captions, fold)))
+        # 3 independent reasons a unit cannot be supervision, attributed to the FIRST that fires so the rows sum to the drop: shorter than 
+        # minimum unit, outside the pose stream, or carrying no letters at all (a cue of digits or punctuation is not a translation target).
+        kept, too_short, outside_poses, no_text = [], 0, 0, 0
+        for c in captions:
+            if not min_dur <= (c[1] - c[0]): too_short += 1; continue
+            if not (c[0] < dur and c[1] <= dur + 1.0): outside_poses += 1; continue
+            if not any(ch.isalpha() for ch in c[2]): no_text += 1; continue
+            kept.append(SentenceSpan(video_id=video_id, start_s=c[0], end_s=c[1], text=c[2], reliable=bool(c[3]) if len(c) > 3 else True))
+        spans = tuple(kept)
+        # Exclude poor temporal coverage as a whole-video data-quality rule. Do not stretch the pose timestamps
+        # to the caption duration: neither an offset nor a different frame rate is established by this mismatch.
+        if covered < min_covered:
+            dropped_uncovered.append((video_id, covered))
             continue
-        spans = tuple(
-            SentenceSpan(video_id=video_id, start_s=c[0], end_s=c[1], text=c[2], reliable=bool(c[3]) if len(c) > 3 else True)
-            for c in captions if min_dur <= (c[1] - c[0])
-            and c[0] < dur and c[1] <= dur + 1.0 and any(ch.isalpha() for ch in c[2])
-        )
         # Require >=1 RELIABLE span: an all-quarantined record contributes no anchor, target, or gold event, so
         # keeping it only loads poses nothing uses. Invariant: a record that reaches training/eval is usable.
-        if any(sp.reliable for sp in spans): records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
-
-    if dropped_unmarked: print(
-        f"[loader] {language}/{split or 'all'}: {len(dropped_unmarked)} video(s) dropped as UNMARKED (<{min_marked:.0%} of unit boundaries carry a "
-        f"period or a following capital; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_unmarked, key=lambda x: x[1])[:3])
-        + "); subtitles.min_marked_boundary_ratio.", flush=True
+        if not any(sp.reliable for sp in spans):
+            dropped_all_quarantined += 1
+            continue
+        records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
+        per_video[video_id] = {
+            "source_cues": len(source_cues), "rolling_duplicates_merged": len(source_cues) - len(raw_cues),
+            "units_after_grouping": len(ordered), "overlaps_swallowed": swallowed, "overlaps_clamped": clamped,
+            "end_straddlers_quarantined": sum(1 for c in captions if len(c) > 3 and not c[3]), "spans_kept": len(spans), 
+            "spans_dropped_too_short": too_short, "spans_dropped_outside_poses": outside_poses, "spans_dropped_no_text": no_text,
+        }
+    if dropped_uncovered: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_uncovered)} video(s) dropped as POSE-TRUNCATED "
+        f"(under {min_covered:.0%} of their caption units fall inside the supplied pose timeline; e.g. "
+        + ", ".join(f"{v} {c:.0%}" for v, c in sorted(dropped_uncovered, key=lambda x: x[1])[:3]) + "); poses.min_unit_coverage.", flush=True
+    )
+    if dropped_multi_person: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_multi_person)} video(s) dropped by MULTI-PERSON rule (2+ detected bodies in >"
+        f"{max_multi:.0%} of frames, extra-slot shape variation >{min_motion:g} or unmeasured; e.g. "
+        + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_multi_person, key=lambda x: -x[1])[:3])
+        + "); poses.max_multi_person_ratio / min_extra_person_motion.", flush=True
+    )
+    if dropped_undetected: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_undetected)} video(s) dropped as LOW-DETECTION (no pose detected in >"
+        f"{max_undetected:.0%} of frames; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_undetected, key=lambda x: -x[1])[:3])
+        + "); poses.max_undetected_ratio.", flush=True
+    )
+    if dropped_scrolling: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_scrolling)} video(s) dropped as SCROLLING "
+        f"(over half the cues start before the previous one ends, so every cue time is a display event; e.g. "
+        + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_scrolling, key=lambda x: -x[1])[:3]) 
+        + "); subtitles.drop_scrolling_tracks.", flush=True
     )
     if dropped_non_latin: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_non_latin)} video(s) dropped as WRONG-LANGUAGE (>{max_non_latin:.0%} non-Latin "
@@ -948,6 +1043,7 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
     # decontamination convention (keep the benchmark intact, purge the training copy) — deleting the eval twin instead would
     # shrink an already small eval set and bias what remains toward content unlike training.
     dedup_cfg = subtitle_cfg.get("dedup", {}) or {}
+    deduplicated_train = 0
     if dedup_cfg.get("enabled") and split == "train" and records:
         eval_ids = {v for s in ("dev", "test") for v in splits.get(s, [])}
         caps = _split_caption_sets(root, [r.video_id for r in records] + sorted(eval_ids), subtitle_cfg, drop_noise)
@@ -960,7 +1056,38 @@ def load_language_records(data_cfg: dict, language: str, split: str | None = Non
             records = [r for r in records if r.video_id not in drop]
             print(f"[loader] {language}/train: de-duplicated {len(drop)} train video(s) whose content also appears in dev/test "
                   f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); subtitles.dedup.", flush=True)
+            deduplicated_train = len(drop)
+    if report is not None:
+        kept_meta = [video_meta.get(r.video_id) or {} for r in records]
+        frames = [r.pose.total_frames for r in records]
+        known = [(m["undetected_ratio"], f) for m, f in zip(kept_meta, frames) if m.get("undetected_ratio") is not None]
+        report.update({
+            "videos_in_split": len(splits.get(split, [])) if split else len(pose_index), "videos_kept": len(records),
+            "dropped_mt_caption": dropped_mt_caption, "dropped_no_caption": dropped_no_caption,
+            "dropped_wrong_language": len(dropped_non_latin), "dropped_scrolling": len(dropped_scrolling),
+            "dropped_multi_person": len(dropped_multi_person), "dropped_undetected": len(dropped_undetected),
+            "dropped_pose_coverage": len(dropped_uncovered), "pose_coverage_rule_enabled": min_covered > 0.0,
+            "deduplicated_train": deduplicated_train, "dropped_all_quarantined": dropped_all_quarantined,
+            "multi_person_ratio_known": sum(1 for m in kept_meta if m.get("multi_person_ratio") is not None),
+            "multi_person_rule_enabled": max_multi < 1.0,
+            # Raw detector counts among kept videos; these do not include the shape-variation condition.
+            **_multi_person_band([m.get("multi_person_ratio") for m in kept_meta]),
+            "frames_kept": int(sum(frames)), "frames_undetected": int(round(sum(r * f for r, f in known))),
+            "undetected_ratio_known_videos": len(known), "undetected_rule_enabled": max_undetected < 1.0,
+            # Summed over the SURVIVORS only (see `per_video` above).
+            **{k: sum(per_video[r.video_id][k] for r in records) for k in next(iter(per_video.values()), {})},
+        })
     return records, splits
+
+
+def _multi_person_band(ratios: list) -> dict: # Raw detected-body share over kept videos; `videos_above` doesn't apply the shape test.
+    known = sorted(r for r in ratios if r is not None)
+    if not known: return {}
+    pct = lambda q: float(known[min(len(known) - 1, int(q * (len(known) - 1)))])
+    return {
+        "multi_person_p50": pct(0.5), "multi_person_p90": pct(0.9), "multi_person_p99": pct(0.99), "multi_person_max": float(known[-1]),
+        "multi_person_videos_above": {f"{t:g}": sum(1 for r in known if r > t) for t in (0.0, 0.01, 0.05, 0.25, 0.5)},
+    }
 
 
 class StreamingWindowDataset(Dataset):

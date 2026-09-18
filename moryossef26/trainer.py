@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from data.windowing import BIO, TRUSTED_GAP_S
-from data.loader import ANNOTATION_PROTOCOL, annotation_fingerprint, assert_pool_safe, resolve_pretrain_records 
+from data.loader import ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, assert_pool_safe, resolve_pretrain_records 
 from moryossef26.dataset import MoryossefChunkDataset, collate_moryossef_chunks, fit_release_stats
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
@@ -75,9 +75,8 @@ def build_moryossef_loaders(
     
     # Same rotation contract as S1 (train/bio_pretrain.py): a pooled run re-draws its balanced sub-sample each
     # epoch so both arms see the same data exposure and the cascade compares METHODS, not data.
-    train_ds = MoryossefChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, records_for_epoch=(
-        lambda e: resolve_pretrain_records(cfg, data_cfg, language, "train", epoch=e)[0]
-    ) if pretrain_mix else None, **common)
+    train_ds = MoryossefChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True,
+        records_for_epoch=PooledEpochRecords(cfg, data_cfg, language) if pretrain_mix else None, **common)
     dev_ds = MoryossefChunkDataset(dev_records, steps_per_epoch=max(dev_steps, 1), training=False, **common)
 
     bs = dist.per_rank_batch_size(int(cfg.get("batch_size", 8)))

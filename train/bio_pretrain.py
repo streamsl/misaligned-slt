@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from data.batch import WindowCollator
 from data.loader import (
-    ANNOTATION_PROTOCOL, StreamingWindowDataset, annotation_fingerprint, 
+    ANNOTATION_PROTOCOL, PooledEpochRecords, StreamingWindowDataset, annotation_fingerprint, 
     assert_pool_safe, resolve_pretrain_records, sentence_p99_s, streaming_loader
 )
 from backbones import UniSignPoseEncoder
@@ -150,7 +150,7 @@ def build_bio_s1(
     # ROTATE and the whole corpus is covered across epochs. Monolingual runs pass no provider and are unchanged.
     train_dataset = StreamingWindowDataset(
         train_records, slt_cfg=cfg, inference_cfg=inference_cfg, pose_augment_cfg=cfg.get("augmentation"),
-        records_for_epoch=(lambda e: resolve_pretrain_records(cfg, data_cfg, language, "train", epoch=e)[0]) if pretrain_mix else None
+        records_for_epoch=PooledEpochRecords(cfg, data_cfg, language) if pretrain_mix else None
     )
     # Record the sampler's resolved geometry once. Checkpoint metadata and whole-video evaluation must use the
     # context the head actually trained on, not a target inference file that may change later.

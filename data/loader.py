@@ -732,6 +732,20 @@ def assert_pool_safe(cfg: dict) -> None:
     )
 
 
+class PooledEpochRecords:
+    """`epoch -> train records` for the pooled rotation, as an importable object rather than a closure.
+
+    A DataLoader worker pickles whole dataset and Python 3.14 starts workers with `forkserver` on POSIX instead of `fork`, so a lambda held 
+    on the dataset stops the run with `Can't pickle local object`. Only the main process ever calls this (set_epoch runs before the workers 
+    are rebuilt), but it has to survive the trip.
+    """
+    def __init__(self, cfg: dict, data_cfg: dict, language: str | None):
+        self.cfg, self.data_cfg, self.language = cfg, data_cfg, language
+
+    def __call__(self, epoch: int) -> list["VideoRecord"]:
+        return resolve_pretrain_records(self.cfg, self.data_cfg, self.language, "train", epoch=epoch)[0]
+
+
 def resolve_pretrain_records(
     cfg: dict, data_cfg: dict, language: str, split: str, requested: str | None = None, epoch: int = 0,
 ) -> tuple[list[VideoRecord], dict[str, int] | None]:

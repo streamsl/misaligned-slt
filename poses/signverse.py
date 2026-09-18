@@ -148,13 +148,11 @@ def extra_person_motion(payloads) -> float | None:
         seen = np.isfinite(arms).all(axis=-1)
         keep = seen.sum(axis=0) >= 10
         if not keep.any(): continue
-        with np.errstate(invalid="ignore"):
-            sd = np.nanstd(np.where(seen[..., None], arms, np.nan), axis=0)
-        scores.append(float(np.nanmax(sd[keep])))
+        # Select the joints BEFORE the standard deviation. A joint with under 2 observations has no deviation, and
+        # numpy warns once per such slice; dropping them first asks only for values that are used.
+        sd = np.nanstd(np.where(seen[..., None], arms, np.nan)[:, keep], axis=0)
+        scores.append(float(np.nanmax(sd)))
     return max(scores) if scores else (None if has_extra else 0.0)
-
-
-
 
 
 def _primary_hands(payload: dict, body: tuple[np.ndarray, np.ndarray] | None) -> dict:

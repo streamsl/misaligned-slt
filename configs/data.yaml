@@ -120,6 +120,11 @@ subtitles:
     # 2 populations separate cleanly — bilingual videos 0.39-0.48, English-with-quotes below 0.05 — so 0.15 sits in the 
     # empty band between them and drops ~30/10588 videos. Set to 1.0 to disable (required for non-Latin TARGET language).
     max_non_latin_ratio: 0.15
+    # Latin-script wrong-language tracks: Spanish and French captions filed as `.en.vtt` pass the script test above.
+    # Share of closed-class English words, over tracks long enough to be prose. Short tracks are exempt because a 
+    # vocabulary list scores near 0 in every language. 0.0 disables this rule.
+    min_english_function_word_ratio: 0.10
+    language_check_min_words: 100
     # Group whole cues into timestamp-supported caption units. A unit may contain several linguistic sentences.
     # Group using original punctuation; render internal sentence-final periods as commas afterward.
     # This defines the BIO and translation target for every corpus, arm and evaluation split.

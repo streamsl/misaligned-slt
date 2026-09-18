@@ -323,7 +323,7 @@ class MisalignedSLTModel(nn.Module):
                 # only to produce 2 log entries. Keeping both arms merged also keeps AR-vs-DLM a clean contrast.
                 labels = target_tokens["labels"].to(bio_tap.device)
                 translation_loss, row_sum, row_valid = self.front_end.ar_loss(
-                    enc_hidden[idx], enc_mask[idx], labels[idx],
+                    enc_hidden[idx], enc_mask[idx], labels[idx], label_smoothing=oput_label_smoothing,
                     omega_bias=None if omega_bias is None else omega_bias[idx], row_stats=True,
                 )
                 self._log_per_mode(logs, mode_to_indices, idx_list if isinstance(mode_names, list) else [], row_sum, row_valid)

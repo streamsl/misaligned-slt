@@ -31,7 +31,7 @@ upload frontier, no failure markers), a few are indexed but absent from their sh
 both are reported and reconciled, not errors.
 """
 from __future__ import annotations
-import argparse, io, csv, json, shutil, sys, tarfile, urllib.request, zipfile
+import argparse, io, csv, json, math, shutil, sys, tarfile, urllib.request, zipfile
 import numpy as np
 
 from pathlib import Path
@@ -306,7 +306,8 @@ def stage_convert(args, plan: dict) -> None:
                         "video_id": vid, "duration_s": f"{stats['duration_s']:.3f}",
                         "width": str(stats["width"] or ""), "height": str(stats["height"] or ""), 
                         "caption_source": stats["caption_source"], "multi_person_ratio": stats["multi_person_ratio"], 
-                        "undetected_ratio": stats["empty_frames"] / frames, "extra_person_motion": stats["extra_person_motion"],
+                        "undetected_ratio": stats["empty_frames"] / frames,
+                        "extra_person_motion": float("nan") if stats["extra_person_motion"] is None else stats["extra_person_motion"],
                     }
                     touched_langs.add(lang)
                     report["converted"] += 1
@@ -390,7 +391,9 @@ def stage_person_counts(args, plan: dict) -> None:
                 row.update({
                     "multi_person_ratio": stats["multi"] / frames if frames else 0.0,
                     "undetected_ratio": 1.0 - stats["detected"] / frames if frames else 1.0,
-                    "extra_person_motion": stats["extra_motion"],
+                    # None means the slots exist but carry no measurable shoulders. Store NaN, not blank, 
+                    # or this shard is re-read on every later run for a value that cannot change.
+                    "extra_person_motion": float("nan") if stats["extra_motion"] is None else stats["extra_motion"],
                 })
                 # Only when the shard knows it: a blank stays blank rather than becoming a wrong 0, because the
                 # spatial augmentations and the segmenter's aspect correction both read these.
@@ -409,10 +412,15 @@ def stage_person_counts(args, plan: dict) -> None:
     for lang, meta in sorted(per_lang_meta.items()):
         blank_counts = sum(1 for row in meta.values() if row.get("multi_person_ratio") is None)
         blank_motion = sum(1 for row in meta.values() if row.get("extra_person_motion") is None)
+        unmeasurable = sum(1 for row in meta.values() if row.get("extra_person_motion") is not None and math.isnan(row["extra_person_motion"]))
         blank_size = sum(1 for row in meta.values() if row.get("width") is None or row.get("height") is None)
         if blank_counts or blank_size or blank_motion: print(
             f"person-counts | {lang}: {blank_counts}/{len(meta)} rows still have no person count, "
-            f"{blank_size}/{len(meta)} no frame size, {blank_motion}/{len(meta)} no shape measurement", flush=True
+            f"{blank_size}/{len(meta)} no frame size, {blank_motion}/{len(meta)} no arm measurement", flush=True
+        )
+        if unmeasurable: print(
+            f"person-counts | {lang}: {unmeasurable}/{len(meta)} rows hold an extra detection whose shoulders are never "
+            f"both visible, so its arm motion has no value. Recorded as `nan`; re-running cannot change it.", flush=True
         )
     if missing_shards: print(
         f"person-counts | {len(missing_shards)} shard(s) absent from {cache}; their videos stay UNKNOWN and data/loader.py "
@@ -511,7 +519,7 @@ def stage_subs(args, plan: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SignVerse-2M → repo language layout (poses/ + subs/ + video_meta.csv)")
     parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "person-counts", "subs", "all"])
-    parser.add_argument("--languages", nargs="+", default=["asf", "bfi"])
+    parser.add_argument("--languages", nargs="+", default=["ase", "asf", "bfi"])
     parser.add_argument("--split-csv", default=DEFAULT_SPLIT_CSV)
     parser.add_argument("--data-config", default="configs/data.yaml", help="reads languages[lang].target_lang for the caption language")
     parser.add_argument("--cache", default=DEFAULT_CACHE, help="shard tar cache dir")

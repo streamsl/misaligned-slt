@@ -46,6 +46,13 @@ NOISE_CAPTION_WORDS = {
     "applause", "background", "foreign", "gentle", "inaudible", "laugh", "laughs",
     "laughter", "music", "piano", "silence", "silent",
 }
+# Most frequent closed-class English words. Closed class since it can't grow with the topic: a caption about
+# any subject still needs these to be English prose, and no other Latin-script language shares more than a few.
+ENGLISH_FUNCTION_WORDS = frozenset("""
+the a an and or but if then than that this these those of to in on at for with from by as is are was were be been being am do does did have 
+has had will would can could should may might must not no nor so such it its he she they them his her their we us our you your i me my there 
+here what when where who whom which how why all any both each few more most other some only own same too very
+""".split())
 # Unicode punctuation -> ASCII, so a curly apostrophe in a reference ("Sydney\u2019s") and a straight one from the model ("Sydney's") are the 
 # SAME BLEU token. Applied after html.unescape (so &#8217; is folded too) and before the leading-symbol strip (so a leading en/em dash still 
 # counts as a speaker dash). nbsp/thin spaces -> space, later collapsed by the \\s+ pass.
@@ -323,6 +330,20 @@ def non_latin_ratio(texts: Iterable[str]) -> float:
                 continue
             if not name.startswith("LATIN"): non_latin += 1
     return non_latin / total if total else 0.0
+
+def english_function_word_ratio(texts: Iterable[str]) -> tuple[int, float]:
+    """(word count, share of words that are closed-class English) for 1 video's captions.
+
+    `non_latin_ratio` tests SCRIPT, so Spanish and French captions filed as `.en.vtt` pass it untouched. Content
+    words cannot separate those from English, because a name or a loanword looks the same in both; function words
+    can, because every language builds its own from a closed set that does not transfer.
+
+    Return the word count too: the caller must not judge a vocabulary list this way. A gloss track carries content
+    words alone ("RUBBISH / MESS / CLEAN"), so it scores near zero in any language.
+    """
+    words = _WORD_RE.findall(" ".join(texts).lower())
+    if not words: return 0, 0.0
+    return len(words), sum(word in ENGLISH_FUNCTION_WORDS for word in words) / len(words)
 
 
 def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> tuple[list[tuple[float, float, str]], int, int]:
@@ -901,15 +922,21 @@ def load_language_records(
     if max_multi < 1.0:
         considered = len(selected_ids)
         unknown = [v for v in selected_ids if (video_meta.get(v) or {}).get("multi_person_ratio") is None]
+
+        # Blank (never measured) and NaN (measured, no answer) both mean the arm test cannot speak, and the count rule alone then decides.
+        def _no_motion_answer(vid: str) -> bool:
+            motion = (video_meta.get(vid) or {}).get("extra_person_motion")
+            return motion is None or motion != motion
+        
         over = {v for v in selected_ids if ((video_meta.get(v) or {}).get("multi_person_ratio") or 0.0) > max_multi
-                                        and ((video_meta.get(v) or {}).get("extra_person_motion") is None
-                                        or video_meta[v]["extra_person_motion"] > min_motion)}
-        unmeasured = sum(video_meta[v].get("extra_person_motion") is None for v in over)
+                                        and (_no_motion_answer(v) or video_meta[v]["extra_person_motion"] > min_motion)}
+        unmeasured = sum(_no_motion_answer(v) for v in over)
         dropped_multi_person.extend((v, float(video_meta[v]["multi_person_ratio"])) for v in selected_ids if v in over)
         selected_ids = [v for v in selected_ids if v not in over]
         if unmeasured: print(
-            f"[loader] {language}/{split or 'all'}: {unmeasured} multi-person exclusions have no measurable extra-person "
-            f"shape; the count rule applies. Run `prepare_data.py --stage person-counts` if that column is missing.", flush=True
+            f"[loader] {language}/{split or 'all'}: {unmeasured} of these videos hold an extra detection whose shoulders are never both "
+            f"visible, so its arm motion can't be measured and the count rule alone excluded them. This is a property of the video, not "
+            f"a missing measurement: re-running `person-counts` returns the same result.", flush=True
         )
         if unknown: print(
             f"[loader] {language}/{split or 'all'}: WARNING the multi-person rule is on but {len(unknown)}/{considered} "
@@ -936,7 +963,10 @@ def load_language_records(
     # 1.0 disables the filter (no video can exceed a full share). The key is GLOBAL under `subtitles:`, which is correct while every 
     # corpus targets English; non-Latin-target corpus need a per-language override which would switch the filter off for English corpora.
     max_non_latin = float(subtitle_cfg.get("max_non_latin_ratio", 1.0))
+    min_english = float(subtitle_cfg.get("min_english_function_word_ratio", 0.0))
+    language_check_min_words = int(subtitle_cfg.get("language_check_min_words", 100))
     dropped_non_latin: list[tuple[str, float]] = []
+    dropped_wrong_language: list[tuple[str, float]] = []
     drop_scrolling = bool(subtitle_cfg.get("drop_scrolling_tracks", True))
     dropped_scrolling: list[tuple[str, float]] = []
     for video_id in tqdm(selected_ids, desc=f"[loader] {language}/{split or 'all'}", unit="vid", leave=False, dynamic_ncols=True):
@@ -981,6 +1011,11 @@ def load_language_records(
             ratio = non_latin_ratio(c[2] for c in captions)
             if ratio > max_non_latin:
                 dropped_non_latin.append((video_id, ratio))
+                continue
+        if min_english > 0.0 and captions:
+            words, english = english_function_word_ratio(c[2] for c in captions)
+            if words >= language_check_min_words and english < min_english:
+                dropped_wrong_language.append((video_id, english))
                 continue
         # 3 independent reasons a unit cannot be supervision, attributed to the FIRST that fires so the rows sum to the drop: shorter than 
         # minimum unit, outside the pose stream, or carrying no letters at all (a cue of digits or punctuation is not a translation target).
@@ -1033,7 +1068,14 @@ def load_language_records(
     if dropped_non_latin: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_non_latin)} video(s) dropped as WRONG-LANGUAGE (>{max_non_latin:.0%} non-Latin "
         f"caption characters; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_non_latin, key=lambda x: -x[1])[:3])
-        + "); subtitles.max_non_latin_ratio.", flush=True)
+        + "); subtitles.max_non_latin_ratio.", flush=True
+    )
+    if dropped_wrong_language: print(
+        f"[loader] {language}/{split or 'all'}: {len(dropped_wrong_language)} video(s) dropped as WRONG-LANGUAGE "
+        f"(under {min_english:.0%} English function words over {language_check_min_words}+ words; e.g. "
+        + ", ".join(f"{v} {r:.1%}" for v, r in sorted(dropped_wrong_language, key=lambda x: x[1])[:3])
+        + "); subtitles.min_english_function_word_ratio.", flush=True
+    )
     if dropped_no_caption: print(
         f"[loader] {language}/{split or 'all'}: {dropped_no_caption}/{len(selected_ids)} videos dropped "
         f"(no usable caption in {root / 'subs'}).", flush=True

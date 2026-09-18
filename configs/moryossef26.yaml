@@ -1,7 +1,8 @@
 # Faithful Moryossef 2026 external segmenter for error calibration and the RQ2 cascade. It is not the in-system FSM
-# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads RAW pose keypoints (+velocity)
-# through a UNet CNN, a DIFFERENT input space from the in-system head's Uni-Sign features (docs/membership_gate.md
-# §1.4 "weights do not transfer"). That input-space difference keeps calibration independent.
+# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input
+# contract — their 50 landmarks (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity
+# after — where the in-system head reads Uni-Sign features. The two arms therefore share no preprocessing at all,
+# which is what keeps calibration independent (docs/membership_gate.md §4, shared components table).
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
@@ -14,11 +15,6 @@ checkpoint:
     monitor: val_phrase_tiou_f1
     mode: max
     restore_best: true
-    # Optional CROSS-MODALITY warm-start from the released Moryossef 2026 weights instead of random init
-    # (moryossef26.model.load_moryossef_pretrained). Their model is MediaPipe-Holistic 50-kp 3D + normalize_mean_std;
-    # ours is DWPose 69-kp 2D — the temporal convs / RoPE encoder / phrase head transfer; frame_cnn.0.fc transfers its
-    # 42 HAND columns index-for-index (identical 21-pt topology) and reinits body+face; the sign head is dropped.
-    # NOT zero-shot — train-moryossef fine-tunes. Comment out to train from random.
     from_pretrained: checkpoints/moryossef26.safetensors
 wandb:
     enabled: false
@@ -28,7 +24,7 @@ wandb:
 
 # MoryossefSegmenter arch (moryossef26/model.py) — the faithful 2026 release: UNet CNN → RoPE Transformer → phrase
 # BIO head, ~5.5M params. Trained END-TO-END on raw keypoints (no frozen backbone).
-pose_joints: 69 # Uni-Sign 69-kp layout (poses.load_pose_window normalizes to it)
+pose_joints: 50 # THEIR layout: 8 body + two 21-point hands, no face (moryossef26.dataset.RELEASE_KP_IDX)
 velocity: true # Moryossef 2026 default: append fps-normalized per-keypoint velocity (pose_dim 3 -> 6)
 hidden_dim: 384
 encoder_depth: 4
@@ -71,7 +67,7 @@ early_stopping:
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 2
+    warmup_epochs: 4
 mixed_precision: auto
 max_grad_norm: 1.0
 # The pred→GT match bar is an analysis knob (`analyze.SEGMENTER_ERROR_MATCH_TIOU = 0.1`,

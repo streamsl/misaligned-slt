@@ -1,6 +1,6 @@
 """Faithful Moryossef 2026 external segmenter for calibration and the RQ2 cascade.
 
-Raw keypoints (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: a different input space from the
+Their 50 landmarks (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: their own input contract, not the
 in-system head's Uni-Sign features. Standalone on whole-video chunks, never the FSM head's bio_head_init.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from data.windowing import BIO, TRUSTED_GAP_S
 from data.loader import ANNOTATION_PROTOCOL, annotation_fingerprint, assert_pool_safe, resolve_pretrain_records 
-from moryossef26.dataset import SegmenterChunkDataset, collate_segmenter_chunks
+from moryossef26.dataset import MoryossefChunkDataset, collate_moryossef_chunks, fit_release_stats
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
 from train import distributed as dist
@@ -20,7 +20,9 @@ from metrics import bio_frame_metrics, moryossef_segment_metrics
 from utils import load_yaml, checkpoint_dir, pool_key
 
 
-def build_segmenter_loaders(data_config: str, moryossef_config: str, language: str | None = None) -> tuple[DataLoader, DataLoader, dict]:
+def build_moryossef_loaders(
+    data_config: str, moryossef_config: str, language: str | None = None
+) -> tuple[DataLoader, DataLoader, dict]:
     data_cfg = load_yaml(data_config)
     cfg = load_yaml(moryossef_config)
     # CLI --language > config language > active_languages; reload so ${language} in checkpoint.dir re-points.
@@ -50,15 +52,20 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
         ckpt["dir"] = checkpoint_dir(cfg, default="checkpoints/moryossef")
         cfg["checkpoint"] = ckpt
         print(f"segmenter | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
-    # Same trusted_gap_s as the labels this arm trains under (`common` feeds SegmenterChunkDataset's make_bio_labels): with the 
+    # Same trusted_gap_s as the labels this arm trains under (`common` feeds MoryossefChunkDataset's make_bio_labels): with the 
     # data.yaml override set, defaulting here would measure O/UNK marginal under 1 gap rule and scale a loss computed under another.
     resolve_bio_class_weights(cfg, train_records, trusted_gap_s=common["trusted_gap_s"])
+    # The released model's standardisation table, fitted ONCE on these records (moryossef26.dataset.fit_release_stats):
+    # a fixed table is what makes a training chunk and the whole-video inference pass agree, exactly as theirs does.
+    release_stats = fit_release_stats(train_records, seed=int(cfg.get("seed", 42)))
+    common["release_stats"] = release_stats
     # Provenance stamp, same keys S1 writes: without it a pooled baseline checkpoint is indistinguishable
     # from a monolingual one at load time and eval.py's pool assertion can never fire for this arm.
     cfg["checkpoint_meta"] = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_records),
         "language": cfg.get("language"), "bio_class_weights": cfg.get("bio_class_weights"),
-        "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"),
+        "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "release_stats": release_stats,
+        "initialization": (cfg.get("checkpoint", {}) or {}).get("from_pretrained"),
     }
     # Dev is balanced by the same rule as train (see train/bio_pretrain.py for the argument) and never rotates.
     # Stamped for the same reason S1 stamps it: the two arms' monitors are only comparable next to their dev sets.
@@ -68,40 +75,44 @@ def build_segmenter_loaders(data_config: str, moryossef_config: str, language: s
     
     # Same rotation contract as S1 (train/bio_pretrain.py): a pooled run re-draws its balanced sub-sample each
     # epoch so both arms see the same data exposure and the cascade compares METHODS, not data.
-    train_ds = SegmenterChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, records_for_epoch=(
+    train_ds = MoryossefChunkDataset(train_records, steps_per_epoch=cfg.get("steps_per_epoch"), training=True, records_for_epoch=(
         lambda e: resolve_pretrain_records(cfg, data_cfg, language, "train", epoch=e)[0]
     ) if pretrain_mix else None, **common)
-    dev_ds = SegmenterChunkDataset(dev_records, steps_per_epoch=max(dev_steps, 1), training=False, **common)
+    dev_ds = MoryossefChunkDataset(dev_records, steps_per_epoch=max(dev_steps, 1), training=False, **common)
 
     bs = dist.per_rank_batch_size(int(cfg.get("batch_size", 8)))
     _sampler = lambda ds: DistributedSampler(
         ds, num_replicas=dist.world_size(), rank=dist.rank(), shuffle=False
     ) if dist.is_distributed() else None
         
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, sampler=_sampler(train_ds), collate_fn=collate_segmenter_chunks)
-    dev_loader = DataLoader(dev_ds, batch_size=bs, sampler=_sampler(dev_ds), collate_fn=collate_segmenter_chunks)
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, sampler=_sampler(train_ds), collate_fn=collate_moryossef_chunks)
+    dev_loader = DataLoader(dev_ds, batch_size=bs, sampler=_sampler(dev_ds), collate_fn=collate_moryossef_chunks)
     return train_loader, dev_loader, cfg
 
 
-def build_segmenter(moryossef_config: str) -> MoryossefSegmenter:
+def build_moryossef(moryossef_config: str, pretrained: bool = True, seed: int | None = None) -> MoryossefSegmenter:
+    # `pretrained=False` + an explicit `seed` is random-init control (eval --segmenter-init random): same architecture and same input 
+    # contract with nothing transferred, which is the range a released-weights score has to be read against.
     cfg = load_yaml(moryossef_config)
+    if seed is not None: torch.manual_seed(int(seed))
     pose_dim = 6 if bool(cfg.get("velocity", True)) else 3  # +velocity doubles the per-keypoint channel dim
     model = MoryossefSegmenter(
-        pose_dims=(int(cfg.get("pose_joints", 69)), pose_dim),
+        pose_dims=(int(cfg.get("pose_joints", 50)), pose_dim),
         hidden_dim=int(cfg.get("hidden_dim", 384)), encoder_depth=int(cfg.get("encoder_depth", 4)),
         attn_nhead=int(cfg.get("attn_nhead", 8)), attn_ff_mult=int(cfg.get("attn_ff_mult", 2)),
         attn_dropout=float(cfg.get("attn_dropout", 0.1)), num_frames=int(cfg.get("num_frames", 1024)),
     )
-    # Optional cross-modality warm-start from the released Moryossef 2026 weights (vs random init). See
-    # load_moryossef_pretrained: not zero-shot — train-segmenter still fine-tunes on our DWPose data.
-    pretrained = (cfg.get("checkpoint", {}) or {}).get("from_pretrained")
-    if pretrained and Path(pretrained).exists(): load_moryossef_pretrained(model, pretrained)
-    elif pretrained: print(f"segmenter | WARNING: from_pretrained {pretrained} not found — random init", flush=True)
+    # Optional warm start from the released Moryossef 2026 weights (vs random init). See load_moryossef_pretrained:
+    # not zero-shot — train-moryossef fine-tunes after, and the untrained control is eval --segmenter-init released.
+    weights = (cfg.get("checkpoint", {}) or {}).get("from_pretrained") if pretrained else None
+    if weights and Path(weights).exists(): load_moryossef_pretrained(model, weights)
+    elif weights: print(f"segmenter | WARNING: from_pretrained {weights} not found — random init", flush=True)
+    elif not pretrained: print(f"segmenter | RANDOM init (seed {seed}), no released weights", flush=True)
     return model
 
 
 @torch.no_grad()
-def evaluate_segmenter(model, loader, device, dice_weight, class_weights) -> dict[str, float]:
+def evaluate_moryossef(model, loader, device, dice_weight, class_weights) -> dict[str, float]:
     rows = []
     with eval_mode(model):
         for batch in loader:
@@ -118,7 +129,7 @@ def evaluate_segmenter(model, loader, device, dice_weight, class_weights) -> dic
     return mean_logs(rows, prefix="val")
 
 
-def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg, resume: bool = False) -> list[dict]:
+def train_moryossef_epochs(model, train_loader, dev_loader, device, epochs, cfg, resume: bool = False) -> int:
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
@@ -130,9 +141,8 @@ def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg,
         return loss, {"bio_loss": float(loss.detach())}
 
     return run_epoch_loop(
-        name="segmenter", model=model, loader=train_loader, optimizer=optimizer, 
-        device=device, epochs=epochs, cfg=cfg, step_fn=step_fn,
-        evaluate_fn=lambda epoch: evaluate_segmenter(model, dev_loader, device, dice_weight, class_weights),
+        name="moryossef", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
+        step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_moryossef(model, dev_loader, device, dice_weight, class_weights),
         default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
         # Same wiring as S1 (train/bio_pretrain.py): without it the SAVE-ON-BEST model.pt and latest.pt carry no meta, 
         # so eval.py's pool-provenance assertion could never fire for this arm and --resume could not detect config drift. 

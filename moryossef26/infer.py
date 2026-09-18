@@ -1,6 +1,6 @@
 """Whole-stream inference + standalone eval, shared by both segmenters.
 
-One wrapper for the faithful Moryossef segmenter (raw keypoints + velocity) and the in-system BIO head as the `s1`
+Wrapper for faithful Moryossef segmenter (their landmarks + velocity) and the in-system BIO head as the `s1`
 ablation (Uni-Sign features). Chunking lives INSIDE the model at train-time chunk size — the train-consistent
 Moryossef inference. Per-model: the `velocity` flag (UNet only) and the logits container.
 """
@@ -13,7 +13,7 @@ from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
 from infer.duration_decode import DurationDecoder
-from moryossef26.dataset import append_velocity
+from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
@@ -41,7 +41,7 @@ def _phrase_logits(
     model, poses_np: np.ndarray, timestamps_np: np.ndarray, 
     device: torch.device, velocity: bool
 ) -> torch.Tensor:
-    if velocity: poses_np = append_velocity(poses_np, timestamps_np)
+    if velocity: poses_np = release_velocity(poses_np, timestamps_np)
     poses = torch.as_tensor(poses_np, dtype=torch.float32, device=device).unsqueeze(0)
     timestamps = torch.as_tensor(timestamps_np, dtype=torch.float32, device=device).unsqueeze(0)
     mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=device)
@@ -52,8 +52,9 @@ def _phrase_logits(
 def whole_video_logits(model, record: VideoRecord, device: torch.device, velocity: bool, rope_chunk_s: float | None):
     """Phrase logits and timestamps. S1 uses one normalization per trained-context chunk.
 
-    The offline Moryossef adaptation uses the video's box in both training and inference.
-    Its Uni-Sign landmark transform differs from the reference's shoulder/mean-std transform.
+    The Moryossef arm reads the RELEASED model's own input contract (moryossef26.dataset.to_release_coords):
+    their 50 landmarks, their shoulder/standardise normalisation, no face, velocity after — the same representation
+    at train and inference, and no video crop box.
     """
     if hasattr(model, "bio_head"):
         if rope_chunk_s is None: raise ValueError("S1 whole-video pass needs rope_chunk_s (the trained context)")
@@ -63,14 +64,16 @@ def whole_video_logits(model, record: VideoRecord, device: torch.device, velocit
         model.bio_head.chunk_size, model.bio_head.chunk_overlap = chunk, True   # a chunk-length input is one RoPE pass
         forward = lambda p, m, t: model(p, frame_mask=m, timestamps_s=t).logits
         return chunk_normalized_logits(forward, raw, timestamps, chunk, device), timestamps
-    poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=True)
-    if poses.shape[0] == 0: return None, timestamps
-    return _phrase_logits(model, poses, timestamps, device, velocity), timestamps
+    raw, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
+    if raw.shape[0] == 0: return None, timestamps
+    coords = to_release_coords(raw, getattr(model, "release_stats", None), aspect=pose_aspect(record.pose))
+    return _phrase_logits(model, coords, timestamps, device, velocity), timestamps
 
 
 @torch.no_grad()
 def predict_phrase_segments(
-    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None, duration=None
+    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
+    rope_chunk_s: float | None = None, duration=None
 ) -> dict[str, list[Segment]]:
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
@@ -97,10 +100,10 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
     for t in tiou_thresholds:
         seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
         row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
-        # Moryossef 2023's "%" metric: predicted/gold segment-count ratio, threshold-independent (counts come 
-        # from the decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper
-        # comparable pair to their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are
-        # gameable (a right count with wrong placements scores 1.0).
+        # Moryossef 2023's "%" metric: predicted/gold segment-count ratio, threshold-independent (counts come from the 
+        # decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper comparable pair to 
+        # their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are gameable (a right count 
+        # with wrong placements scores 1.0).
         row.setdefault("phrase_segment_count_ratio", float(seg["phrase_n_pred"]) / max(1.0, float(seg["phrase_n_gold"])))
         for k in seg_keys:
             row[f"{k}@{t:g}"] = seg[k]
@@ -110,7 +113,7 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
 
 
 @torch.no_grad()
-def evaluate_segmenter_whole_video(
+def evaluate_moryossef_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
     trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,), 
     return_segments: bool = False, duration=None,

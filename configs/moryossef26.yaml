@@ -77,4 +77,8 @@ max_grad_norm: 1.0
 # cascade rows compare methods rather than the amount of segmentation data each arm saw. Set both to null together
 # for the monolingual recipe.
 pretrain_languages: [ase, asf, bfi]
-pretrain_temperature: 0.3
+# τ=1.0  ase 84% / asf 9%  / bfi 8%     (proportional)
+# τ=0.5  ase 62% / asf 20% / bfi 19%
+# τ=0.3  ase 50% / asf 25% / bfi 24% 
+# τ=0.0  ase 33% / asf 33% / bfi 33%    (uniform)
+pretrain_temperature: 0.0

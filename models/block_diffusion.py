@@ -137,6 +137,39 @@ def build_block_causal_mask(batch_size, tgt_len, block_size, dtype, device):
 # Abstract base: BD3LM core (training + block-diffusion generation)
 # ════════════════════════════════════════════════════════════════════════════
 
+class CanvasEmbedding(nn.Module):
+    """The DLM's (vocab+1)-row input embedding: a copy of the backbone's table + 1 appended [MASK] row.
+
+    [MASK] row is drawn at the copied table's scale, using its per-dimension mean and scalar standard deviation. 
+    The table and new row are separate parameters so LoRA can freeze the table and train the row.
+
+    `embed_scale` is the backbone's own word-embedding factor (mBART: sqrt(d); mT5: 1), applied here so the
+    custom forward and the HF cached forward embed a token identically without a second scaled copy of the table.
+    """
+    def __init__(self, source_weight: torch.Tensor, mask_token_id: int, embed_scale: float = 1.0):
+        super().__init__()
+        vocab, d_model = source_weight.shape
+        self.mask_token_id, self.embed_scale = int(mask_token_id), float(embed_scale)
+        self.base = nn.Embedding(vocab, d_model)
+        with torch.no_grad():
+            self.base.weight.copy_(source_weight)
+            table = source_weight.detach().float()
+            self.mask_row = nn.Parameter(torch.normal(table.mean(dim=0), table.std()).to(source_weight.dtype))
+
+    @property
+    def num_embeddings(self) -> int: return self.base.num_embeddings + 1
+
+    @property
+    def embedding_dim(self) -> int: return self.base.embedding_dim
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        is_mask = (ids == self.mask_token_id)
+        # Send [MASK] to row 0 rather than clamping the whole tensor: a clamp would also swallow an id 
+        # ABOVE [MASK], which one (vocab+1) table would raise on. Only the [MASK] id is substituted here.
+        out = torch.where(is_mask.unsqueeze(-1), self.mask_row, self.base(torch.where(is_mask, 0, ids)))
+        return out * self.embed_scale if self.embed_scale != 1.0 else out
+
+
 class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     '''BD3LM decoder built on the pretrained AR decoder backbone.
 
@@ -173,14 +206,18 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         self.mask_token_id = vocab_size # Append [MASK] at index vocab_size so existing token IDs are unchanged
 
         # ── Extend embedding and language model heads ───────────────────────
+        # The input canvas keeps the copied table and the appended [MASK] row as SEPARATE parameters (CanvasEmbedding),
+        # so a policy that freezes the pretrained rows and trains the new one needs no gradient mask and puts no dead
+        # element into the optimizer. The output head keeps one (vocab+1, d) table so its shape mirrors the input canvas; 
+        # its [MASK] column sits outside both losses (models/dmax.py slices OPUT and confidence-bound logits to real 
+        # vocabulary) and outside the decode (infer/decode.py forces it to the dtype minimum).
         # No padding_idx: on mT5, pad id is also the canvas BOS, and padding_idx would freeze the BOS row the AR arm trains. 
         # A pad slot never reaches a supervised slot under block-causal attention, so its gradient is zero anyway.
-        self.embed_tokens = nn.Embedding(vocab_size + 1, d_model)
+        self.embed_tokens = CanvasEmbedding(embed_source_weight, mask_token_id=vocab_size, embed_scale=self.embed_scale)
+        self.embed_scale = 1.0  # the canvas applies the backbone's scale itself; never apply it twice
         self.lm_head = nn.Linear(d_model, vocab_size + 1, bias=False)
         with torch.no_grad():
-            self.embed_tokens.weight[:vocab_size].copy_(embed_source_weight)
             self.lm_head.weight[:vocab_size].copy_(lm_source_weight)
-            nn.init.normal_(self.embed_tokens.weight[vocab_size:], std=0.02)
             nn.init.zeros_(self.lm_head.weight[vocab_size:])
 
 
@@ -260,4 +297,3 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
             torch.cat([noisy_ids, clean_ids], dim=1), enc_hidden, enc_mask,
             self_attn_mask=bd3lm_mask, position_ids=position_ids, omega_bias=omega_bias, logits_len=length,
         )  # (B, L, V+1) — xt half
-

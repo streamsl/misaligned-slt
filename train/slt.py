@@ -9,6 +9,7 @@ from transformers import AutoTokenizer, T5Tokenizer
 
 from data.batch import WindowCollator
 from data.loader import ANNOTATION_PROTOCOL, StreamingWindowDataset, annotation_fingerprint, load_language_records, streaming_loader 
+from models.lora import apply_lora
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from infer.duration_decode import DurationModel, DurationDecoder
@@ -66,6 +67,9 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
         "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
         "architecture": "shared_temporal_slt" if float(slt_cfg.get("lambda_bio", 1.0)) else "clean_translation",
         "bio_objective": "ce_dice", "dice_loss_weight": float(slt_cfg.get("dice_loss_weight", 1.5)),
+        # The adapted model is a different model: a checkpoint trained at 1 rank or target set cannot be loaded
+        # into another, because the wrapped modules carry different tensors.
+        "lora": slt_cfg.get("lora_applied"),
         "gate": {k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps")},
         "buffer_cap_s": inference_cfg.get("buffer_cap_s"), 
         "segmentation_decode": "semi_markov_viterbi" if slt_cfg.get("duration_model") else "none",
@@ -91,14 +95,62 @@ def build_slt_optimizer(slt_cfg: dict, model) -> torch.optim.Optimizer:
     head_from_s1 = bool(getattr(model, "bio_head_from_s1", False))
     mods = [model.front_end.pose_encoder] + ([model.bio_head] if head_from_s1 else [])
     pretrained = {id(p) for m in mods for p in m.parameters()}
+    # LoRA factors use the adapter rate; task modules keep their own learning-rate groups.
+    adapter_ids = {id(p) for n, p in model.named_parameters() if n.endswith(".lora_A") or n.endswith(".lora_B")}
     trainable = [p for p in model.parameters() if p.requires_grad]
     backbone = [p for p in trainable if id(p) in pretrained]
-    main = [p for p in trainable if id(p) not in pretrained]
+    adapters = [p for p in trainable if id(p) in adapter_ids]
+    main = [p for p in trainable if id(p) not in pretrained and id(p) not in adapter_ids]
+
     lr, backbone_lr = resolve_lrs(slt_cfg)
     label = "S1-pretrained (pose_encoder+bio_head)" if head_from_s1 else "warm-started pose_encoder (bio_head random init, full lr)"
+    adapter_lr = float(((slt_cfg.get("lora") or {}).get("learning_rate") or 0.0)) or lr
+    extra = f" | LoRA {sum(p.numel() for p in adapters) / 1e6:.2f}M @ lora.learning_rate={adapter_lr:g}" if adapters else ""
     print(f"slt | optimizer: main {sum(p.numel() for p in main) / 1e6:.2f}M @ lr={lr:g} | {label} "
-          f"{sum(p.numel() for p in backbone) / 1e6:.2f}M @ backbone_lr={backbone_lr:g}", flush=True)
-    return build_optimizer(slt_cfg, main, backbone_params=backbone)
+          f"{sum(p.numel() for p in backbone) / 1e6:.2f}M @ backbone_lr={backbone_lr:g}{extra}", flush=True)
+    return build_optimizer(slt_cfg, main, backbone_params=backbone, adapter_params=adapters or None)
+
+
+def apply_lora_to_front_end(model, slt_cfg: dict) -> dict | None:
+    """Adapt the shared mT5 stack and keep the parameters LoRA cannot reach trainable.
+
+    AR and DLM train separate adapters with the same settings. Within a DLM model the manual and cached forwards share the adapted decoder. 
+    The modules outside the language-model root keep these policies:
+      * the BIO head and the visual-language mapper, which are this project's own modules;
+      * the pose encoder, under its own `freeze_backbone` / `backbone_lr` policy;
+      * the DLM canvas, a COPY of mT5's embedding and head that lives on the decoder — its appended [MASK] row is fresh and must learn, while 
+        its copied rows are the pretrained table and stay fixed. The canvas holds the 2 as separate parameters (models/block_diffusion.py 
+        CanvasEmbedding), so this is a plain freeze.
+    Omega is unaffected: it biases cross-attention SCORES through a forward hook, not a projection weight.
+    """
+    cfg = slt_cfg.get("lora") or {}
+    # BEFORE the enabled check: a typo in `enabled` itself would otherwise return None here, and the run would
+    # full-finetune the language model (582M against 1.8M) with nothing in the log or the stamped meta to say so.
+    unknown = set(cfg) - {"enabled", "rank", "alpha", "dropout", "target_modules", "learning_rate"}
+    if unknown: raise ValueError(f"lora: unknown key(s) {sorted(unknown)}")
+    if not bool(cfg.get("enabled", False)): return None
+
+    front = model.front_end
+    # `apply_lora` freezes everything under the root it is given, and that root is the LM alone: the BIO head, 
+    # the visual-language mapper and the pose encoder live outside it and keep the policies set before this call.
+    meta = apply_lora(front.lm_model, cfg.get("target_modules", ["q", "v"]),
+                      int(cfg.get("rank", 16)), float(cfg.get("alpha", 32)), float(cfg.get("dropout", 0.0)))
+    meta["learning_rate"] = float(cfg.get("learning_rate") or resolve_lrs(slt_cfg)[0])
+
+    dlm = getattr(model, "dlm_decoder", None)
+    if dlm is not None:
+        # Apply the same pretrained-table freeze policy as AR. DLM additionally trains the separate MASK input row.
+        # Equal parameter budgets do not establish equal adaptation capacity for the two objectives.
+        dlm.embed_tokens.base.weight.requires_grad_(False)   # the copied table; only `mask_row` keeps training
+        dlm.embed_tokens.mask_row.requires_grad_(True)
+        # Its [MASK] column is outside the scored support: the OPUT cross-entropy slices the logits to the real
+        # vocabulary, so that row has no target, no gradient and no effect on the loss.
+        dlm.lm_head.weight.requires_grad_(False)
+        meta["dlm_canvas"] = "copied table and output head frozen, as their AR originals are; [MASK] input row trainable"
+    meta["effective_trainable"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"slt | LoRA r={meta['rank']} alpha={meta['alpha']:g} on {meta['target_modules']}: {meta['adapted_modules']} modules, "
+          f"{meta['trainable_params'] / 1e6:.2f}M adapter params, {meta['effective_trainable'] / 1e6:.2f}M trainable in total", flush=True)
+    return meta
 
 
 def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: float, split: str) -> None:
@@ -288,11 +340,12 @@ def build_slt_components(
         n = model.front_end.freeze_pose_backbone(freeze_projection=bool(slt_cfg.get("freeze_projection", False)))
         print(f"slt | froze pose backbone ({n / 1e6:.2f}M parameters)", flush=True)
 
+    lora_meta = apply_lora_to_front_end(model, slt_cfg)
+    if lora_meta: slt_cfg["lora_applied"] = lora_meta
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"slt | model: {total_params / 1e6:.2f}M parameters ({trainable_params / 1e6:.2f}M trainable, "
           f"{(total_params - trainable_params) / 1e6:.2f}M frozen)", flush=True)
-          
     return SLTComponents(
         model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg,
         checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language),

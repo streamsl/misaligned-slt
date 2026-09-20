@@ -84,6 +84,7 @@ CSV: the first stage run on a machine holding the whole pool writes `data/youtub
 it alongside the corpus to any machine that holds one language, or that machine cannot render the same references.
 
 ```bash
+set -e  # Stop the runbook if a calibration or training command fails.
 # ═══ STAGE A — run ONCE. Both segmenters train on the SAME multilingual pool ([ase, asf, bfi]). ═══
 # ── A0. One-time data + checkpoints ──
 #   Warm start: checkpoints/openasl_pose_only_slt.pth.
@@ -104,7 +105,7 @@ python train.py --stage train-moryossef        # -> checkpoints/moryossef/multi_
 #   encoder AND head via bio_head_init. The pool is temperature-flattened and balanced by SUB-sampling with
 #   per-epoch rotation — nothing is replicated, nothing is permanently dropped. Dev is a balanced fixed
 #   sub-sample; test is pooled as-is. Every design value (fixed mode mix, designed jitter, uniform cuts,
-#   fixed 40 s context, above every deployed cap, legal-BIO monitor) is documented in configs/bio_pretrain.yaml.
+#   fixed context checked against each measured deployment cap, legal-BIO monitor) is documented in configs/bio_pretrain.yaml.
 #   Checkpoints stamp their pool (meta.pretrain_pool) and every loader refuses a pool-KEY mismatch. The key alone
 #   does not make A1 and A2 comparable: train them from ONE code state, then check that the two checkpoints
 #   agree on meta.pretrain_mix and meta.annotation_fingerprint before quoting any cascade result.
@@ -114,6 +115,8 @@ python train.py --stage train-bio              # -> checkpoints/bio_s1/multi_ase
 # ═══ STAGE B — per target language. MEASURE (B1) → TRAIN (B2, B3) → EVALUATE (B4, B5, B6). ═══
 # WHAT A CHANGE INVALIDATES:
 #   New joint architecture/loss -> fresh AR and DLM training, followed by their RQ1/RQ2 evaluations.
+#   Changed `lora` block (enabled/rank/alpha/dropout/target_modules) -> fresh AR and DLM training; --resume refuses
+#     across the edit, and RQ1, RQ2 and the loss-balance probe all read the arms that change.
 #   New S1 checkpoint or legal decode -> S1 evaluation and B1 for every target language.
 #   Changed delta/minimum span -> B1b capacity, B1c lag, and the arms that consume those values.
 #   Changed capacity -> clean baseline and arms if their training windows change.
@@ -136,6 +139,9 @@ python analyze.py --stage tune-decode --segmenter-arch s1 --language "$LANG" --s
 python analyze.py --stage delta-enc --language "$LANG" --split dev --write-config
 # On a large dev set, --num-sentences 3000 uses a fixed random subset.
 # B1b — capacity from reliable TRAIN sentence durations, stride and measured tolerance.
+# Always saves outputs/buffer_cap_$LANG.json. If the measured cap exceeds the S1 context, it exits with an error
+# and leaves inference.yaml unchanged. The report compares measured, trained and configured capacities. The
+# configured value can be stale; do not continue B1 on a failed command.
 python analyze.py --stage buffer-cap --language "$LANG" --split train --write-config
 # B1c — commit lag under the resolved capacity/tolerance; duration-score weights stay fixed.
 python analyze.py --stage tune-stream --segmenter-arch s1 --language "$LANG" --split dev --write-config
@@ -169,8 +175,12 @@ python train.py --stage train-slt --language "$LANG" --slt-config configs/baseli
 # ── B3. TRAIN the arms — stage-2 fine-tune under the gate ──
 #   Both arms train under the membership gate, on the S1 init, with the B1 constants. Requires the B2b re-root.
 #   The S1-pretrained pose encoder and BIO head train at backbone_lr (default 0.3 x learning_rate) — the rule stage 1
-#   applies to the released encoder; the LM trains at learning_rate. baseline_train.yaml pins backbone_lr = learning_rate
-#   (Uni-Sign's one-rate transfer recipe), so the clean floor is unchanged.
+#   applies to the released encoder. The mT5 stack is adapted with LoRA (dlm.yaml `lora`: q/v, rank 16, alpha 32,
+#   dropout 0.1, following SpaMo's adapter scope) at lora.learning_rate, with LM base weights frozen. The shared
+#   starting rate is 3.0e-4; compare rates on dev with equal search effort for both arms. Each arm trains its own
+#   adapters. The DLM's manual and cached paths share its adapters; copied token/output tables freeze, [MASK] input trains.
+#   baseline_train.yaml pins the adapter off and backbone_lr = learning_rate (Uni-Sign's one-rate transfer recipe),
+#   so the clean floor stays a full fine-tune of the released front end.
 #   Stage 2 shares the pretrained visual temporal features H across BIO classification and a nonlinear V-L mapper.
 #   The mapper is residual: F + mapper(H), with its last layer initialized to zero to preserve the warm-start input.
 #   Both the shared features and first-span membership carry caption gradients. BIO labels and the first-complete
@@ -587,7 +597,7 @@ Per-language constants, in the order B1 derives them (`--write-config` writes ea
 | `translation.commit_confidence_tau` and `translation.tau_dec` | after the arms train: the RQ1 clean point (`--rq 1 --method dlm --severity-grid-s 0.0`) reports `mean_translation_confidence` and `mean_decoder_passes`. Set tau a touch below the clean mean; select `tau_dec` on a dev curve of BLEU against `mean_decoder_passes` at `eval.yaml rq1.batch_size 1` (each point is one edit of `inference.yaml translation.tau_dec`): `block_size` bounds the arm's parallelism and is fixed at training, `tau_dec` is the inference-time dial inside it, and label smoothing 0.2 puts the per-token loss minimiser at max-prob 0.8, so a threshold near it approaches one commit per pass. No speed claim without that curve | `inference.yaml` |
 | `buffer_cap_s`                    | B1b `buffer-cap --split train` = train-split p99 + stride + δ/fps (label-only, model-free; runs after delta-enc)                     | `inference.yaml`                     |
 | `bio_class_weights`               | `balanced` — resolved from measured label counts at train start, logged                                                              | automatic                            |
-| pooled S1 context                 | `bio_pretrain.yaml pretrain_geometry.buffer_cap_s` — a fixed 40 s, set above every pool language's deployed cap (train p99 + stride + δ/fps). Fixed rather than derived from δ because `delta-enc` writes δ AFTER S1, so a δ-derived context needs a new S1 whenever δ grows. The trained value is pinned in checkpoint meta and B1b refuses a deployed cap above it | train-bio, fixed |
+| pooled S1 context                 | `bio_pretrain.yaml pretrain_geometry.buffer_cap_s` — the maximum training-window duration, recorded in the checkpoint. B1b checks the measured deployment cap against this value. It does not establish how often training used a window near the maximum. | train-bio |
 
 Rules that are not optional: run tune-decode before delta-enc, then delta-enc before buffer-cap (the cap reads δ); buffer-cap runs on the train split (label-only constants are measured on train, model-dependent constants are selected on dev; the stage refuses any other split). One shared `inference.yaml` serves every language — the measured constants live in PER-LANGUAGE rows (delta, minimum span, capacity and commit lag), resolved for the active language at load and refused loudly when the row is missing; the sampler, gate and FSM share target eligibility. A changed annotation fingerprint requires a new duration fit — `require_annotations` refuses to start stage 2 until the fit matches the loaded records, so the calibration chain is on the critical path for every experiment, not only for a decoder change.
 

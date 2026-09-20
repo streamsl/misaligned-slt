@@ -180,6 +180,25 @@ max_text_tokens: 320
 pad_text_to_max_length: false
 validation:
     max_translation_samples: 0 # 0 = score translation on ALL dev windows
+# SpaMo's T5 adapter scope: https://github.com/eddie-euijun-hwang/SpaMo/blob/main/spamo/t5_slt.py
+# AR and DLM train separate adapters with the same settings. Adapt encoder self-attention, decoder self-attention
+# and decoder cross-attention. Freeze all LM base weights, including embeddings and output heads. The DLM trains
+# its separate [MASK] input row. BIO, mapper and pose encoder retain their declared policies.
+lora:
+    # Read by the stage-2 trainers only. bio_pretrain.yaml extends this file and inherits the block; 
+    # S1 trains no language model, so train/bio_pretrain.py never reads it.
+    enabled: true
+    rank: 16
+    alpha: 32
+    dropout: 0.1
+    # Attribute names, and they are backbone-specific: mT5 names its projections q/k/v/o, so [q, v] reaches the encoder 
+    # self-attention, the decoder self-attention and the decoder cross-attention. mBART ablation (language_model.name: 
+    # facebook/mbart-large-cc25) names them q_proj/v_proj and needs [q_proj, v_proj]; a name that matches nothing raises 
+    # rather than training an empty adapter set.
+    target_modules: [q, v]
+    # Shared starting rate, not a conversion from the full-tuning rate. Select on dev with equal search
+    # effort for AR and DLM; the same adapter budget does not imply the same optimal learning rate.
+    learning_rate: 3.0e-4
 # Block size: BD3LM's interpolation dial between autoregression (block 1: 1 slot/block — AR order, with at most 1 soft-state 
 # revision pass/slot) and full diffusion (block = canvas). It bounds DLM arm's parallelism and is a TRAINING parameter — the 
 # block-causal mask, OPUT corruption and canvas alignment all read it — so it is stamped in the checkpoint and eval refuses 

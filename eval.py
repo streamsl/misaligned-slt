@@ -22,13 +22,14 @@ from data.loader import ANNOTATION_PROTOCOL, VideoRecord, annotation_fingerprint
 from data.batch import frame_mask_for, repeat_last_frame
 
 from transformers import T5Tokenizer, AutoTokenizer
+from models.lora import apply_lora
 from models.bio_head import chunk_normalized_logits
-from infer.duration_decode import DurationModel, DurationDecoder
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import _load_state, s1_layout_state, load_checkpoint_meta, load_model_checkpoint
 
 from moryossef26.infer import evaluate_moryossef_whole_video
+from infer.duration_decode import DurationModel, DurationDecoder
 from infer.stream import MoryossefRunnerAdapter, S1RunnerAdapter, StreamingSLTRunner
 from infer.stability import TAU_GRID, accumulate_policy, group_tracks, build_policies, merged_policy, score_policy
 from metrics import (
@@ -487,6 +488,11 @@ def _build_eval_model(method: str, checkpoint: str | None, language: str, data_c
         bio_conv_stem_layers=int(method_cfg.get("bio_conv_stem_layers", 2)),
         block_size=int(method_cfg.get("block_size", 16)),
     )
+    # Rebuild the adapter the run trained with BEFORE loading: a LoRA checkpoint carries `...q.lora_A` / `lora_B`
+    # keys that only exist once the modules are wrapped, and the strict load is what proves the weights match.
+    lora = meta.get("lora")
+    if lora: apply_lora(model.front_end.lm_model, tuple(lora["target_modules"]), int(lora["rank"]), float(lora["alpha"]),
+                        float(lora.get("dropout", 0.0)))  # dropout too: a rebuilt model must match in train mode as well
     load_model_checkpoint(model, ckpt, strict=True)
     model.duration_model = duration
     model.to(device); model.eval()

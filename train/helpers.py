@@ -29,7 +29,7 @@ def resolve_lrs(cfg: dict) -> tuple[float, float]:
     return lr, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.3)))
 
 
-def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Optimizer:
+def build_optimizer(cfg: dict, params, backbone_params=None, adapter_params=None) -> torch.optim.Optimizer:
     """AdamW from a config, reading the SAME keys for every stage.
 
     Prefers top-level `learning_rate` / `weight_decay`; falls back to `optimizer.lr` / `optimizer.weight_decay`
@@ -37,20 +37,26 @@ def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Opti
 
     `backbone_params`: optional second param set at `backbone_lr` (default learning_rate × 0.3) — discriminative
     fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
+
+    `adapter_params`: optional 3rd set at `lora.learning_rate`, defaulting to the main learning rate.
     """
     opt = cfg.get("optimizer", {}) or {}
     lr, backbone_lr = resolve_lrs(cfg)
+    adapter_lr = float(((cfg.get("lora") or {}).get("learning_rate") or 0.0)) or lr
     weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
 
-    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): decaying norm gains regularizes the wrong
-    # thing. Same split as Uni-Sign (timm create_optimizer filter_bias_and_bn=True) and standard HF practice.
+    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm, DLM canvas [MASK] row): decaying norm gains regularizes the 
+    # wrong thing. Same split as Uni-Sign (timm create_optimizer filter_bias_and_bn=True) and standard HF practice.
     def wd_split(ps, group_lr):
         ps = [p for p in ps if p.requires_grad]
-        return [g for g in ({"params": [p for p in ps if p.ndim > 1], "weight_decay": weight_decay, "lr": group_lr},
-                            {"params": [p for p in ps if p.ndim <= 1], "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
+        decay = [p for p in ps if p.ndim > 1]
+        plain = [p for p in ps if p.ndim <= 1]
+        return [g for g in ({"params": decay, "weight_decay": weight_decay, "lr": group_lr},
+                            {"params": plain, "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
 
     groups = wd_split(params, lr)
     if backbone_params is not None: groups += wd_split(backbone_params, backbone_lr)
+    if adapter_params is not None: groups += wd_split(adapter_params, adapter_lr)
     # fused=True on CUDA: one multi-tensor kernel per step instead of a Python loop over ~800M trainable params.
     return torch.optim.AdamW(groups, lr=lr, fused=torch.cuda.is_available())
 
@@ -392,23 +398,9 @@ def run_epoch_loop(
         if latest_path is None or not latest_path.exists():
             raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
         
-        state = load_train_state(latest_path, model, optimizer)
-        # Analysis stages rewrite inference.yaml and the jitter artifact between sessions. Both parameterize this run. Resuming across such 
-        # a change trains the 2nd half under a different objective — visible afterwards only as an unexplained discontinuity in loss curves.
-        saved_meta = dict(state.get("meta") or {})
-        if saved_meta and checkpoint_meta:
-            drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))
-            if drift and set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
-                "--resume: the validation protocol changed; the saved best score is not comparable. "
-                "The trained weights remain usable. Re-evaluate saved checkpoints with the corrected dev generation "
-                "and use a separate checkpoint directory for any continuation; do not reuse the old best-score history."
-            )
-            if drift: raise SystemExit(
-                f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
-                + "; ".join(f"{k}: {saved_meta.get(k)!r} -> {checkpoint_meta.get(k)!r}" for k in drift[:4])
-                + f". Restore those values to resume, or start a fresh run (move {latest_path}) — resuming across "
-                f"the change trains the two halves under different objectives."
-            )
+        # The drift comparison runs INSIDE load_train_state, before the weights: a `lora` edit changes which
+        # parameters exist, so `load_state_dict` would raise a raw shape error first and hide the cause.
+        state = load_train_state(latest_path, model, optimizer, expected_meta=checkpoint_meta)
         saved_epochs = int(state.get("epochs", epochs))
         if saved_epochs != int(epochs) and scheduler.scheduler is not None: raise SystemExit(
             f"--resume: run was launched with epochs={saved_epochs} but this invocation says {epochs}; the LR schedule horizon is baked "

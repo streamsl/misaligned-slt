@@ -21,7 +21,7 @@ import numpy as np
 
 def apply_fps_aug(
     poses: np.ndarray, source_fps: float, min_fps: float = 15.0, max_fps: float = 30.0,
-    rng: np.random.Generator | None = None, source_timestamps_s: np.ndarray | None = None,
+    rng: np.random.Generator = None, source_timestamps_s: np.ndarray = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Moryossef-style fps augmentation (frame-density resampling, no speed change).
 
@@ -52,7 +52,7 @@ def apply_fps_aug(
 
 
 # ── Spatial primitives (parametrised by frame size; operate on x,y only, conf left intact) ─────────────
-def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Generator | None = None) -> np.ndarray:
+def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Generator = None) -> np.ndarray:
     # Rotate (x, y) by U(-max_angle_deg, max_angle_deg) around the centroid of non-zero keypoints. Needs no frame size.
     keypoints = np.asarray(keypoints, dtype=np.float32).copy()
     if keypoints.ndim != 3 or keypoints.shape[-1] < 2: return keypoints
@@ -70,11 +70,8 @@ def rotate(keypoints: np.ndarray, max_angle_deg: float = 15.0, rng: np.random.Ge
 
 def affine(
     keypoints: np.ndarray, width: float, height: float,
-    scale: tuple[float, float] | None = (0.9, 1.1),
-    shift: tuple[float, float] | None = (-0.05, 0.05),
-    degree: tuple[float, float] | None = None,
-    shear: tuple[float, float] | None = None,
-    rng: np.random.Generator | None = None,
+    scale: tuple[float, float] = (0.9, 1.1), shift: tuple[float, float] = (-0.05, 0.05),
+    degree: tuple[float, float] = None, shear: tuple[float, float] = None, rng: np.random.Generator = None,
 ) -> np.ndarray:
     """Random affine (scale/shift/rotate/shear) around the frame centre, on conf>0 points only.
 
@@ -113,7 +110,7 @@ def affine(
 
 def spatial_mask(
     keypoints: np.ndarray, width: float, height: float,
-    size: tuple[float, float] = (0.1, 0.2), rng: np.random.Generator | None = None,
+    size: tuple[float, float] = (0.1, 0.2), rng: np.random.Generator = None,
 ) -> np.ndarray: # Zero a random spatial box (cutout). Masked points become invalid (normalization zeroes them).
     rng = rng or np.random.default_rng()
     keypoints = np.asarray(keypoints, dtype=np.float32).copy()
@@ -145,7 +142,7 @@ class PoseAugmentor:
         self.aff = {**_DEFAULTS["affine"], **(c.get("affine") or {})}
         self.smask = {**_DEFAULTS["spatial_mask"], **(c.get("spatial_mask") or {})}
 
-    def __call__(self, poses: np.ndarray, width: float | None, height: float | None) -> np.ndarray:
+    def __call__(self, poses: np.ndarray, width: float, height: float) -> np.ndarray:
         poses = np.asarray(poses, dtype=np.float32)
         if poses.ndim != 3 or poses.shape[0] == 0: return poses
         has_frame = bool(width) and bool(height)
@@ -159,7 +156,7 @@ class PoseAugmentor:
         return poses
 
 
-def build_pose_augmentor(cfg: dict | None, rng: np.random.Generator | None = None) -> PoseAugmentor | None:
+def build_pose_augmentor(cfg: dict, rng: np.random.Generator = None) -> PoseAugmentor:
     """Build a `PoseAugmentor` from an `augment:` config block, or None when disabled. TRAIN-ONLY callers
     pass their config + a seeded rng; eval/val pass None (no augmentation)."""
     if not cfg or not bool(cfg.get("enabled", False)): return None

@@ -23,7 +23,6 @@ from transformers import MT5Config, MT5ForConditionalGeneration, T5Tokenizer
 from transformers import MBartConfig, MBartForConditionalGeneration, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.models.mbart.modeling_mbart import MBartScaledWordEmbedding
 
 from backbones import UniSignPoseEncoder
 from models.block_diffusion import build_block_causal_mask
@@ -72,13 +71,9 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
             pad_index=pad_index, eos_index=eos_id, bos_index=decoder_start_id, embed_scale=embed_scale,
             block_size=block_size, **kw,
         )
-        # The canvas needs vocab+1 (MASK row) AND mBART's INTERNAL sqrt(d_model) scale, so `_decode` and the HF
-        # `decoder.forward` behind the block KV cache embed identically.
-        scaled = MBartScaledWordEmbedding(self.vocab_size + 1, self.d_model, self.pad_index, embed_scale=embed_scale)
-        with torch.no_grad(): scaled.weight.copy_(self.embed_tokens.weight)
-        self.embed_tokens = scaled
-        self.embed_scale = 1.0  # scale lives inside embed_tokens now; never apply it twice
-        self.mbart_decoder.embed_tokens = self.embed_tokens  # avoids a duplicate parameter
+        # The canvas carries mBART's sqrt(d_model) word-embedding scale itself (CanvasEmbedding), so `_decode` and
+        # the HF `decoder.forward` behind the block KV cache embed a token identically; hand it to the HF stack too.
+        self.mbart_decoder.embed_tokens = self.embed_tokens
         print(f"MBartBlockDiffusionDecoder (mBART A2D): d_model={self.d_model}, "
               f"vocab={self.vocab_size}+1(MASK), block_size={self.block_size}")
 
@@ -125,8 +120,8 @@ class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
         past_key_values=None, use_cache=False, cache_position=None, logits=True,
     ):
-        # Block KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). MBartDecoder 
-        # takes 4D mask verbatim and embeds via MBartScaledWordEmbedding, so the cached path matches the no-cache `_decode`.
+        # Block KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). 
+        # MBartDecoder takes 4D mask verbatim and embeds via the canvas, so the cached path matches the no-cache `_decode`.
         out = self.mbart_decoder(
             input_ids=None if inputs_embeds is not None else decoder_input_ids,
             inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
@@ -248,6 +243,10 @@ def released_layout_state(sd: dict) -> dict:
         dlm_decoder) dropped as training-arm state, not the transferable front end.
     """
     if not any(k.startswith("front_end.") for k in sd): return sd
+    if any(".lora_" in k for k in sd): raise ValueError(
+        "A LoRA checkpoint must be loaded with its adapters. Use the matching AR/DLM evaluation path; "
+        "pretrained_slt requires a full-weight clean translator checkpoint."
+    )
     out = {}
     for k, v in sd.items():
         if k.startswith("front_end.pose_encoder."): out[k[len("front_end.pose_encoder."):]] = v

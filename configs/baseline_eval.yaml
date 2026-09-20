@@ -7,6 +7,11 @@
 extends: dlm.yaml
 
 decoder: ar
+# The floor is the PRIOR-ART recipe and must stay a full fine-tune of the released front end, whatever the arms do.
+# Without this pin it inherits dlm.yaml's block, and one flag flip there would silently adapt the baseline too —
+# then README's `pretrained_slt` re-root would point the arms at a checkpoint trained under a different rule.
+lora:
+    enabled: false
 membership_gate:
     enabled: false # the clean floor is UNGATED (cf. ar.yaml, the GATED AR de-risk of §9.3)
 confidence_bound:

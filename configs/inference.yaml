@@ -4,26 +4,26 @@ stride_s: 1.0
 # duration + stride_s + δ/fps, reliable sentences only; run after delta-enc). Label-only constants are measured on
 # train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
 buffer_cap_s:
-    ase: 34.67
-    asf: 36.66
-    bfi: 38.27
+    ase: 34.92
+    asf: 38.63
+    bfi: 40.0
 # Shared hard/soft duration scores. tune-decode writes each complete per-language model.
 # Untuned languages stay absent; joint training refuses to borrow another language's settings.
 duration_model:
     moryossef:
-        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
-        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
-        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 1.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
+        ase: {"mu_log_s": 1.6394003173236087, "sd_log_s": 0.8218970414678328, "tail_start_s": 33.5, "completion_bias": 2.0, "boundary_logit_weight": 2.0, "annotation_signature": "caption_units:0ce47374975c962ff9a71f401faa6eeab821afbec540f33e492d39fb55a49fba"}
+        bfi: {"mu_log_s": 1.6597917642153683, "sd_log_s": 0.824794324921, "tail_start_s": 38.28483999999997, "completion_bias": 1.0, "boundary_logit_weight": 2.0, "annotation_signature": "caption_units:5b20cd630e845834ef7fb315b8d7f79a949d077a59663fb973d6a388c580a32b"}
+        asf: {"mu_log_s": 1.92113510819858, "sd_log_s": 0.7520746030001573, "tail_start_s": 37.16815999999996, "completion_bias": 1.0, "boundary_logit_weight": 2.0, "annotation_signature": "caption_units:95439874b5e5e061fcd578f265b3e4d4b4f878b8b0594a9dfa507392893ae435"}
     s1:
-        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 0.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
-        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
-        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
+        ase: {"mu_log_s": 1.6394003173236085, "sd_log_s": 0.8218970414678328, "tail_start_s": 33.5, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:0ce47374975c962ff9a71f401faa6eeab821afbec540f33e492d39fb55a49fba"}
+        bfi: {"mu_log_s": 1.6597917642153683, "sd_log_s": 0.824794324921, "tail_start_s": 38.28483999999997, "completion_bias": 5.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:5b20cd630e845834ef7fb315b8d7f79a949d077a59663fb973d6a388c580a32b"}
+        asf: {"mu_log_s": 1.92113510819858, "sd_log_s": 0.7520746030001573, "tail_start_s": 37.16815999999996, "completion_bias": 5.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:95439874b5e5e061fcd578f265b3e4d4b4f878b8b0594a9dfa507392893ae435"}
 boundary_stability:
     # delta-enc records which duration model was measured; stage 2 refuses a stale tolerance.
     duration_model_signature:
-        ase: "7bc4201972c87f37"
-        bfi: "c25dd7e1709d0065"
-        asf: "5317eb577c6811c6"
+        ase: "6d248010c5209c3a"
+        bfi: "fbd265fb3c5df730"
+        asf: "0a688da746eeaaeb"
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
     #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
@@ -34,15 +34,15 @@ boundary_stability:
     #      a span, and select_target_span skips any span terminating at or before the commit frontier χ);
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
-        ase: 12
-        asf: 9
-        bfi: 8
+        ase: 10
+        asf: 11
+        bfi: 38
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
     # Fixed lag for B terminators. O terminators need no extra lag. Selected on dev by the lag-only tune-stream stage.
     commit_lag_s:
         ase: 4.0
-        asf: 4.0
-        bfi: 4.0
+        asf: 3.0
+        bfi: 3.0
 
 span_selection:
     # Λ_min: shortest span the FSM may commit, in encoder frames. A LABEL-domain floor: it answers "what is the

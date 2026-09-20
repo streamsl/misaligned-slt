@@ -71,6 +71,10 @@ def oput_two_pass_loss(
     double the DLM's per-token translation scale against the AR arm's single-pass CE. 2x decoder cost buys lower variance.
     """
     valid_mask = valid_mask.bool()
+    # The canvas appends [MASK] ABOVE the tokenizer's vocabulary, so a real target can never carry that id. The scoring 
+    # slice below relies on it; a fixture that breaks it would otherwise fail inside cross-entropy.
+    if bool((clean_ids[valid_mask.bool()] == int(mask_token_id)).any()):
+        raise ValueError("a supervised target carries the [MASK] id; [MASK] must sit above the real vocabulary")
     replay_pred = None
     if noise is None:  # `noise` replays a previous draw (mask AND rollout) so two conditionings differ in Omega alone
         t = sample_mask_ratio(clean_ids.shape, clean_ids.device, t_low=t_low, t_high=t_high)
@@ -83,6 +87,9 @@ def oput_two_pass_loss(
         if replay_pred is not None: pred_ids = replay_pred
         else:
             rollout_logits = rollout_decode_fn(masked_ids) if rollout_decode_fn is not None else mask_logits
+            # Over the REAL vocabulary, for the same reason the loss is sliced below: the corruption must be a token
+            # the decode could commit, and an unsliced argmax or sample can return [MASK] itself.
+            rollout_logits = rollout_logits[..., :mask_token_id]
             if sample_rollout:
                 probs = rollout_logits.softmax(dim=-1)
                 rollout = torch.distributions.Categorical(probs=probs).sample()
@@ -90,6 +97,11 @@ def oput_two_pass_loss(
             pred_ids = torch.where(masked, rollout, masked_ids)
 
     pred_logits = decode_fn(pred_ids)
+    # Score over the REAL vocabulary only. The canvas head carries a [MASK] column so its shape mirrors the input canvas, 
+    # but [MASK] is never a target and the decode forces its logit to the dtype minimum, so leaving it in the softmax would 
+    # train against a support the decode does not have. It also interacts badly with label smoothing: the smoothed target 
+    # puts eps/(V+1) on a column whose row is frozen at 0, which the model cannot answer.
+    mask_logits, pred_logits = mask_logits[..., :mask_token_id], pred_logits[..., :mask_token_id]
     loss_mask = valid_mask if loss_over_all_positions else masked
     mask_loss = masked_cross_entropy(mask_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
     pred_loss = masked_cross_entropy(pred_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
@@ -106,7 +118,6 @@ def oput_two_pass_loss(
         loss=0.5 * (mask_loss + pred_loss), mask_loss=mask_loss, pred_loss=pred_loss, masked_positions=masked,
         rollout_tokens=pred_ids.detach(), row_loss_sum=rows, row_valid_count=m.sum(dim=1), noise=(t, masked, pred_ids.detach()),
     )
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # Abstract DMax decoder: OPUT training + block decode
@@ -187,7 +198,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
         remask[:, 0] = False  # BOS fixed
         token_ids = torch.where(remask, torch.full_like(decoded_tokens, int(self.mask_token_id)), decoded_tokens)
-        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)
+        # MASK is an input symbol, not an output target. Match OPUT and generation so both the
+        # confidence test and its CE use the same distribution over caption tokens.
+        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)[..., :self.vocab_size]
 
 
     # ── Block decode over a KV cache of the final blocks (backbone-agnostic) ──

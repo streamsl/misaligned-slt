@@ -20,13 +20,13 @@
 extends: baseline_eval.yaml
 
 epochs: 100
-backbone_lr: 3.0e-4     # Uni-Sign's transfer recipe trains everything at ONE rate; the arms keep the 0.3x default.
-learning_rate: 3.0e-4
+backbone_lr: 2.0e-4     # Uni-Sign's transfer recipe trains everything at ONE rate; the arms keep the 0.3x default.
+learning_rate: 2.0e-4
 weight_decay: 1.0e-4
 scheduler:
     type: cosine
 max_grad_norm: 1.0
-batch_size: 32
+batch_size: 16
 grad_accum_steps: 1     # Effective batch = batch_size * grad_accum_steps
 freeze_backbone: false  # Uni-Sign transfer recipe: everything trainable, pose encoder included.
 lambda_bio: 0.0         # Uni-Sign SLT loss is a SINGLE label-smoothed CE — no BIO auxiliary. 0 SKIPS the

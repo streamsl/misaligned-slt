@@ -89,11 +89,38 @@ def save_train_state(
     return _atomic_torch_save(state, Path(path))
 
 
-def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer) -> dict:
+def _refuse_meta_drift(path, saved: dict, expected: dict) -> None:
+    """Refuse a resume whose training-critical config moved. Analysis stages rewrite inference.yaml and the 
+    jitter artifact between sessions, and both parameterize the run: resuming across such a change trains 2 
+    halves under different objectives, visible afterwards only as an unexplained break in the loss curve."""
+    drift = sorted(k for k in set(saved) | set(expected) if saved.get(k) != expected.get(k))
+    if not drift: return
+    if set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
+        "--resume: Validation protocol changed; the saved best score is not comparable. Trained weights remain usable. "
+        "Re-evaluate saved checkpoints with corrected dev generation and use a separate checkpoint directory for any "
+        "continuation; don't reuse the old best-score history."
+    )
+    raise SystemExit(
+        f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
+        + "; ".join(f"{k}: {saved.get(k)!r} -> {expected.get(k)!r}" for k in drift[:4])
+        + f". Restore those values to resume, or start a fresh run (move {path}) "
+        f"— resuming across the change trains 2 halves under different objectives."
+    )
+
+
+def load_train_state(
+    path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer, expected_meta: dict | None = None,
+) -> dict:
     """Load a latest.pt snapshot into model+optimizer; returns the raw state for the caller to finish
-    (scheduler/scaler/control/rng), since those objects live in the training loop."""
+    (scheduler/scaler/control/rng), since those objects live in the training loop.
+
+    `expected_meta` is compared BEFORE the weights are loaded. A config edit that changes which parameters exist
+    (`lora.enabled`, `lora.rank`, `lora.target_modules`) makes `load_state_dict` raise a raw shape/key error, and 
+    a guard placed after it can never report the cause. Drift that does not change the layout (`lora.alpha`, which
+    scales the update but adds no tensor) has no other detector at all."""
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
     state["meta"] = dict(state.get("meta") or {})
+    if expected_meta: _refuse_meta_drift(path, state["meta"], expected_meta)
     model.load_state_dict(state["model"])
     saved_groups, live_groups = len(state["optimizer"]["param_groups"]), len(optimizer.param_groups)
     if saved_groups != live_groups: raise SystemExit(

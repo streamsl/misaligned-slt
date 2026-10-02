@@ -3,43 +3,50 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import os, re, csv
+import os, re, csv, json
 import numpy as np
 from .preprocessing import normalize_keypoints_unisign
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
-# caption_source: caption provenance — human | mt (NLLB machine-translation) | shard (raw bundled YouTube track)
-# | none. Blank for the own-extraction (ase) path, which does not resolve captions here.
-# extra_person_motion: shoulder-normalized arm variation in extra detector slots (poses.signverse.extra_person_motion).
-# Low values can exempt artwork; detector errors and changing slot assignments can also raise this measure.
-# multi_person_ratio / undetected_ratio: share of frames with 2+ people ON SCREEN AT ONCE / share with nobody detected,
-# both from the SignVerse payload's per-frame `num_persons` (the .npy keeps person_000 only, so neither can be recovered
-# from it later). `--stage convert` writes them for a video it converts; `--stage person-counts` backfills a row left
-# blank by a corpus converted before the columns existed, from the shard, without re-converting. Blank means UNKNOWN.
-META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source", 
-               "multi_person_ratio", "undetected_ratio", "extra_person_motion")
-# Default --format for the metadata fetch. Must match the yt-dlp --format the videos were 
-# downloaded with, so metadata width/height describe the downloaded stream; override per language via 
-# `python -m poses <lang_root> --format SEL` when a language was downloaded at a different (e.g. higher) 
-# resolution. Duration — the only fps-calibration input — is the same at every resolution.
-YTDLP_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+# caption_source: caption provenance — human | mt (NLLB machine-translation) | shard (raw bundled YouTube track) | none.
+# undetected_ratio: share of frames with nobody detected, from SignVerse payload's per-frame `num_persons` (the .npy keeps
+# 1 primary person/frame, `prepare_yt25._primary_slots`, so it cannot be recovered from it later). An audit diagnostic only:
+# no rule reads it. `--stage convert` writes it for a video it converts; `--stage person-counts` backfills a row left blank
+# (UNKNOWN), from the shard, without re-converting.
+# masked_runs / empty_runs: JSON lists of half-open .npy frame runs [a, b) where a second real body is present and moves /
+# where no real body is present (prepare_yt25.masked_runs / empty_runs); [] = measured, no run; blank = unknown. Same writers 
+# as the counts. The loader cuts both out of every stream (data.loader.split_clean_segments).
+# handless_runs: the same JSON form, runs where the kept body shows no hand (prepare_yt25.handless_runs, read from the .npy).
+# The loader quarantines a caption unit mostly inside them and cuts no frame.
+RUN_FIELDS = ("masked_runs", "empty_runs", "handless_runs")
+META_FIELDS = ("video_id", "duration_s", "width", "height", "caption_source", "undetected_ratio", *RUN_FIELDS)
 
 
 @dataclass(frozen=True)
 class PoseIndex:
+    # `video_id` is the SOURCE video. A clean-segment record (data.loader.split_clean_segments) views frames
+    # [start_frame, start_frame + num_frames) of it; the defaults (0, None) view the whole file. Every frame index and
+    # time of a view is local (frame 0 = start_frame, time 0 = offset_s on the source timeline).
     video_id: str
     paths: tuple[Path, ...]
     frame_counts: tuple[int, ...]
     fps: float
-    # Pixel frame size (data.yaml pose.width/height), used only by the train-time spatial augmentations
-    # (affine / spatial_mask); Uni-Sign normalization is bbox-relative and resolution-independent.
+    # Pixel frame size of THIS video (video_meta.csv width/height, else data.yaml pose.width/height), read only by 
+    # the Moryossef aspect correction (moryossef26.dataset.pose_aspect); Uni-Sign normalization is bbox-relative 
+    # and resolution-independent.
     width: int | None = None
     height: int | None = None
+    start_frame: int = 0
+    num_frames: int | None = None
 
     @property
     def total_frames(self) -> int:
-        return int(sum(self.frame_counts))
+        return int(sum(self.frame_counts)) if self.num_frames is None else int(self.num_frames)
+
+    @property
+    def offset_s(self) -> float:  # source time of the view's frame 0
+        return self.start_frame / float(self.fps)
 
     @property
     def duration_s(self) -> float:
@@ -82,9 +89,8 @@ def load_video_meta(path: str | Path) -> dict[str, dict]:
                 "duration_s": float(duration),
                 "width": _opt_int(row.get("width")), "height": _opt_int(row.get("height")),
                 "caption_source": (row.get("caption_source") or "").strip() or None,
-                "multi_person_ratio": _opt_float(row.get("multi_person_ratio")),
                 "undetected_ratio": _opt_float(row.get("undetected_ratio")),
-                "extra_person_motion": _opt_float(row.get("extra_person_motion")),
+                **{key: json.loads(runs) if (runs := (row.get(key) or "").strip()) else None for key in RUN_FIELDS},
             }
     return meta
 
@@ -116,13 +122,12 @@ def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
                 "" if m.get("width") is None else m["width"],
                 "" if m.get("height") is None else m["height"],
                 m.get("caption_source") or "",
-                "" if m.get("multi_person_ratio") is None else f"{float(m['multi_person_ratio']):.4f}",
                 "" if m.get("undetected_ratio") is None else f"{float(m['undetected_ratio']):.4f}",
-                "" if m.get("extra_person_motion") is None else repr(float(m['extra_person_motion'])),
+                *("" if m.get(key) is None else json.dumps(m[key]) for key in RUN_FIELDS),
             ])
 
 
-def build_pose_index( # Index pose .npy files; fps is resolved PER VIDEO when `video_meta` covers it
+def build_pose_index( # Index pose .npy files; fps and frame size are resolved PER VIDEO when `video_meta` covers them
     pose_root: str | Path, fps: float, width: int | None = None, height: int | None = None,
     video_meta: dict[str, dict] | None = None,
 ) -> dict[str, PoseIndex]:
@@ -142,81 +147,12 @@ def build_pose_index( # Index pose .npy files; fps is resolved PER VIDEO when `v
         meta = (video_meta or {}).get(video_id) or {}
         duration = meta.get("duration_s")
         video_fps = sum(counts) / float(duration) if duration and float(duration) > 0 else float(fps)
+        sized = bool(meta.get("width") and meta.get("height"))   # both or neither: a mixed pair is no aspect
         index[video_id] = PoseIndex(
-            video_id=video_id, paths=ordered, frame_counts=counts, 
-            fps=float(video_fps), width=width, height=height
+            video_id=video_id, paths=ordered, frame_counts=counts, fps=float(video_fps),
+            width=meta["width"] if sized else width, height=meta["height"] if sized else height,
         )
     return index
-
-
-def fetch_youtube_meta(
-    video_ids: list[str], ytdlp_format: str = YTDLP_FORMAT, workers: int = 4, chunk: int = 25,
-) -> dict[str, dict]:
-    """yt-dlp METADATA-ONLY fetch -> {video_id: {duration_s, width, height}}. No video download.
-
-    Raw videos are never needed (too heavy for large languages, e.g. ase): duration — the only fps-calibration input — comes 
-    from YouTube metadata in WHOLE SECONDS. width/height resolve via `ytdlp_format`; pass the SAME --format the videos were 
-    downloaded with, and treat them as advisory (yt-dlp may resolve fewer formats than a browser: JS-runtime/PO-token limits). 
-    Removed/private videos are skipped → config pose_fps fallback with a loud loader warning.
-    """
-    import subprocess
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from tqdm import tqdm
-
-    def _fetch(ids: list[str]) -> dict[str, dict]:
-        urls = [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
-        try:
-            out = subprocess.run(
-                ["python", "-m", "yt_dlp", "--skip-download", "--no-warnings", "--ignore-errors",
-                 "--format", ytdlp_format, "--print", "%(id)s %(duration)s %(width)s %(height)s", *urls],
-                capture_output=True, text=True, timeout=120 * len(ids),
-            ).stdout
-        except Exception: return {}
-
-        result: dict[str, dict] = {}
-        for line in out.splitlines():
-            parts = line.strip().split()
-            if len(parts) == 4 and parts[1].replace(".", "", 1).isdigit():
-                result[parts[0]] = {
-                    "duration_s": float(parts[1]),
-                    "width": int(parts[2]) if parts[2].isdigit() else None,
-                    "height": int(parts[3]) if parts[3].isdigit() else None,
-                }
-        return result
-
-    chunks = [video_ids[i:i + chunk] for i in range(0, len(video_ids), chunk)]
-    meta: dict[str, dict] = {}
-    with ThreadPoolExecutor(workers) as ex:
-        futures = [ex.submit(_fetch, c) for c in chunks]
-        with tqdm(total=len(video_ids), desc="yt-dlp metadata", unit="video") as bar:
-            for future in as_completed(futures):
-                partial = future.result()
-                meta.update(partial)
-                bar.update(len(partial))
-    return meta
-
-
-def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) -> dict[str, dict]:
-    """Build/refresh <lang_root>/video_meta.csv. CLI: `python -m poses <lang_root> [--format SEL]`.
-
-    Existing sidecar rows are kept; yt-dlp metadata is fetched only for pose ids still missing (no video
-    download). A single constant fps CANNOT replace this — see `build_pose_index` for the measured drift.
-    """
-    lang_root = Path(lang_root)
-    out_path = lang_root / META_FILENAME
-    meta = load_video_meta(out_path)
-    pose_ids = {base_video_id(p) for p in (lang_root / "poses").glob("*.npy")}
-
-    missing = sorted(pose_ids - set(meta))
-    if missing:
-        print(f"fetching {len(missing)} videos' metadata from YouTube (yt-dlp, no download)...")
-        meta.update(fetch_youtube_meta(missing, ytdlp_format=ytdlp_format))
-        
-    save_video_meta(out_path, meta)
-    still_missing = sorted(pose_ids - set(meta))
-    print(f"{len(meta)} videos -> {out_path}; pose ids still missing: {len(still_missing)}"
-          + (f" (will fall back to config pose_fps): {still_missing[:5]}..." if still_missing else ""))
-    return meta
 
 
 @lru_cache(maxsize=64)
@@ -227,10 +163,12 @@ def _pose_memmap(path_str: str):
 
 
 def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) -> np.ndarray:
+    # Frames of the VIEW (PoseIndex.start_frame is its frame 0). The only reader of pose files, so every reader honours it.
     if start_frame < 0 or end_frame < start_frame: raise ValueError(f"Invalid frame range [{start_frame}, {end_frame})")
     end_frame = min(end_frame, pose_index.total_frames)
-    cumulative = pose_index.cumulative_frames
     if start_frame >= end_frame: return np.zeros((0, 133, 3), dtype=np.float32)
+    start_frame, end_frame = start_frame + pose_index.start_frame, end_frame + pose_index.start_frame
+    cumulative = pose_index.cumulative_frames
 
     start_file = int(np.searchsorted(cumulative, start_frame, side="right") - 1)
     end_file = int(np.searchsorted(cumulative, end_frame - 1, side="right") - 1)
@@ -244,17 +182,15 @@ def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) ->
 
 
 def load_pose_window(
-    pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True, augment=None,
+    pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Load a real-timeline pose window + relative timestamps. `normalize` converts raw (T,133,3) DWPose to Uni-Sign 69-kp 
-    # representation (poses.normalize_keypoints_unisign). `augment` (train only) is a callable (raw_poses, width, height) 
-    # -> raw_poses applied to RAW keypoints BEFORE normalization — spatial & length-preserving, so timestamps/BIO stay aligned.
+    # Load a real-timeline pose window + relative timestamps. `normalize` converts raw (T,133,3) 
+    # DWPose to Uni-Sign 69-kp representation (poses.normalize_keypoints_unisign).
     start_s = max(0.0, float(start_s))
     end_s = min(float(end_s), pose_index.duration_s)
     start_frame = int(np.floor(start_s * pose_index.fps))
     end_frame = int(np.ceil(end_s * pose_index.fps))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
-    if augment is not None and poses.shape[1:] == (133, 3): poses = augment(poses, pose_index.width, pose_index.height)
     if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses)
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)
     return poses.astype(np.float32, copy=False), timestamps

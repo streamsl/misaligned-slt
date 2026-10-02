@@ -5,12 +5,6 @@ import torch.nn.functional as F
 from data.windowing import BIO
 
 
-def frame_mask_for(n_frames: int, visual_padding: str = "none") -> torch.Tensor:
-    """All-True per-frame mask for an unpadded window. Uni-Sign uses raw windows ('none') and has no 
-    zero-pad mode at all (datasets.py collate_fn repeats the last frame + masks by true length)."""
-    if visual_padding == "none": return torch.ones(int(n_frames), dtype=torch.bool)
-    raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
-
 def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
     """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn), 
     not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero pads leak into the last real frames' 
@@ -20,13 +14,15 @@ def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
     if poses.shape[0]: return torch.cat([poses, poses[-1:].expand(pad, *poses.shape[1:])])
     return torch.nn.functional.pad(poses, (0,) * (2 * (poses.ndim - 1)) + (0, pad))
 
-def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str, torch.Tensor | list]:
+def collate_windows(batch: list[dict]) -> dict[str, torch.Tensor | list]:
     prepared = []
     for item in batch:
         poses_i = torch.as_tensor(item["poses"]).float()
         ts_i = torch.as_tensor(item["timestamps_s"]).float()
         labels_i = torch.as_tensor(item["bio_labels"]).long()
-        mask_i = frame_mask_for(poses_i.shape[0], visual_padding)
+        # All-True for the unpadded window: Uni-Sign has no zero-pad mode (its collate_fn repeats the last frame 
+        # and masks by true length), and the LM encoder masks the padding added below through attention_mask.
+        mask_i = torch.ones(poses_i.shape[0], dtype=torch.bool)
         prepared.append((item, poses_i, ts_i, mask_i, labels_i))
 
     max_len = max(poses_i.shape[0] for _, poses_i, _, _, _ in prepared)
@@ -60,24 +56,17 @@ def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str
 
 
 class WindowCollator:# Collate windows and optionally tokenize complete-anchor references.
-    def __init__(
-        self, tokenizer=None, max_text_tokens: int = 128, pad_to_max_length: bool = True, 
-        visual_padding: str = "none", block_size: int = 1, eos_supervision_tokens: int = 0,
-    ):
+    def __init__(self, tokenizer=None, max_text_tokens: int = 128, block_size: int = 1):
         self.tokenizer = tokenizer
         self.max_text_tokens = int(max_text_tokens)
-        self.pad_to_max_length = bool(pad_to_max_length)
-        self.visual_padding = str(visual_padding)
-        # Dynamic padding (pad_to_max_length=False) needs the DLM's canvas geometry to stay equivalent to a
-        # full-width canvas: see _tokenize_texts.
+        # The canvas is sized to the batch; DLM's canvas geometry must stay equivalent to a full-width canvas.
         self.block_size = max(1, int(block_size))
         # The dynamic canvas is block-aligned but capped at max_text_tokens, so a cap that is not a whole number of
         # blocks silently hands the longest rows a canvas ending mid-block — the one geometry the alignment prevents.
-        if not self.pad_to_max_length and self.max_text_tokens % self.block_size: raise ValueError(
+        if self.max_text_tokens % self.block_size: raise ValueError(
             f"max_text_tokens={self.max_text_tokens} is not a multiple of block_size={self.block_size}; the dynamic "
             f"canvas would cap mid-block. Use {-(-self.max_text_tokens // self.block_size) * self.block_size}."
         )
-        self.eos_supervision_tokens = max(0, int(eos_supervision_tokens))
 
     def _tokenize_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
@@ -88,26 +77,24 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         # token from the gate. EOS tail needs no reservation here — target builder (models/block_diffusion.py _prepare_x0) 
         # pads its own canvas to block boundary. Block alignment matters too — BD3LM attends bidirectionally WITHIN a block, 
         # so canvas ending mid-block change last positions' logits. With headroom + alignment the result matches full canvas.
-        pad = {"padding": "max_length", "max_length": self.max_text_tokens} if self.pad_to_max_length else {"padding": True}
-        encoded = self.tokenizer(texts, truncation=False, return_tensors="pt", **pad)
+        encoded = self.tokenizer(texts, truncation=False, return_tensors="pt", padding=True)
         input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
         if input_ids.shape[1] > self.max_text_tokens: raise ValueError(
             f"Caption target needs {input_ids.shape[1]} tokens, exceeding max_text_tokens={self.max_text_tokens}; "
              "increase the text capacity. Complete-caption targets must not be silently truncated."
         )
-        if not self.pad_to_max_length:
-            need = input_ids.shape[1] + 1
-            width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
-            if width > input_ids.shape[1]:
-                grow = width - input_ids.shape[1]
-                input_ids = F.pad(input_ids, (0, grow), value=int(self.tokenizer.pad_token_id))
-                attention_mask = F.pad(attention_mask, (0, grow), value=0)
+        need = input_ids.shape[1] + 1
+        width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
+        if width > input_ids.shape[1]:
+            grow = width - input_ids.shape[1]
+            input_ids = F.pad(input_ids, (0, grow), value=int(self.tokenizer.pad_token_id))
+            attention_mask = F.pad(attention_mask, (0, grow), value=0)
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     def __call__(self, batch: list[dict]) -> dict[str, torch.Tensor | list | dict]:
-        out = collate_windows(batch, visual_padding=self.visual_padding)
+        out = collate_windows(batch)
         out["mode_names"] = [spec["mode"] if isinstance(spec, dict) else spec.mode for spec in out["specs"]]
         out["mode2_subcases"] = [(spec.get("subcase") if isinstance(spec, dict) else spec.subcase) for spec in out["specs"]]
         out["translation_supervised"] = torch.tensor(
@@ -135,5 +122,5 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         full_items = [item["full_evidence"] for item in batch if item.get("full_evidence") is not None]
         full_indices = [idx for idx, item in enumerate(batch) if item.get("full_evidence") is not None]
         out["full_evidence_indices"] = torch.tensor(full_indices, dtype=torch.long)
-        out["full_evidence"] = collate_windows(full_items, visual_padding=self.visual_padding) if full_items else None
+        out["full_evidence"] = collate_windows(full_items) if full_items else None
         return out

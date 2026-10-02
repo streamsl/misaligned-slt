@@ -9,9 +9,8 @@ UNISIGN_BODY_IDX = [0] + list(range(3, 11))                                  # 9
 UNISIGN_LEFT_IDX = list(range(91, 112))                                      # 21 (left hand)
 UNISIGN_RIGHT_IDX = list(range(112, 133))                                    # 21 (right hand)
 UNISIGN_FACE_IDX = list(range(23, 40))[::2] + list(range(83, 91)) + [53]     # 18 (9 contour + 8 mouth + nose)
-# The 69 raw-133 indices in part order — for selecting the raw subset (e.g. visualize.py skeleton overlay).
+# 69 raw-133 indices in part order — for selecting the raw subset (e.g. the reporting/debug.py skeleton overlay).
 UNISIGN_SELECTED_IDS = UNISIGN_BODY_IDX + UNISIGN_LEFT_IDX + UNISIGN_RIGHT_IDX + UNISIGN_FACE_IDX
-UNISIGN_NUM_KP = len(UNISIGN_SELECTED_IDS)
 
 from .preprocessing import *
 from .augmentation import *

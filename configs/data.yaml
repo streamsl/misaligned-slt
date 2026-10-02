@@ -1,15 +1,14 @@
-seed: 42
 active_languages: [asf]
 
 # Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. pose.fps is a 
 # FALLBACK only. Real pose fps is resolved per video as total_pose_frames/video_duration from <root>/video_meta.csv. 
-# ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_data.py` writes their video_meta.csv (duration = 
+# ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_yt25.py` writes their video_meta.csv (duration = 
 # frames/24, exact). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are extracted at the 
-# NATIVE rate varies per YouTube video. You can generate its labels once with `python -m poses <root> [--format SEL]` 
-# (yt-dlp metadata fetch, no video download).
+# NATIVE rate varies per YouTube video. You can generate its labels once with:
+# `python prepare_yt25.py --stage meta --languages <lang> [--format SEL]` (yt-dlp metadata fetch, no video download).
 languages:
     # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
-    # `python prepare_data.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
+    # `python prepare_yt25.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
     # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in the shards) and <root>/video_meta.csv (duration 
     # from frame_count/24, so per-video fps calibration recovers exactly 24.0). pose.fps stays the fallback only.
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
@@ -20,42 +19,39 @@ languages:
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
-        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
-        # checkpoint over the warm start, and buffer-cap builds no model at all.
+        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
+        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
         # pretrained_slt: checkpoints/baseline_train/ase/model.pt
         root: data/youtube-sl-25/ase
         pose:
-            fps: 24.0
-            width: 1920
+            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
+            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
     asf:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
-        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
-        # checkpoint over the warm start, and buffer-cap builds no model at all.
+        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
+        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
         # pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
         pose:
-            fps: 24.0 # SignVerse unified extraction rate (dataset card; verified on real shard headers)
-            width: 1920 # dominant frame size (spatial augs only); real per-video W/H in video_meta.csv
+            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
+            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
     bfi:
         name: BSL (SignVerse-2M poses)
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms, every later --method baseline eval, and a monolingual S1 share one init (§1.4 +
-        # controlled comparison). The B1 MEASURE stages are indifferent: delta-enc strict-loads the S1
-        # checkpoint over the warm start, and buffer-cap builds no model at all.
+        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
+        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
         # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
         pose:
-            fps: 24.0
-            width: 1920
+            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
+            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
 
 splits:
@@ -66,23 +62,28 @@ splits:
     # test split is the remainder (1 - train - dev), computed by build_splits.
 
 poses:
-    # 1 rule for every split and language. Exclude when 2+ bodies are detected in more than configured frame 
-    # share AND the extra slots' shoulder-normalized arm variation exceeds the motion threshold. Missing shape 
-    # measurements use count rule alone. Low variation exempts many pictures of people. This is a detector-based 
-    # filter: noise and changing detection slots can also raise the score. Sequential signers are allowed. No 
-    # video or channel exceptions. Motion is in shoulder widths, not a fraction capped at 1.
-    max_multi_person_ratio: 0.5 # 1.0 disables this rule
+    # Visual cuts, 1 rule for every split and language (data.loader.split_clean_segments): the loader cuts every stream 
+    # at video_meta.csv masked_runs (2+ real bodies and extra arms move) and empty_runs (no real body), and each clean 
+    # segment between them is a record. A multi-body run is scored in 2s windows at 1s steps (prepare_yt25._MOTION_BLOCK): 
+    # a window is cut when extra slots' shoulder-normalized arm variation over it exceeds this threshold, or cannot be 
+    # measured over whole run (a window too sparse to measure takes whole run's value), so a still picture of a person is 
+    # no run. Motion is in shoulder widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` 
+    # apply it when they write masked_runs, so a change needs `--stage convert --overwrite`.
     min_extra_person_motion: 0.7
-    # Exclude videos with too many frames where no body is detected. Detection failure does not prove that
-    # signing is absent. This threshold is applied to train, dev and test.
-    max_undetected_ratio: 0.35
+    # No-hand quarantine, 1 rule for every split and language (data.loader.quarantine_handless): a reliable caption unit 
+    # with at least this share of its frames inside video_meta.csv handless_runs (12+ frames where the kept body shows no 
+    # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. On 250 train videos per language asf has no unit 
+    # between 0.70-0.99 and bfi has 6 at 0.8-0.95; at 0.9 the rule flags asf 8/5,579 and bfi 8/7,641 units, all non-signing 
+    # captions. These counts are on whole source videos, before visual cuts, which already remove most of these units (empty 
+    # run is also handless run); `report.py data` units_quarantined_handless gives the count that the rule adds after cuts.
+    handless_unit_share: 0.9
     # Exclude when fewer than this share of grouped caption intervals fits inside the supplied pose timeline
     # (1s end tolerance). This doesn't infer the cause, clip offset, or caption source. 0.0 disables it.
     min_unit_coverage: 0.5
     
 subtitles:
     # Caption resolution per video: pick the best usable .vtt in <root>/subs/ (suffix priority below). subs/ is
-    # delivered COMPLETE at prep time by `prepare_data.py --stage subs` (curated SignVerse English, provenance in
+    # delivered COMPLETE at prep time by `prepare_yt25.py --stage subs` (curated SignVerse English, provenance in
     # video_meta.csv caption_source), so there is no load-time fallback dir — a video with no vtt is genuinely
     # caption-less and dropped. human_only_splits: on these splits, exclude videos whose caption_source is in
     # human_only_exclude_sources (default just `mt` = NLLB machine-translation) so BLEU scores against human refs.

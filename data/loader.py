@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from itertools import combinations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 from pathlib import Path
 from tqdm import tqdm
@@ -9,12 +9,13 @@ from tqdm import tqdm
 import re, os, random, csv, html, json, unicodedata, zlib, hashlib, inspect
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, get_worker_info
-from train import distributed as dist
-
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from data.windowing import SentenceSpan, ANNOTATION_PROTOCOL, TRUSTED_GAP_S
+
 from poses import PoseIndex, build_pose_index
 from poses.pose_io import META_FILENAME, base_video_id, load_video_meta
+from train import distributed as dist
+from utils import LAMBDA_MIN_FRAMES
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -68,6 +69,7 @@ _PUNCT_NORMALISE = {ord(k): v for k, v in {
 _PUNKT = None
 _LANG_RECORDS_CACHE: dict[tuple, list[VideoRecord]] = {}
 _FOLD_LEXICON_CACHE: dict[tuple, frozenset[str]] = {}
+RUN_COLUMNS = ("masked_runs", "empty_runs")   # video_meta.csv frame runs the loader cuts out (split_clean_segments)
 
 # Measured on asf/bfi/ase train cues: merged prose signs at 0.70 w/s (asf p1) to 2.2 w/s (p50) with 6-11 words per display cue and 4-22% 
 # capitalised tokens; fingerspelling and vocabulary lists sign at ~0.1 w/s with 1.3-2.2 words per cue and 66-78% capitalised tokens. 
@@ -86,9 +88,6 @@ class VideoRecord:
 def _is_pronoun_i(word: str) -> bool:
     return word == "I" or word.startswith("I'")
 
-def _caption_video_id(path: Path) -> str: # `<vid>.<target>.vtt` -> vid. `Path.stem` strips 1 suffix only, and video ids never contain a dot.
-    return base_video_id(path.name.split(".", 1)[0])
-
 def _fold_rule_id() -> str: # The counting rule's own identity, so an edited rule invalidates every lexicon built under the old one.
     return hashlib.sha256(inspect.getsource(fold_lexicon).encode()).hexdigest()
 
@@ -98,8 +97,10 @@ def _lexicon_key(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> s
     for subs, ids in sources:
         want = set(ids)
         # 1 directory glob, not 1 per video: `<vid>.*.vtt` per id is ~2850x slower over a 10k-video corpus.
+        # `<vid>.<target>.vtt` -> vid: `Path.stem` strips 1 suffix only, and video ids never contain a dot.
         for path in sorted(Path(subs).glob("*.vtt")):
-            if _caption_video_id(path) in want: digest.update(f"{path.name}\t".encode() + hashlib.sha256(path.read_bytes()).digest())
+            if base_video_id(path.name.split(".", 1)[0]) in want: 
+                digest.update(f"{path.name}\t".encode() + hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
 def _train_captions(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
@@ -111,7 +112,7 @@ def _train_captions(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
     root = Path(data_cfg["languages"][language]["root"])
     ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})
     if not ids: return root / "subs", []
-    captioned = {_caption_video_id(p) for p in (root / "subs").glob("*.vtt")}
+    captioned = {base_video_id(p.name.split(".", 1)[0]) for p in (root / "subs").glob("*.vtt")}   # `<vid>.<target>.vtt` -> vid
     return root / "subs", [v for v in build_splits(ids, data_cfg.get("splits", {})).get("train", []) if v in captioned]
 
 def timestamp_to_seconds(value: str) -> float:
@@ -177,7 +178,7 @@ def case_lexicon(data_cfg: dict, language: str) -> frozenset[str]:
         raise FileNotFoundError(
             f"[loader] the case lexicon for target {target} pools the train captions of {', '.join(pool)}; this machine has none for "
             f"{', '.join(absent)}. Copy {artifact} from the machine that holds the whole pool, or fetch the corpus "
-            f"(prepare_data.py --languages {' '.join(absent)}), or drop it from data.yaml languages and re-render everything."
+            f"(prepare_yt25.py --languages {' '.join(absent)}), or drop it from data.yaml languages and re-render everything."
         )
     key = _lexicon_key(sources, data_cfg.get("subtitles", {}))
     if stored.get("key") == key: return frozenset(stored["words"])
@@ -384,6 +385,56 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
     return [(c[0], float(duration_s), c[2], False) if (c[0] < duration_s and c[1] > duration_s + float(slack_s)) else c for c in captions]
 
 
+def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
+    """The clean segments of `rec` between pose-invalid frame `runs` (half-open .npy frames [a, b), any order, may overlap).
+
+    Runs closer than Λ_min frames merge, and a run within Λ_min frames of a video end reaches it, so no segment is shorter than Λ_min. No run: 
+    `[rec]`, unchanged. Otherwise segment [a, b) is the record `f"{vid}@{a}"` whose pose is the view `start_frame=a, num_frames=b - a` and 
+    whose units are in segment time (source time - a/fps). A unit wholly inside a run is gone. A unit that crosses a segment edge stays in 
+    each segment it touches, QUARANTINED, with its true times (so start < 0 or end > the segment duration). A unit may end past the LAST 
+    segment by the loader's pose-end tolerance.
+    """
+    n, fps = rec.pose.total_frames, float(rec.pose.fps)
+    cuts: list[list[int]] = []
+    for a, b in sorted(runs):
+        if cuts and a - cuts[-1][1] < LAMBDA_MIN_FRAMES: cuts[-1][1] = max(cuts[-1][1], b)
+        else: cuts.append([a, b])
+
+    if not cuts: return [rec]
+    if cuts[0][0] < LAMBDA_MIN_FRAMES: cuts[0][0] = 0
+    if n - cuts[-1][1] < LAMBDA_MIN_FRAMES: cuts[-1][1] = n
+    edges = [0, *(x for cut in cuts for x in cut), n]
+    out = []
+
+    for a, b in zip(edges[::2], edges[1::2]):
+        if b <= a: continue
+        lo, hi, sid = a / fps, b / fps, f"{rec.video_id}@{a}"
+        spans = tuple(replace(
+            s, video_id=sid, start_s=s.start_s - lo, end_s=s.end_s - lo, 
+            reliable=s.reliable and lo <= s.start_s and (b == n or s.end_s <= hi)
+        ) for s in rec.sentences if s.end_s > lo and s.start_s < hi)
+        out.append(replace(rec, video_id=sid, pose=replace(rec.pose, start_frame=a, num_frames=b - a), sentences=spans))
+    return out
+
+
+def quarantine_handless(rec: VideoRecord, runs, share: float) -> VideoRecord:
+    """`rec` with every reliable unit that has at least `share` of its frames inside `runs` quarantined (reliable=False).
+
+    `runs` are video_meta.csv handless_runs (half-open .npy frames [a, b) where the kept body shows no hand) on the timeline of `rec.pose`. 
+    A unit covers frames [floor(start * fps), ceil(end * fps)), clipped to the pose stream. No unit time moves and no frame is cut, so the 
+    signing transitions into and out of the unit stay in the stream.
+    """
+    n, fps = rec.pose.total_frames, float(rec.pose.fps)
+    handless = np.zeros(n, dtype=bool)
+    for a, b in runs: handless[a:b] = True
+
+    def inside(s: SentenceSpan) -> bool:
+        a, b = max(0, int(np.floor(s.start_s * fps))), min(n, int(np.ceil(s.end_s * fps)))
+        return b > a and float(handless[a:b].mean()) >= share
+
+    return replace(rec, sentences=tuple(replace(s, reliable=False) if s.reliable and inside(s) else s for s in rec.sentences))
+
+
 def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: int = 60, fold: frozenset[str] | None = None) -> list[tuple]:
     """Group whole display cues into timestamp-supported caption units.
 
@@ -512,34 +563,6 @@ def is_scrolling_display(cues) -> bool:
     return overlapping / (len(cues) - 1) > 0.5
 
 
-def marked_boundary_ratio(units, fold: frozenset[str] | None = None) -> float:
-    """Share of a video's UNIT boundaries the caption author marked, read AFTER grouping.
-
-    A boundary is marked when the unit ends in sentence punctuation, or the next unit opens with a POSITIONAL capital. Terminal punctuation alone 
-    is a punctuation-STYLE test: over the three corpora 37 % (asf), 73 % (ase) and 69 % (bfi) of boundaries carrying no period are followed by a 
-    capital, so a period-only rule rejects song lyrics and capital-marked prose whose boundaries are real.
-
-    A capital is POSITIONAL only when the word is ordinarily lowercase, which is what the train `fold` lexicon records (`fold_lexicon`, same test 
-    `_fold_sentence_start` applies). "NDIS", "Auslan" and "David" carry a LEXICAL capital and say nothing about a boundary: a wrap that lands before 
-    a proper noun would otherwise read as a sentence start. Without a lexicon only the punctuation half is available, and an all-caps unit is never
-    evidence, because in a gloss list every line opens with a capital.
-
-    Read after grouping since that is where gold boundaries live. On raw cues a continuous unpunctuated narration scores near 0 although grouping 
-    fuses it into 1 unit without internal boundary at all. What this leaves is the channel whose line breaks fall mid-phrase: the annotation marks 
-    no boundary of either kind.
-    """
-    units = list(units)
-    if len(units) < 2: return 1.0
-
-    def positional_capital(text: str) -> bool:
-        word = text.strip().split(" ")[0] if text.strip() else ""
-        if not word[:1].isupper() or word.isupper(): return False
-        return fold is not None and word.strip(".,;:!?\"')]").lower() in fold
-
-    marked = sum(1 for a, b in zip(units, units[1:]) if _SENTENCE_FINAL_RE.search(a[2]) or positional_capital(b[2]))
-    return marked / (len(units) - 1)
-
-
 def looks_flattened_transcript(
     captions: list[tuple[float, float, str]], max_cues: int = 2, min_chars: int = 500, max_chars_per_second: float = 120.0,
 ) -> bool:
@@ -590,7 +613,7 @@ def find_best_subtitle(
 
 def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, lang_prefix: str | None = None) -> Path | None:
     """`find_best_subtitle` driven by the `subtitles:` config block — the ONE selection rule, shared by the loader
-    (lang_prefix=None; only the canonical `<vid>.<target>.vtt` exists) and prepare_data (shard tracks, lang_prefix=target)."""
+    (lang_prefix=None; only the canonical `<vid>.<target>.vtt` exists) and prepare_yt25 (shard tracks, lang_prefix=target)."""
     return find_best_subtitle(
         subtitle_root, video_id,
         preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
@@ -713,25 +736,6 @@ def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, st
     return sorted([(a, b, score) for (a, b), score in scores.items() if score > cover], key=lambda p: -p[2])
 
 
-def assert_pool_safe(cfg: dict) -> None:
-    """A pooled run may not read a MEASURED, language-keyed artifact.
-
-    Measured calibration (jitter, mode ratios) describes one corpus decoded by one segmenter. Pooling the data while keeping 1 language's 
-    artifact trains the pool under that language's error distribution — a silent mismatch, since the path resolves and the run looks healthy. 
-    A pool has no such artifact, so it must train on DESIGNED fallbacks (`source: null`).
-
-    Deployment constants are unaffected: delta/Lambda/buffer_cap/the decode triple are measured per TARGET language after pretraining, with 
-    the deployed head, and the head is always evaluated at the context it trained under (`rope_eval_chunk_s` pinned in the checkpoint).
-    """
-    if not cfg.get("pretrain_languages"): return
-    bad = [k for k in ("jitter", "mode_ratios") if (cfg.get(k) or {}).get("source")]
-    if bad: raise SystemExit(
-        f"pretrain_languages={list(cfg['pretrain_languages'])} but {', '.join(f'{k}.source' for k in bad)} "
-        f"is set to a per-language artifact ({', '.join(str(cfg[k]['source']) for k in bad)}). A pool has no single "
-        f"target language: set those to null to train on the designed fallbacks, or drop pretrain_languages."
-    )
-
-
 class PooledEpochRecords:
     """`epoch -> train records` for the pooled rotation, as an importable object rather than a closure.
 
@@ -744,6 +748,12 @@ class PooledEpochRecords:
 
     def __call__(self, epoch: int) -> list["VideoRecord"]:
         return resolve_pretrain_records(self.cfg, self.data_cfg, self.language, "train", epoch=epoch)[0]
+
+    def cycle_epochs(self) -> int:
+        # Consecutive epochs until the rotation has drawn every train video once: the slowest language's ceil(n / per-epoch target).
+        counts = {str(l): len(_cached_language_records(self.data_cfg, str(l), "train")) for l in self.cfg["pretrain_languages"]}
+        targets = _pool_targets(counts, float(self.cfg["pretrain_temperature"]))
+        return max(-(-n // targets[l]) for l, n in counts.items())
 
 
 def resolve_pretrain_records(
@@ -765,8 +775,7 @@ def resolve_pretrain_records(
     )
     langs = [str(x) for x in langs]
     recs, realised = load_multilingual_records(
-        data_cfg, langs, split=split, temperature=float(cfg.get("pretrain_temperature", 0.5)),
-        seed=int(cfg.get("seed", 42)), epoch=int(epoch),
+        data_cfg, langs, split=split, temperature=float(cfg["pretrain_temperature"]), seed=int(cfg.get("seed", 42)), epoch=int(epoch),
     )
     return recs, realised
 
@@ -791,17 +800,8 @@ def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[
     return _LANG_RECORDS_CACHE[key]
 
 
-def sentence_p99_s(data_cfg: dict, languages: list[str], split: str = "train") -> dict[str, float]:
-    # Per-language p99 of reliable sentence durations: the label-only cap statistic. Shares the pool's record cache.
-    out: dict[str, float] = {}
-    for lang in languages:
-        d = [sp.duration_s for r in _cached_language_records(data_cfg, lang, split) for sp in r.sentences if getattr(sp, "reliable", True)]
-        out[lang] = float(np.percentile(d, 99)) if d else 0.0
-    return out
-
-
 def load_multilingual_records(
-    data_cfg: dict, languages: list[str], split: str, temperature: float = 0.5, seed: int = 42, epoch: int = 0,
+    data_cfg: dict, languages: list[str], split: str, temperature: float, seed: int = 42, epoch: int = 0,
 ) -> tuple[list[VideoRecord], dict[str, int]]:
     """Records pooled across languages for language-agnostic SEGMENTATION pretraining.
 
@@ -813,15 +813,15 @@ def load_multilingual_records(
     0.0 uniform, 0.5 the usual compromise.
 
     Balance is reached by SUB-sampling the over-represented languages, never by replicating the under-represented ones. Replicating
-    up to the largest corpus makes the pool as big as the most-scaled-up language demands: on ase/asf/bfi that was a 16x epoch with
-    each asf video repeated ~5 times WITHIN one epoch, so the model saw many epochs' worth of data (and heavy repetition) before the
-    first checkpoint. Sub-sampling keeps 1 epoch a bounded, comparable unit of compute.
+    up to the largest corpus would make the pool as big as the most-scaled-up language demands: on ase/asf/bfi a 16x epoch with
+    each asf video repeated ~5 times WITHIN 1 epoch, so the model would see many epochs' worth of data (and heavy repetition) 
+    before the first checkpoint. Sub-sampling keeps 1 epoch a bounded, comparable unit of compute.
 
     `epoch` rotates WHICH subset each language contributes, so no video is permanently discarded: coverage of the large corpora is
     spread across epochs instead of forced into one. Deterministic in (seed, epoch), so a resumed run replays its epoch exactly.
 
-    Returns the pooled records and the realised per-language video counts, which belong in the paper: the sampling rates are part 
-    of the experimental setup, not an implementation detail.
+    Returns the pooled records and the realised per-language record counts (records are clean segments), which belong in the paper: 
+    the sampling rates are part of the experimental setup, not an implementation detail.
     """
     if not languages: raise ValueError("load_multilingual_records needs at least one language")
     per_lang: dict[str, list[VideoRecord]] = {}
@@ -832,34 +832,27 @@ def load_multilingual_records(
     empty = sorted(l for l, recs in per_lang.items() if not recs)
     if empty: raise FileNotFoundError(
         f"pretrain_languages lists {list(languages)}, but {', '.join(empty)} has no {split} record on this machine. "
-        f"Fetch the corpus (prepare_data.py --languages {' '.join(empty)}), or drop it from pretrain_languages."
+        f"Fetch the corpus (prepare_yt25.py --languages {' '.join(empty)}), or drop it from pretrain_languages."
     )
     if len(per_lang) == 1 or split == "test": # TEST is pooled AS-IS: it is a REPORTING set.
         pooled = [r for recs in per_lang.values() for r in recs]
         return pooled, {k: len(v) for k, v in per_lang.items()}
 
     counts = {k: len(v) for k, v in per_lang.items()}
-    weights = {k: n ** float(temperature) for k, n in counts.items()}
-    total_w = sum(weights.values())
-    # SUB-sample to target shares: pick the pool size that the most over-represented language can support WITHOUT replication, i.e. largest 
-    # total for which every target <= that language's real video count. Upsampling instead (scaling up to biggest corpus) repeats the small 
-    # corpora several times inside ONE epoch, so the model sees many epochs' worth of a language before the first checkpoint and overfits 
-    # during epoch 1 — the failure this bound exists to prevent. Temperature then only sets the SHARES, never the repetition, so lowering 
-    # it rebalances instead of inflating the epoch.
-    scale = min(counts[k] * total_w / weights[k] for k in counts)
+    targets = _pool_targets(counts, temperature)
     rng = random.Random(int(seed))
     pooled: list[VideoRecord] = []
     realised: dict[str, int] = {}
 
     for lang, recs in per_lang.items():
-        target = max(1, min(len(recs), int(round(scale * weights[lang] / total_w))))
+        target = targets[lang]
         # ROTATE the slice per epoch so a sub-sampled corpus is never permanently truncated: a language reduced to
         # `target` of `n` videos covers all of them every ceil(n / target) epochs. Order is shuffled once per
         # language (seeded, so it is stable across epochs and resumes) and the window then advances by `target`.
         order = list(recs)
-        # crc32, NOT hash(): str.__hash__ is PYTHONHASHSEED-salted, so hash() gave a DIFFERENT sub-sample on
-        # every process launch — train and dev alike. Best-checkpoint selection then compared scores measured
-        # on different dev sets, and no run was reproducible or resumable. crc32 is stable across processes.
+        # crc32, NOT hash(): str.__hash__ is PYTHONHASHSEED-salted, so hash() would give a DIFFERENT sub-sample on
+        # every process launch — train and dev alike — and best-checkpoint selection would compare scores measured
+        # on different dev sets. crc32 is stable across processes, so a run is reproducible and resumable.
         random.Random(int(seed) ^ zlib.crc32(lang.encode())).shuffle(order)
         offset = (int(epoch) * target) % len(order)
         pooled.extend((order + order)[offset:offset + target])
@@ -867,48 +860,76 @@ def load_multilingual_records(
 
     rng.shuffle(pooled)
     shares = {k: round(v / sum(realised.values()), 3) for k, v in realised.items()}
-    print(f"[loader] multilingual {split}: videos {counts} -> sampled {realised} (tau={temperature}, shares {shares})", flush=True)
+    print(f"[loader] multilingual {split}: records {counts} -> sampled {realised} (tau={temperature}, shares {shares})", flush=True)
     return pooled, realised
+
+
+def _pool_targets(counts: dict[str, int], temperature: float) -> dict[str, int]:
+    """Records each language contributes to one pooled epoch, for per-language record counts `counts` (a record is one clean segment).
+
+    SUB-sample to target shares: pick the pool size that the most over-represented language can support WITHOUT replication, i.e. largest 
+    total for which every target <= that language's real video count. Upsampling instead (scaling up to biggest corpus) repeats the small 
+    corpora several times inside ONE epoch, so the model sees many epochs' worth of a language before the first checkpoint and overfits 
+    during epoch 1 — the failure this bound exists to prevent. Temperature then only sets the SHARES, never the repetition, so lowering 
+    it rebalances instead of inflating the epoch.
+    """
+    weights = {k: n ** float(temperature) for k, n in counts.items()}
+    total_w = sum(weights.values())
+    scale = min(counts[k] * total_w / weights[k] for k in counts)
+    return {k: max(1, min(n, int(round(scale * weights[k] / total_w)))) for k, n in counts.items()}
 
 
 def load_language_records(
     data_cfg: dict, language: str, split: str | None = None, report: dict | None = None,
 ) -> tuple[list[VideoRecord], dict[str, list[str]]]:
-    """`report`, when given, is filled with the per-rule tallies of this load (videos and cues kept or dropped by
-    each pipeline rule) — the corpus audit `report.py data` prints. Every consumer of the records is unaffected."""
+    """Records of the clean segments of every kept video (`split_clean_segments`): the id is the source video id, or
+    `f"{vid}@{a}"` for a video cut at a visual run, and `rec.pose.video_id` is always the source id.
+
+    `report`, when given, is filled with the per-rule tallies of this load (videos and cues kept or dropped by each
+    pipeline rule) — the corpus audit `report.py data` prints. Every consumer of the records is unaffected."""
     lang_cfg = data_cfg["languages"][language]
     root = Path(lang_cfg["root"])
     # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
-    # config pose_fps is fallback-only: without the sidecar timestamps drift ~2x and ~44% of captions get dropped.
+    # config pose_fps is only the fallback for a video without a sidecar row: on it timestamps drift ~2x and ~44% of captions get dropped.
     video_meta = load_video_meta(root / META_FILENAME)
+    # A sidecar without the run columns predates the visual cuts: every stream would stay uncut, so refuse it. A blank
+    # value in an existing column is one unknown video and only warns (below).
+    header: list[str] = []
+    if (root / META_FILENAME).exists():
+        with (root / META_FILENAME).open("r", encoding="utf-8", newline="") as f: header = next(csv.reader(f), [])
+    if missing := [key for key in (*RUN_COLUMNS, "handless_runs") if key not in header]: raise SystemExit(
+        f"[loader] {root / META_FILENAME} has no {'/'.join(missing)} column (stale or absent sidecar). For SignVerse poses run "
+        f"`python prepare_yt25.py --stage all --overwrite --languages {language}`; for poses extracted outside SignVerse run "
+        f"`python prepare_yt25.py --stage meta --languages {language}` (it fills handless_runs from the pose files; its blank "
+        f"masked_runs/empty_runs then warn as unknown)."
+    )
     pose_cfg = lang_cfg.get("pose", {}) or {}
     fps_fallback = float(pose_cfg.get("fps", 25.0))
     pose_index = build_pose_index(
-        root / "poses", fps=fps_fallback,
+        root / "poses", fps=fps_fallback, video_meta=video_meta,
         width=int(pose_cfg["width"]) if pose_cfg.get("width") is not None else None,
         height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
-        video_meta=video_meta,
     )
     if not pose_index: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
         f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
-        f"For SignVerse-2M languages (asf/bfi) run `python prepare_data.py --stage all --languages {language}` "
+        f"For SignVerse-2M languages (asf/bfi) run `python prepare_yt25.py --stage all --languages {language}` "
         f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
     )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
     if missing_meta: print(
-        f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from "
-        f"{root / META_FILENAME}; falling back to pose.fps={fps_fallback} "
-        f"for them — run `python -m poses {root}` (yt-dlp metadata fetch, no video download)."
+        f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from {root / META_FILENAME}; falling back "
+        f"to pose.fps={fps_fallback} for them — run `python prepare_yt25.py --stage meta --root {root.parent} --languages {root.name}` "
+        f"(yt-dlp metadata fetch, no video download)."
     )
     subtitle_cfg = data_cfg.get("subtitles", {})
     splits = build_splits(sorted(pose_index.keys()), data_cfg.get("splits", {}))
     selected_ids = splits.get(split, []) if split else sorted(pose_index.keys())
     drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
-    # Human-caption-only splits (default: test). NLLB machine-translated references are noisy BLEU targets — scoring 
-    # against them measures "agreement with NLLB", not translation quality — so drop MT-captioned videos on those 
-    # splits. Provenance is video_meta.csv `caption_source` (written by `prepare_data.py --stage subs`); the excluded
-    # sources default to just "mt" (raw-shard captions are kept — usually human uploads). Absent → nothing excluded.
+    # Human-caption-only splits (default: test). NLLB machine-translated references are noisy BLEU targets — scoring against them 
+    # measures "agreement with NLLB", not translation quality — so drop MT-captioned videos on those splits. Provenance is video_meta.csv 
+    # `caption_source` (written by `prepare_yt25.py --stage subs`); excluded sources default to just "mt" (raw-shard captions are kept 
+    # — usually human uploads). Absent → nothing excluded.
     human_only = set(subtitle_cfg.get("human_only_splits", ["test"]) or [])
     exclude_sources = set(subtitle_cfg.get("human_only_exclude_sources", ["mt"]) or [])
     dropped_mt_caption = 0
@@ -921,54 +942,8 @@ def load_language_records(
             f"[loader] {language}/{split}: excluded {before - len(selected_ids)} video(s) with "
             f"{'/'.join(sorted(exclude_sources))} captions (human references only; subtitles.human_only_splits).", flush=True
         )
-    # MULTI-PERSON videos: 2+ people on screen AT SAME TIME. Converter keeps person_000 = largest body per frame, so the caption may follow 
-    # a person the stored pose is not, and 2nd body on screen is exactly what the detector can lose track between. Signers appearing 1 AFTER 
-    # the other are not this. BOTH conditions must hold. Low measured shape variation exempts those extra detections.
-    max_multi = float((data_cfg.get("poses", {}) or {}).get("max_multi_person_ratio", 1.0))
-    min_motion = float((data_cfg.get("poses", {}) or {}).get("min_extra_person_motion", 0.0))
-    # A high undetected share means little pose evidence is available for the captions. It can reflect a screen
-    # recording, or a detector missing a real signer; the filter does not distinguish these causes.
-    max_undetected = float((data_cfg.get("poses", {}) or {}).get("max_undetected_ratio", 1.0))
     min_covered = float((data_cfg.get("poses", {}) or {}).get("min_unit_coverage", 0.0))
-    dropped_multi_person: list[tuple[str, float]] = []
-    dropped_undetected: list[tuple[str, float]] = []
     dropped_uncovered: list[tuple[str, float]] = []
-    if max_multi < 1.0:
-        considered = len(selected_ids)
-        unknown = [v for v in selected_ids if (video_meta.get(v) or {}).get("multi_person_ratio") is None]
-
-        # Blank (never measured) and NaN (measured, no answer) both mean the arm test cannot speak, and the count rule alone then decides.
-        def _no_motion_answer(vid: str) -> bool:
-            motion = (video_meta.get(vid) or {}).get("extra_person_motion")
-            return motion is None or motion != motion
-        
-        over = {v for v in selected_ids if ((video_meta.get(v) or {}).get("multi_person_ratio") or 0.0) > max_multi
-                                        and (_no_motion_answer(v) or video_meta[v]["extra_person_motion"] > min_motion)}
-        unmeasured = sum(_no_motion_answer(v) for v in over)
-        dropped_multi_person.extend((v, float(video_meta[v]["multi_person_ratio"])) for v in selected_ids if v in over)
-        selected_ids = [v for v in selected_ids if v not in over]
-        if unmeasured: print(
-            f"[loader] {language}/{split or 'all'}: {unmeasured} of these videos hold an extra detection whose shoulders are never both "
-            f"visible, so its arm motion can't be measured and the count rule alone excluded them. This is a property of the video, not "
-            f"a missing measurement: re-running `person-counts` returns the same result.", flush=True
-        )
-        if unknown: print(
-            f"[loader] {language}/{split or 'all'}: WARNING the multi-person rule is on but {len(unknown)}/{considered} "
-            f"videos lack multi_person_ratio in video_meta.csv; run `prepare_data.py --stage person-counts` "
-            f"to measure them. Those videos are NOT filtered.", flush=True
-        )
-    for key, limit, dropped in (("undetected_ratio", max_undetected, dropped_undetected),):
-        if limit >= 1.0: continue
-        considered = len(selected_ids)   # the denominator: an unknown video stays in selected_ids, so adding 2 double-counts it
-        unknown = [v for v in selected_ids if (video_meta.get(v) or {}).get(key) is None]
-        over = {v for v in selected_ids if ((video_meta.get(v) or {}).get(key) or 0.0) > limit}
-        dropped.extend((v, float(video_meta[v][key])) for v in selected_ids if v in over)
-        selected_ids = [v for v in selected_ids if v not in over]
-        if unknown: print(
-            f"[loader] {language}/{split or 'all'}: WARNING poses.max_{key.replace('_ratio', '')}_ratio is set but "
-            f"{len(unknown)}/{considered} videos have no {key} in video_meta.csv; run `prepare_data.py --stage person-counts` "
-            f"to measure it. Those videos are NOT filtered.", flush=True
-        )
     records: list[VideoRecord] = []
     dropped_no_caption, dropped_all_quarantined = 0, 0
     per_video: dict[str, dict[str, int]] = {}
@@ -1062,17 +1037,6 @@ def load_language_records(
         f"(under {min_covered:.0%} of their caption units fall inside the supplied pose timeline; e.g. "
         + ", ".join(f"{v} {c:.0%}" for v, c in sorted(dropped_uncovered, key=lambda x: x[1])[:3]) + "); poses.min_unit_coverage.", flush=True
     )
-    if dropped_multi_person: print(
-        f"[loader] {language}/{split or 'all'}: {len(dropped_multi_person)} video(s) dropped by MULTI-PERSON rule (2+ detected bodies in >"
-        f"{max_multi:.0%} of frames, extra-slot shape variation >{min_motion:g} or unmeasured; e.g. "
-        + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_multi_person, key=lambda x: -x[1])[:3])
-        + "); poses.max_multi_person_ratio / min_extra_person_motion.", flush=True
-    )
-    if dropped_undetected: print(
-        f"[loader] {language}/{split or 'all'}: {len(dropped_undetected)} video(s) dropped as LOW-DETECTION (no pose detected in >"
-        f"{max_undetected:.0%} of frames; e.g. " + ", ".join(f"{v} {r:.0%}" for v, r in sorted(dropped_undetected, key=lambda x: -x[1])[:3])
-        + "); poses.max_undetected_ratio.", flush=True
-    )
     if dropped_scrolling: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_scrolling)} video(s) dropped as SCROLLING "
         f"(over half the cues start before the previous one ends, so every cue time is a display event; e.g. "
@@ -1113,98 +1077,94 @@ def load_language_records(
             print(f"[loader] {language}/train: de-duplicated {len(drop)} train video(s) whose content also appears in dev/test "
                   f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); subtitles.dedup.", flush=True)
             deduplicated_train = len(drop)
+
+    # NO VISIBLE HANDS, every split: a reliable unit with at least poses.handless_unit_share of its frames in handless_runs (the
+    # kept body shows no hand: credits, a URL, an end card, lyrics over a person whose hands are out of shot) is quarantined
+    # in source time, BEFORE the cuts. No frame is cut and no unit time moves.
+    # VISUAL CUTS, every split: frames where a second real body moves (masked_runs) or no real body is present (empty_runs)
+    # leave every stream, and each clean segment between them is a record (split_clean_segments). Split AFTER the dedup
+    # above, which reads captions by source id. A blank column is unknown: warn, and cut or quarantine nothing for that kind.
+    handless_share = float(data_cfg["poses"]["handless_unit_share"])
+    for key in (*RUN_COLUMNS, "handless_runs"):
+        if unknown := sum(1 for r in records if (video_meta.get(r.video_id) or {}).get(key) is None): print(
+            f"[loader] {language}/{split or 'all'}: WARNING {unknown}/{len(records)} videos have no {key} in video_meta.csv; "
+            f"run `prepare_yt25.py --stage person-counts` to measure them. Nothing is "
+            f"{'cut' if key in RUN_COLUMNS else 'quarantined'} for them by that column.", flush=True
+        )
+    segments: list[VideoRecord] = []
+    for source in records:
+        meta = video_meta.get(source.video_id) or {}
+        cut_runs = [run for key in RUN_COLUMNS for run in meta.get(key) or []]
+        parts = split_clean_segments(quarantine_handless(source, meta.get("handless_runs") or [], handless_share), cut_runs)
+        reliable = sum(sp.reliable for part in parts for sp in part.sentences)
+        if not reliable:  # the all-quarantined rule, after the cuts
+            dropped_all_quarantined += 1
+            continue
+        segments.extend(parts)
+        # The cut is attributed first: a unit that the cut alone removes or quarantines is a cut unit, also when it is
+        # handless (an empty run is always a handless run). A reliable unit lies in exactly 1 segment, so these sums count units.
+        reliable_after_cut = sum(sp.reliable for part in split_clean_segments(source, cut_runs) for sp in part.sentences)
+        per_video[source.video_id].update({
+            "units_cut": sum(sp.reliable for sp in source.sentences) - reliable_after_cut,
+            "units_quarantined_handless": reliable_after_cut - reliable,
+            "frames_cut": source.pose.total_frames - sum(part.pose.total_frames for part in parts),
+            **{f"frames_{key}": sum(b - a for a, b in meta.get(key) or []) for key in RUN_COLUMNS},
+        })
+    records = segments
     if report is not None:
-        kept_meta = [video_meta.get(r.video_id) or {} for r in records]
-        frames = [r.pose.total_frames for r in records]
-        known = [(m["undetected_ratio"], f) for m, f in zip(kept_meta, frames) if m.get("undetected_ratio") is not None]
+        kept = list(dict.fromkeys(r.pose.video_id for r in records))   # source videos, in record order
+        kept_meta = [video_meta.get(v) or {} for v in kept]
+        known = [(m["undetected_ratio"], pose_index[v].total_frames) for v, m in zip(kept, kept_meta) if m.get("undetected_ratio") is not None]
         report.update({
-            "videos_in_split": len(splits.get(split, [])) if split else len(pose_index), "videos_kept": len(records),
+            "videos_in_split": len(splits.get(split, [])) if split else len(pose_index), "videos_kept": len(kept),
+            "segments_kept": len(records), "videos_cut": len(kept) - sum(r.video_id == r.pose.video_id for r in records),
             "dropped_mt_caption": dropped_mt_caption, "dropped_no_caption": dropped_no_caption,
-            "dropped_wrong_language": len(dropped_non_latin), "dropped_scrolling": len(dropped_scrolling),
-            "dropped_multi_person": len(dropped_multi_person), "dropped_undetected": len(dropped_undetected),
+            "dropped_wrong_language": len(dropped_non_latin) + len(dropped_wrong_language), "dropped_scrolling": len(dropped_scrolling),
             "dropped_pose_coverage": len(dropped_uncovered), "pose_coverage_rule_enabled": min_covered > 0.0,
             "deduplicated_train": deduplicated_train, "dropped_all_quarantined": dropped_all_quarantined,
-            "multi_person_ratio_known": sum(1 for m in kept_meta if m.get("multi_person_ratio") is not None),
-            "multi_person_rule_enabled": max_multi < 1.0,
-            # Raw detector counts among kept videos; these do not include the shape-variation condition.
-            **_multi_person_band([m.get("multi_person_ratio") for m in kept_meta]),
-            "frames_kept": int(sum(frames)), "frames_undetected": int(round(sum(r * f for r, f in known))),
-            "undetected_ratio_known_videos": len(known), "undetected_rule_enabled": max_undetected < 1.0,
+            "frames_kept": sum(r.pose.total_frames for r in records),
+            "frames_undetected": int(round(sum(u * f for u, f in known))), "undetected_ratio_known_videos": len(known),
+            **{f"{key}_unknown": sum(1 for m in kept_meta if m.get(key) is None) for key in (*RUN_COLUMNS, "handless_runs")},
             # Summed over the SURVIVORS only (see `per_video` above).
-            **{k: sum(per_video[r.video_id][k] for r in records) for k in next(iter(per_video.values()), {})},
+            **{k: sum(per_video[v][k] for v in kept) for k in (per_video[kept[0]] if kept else {})},
         })
     return records, splits
 
 
-def _multi_person_band(ratios: list) -> dict: # Raw detected-body share over kept videos; `videos_above` doesn't apply the shape test.
-    known = sorted(r for r in ratios if r is not None)
-    if not known: return {}
-    pct = lambda q: float(known[min(len(known) - 1, int(q * (len(known) - 1)))])
-    return {
-        "multi_person_p50": pct(0.5), "multi_person_p90": pct(0.9), "multi_person_p99": pct(0.99), "multi_person_max": float(known[-1]),
-        "multi_person_videos_above": {f"{t:g}": sum(1 for r in known if r > t) for t in (0.0, 0.01, 0.05, 0.25, 0.5)},
-    }
-
-
 class StreamingWindowDataset(Dataset):
     """On-the-fly Stage 2 window dataset. `__getitem__` samples from the training distribution rather than indexing
-    a fixed window table, keeping the stochastic sampler inside PyTorch/HF Trainer's map-style interface."""
-    def __init__(
-        self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any], steps_per_epoch: int | None = None, 
-        include_full_evidence: bool = True, deterministic: bool = False, pose_augment_cfg: dict | None = None, records_for_epoch=None,
-    ):
-        # Optional `epoch -> records` provider: a multilingual pool re-draws its balanced sub-sample each epoch so
-        # coverage of the sub-sampled corpora rotates (see set_epoch). None = a fixed record list, as before.
-        self._records_for_epoch = records_for_epoch
-        self._slt_cfg, self._inference_cfg, self._pose_augment_cfg = slt_cfg, inference_cfg, pose_augment_cfg
+    a fixed window table, keeping the stochastic sampler inside PyTorch/HF Trainer's map-style interface. 1 epoch
+    holds 1 index per anchor, so every reliable sentence anchors exactly 1 window/epoch."""
+    def __init__(self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any], deterministic: bool = False):
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
-        # Lazy, NOT module-level: train.sampler imports VideoRecord from this module, so a top-level import here is a data.loader <-> 
-        # train.sampler cycle that breaks every entry point at import time. WindowSampler is only ever used inside methods.
-        from train.sampler import WindowSampler
-        self.sampler = WindowSampler.from_slt_config(records, slt_cfg, inference_cfg, pose_augment_cfg=pose_augment_cfg)
-        self.steps_per_epoch = int(steps_per_epoch or max(len(self.sampler.anchors), 1))
-        # Epoch cursor for CAPPED epochs (steps_per_epoch < anchor count — e.g. multilingual pool, where a full pass is several hours): 
-        # successive epochs walk successive anchor slices, so every anchor is still visited every ceil(anchors/steps) epochs. Without 
-        # offset, DataLoader indices restart at 0 each epoch and anchors[index % N] would revisit the SAME first slice forever — a silent 
-        # fixed-prefix training set. No-op when uncapped: (index + e*N) % N == index % N. Dev loaders are deterministic and never offset.
+        # Lazy, NOT module-level: data.sampler imports VideoRecord from this module, so a top-level import here is a data.loader 
+        # <-> data.sampler cycle that breaks every entry point at import time. WindowSampler is only ever used inside methods.
+        from data.sampler import WindowSampler
+        self.sampler = WindowSampler.from_slt_config(records, slt_cfg, inference_cfg)
         self._epoch = 0
-        self.include_full_evidence = bool(include_full_evidence)
-        # Eval loaders set deterministic=True: an index then always yields the SAME anchor under a per-index rng, so early-stopping 
-        # monitor scores a fixed dev set each epoch instead of a fresh draw (else "best epoch" is partly a lottery).
+        # Eval loaders set deterministic=True: an index then always yields the SAME window (the sampler seeds every draw from the 
+        # index and no epoch shift applies), so the early-stopping monitor scores a fixed dev set each epoch instead of a fresh draw.
         self.deterministic = bool(deterministic)
-        self.seed = int(slt_cfg.get("seed", 42))
 
     def __len__(self) -> int:
-        return self.steps_per_epoch
+        return len(self.sampler.anchors)
 
     def set_epoch(self, epoch: int) -> None:
         if self.deterministic: return
         self._epoch = int(epoch)
-        # Multilingual pool: the balanced sub-sample ROTATES so a large corpus reduced to k of n videos is covered
-        # in full every ceil(n/k) epochs. Without this the run trains on one fixed epoch-0 slice forever and the
-        # rest of the dominant corpus is never loaded at all. Rebuilding is cheap (records hold no pose data).
-        if getattr(self, "_records_for_epoch", None) is None: return
-        records = self._records_for_epoch(self._epoch)
-        if not records: return
-        self.records = records
-        self.records_by_id = {r.video_id: r for r in records}
-        from train.sampler import WindowSampler   # lazy: see __init__ (import cycle)
-        self.sampler = WindowSampler.from_slt_config(records, self._slt_cfg, self._inference_cfg, pose_augment_cfg=self._pose_augment_cfg,)
-        # steps_per_epoch is deliberately NOT recomputed: it is the epoch's fixed compute BUDGET. Rotation changes the anchor COUNT by a few 
-        # percent (different videos hold different numbers of sentences), and `effective_index` shifts the cursor by epoch, so the slice each 
-        # epoch walks moves and nothing is systematically skipped. Exact once-per-epoch coverage holds only when the anchor count is stable.
 
     def effective_index(self, index: int) -> int:
-        # The index actually handed to the sampler. Uncapped epochs shift by epoch so a capped run does not replay
-        # the same slice forever; the length pre-pass must apply the SAME shift or it predicts the wrong window.
-        return index if self.deterministic else index + self._epoch * self.steps_per_epoch
+        # The index actually handed to the sampler. Training shifts it by whole epochs: the anchor (anchors[index % N]) stays the 
+        # same, but the sampler seeds its draws from the index, so each epoch draws new modes and edges. The length pre-pass must 
+        # apply the SAME shift or it predicts the wrong window.
+        return index if self.deterministic else index + self._epoch * len(self)
 
-    def _sample_item(self, index: int) -> dict:
+    def __getitem__(self, index: int) -> dict:
         index = self.effective_index(index)
         sample = self.sampler.sample(index)   # anchor = anchors[index % N]
         item = self.sampler.to_dict(sample)
-        if self.include_full_evidence and sample.full_evidence_spec is not None:
+        if sample.full_evidence_spec is not None:
             rec = self.records_by_id[sample.full_evidence_spec.video_id]
             full = self.sampler.materialize(rec, sample.full_evidence_spec)
             # CB must compare 2 views of the same complete anchor, after actual frame materialization.
@@ -1212,38 +1172,12 @@ class StreamingWindowDataset(Dataset):
         else: item["full_evidence"] = None
         return item
 
-    def __getitem__(self, index: int) -> dict:
-        if not self.deterministic: return self._sample_item(index)
-        # Per-index rng makes mode/jitter reproducible. fps_aug off — a TRAIN augmentation (Moryossef 2026 gates it
-        # on split==TRAIN, evaluates at native fps); leaving it on scored the monitor on 15–30fps resampled windows
-        # the head never deploys under.
-        rng = np.random.default_rng(self.seed * 100_003 + int(index))
-        saved = (self.sampler.rng, self.sampler.fps_aug_enabled)
-        self.sampler.rng = rng
-        self.sampler.fps_aug_enabled = False
-        try: return self._sample_item(index)
-        finally: (self.sampler.rng, self.sampler.fps_aug_enabled) = saved
-
-
-def _streaming_worker_init(worker_id: int) -> None:
-    """Reseed each worker's WindowSampler so parallel workers don't replay identical mode/jitter streams.
-
-    Forked/spawned workers inherit the sampler's Generator state IDENTICALLY (PyTorch's per-worker seeding never
-    touches a Generator stored on the dataset); `info.seed` is unique per worker (base_seed + worker_id). Anchors
-    stay index-driven, so coverage is untouched — only mode/jitter/fps/pose-aug draws are decorrelated.
-    """
-    info = get_worker_info()
-    if info is None: return
-    sampler = getattr(info.dataset, "sampler", None)
-    if sampler is not None and hasattr(sampler, "configure_worker"):
-        sampler.configure_worker(int(info.seed) % (2**32))
-
 
 class LengthBucketSampler(torch.utils.data.Sampler):
     """Batch indices so each batch holds windows of SIMILAR length.
 
     Step cost is linear in the total frames a batch computes, and a batch is padded to its longest window — so with random batching the 
-    median window (~146 frames) is computed at the batch maximum (~433).
+    median window is computed at the batch maximum.
 
     Coverage is untouched: this is a PERMUTATION of the same index set, and the anchor is `anchors[index % N]`, so every anchor is still 
     realised exactly once per epoch. Lengths come from `WindowSampler.spec_frames`, pose-free index-seeded pre-pass costing ~0.02ms/index.
@@ -1289,28 +1223,31 @@ def streaming_loader(
     dataset: StreamingWindowDataset, batch_size: int, collate_fn, num_workers: int = 0,
     bucket_by_length: bool = False, bucket_seed: int = 0
 ) -> DataLoader:
-    """The ONE DataLoader constructor for StreamingWindowDataset (both trainers route through here).
+    """The ONE DataLoader constructor for the window and chunk datasets (stage 2, S1 and the Moryossef segmenter).
 
-    num_workers is a plain throughput knob: the ANCHOR is a deterministic function of the global sample index
-    (WindowSampler.sample → anchors[index % N]), so every anchor is realized exactly once per epoch however indices
-    are partitioned — no duplication, no lost coverage. `_streaming_worker_init` decorrelates the per-window random
-    stream forked workers would otherwise share; dev datasets seed from the index and need neither.
+    num_workers is a plain throughput knob: the ANCHOR is a deterministic function of the global sample index (WindowSampler.sample → 
+    anchors[index % N]). Every anchor is realized exactly once per epoch however indices are partitioned — no duplication or lost coverage. 
+    Every per-window draw is seeded from the index (WindowSampler.spec_for, ChunkDataset.__getitem__), so forked workers need no reseed.
     """
     # A dataset whose __getitem__ depends on the epoch cannot use persistent workers.
     epoch_stateful = hasattr(dataset, "set_epoch") and not bool(getattr(dataset, "deterministic", False))
     persistent = num_workers > 0 and not epoch_stateful
     sampler = None
-    if dist.is_distributed(): sampler = DistributedSampler(dataset, num_replicas=dist.world_size(), rank=dist.rank(), shuffle=False)
-    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour. Incompatible
-    # with a DistributedSampler (both decide the index order), so it is single-process only; multi-GPU already
-    # splits the batch and gets its speed there.
+    # A training set is shuffled per epoch (the trainer's set_epoch reseeds it), so a global batch is 
+    # not a block of consecutive anchors from 1 or 2 videos; a deterministic (dev) set keeps its order.
+    if dist.is_distributed(): sampler = DistributedSampler(
+        dataset, num_replicas=dist.world_size(), rank=dist.rank(),
+        shuffle=not bool(getattr(dataset, "deterministic", False)), seed=int(bucket_seed),
+    )
+    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour. Incompatible with DistributedSampler 
+    # (both decide the index order), so it is single-process only; multi-GPU already splits the batch and gets its speed there.
     if bucket_by_length and sampler is None and hasattr(dataset, "sampler"): return DataLoader(
-        dataset, batch_sampler=LengthBucketSampler(dataset, int(batch_size), seed=int(bucket_seed)), num_workers=int(num_workers), 
-        persistent_workers=persistent, collate_fn=collate_fn, worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
+        dataset, batch_sampler=LengthBucketSampler(dataset, int(batch_size), seed=int(bucket_seed)), 
+        num_workers=int(num_workers), persistent_workers=persistent, collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(), prefetch_factor=4 if num_workers > 0 else None,
     )
     return DataLoader(
-        dataset, batch_size=int(batch_size), shuffle=False, sampler=sampler, num_workers=int(num_workers),
-        persistent_workers=persistent, collate_fn=collate_fn, worker_init_fn=_streaming_worker_init if num_workers > 0 else None,
+        dataset, batch_size=int(batch_size), shuffle=False, sampler=sampler, 
+        num_workers=int(num_workers), persistent_workers=persistent, collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(), prefetch_factor=4 if num_workers > 0 else None,
     )

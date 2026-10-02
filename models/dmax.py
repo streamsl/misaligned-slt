@@ -29,15 +29,10 @@ from train.losses import masked_cross_entropy
 @dataclass
 class OPUTOutput:
     loss: torch.Tensor
-    mask_loss: torch.Tensor
-    pred_loss: torch.Tensor
-    masked_positions: torch.Tensor
-    rollout_tokens: torch.Tensor
     # Detached per-row (summed token loss, valid-token count). Lets one merged OPUT call report the per-mode
     # breakdown without paying for a second decoder pass per mode group.
     row_loss_sum: torch.Tensor | None = None
     row_valid_count: torch.Tensor | None = None
-    noise: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None  # (t, masked, rollout) drawn here.
 
 
 def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float = 0.0, t_high: float = 1.0) -> torch.Tensor:
@@ -50,51 +45,50 @@ def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float
 
 
 def oput_two_pass_loss(
-    clean_ids: torch.Tensor, valid_mask: torch.Tensor, decode_fn: Callable[[torch.Tensor], torch.Tensor], mask_token_id: int, 
-    t_low: float = 0.3, t_high: float = 0.8, loss_over_all_positions: bool = True, sample_rollout: bool = False, 
-    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor] | None = None, label_smoothing: float = 0.0,
-    noise: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    clean_ids: torch.Tensor, valid_mask: torch.Tensor, decode_fn: Callable[[torch.Tensor], torch.Tensor],
+    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor], mask_token_id: int, t_low: float = 0.3, t_high: float = 0.8,
+    *, label_smoothing: float,
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
-    `decode_fn` must close over fixed, complete conditioning. Called twice: on masked target tokens (L_mask), then on an 
-    on-policy corruption from the rollout pass (L_pred). Both supervise recovery of `clean_ids` over all valid positions 
-    (DMax §3.1; OPUT SFT transform leaves loss un-restricted to masked positions — see commented `labels[~loss_mask] = -100` 
+    `decode_fn` must close over fixed, complete conditioning. Called twice: on masked target tokens (L_mask), then on an
+    on-policy corruption from the rollout pass (L_pred). Both supervise recovery of `clean_ids` over all valid positions
+    (DMax §3.1; OPUT SFT transform leaves loss un-restricted to masked positions — see commented `labels[~loss_mask] = -100`
     in DMax dFactory/.../data_transform.py).
 
-    Rollout is argmax by default (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`) — exactly what SPD commits at 
-    temperature 0, so the model self-corrects errors it will actually make. `sample_rollout=True` is the sampled ablation. 
-    DMax rolls out under `model.eval()` + no_grad (train_llada2_bd_oput.py lines 450-472): dropout OFF, matching inference. 
-    Pass `rollout_decode_fn` to rerun whole conditioning+decode path in eval; without it rollout reuses masked-pass logits.
+    Rollout is argmax (train_llada2_bd_oput.py: `token = semi_logits.argmax(...)`) — exactly what SPD commits at
+    temperature 0, so the model self-corrects errors it will actually make. DMax rolls out under `model.eval()` + no_grad
+    (train_llada2_bd_oput.py lines 450-472): dropout OFF, matching inference. `rollout_decode_fn` is that eval-mode decode.
 
     Unlike DMax (per-example mask-vs-pred `flag`, one grad pass), this takes the MEAN of L_mask and L_pred: a sum would
     double the DLM's per-token translation scale against the AR arm's single-pass CE. 2x decoder cost buys lower variance.
     """
     valid_mask = valid_mask.bool()
-    replay_pred = None
-    if noise is None:  # `noise` replays a previous draw (mask AND rollout) so two conditionings differ in Omega alone
-        t = sample_mask_ratio(clean_ids.shape, clean_ids.device, t_low=t_low, t_high=t_high)
-        masked = (torch.rand_like(t) < t) & valid_mask
-    else: t, masked, replay_pred = noise
+    # The canvas appends [MASK] ABOVE the tokenizer's vocabulary, so a real target can never carry that id. The scoring 
+    # slice below relies on it; a fixture that breaks it would otherwise fail inside cross-entropy.
+    if bool((clean_ids[valid_mask.bool()] == int(mask_token_id)).any()):
+        raise ValueError("a supervised target carries the [MASK] id; [MASK] must sit above the real vocabulary")
+    t = sample_mask_ratio(clean_ids.shape, clean_ids.device, t_low=t_low, t_high=t_high)
+    masked = (torch.rand_like(t) < t) & valid_mask
     masked_ids = torch.where(masked, torch.full_like(clean_ids, int(mask_token_id)), clean_ids)
 
     mask_logits = decode_fn(masked_ids)
     with torch.no_grad():
-        if replay_pred is not None: pred_ids = replay_pred
-        else:
-            rollout_logits = rollout_decode_fn(masked_ids) if rollout_decode_fn is not None else mask_logits
-            if sample_rollout:
-                probs = rollout_logits.softmax(dim=-1)
-                rollout = torch.distributions.Categorical(probs=probs).sample()
-            else: rollout = rollout_logits.argmax(dim=-1)
-            pred_ids = torch.where(masked, rollout, masked_ids)
+        # Over the REAL vocabulary, for the same reason the loss is sliced below: the corruption must be a token
+        # the decode could commit, and an unsliced argmax can return [MASK] itself.
+        rollout = rollout_decode_fn(masked_ids)[..., :mask_token_id].argmax(dim=-1)
+        pred_ids = torch.where(masked, rollout, masked_ids)
 
     pred_logits = decode_fn(pred_ids)
-    loss_mask = valid_mask if loss_over_all_positions else masked
-    mask_loss = masked_cross_entropy(mask_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
-    pred_loss = masked_cross_entropy(pred_logits, clean_ids, loss_mask, label_smoothing=label_smoothing)
+    # Score over the REAL vocabulary only. The canvas head carries a [MASK] column so its shape mirrors the input canvas, 
+    # but [MASK] is never a target and the decode forces its logit to the dtype minimum, so leaving it in the softmax would 
+    # train against a support the decode does not have. It also interacts badly with label smoothing: the smoothed target 
+    # puts eps/(V+1) on a column whose row is frozen at 0, which the model cannot answer.
+    mask_logits, pred_logits = mask_logits[..., :mask_token_id], pred_logits[..., :mask_token_id]
+    mask_loss = masked_cross_entropy(mask_logits, clean_ids, valid_mask, label_smoothing=label_smoothing)
+    pred_loss = masked_cross_entropy(pred_logits, clean_ids, valid_mask, label_smoothing=label_smoothing)
     with torch.no_grad():
-        m = loss_mask.to(dtype=mask_logits.dtype)
+        m = valid_mask.to(dtype=mask_logits.dtype)
         rows = 0.5 * sum(
             F.cross_entropy(lg.reshape(-1, lg.shape[-1]), clean_ids.reshape(-1), reduction="none").reshape_as(clean_ids) * m
             for lg in (mask_logits, pred_logits)
@@ -102,11 +96,7 @@ def oput_two_pass_loss(
     # MEAN of 2 passes, not their sum: the pooled translation loss weighs OPUT rows and Mode-2a CB rows by
     # token count, and the AR arm's CE is single-pass — a summed two-pass OPUT would silently double the DLM's
     # per-token translation scale relative to both (halving CB's share on the DLM arm only).
-    return OPUTOutput(
-        loss=0.5 * (mask_loss + pred_loss), mask_loss=mask_loss, pred_loss=pred_loss, masked_positions=masked,
-        rollout_tokens=pred_ids.detach(), row_loss_sum=rows, row_valid_count=m.sum(dim=1), noise=(t, masked, pred_ids.detach()),
-    )
-
+    return OPUTOutput(loss=0.5 * (mask_loss + pred_loss), row_loss_sum=rows, row_valid_count=m.sum(dim=1))
 
 # ════════════════════════════════════════════════════════════════════════════
 # Abstract DMax decoder: OPUT training + block decode
@@ -121,56 +111,39 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     '''
     def oput_forward(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
-        decoder_input_ids: torch.Tensor | None = None, t_low: float = 0.3, t_high: float = 0.8,
-        loss_over_all_positions: bool = True, sample_rollout: bool = False,
-        rollout_eval_mode: bool = True, eos_supervision: int | None = None,
-        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None,
-        omega_bias: torch.Tensor | None = None, label_smoothing: float = 0.0,
-        noise: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], decoder_input_ids: torch.Tensor | None = None, 
+        t_low: float = 0.3, t_high: float = 0.8, omega_bias: torch.Tensor | None = None, *, label_smoothing: float,
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
-        The rollout corruption is sampled with dropout OFF: `rollout_encode_fn` re-encodes the whole conditioning
-        path in eval; otherwise only the decoder is toggled to eval over the same `enc_hidden`.
+        The rollout corruption is drawn in eval mode on the whole path: `rollout_encode_fn` rebuilds the conditioning
+        in eval (DMax's eval-mode rollout), and the decoder is toggled to eval for the rollout decode.
 
         `omega_bias` (models.membership_gate) is FIXED conditioning: identical across both OPUT passes AND the rollout, 
         since it depends on BIO posteriors / encoder features, not target tokens. OPUT corrupts *target*, Ω conditions 
         the *input*, so Ω rides every decode here; its gradient into BIO logits flows via the grad-bearing passes only.
         '''
-        x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids, eos_supervision=eos_supervision)
-        rollout_decode_fn = None
-        if rollout_encode_fn is not None:
-            def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
-                # Decoder in eval too (caller's rollout_encode_fn covers the encoder): whole path dropout-off.
-                was_training = self.training
-                self.eval()
-                try:
-                    r_enc, r_mask = rollout_encode_fn()
-                    return self._bd3lm_logits(noisy_ids, x0, r_enc, r_mask, omega_bias=omega_bias)
-                finally: self.train(was_training)
-        elif rollout_eval_mode:
-            # Decoder-only eval rollout: L_mask/L_pred below still share the train-mode `enc_hidden`, 
-            # so their conditioning stays fixed.
-            def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
-                was_training = self.training
-                self.eval()
-                try: return self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias)
-                finally: self.train(was_training)
+        x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids)
+
+        def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
+            # Decoder in eval too (caller's rollout_encode_fn covers the encoder): whole path dropout-off. Encode FIRST:
+            # rollout_encode_fn restores the caller's train mode on exit, which would put this decoder back in train.
+            r_enc, r_mask = rollout_encode_fn()
+            was_training = self.training
+            self.eval()
+            try: return self._bd3lm_logits(noisy_ids, x0, r_enc, r_mask, omega_bias=omega_bias)
+            finally: self.train(was_training)
 
         # Conditioning c must be fixed and complete across both passes; `_version` catches in-place mutation.
         enc_version = enc_hidden._version
         out = oput_two_pass_loss(
             clean_ids=x0, valid_mask=valid,
             decode_fn=lambda noisy_ids: self._bd3lm_logits(noisy_ids, x0, enc_hidden, enc_mask, omega_bias=omega_bias),
-            mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high, loss_over_all_positions=loss_over_all_positions, 
-            sample_rollout=sample_rollout, rollout_decode_fn=rollout_decode_fn, label_smoothing=label_smoothing, noise=noise
+            rollout_decode_fn=rollout_decode_fn, mask_token_id=self.mask_token_id, t_low=t_low, t_high=t_high,
+            label_smoothing=label_smoothing,
         )
         assert enc_hidden._version == enc_version, "OPUT conditioning mutated between passes (fixed c)"
-        return {
-            "translation_loss": out.loss, "oput_mask_loss": out.mask_loss.detach(),
-            "oput_pred_loss": out.pred_loss.detach(), "oput_masked_fraction": out.masked_positions.float().mean().detach(),
-            "row_loss_sum": out.row_loss_sum, "row_valid_count": out.row_valid_count, "noise": out.noise,
-        }
+        return {"translation_loss": out.loss, "row_loss_sum": out.row_loss_sum, "row_valid_count": out.row_valid_count}
 
 
     def remasked_logits(
@@ -187,7 +160,9 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
         remask[:, 0] = False  # BOS fixed
         token_ids = torch.where(remask, torch.full_like(decoded_tokens, int(self.mask_token_id)), decoded_tokens)
-        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)
+        # MASK is an input symbol, not an output target. Match OPUT and generation so both the
+        # confidence test and its CE use the same distribution over caption tokens.
+        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)[..., :self.vocab_size]
 
 
     # ── Block decode over a KV cache of the final blocks (backbone-agnostic) ──

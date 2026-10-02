@@ -10,9 +10,7 @@ from poses import normalize_keypoints_unisign
 
 @dataclass
 class BIOHeadOutput:
-    phrase_logits: torch.Tensor
     logits: torch.Tensor
-    hidden_states: torch.Tensor
 
 
 class RoPETransformerEncoderLayer(nn.Module):
@@ -54,22 +52,20 @@ class RoPETransformerEncoderLayer(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
 
-    def forward(self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None, key_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        key_mask: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`attn_mask` is a prebuilt `attention_mask(...)` (chunked_rope_encode builds it once for all layers); 
+        without it the layer builds the key-padding mask from `key_mask` itself."""
         batch, frames, hidden_dim = x.shape
         # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
         if timestamps_s is None: timestamps_s = torch.arange(frames, device=x.device, dtype=torch.float32) / self.REFERENCE_FPS
         if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
         timestamps_s = timestamps_s.to(device=x.device)
         cos, sin = self._compute_rope(timestamps_s)
-
-        # Key-padding mask (True = real frame): excluding padded KEYS makes training attention match dense unbatched inference (collator 
-        # contract, data/batch.py). NOT the query-side mask Moryossef 2026 removed (README:66) — his uniform 1024-frame chunks barely 
-        # pad; our 0.5s–18s windows would leave ghost keys at train and none at inference, the exact mismatch his rule targets.
-        attn_mask = None
-        if key_mask is not None:
-            km = key_mask.to(device=x.device, dtype=torch.bool)
-            km = km | ~km.any(dim=-1, keepdim=True)  # fully-padded row: attend anywhere; outputs are loss-ignored
-            attn_mask = km[:, None, None, :]
+        if attn_mask is None: attn_mask = attention_mask(timestamps_s, key_mask, None)
+        if attn_mask is not None: attn_mask = attn_mask.to(device=x.device)
 
         # fp32 RMSNorm (cast back): autocast excludes rms_norm, so bf16 input + fp32 weight warns and falls back to
         # the unfused kernel; fp32 matches autocast's LayerNorm semantics.
@@ -86,43 +82,66 @@ class RoPETransformerEncoderLayer(nn.Module):
         return x + self.ffn(self.norm2(x.float()).to(x.dtype))
 
 
-def chunked_rope_encode(
-    layers: nn.ModuleList, x: torch.Tensor, timestamps_s: torch.Tensor | None,
-    chunk_size: int | None, key_mask: torch.Tensor | None = None, overlap: bool = False,
-) -> torch.Tensor:
-    """Run pre-norm RoPE layers over fixed-size chunks (Moryossef chunked inference).
+def attention_mask(
+    timestamps_s: torch.Tensor | None, key_mask: torch.Tensor | None, attention_radius_s: float | None,
+) -> torch.Tensor | None:
+    """Boolean SDPA mask (True = may attend) for one encode pass, or None for full attention.
 
-    Shared by `RoPEBIOHead` (BioS1Model) and the analysis `MoryossefSegmenter.encoder_attn`. Each chunk attends only within itself;
+    Key padding (`key_mask` True = real frame): excluding padded KEYS makes training attention match dense unbatched inference 
+    (collator contract, data/batch.py). NOT the query-side mask Moryossef 2026 removed — his uniform 1024-frame chunks barely pad; 
+    our variable windows would leave ghost keys at train and none at inference, the exact mismatch his rule targets.
+
+    Band (`attention_radius_s` r): query i attends key j only if |t_i - t_j| <= r seconds, so a frame's output reads a bounded
+    stretch of time and doesn't change when the buffer grows beyond it (dlm.yaml bio_attention_radius_s). The diagonal always stays
+    open, so no row is empty (no NaN), padded rows included. r=None is the full-attention key-padding mask, shape (B,1,1,T).
+    """
+    km = None if key_mask is None else key_mask.to(dtype=torch.bool)
+    if attention_radius_s is None:
+        if km is None: return None
+        km = km | ~km.any(dim=-1, keepdim=True)  # fully-padded row: attend anywhere; outputs are loss-ignored
+        return km[:, None, None, :]
+    if timestamps_s is None: raise ValueError("attention_radius_s needs timestamps_s: the band is a time window, not a frame count")
+    ts = timestamps_s if timestamps_s.dim() == 2 else timestamps_s.unsqueeze(0)
+    # 1e-4 s absorbs float32 rounding of k/fps timestamps, so a key exactly r away stays inside; far below any frame period.
+    allowed = (ts[:, :, None] - ts[:, None, :]).abs() <= float(attention_radius_s) + 1e-4       # (B, T, T)
+    if km is not None: allowed = allowed & km.to(device=allowed.device)[:, None, :]
+    allowed = allowed | torch.eye(ts.shape[-1], dtype=torch.bool, device=allowed.device)
+    return allowed[:, None]
+
+
+def chunked_rope_encode(
+    layers: nn.ModuleList, x: torch.Tensor, timestamps_s: torch.Tensor | None, chunk_size: int | None, 
+    key_mask: torch.Tensor | None = None, attention_radius_s: float | None = None,
+) -> torch.Tensor:
+    """Run pre-norm RoPE layers over overlap-stitched chunks (Moryossef chunked inference).
+
+    Shared by `RoPEBIOHead` (BioS1Model) and the Moryossef segmenter's `encoder_attn`. Each chunk attends only within itself;
     RoPE relative time in seconds keeps positions consistent across boundaries, so train-size chunked eval matches the training
     distribution. `chunk_size=None` (or T <= chunk_size) is one full pass. Timestamps are dim-normalized up front, else 1-D inputs
     are dropped on the chunked path and fall back to the 50fps index assumption, breaking fps-augmented inputs.
 
-    `overlap=True` — OVERLAP-STITCHED chunking for the S1 whole-video paths. Contiguous chunks give frames at a seam context on ONE 
-    side only, so a sentence straddling a chunk boundary is decoded from two truncated halves — with ~18s chunks and ~4-6s sentences 
-    that is a large fraction of sentences, and it is a decode ARTIFACT, not head error (the FSM never suffers it: its buffer follows 
-    commits). Windows advance by half a chunk and each frame keeps the estimate from the window where it is most INTERIOR, so every 
-    frame (stream edges aside) has at least a quarter-chunk of context on both sides. Window size stays the TRAINED extent — only the 
-    stitching changes. The external Moryossef baseline keeps `overlap=False`: its released protocol is contiguous chunks.
+    Stitching follows `overlap_windows`: windows advance by half a chunk and each frame keeps the estimate from the window where it
+    is most INTERIOR, so every frame (stream edges aside) has at least a quarter-chunk of context on both sides and a sentence that
+    straddles a seam is not decoded from 2 truncated halves. Window size stays the TRAINED extent.
+
+    `attention_radius_s` bands the attention in time (see `attention_mask`; timestamps required). The mask is built once per chunk and
+    every layer reuses it. None = full attention (the Moryossef baseline).
     """
     if timestamps_s is not None:
         if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(x.shape[0], -1)
         timestamps_s = timestamps_s.to(device=x.device)
 
-    if chunk_size is None or x.shape[1] <= int(chunk_size):
-        for layer in layers: x = layer(x, timestamps_s, key_mask=key_mask)
-        return x
-
     def run(start: int, end: int) -> torch.Tensor:
         chunk = x[:, start:end]
         chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None else None
         chunk_mask = key_mask[:, start:end] if key_mask is not None else None
-        for layer in layers: chunk = layer(chunk, chunk_ts, key_mask=chunk_mask)
+        mask = attention_mask(chunk_ts, chunk_mask, attention_radius_s)
+        for layer in layers: chunk = layer(chunk, chunk_ts, key_mask=chunk_mask, attn_mask=mask)
         return chunk
 
-    chunk_size, T = int(chunk_size), x.shape[1]
-    if not overlap: return torch.cat([run(s, min(T, s + chunk_size)) for s in range(0, T, chunk_size)], dim=1)
+    if chunk_size is None or x.shape[1] <= int(chunk_size): return run(0, x.shape[1])
     out = torch.empty_like(x)
-    for start, end, write_from, keep_hi in overlap_windows(T, chunk_size):
+    for start, end, write_from, keep_hi in overlap_windows(x.shape[1], int(chunk_size)):
         out[:, write_from:keep_hi] = run(start, end)[:, write_from - start : keep_hi - start]
     return out
 
@@ -178,14 +197,14 @@ class ClassifierHead(nn.Module): # Two-layer MLP classifier.
 class TemporalConvStem(nn.Module):
     """Residual stride-1 temporal Conv1d stem restoring the local boundary bias of Moryossef 2026's UNet front-end.
 
-    Moryossef's ablations credit the UNet skip convolutions for boundary precision (EXPERIMENTS.md finding 23 "UNet
-    skip connections are critical for sign boundary precision"; finding 8 "CNN naturally detects B"). This head reads
-    pose tokens directly with no UNet, so without a stem it is a transformer/BiLSTM tagger — weak on B, which feeds
-    the commit gate's I→O δ_enc stability and RQ2 tIoU. 2 conv layers, not the full UNet, to keep the head small.
+    Moryossef's ablations credit UNet skip convolutions for boundary precision (Moryossef 2026 release, dist/2026/EXPERIMENTS.md, 
+    findings 8/23: "CNN naturally detects B"; "UNet skip connections are critical for sign boundary precision"). This head reads 
+    pose tokens directly with no UNet, so without a stem it is a transformer/BiLSTM tagger — weak on B, which feeds commit gate's 
+    terminator δ_enc stability and RQ2 tIoU. 2 conv layers, not the full UNet, to keep the head small.
 
     Stride 1 + odd kernel + 'same' padding keeps length, so per-frame BIO labels stay aligned. Per-position RMSNorm
     (channels only) is length- and batch-independent: no train/inference mismatch over the growing streaming buffer
-    (unlike BatchNorm running stats or a time-pooling GroupNorm). conv_stem_layers=0 disables it (ablation).
+    (unlike BatchNorm running stats or a time-pooling GroupNorm).
     """
     def __init__(self, hidden_dim: int, num_layers: int = 2, kernel_size: int = 5, dropout: float = 0.1):
         super().__init__()
@@ -215,24 +234,21 @@ class TemporalConvStem(nn.Module):
 class RoPEBIOHead(nn.Module):
     """Phrase-level Moryossef-style BIO head over per-frame pose-token features.
 
-    `.logits` aliases the phrase BIO logits the FSM consumes. Moryossef 2026's extra *sign* (sub-sentence) head needs sign-level 
+    `.logits` is the phrase BIO logits the FSM consumes. Moryossef 2026's extra *sign* (sub-sentence) head needs sign-level 
     segment annotations; YouTube-SL-25 has only sentence/caption timestamps, so it is dropped rather than left as an unsupervised 
     dead branch. A residual `TemporalConvStem` precedes the RoPE layers to recover the boundary bias this UNet-less head lacks.
+    `attention_radius_s` bands every RoPE layer to +-r seconds (see `attention_mask`); None = full attention.
     """
     def __init__(
-        self, input_dim: int, hidden_dim: int = 384, depth: int = 4, nhead: int = 8, ff_mult: int = 2, dropout: float = 0.1,
-        num_classes: int = 4, chunk_size: int | None = None, conv_stem_layers: int = 2, conv_stem_kernel: int = 5,
+        self, input_dim: int, hidden_dim: int = 384, depth: int = 4, nhead: int = 8, 
+        ff_mult: int = 2, dropout: float = 0.1, num_classes: int = 4,
+        conv_stem_layers: int = 2, conv_stem_kernel: int = 5, attention_radius_s: float | None = None,
     ):
         super().__init__()
-        self.chunk_size = chunk_size
-        # Runtime flag, set by whole-video S1 paths (moryossef26.infer.whole_video_logits, eval.run_offline): overlap-stitched chunking.
-        # False for training (windows fit one chunk; the flag is inert) and for the faithful Moryossef baseline.
-        self.chunk_overlap = False
+        self.attention_radius_s = None if attention_radius_s is None else float(attention_radius_s)
         self.input_proj = nn.Identity() if input_dim == hidden_dim else nn.Linear(input_dim, hidden_dim)
         self.input_norm = nn.RMSNorm(hidden_dim)
-        self.conv_stem = TemporalConvStem(
-            hidden_dim, num_layers=conv_stem_layers, kernel_size=conv_stem_kernel, dropout=dropout,
-        ) if conv_stem_layers > 0 else None
+        self.conv_stem = TemporalConvStem(hidden_dim, num_layers=conv_stem_layers, kernel_size=conv_stem_kernel, dropout=dropout)
         self.layers = nn.ModuleList([RoPETransformerEncoderLayer(
             hidden_dim=hidden_dim, nhead=nhead,
             dim_feedforward=hidden_dim * ff_mult, dropout=dropout,
@@ -244,14 +260,13 @@ class RoPEBIOHead(nn.Module):
     ) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm (see layer note)
-        # Conv stem runs on the full sequence BEFORE RoPE chunking: local/translation-equivariant, so it does not
-        # reintroduce the absolute-position issue chunking eliminates. Mask-aware (see TemporalConvStem).
-        if self.conv_stem is not None: x = self.conv_stem(x, key_mask=frame_mask)
-        return chunked_rope_encode(self.layers, x, timestamps_s, self.chunk_size, key_mask=frame_mask, overlap=bool(self.chunk_overlap))
+        # Mask-aware conv stem (see TemporalConvStem), then one banded RoPE pass: whole-video callers window 
+        # the input to the trained context first (`chunk_normalized_logits`), so the head never chunks.
+        x = self.conv_stem(x, key_mask=frame_mask)
+        return chunked_rope_encode(self.layers, x, timestamps_s, None, key_mask=frame_mask, attention_radius_s=self.attention_radius_s)
 
     def forward(
         self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
     ) -> BIOHeadOutput:
         hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
-        phrase_logits = self.phrase_bio_head(hidden)
-        return BIOHeadOutput(phrase_logits=phrase_logits, logits=phrase_logits, hidden_states=hidden)
+        return BIOHeadOutput(logits=self.phrase_bio_head(hidden))

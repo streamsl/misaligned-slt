@@ -113,10 +113,10 @@ class UniSignPoseEncoder(nn.Module):
         hides the pad COLUMNS but cannot undo corruption already folded into the real ones, and here the affected
         frames carry the sentence terminator the commit gate reads. With the mask, a padded batch reproduces an
         exact-length forward bit-for-bit; a fully packed batch is unchanged, and the released weights still load
-        strict. `None` keeps the original (leaky) behaviour.
+        strict. `None` applies no mask (the upstream Uni-Sign forward).
 
-        NOT covered: the 33 BatchNorm2d layers still pool padded frames into their batch statistics when the
-        encoder is unfrozen. That is a separate decision, not a bug fix — see docs.
+        NOT covered: in train mode the 33 BatchNorm2d layers pool padded frames into their batch statistics
+        (both stage-2 pose encoders and the S1 encoder train).
         """
         parts = self._split_parts(poses)
         features = []

@@ -1,19 +1,15 @@
-"""Whole-video-chunk dataset for the faithful Moryossef segmenter (segmenter-error analysis + RQ2 cascade floor).
+"""Whole-video-chunk dataset for the faithful Moryossef segmenter (the RQ2 cascade floor).
 
-Random natural-timeline chunks — the Moryossef 2026 segmentation regime, not the SLT window sampler that trains
-the in-system BIO head. It reads the RELEASED model's own input contract — their 50 landmarks (8 body, two hands,
-no face), their shoulder-and-standardise normalisation, velocity after — so this arm reproduces Moryossef 2026
-rather than adapting it, and shares no preprocessing with the in-system head.
+The release input contract that S1's chunk pipeline (data/chunks.py ChunkDataset with `release`) applies for this arm: 
+the release's 50-landmark layout, its standardisation and velocity features; the trainer uses fixed-length chunks. 
+DWPose transfer, fitted coordinate statistics and caption-unit supervision adapt it to the target corpus.
 """
 from __future__ import annotations
 import warnings
 import numpy as np
-import torch
-from torch.utils.data import Dataset
 
-from data.loader import VideoRecord
-from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
-from poses import load_pose_window, apply_fps_aug
+from data.batch import collate_windows
+from poses import load_pose_window
 from poses.preprocessing import UNISIGN_LEFT_IDX, UNISIGN_RIGHT_IDX
 
 # ── The RELEASED weights' own input contract (this arm trains and infers under it) ────────────────────────────
@@ -28,115 +24,16 @@ RELEASE_RHAND = (RELEASE_LHAND[1], RELEASE_LHAND[1] + len(UNISIGN_RIGHT_IDX))   
 RELEASE_POSE_DIMS = (len(RELEASE_KP_IDX), 6)
 
 
-class MoryossefChunkDataset(Dataset):
-    def __init__(
-        self, records: list[VideoRecord], num_frames: int = 1024, steps_per_epoch: int | None = None, 
-        records_for_epoch=None, fps_aug_enabled: bool = True, fps_aug_min: float = 15.0, fps_aug_max: float = 30.0,
-        velocity: bool = True, training: bool = True, frame_dropout: float = 0.0, body_part_dropout: float = 0.0,
-        seed: int = 42, trusted_gap_s: float | None = TRUSTED_GAP_S, release_stats: dict | None = None,
-    ):
-        if not records: raise ValueError("MoryossefChunkDataset requires at least one record")
-        self.records = records
-        # Optional `epoch -> records` provider, identical to StreamingWindowDataset's: a multilingual pool
-        # re-draws its balanced sub-sample each epoch so coverage rotates. Without it this arm trains on one
-        # fixed epoch-0 slice while S1 rotates, and the RQ2 cascade would compare methods AND data exposure.
-        self._records_for_epoch = records_for_epoch
-        self.num_frames = int(num_frames)
-        if steps_per_epoch is None and training:
-            # Epoch = enough chunks to COVER the corpus once, not one per video — 
-            # else epoch-based early stopping kills runs after a handful of steps.
-            total_frames = sum(int(r.pose.total_frames) for r in records)
-            steps_per_epoch = max(len(records), total_frames // max(1, self.num_frames))
-        self.steps_per_epoch = int(steps_per_epoch or len(records))
-        self.trusted_gap_s = trusted_gap_s
-        self.fps_aug_enabled = bool(fps_aug_enabled)
-        self.fps_aug_min = float(fps_aug_min)
-        self.fps_aug_max = float(fps_aug_max)
-        self.velocity = bool(velocity)
-        self.training = bool(training)
-        self.frame_dropout = max(0.0, float(frame_dropout))
-        self.body_part_dropout = max(0.0, float(body_part_dropout))
-        self.seed = int(seed)
-        self.rng = np.random.default_rng(seed)
-        self.release_stats = release_stats   # fitted once on the corpus; None falls back to per-clip moments
-
-    def __len__(self) -> int:
-        return self.steps_per_epoch
-
-    def set_epoch(self, epoch: int) -> None:
-        if not self.training or self._records_for_epoch is None: return
-        records = self._records_for_epoch(int(epoch))
-        if records: self.records = records
-
-    def __getitem__(self, index: int) -> dict:
-        # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from (seed, index) so the 
-        # SAME chunks are scored every epoch — a per-epoch-random dev set makes the early-stopping monitor noise.
-        rng = self.rng if self.training else np.random.default_rng(self.seed * 100_003 + int(index))
-        rec = self.records[int(index) % len(self.records)]
-        chunk_s = self.num_frames / rec.pose.fps
-
-        start_s = 0.0 if rec.pose.duration_s <= chunk_s else float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))
-        end_s = min(rec.pose.duration_s, start_s + chunk_s)
-        # The released model's own input contract (to_release_coords), so this arm reproduces Moryossef 2026
-        # rather than adapting it: their 50 landmarks, their normalisation, no face, velocity added after the
-        # augmentations. Needs no video crop box — their normaliser is shoulder-relative.
-        raw, abs_timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=False)
-        poses = to_release_coords(
-            raw, self.release_stats, aspect=pose_aspect(rec.pose)
-        ) if raw.shape[1:] == (133, 3) else raw
-        if poses.shape[0] > self.num_frames:
-            poses, abs_timestamps = poses[: self.num_frames], abs_timestamps[: self.num_frames]
-
-        # All augmentations are train-only (Moryossef gates fps_aug/dropouts on split==TRAIN; eval runs native fps).
-        if self.training and self.fps_aug_enabled and poses.shape[0] > 1:
-            poses, abs_timestamps, _ = apply_fps_aug(
-                poses, source_fps=rec.pose.fps, min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, 
-                rng=rng, source_timestamps_s=abs_timestamps,
-            )
-        if self.training and self.body_part_dropout > 0.0:
-            poses = apply_body_part_dropout(poses, self.body_part_dropout, rng)
-        if self.training and self.frame_dropout > 0.0:
-            poses, abs_timestamps = apply_frame_dropout(poses, abs_timestamps, self.frame_dropout, rng)
-        if self.velocity: poses = release_velocity(poses, abs_timestamps)
-        labels = make_bio_labels(
-            abs_timestamps, rec.sentences, start_s, end_s,
-            trusted_gap_s=self.trusted_gap_s, video_duration_s=rec.pose.duration_s,
-        )
-        return {
-            "poses": poses, "timestamps_s": abs_timestamps - start_s,
-            "phrase_bio": labels, "frame_mask": np.ones((poses.shape[0],), dtype=bool),
-            "video_id": rec.video_id, "start_s": start_s, "end_s": end_s,
-        }
-
-
 def collate_moryossef_chunks(batch: list[dict]) -> dict:
-    # Right-pad; labels pad with UNK so padded frames drop out of the loss.
-    max_len = max(item["poses"].shape[0] for item in batch)
-    pose_shape = batch[0]["poses"].shape[1:]
-    poses, timestamps, labels, masks, meta = [], [], [], [], []
-    for item in batch:
-        n = item["poses"].shape[0]
-        pad = max_len - n
-        poses.append(torch.nn.functional.pad(torch.as_tensor(item["poses"]).float(), (0, 0, 0, 0, 0, pad)))
-        timestamps.append(torch.nn.functional.pad(torch.as_tensor(item["timestamps_s"]).float(), (0, pad)))
-        labels.append(torch.cat([
-            torch.as_tensor(item["phrase_bio"]).long(),
-            torch.full((pad,), BIO["UNK"], dtype=torch.long)
-        ]))
-        masks.append(torch.cat([torch.ones(n, dtype=torch.bool), torch.zeros(pad, dtype=torch.bool)]))
-        meta.append({k: item[k] for k in ("video_id", "start_s", "end_s")})
-    return {
-        "poses": torch.stack(poses).reshape(len(batch), max_len, *pose_shape),
-        "timestamps_s": torch.stack(timestamps), "phrase_bio": torch.stack(labels),
-        "frame_mask": torch.stack(masks), "meta": meta,
-    }
-
+    # collate_windows (UNK label padding, frame_mask), with the release's ZERO pose padding: its model attends over the pad.
+    out = collate_windows(batch)
+    out["poses"] = out["poses"] * out["frame_mask"][:, :, None, None]
+    return out
 
 def pose_aspect(pose_index) -> float | None:
-    # width/height of the source video, or None when the sidecar omits either (poses/pose_io.py allows blanks).
+    # width/height of the source video (video_meta.csv, else data.yaml pose.width/height; poses.build_pose_index), or None.
     w, h = getattr(pose_index, "width", None), getattr(pose_index, "height", None)
     return float(w) / float(h) if w and h else None
-
 
 def fit_release_stats(records, frames_per_video: int = 256, max_videos: int = 400, seed: int = 42) -> dict:
     """Per-keypoint-per-dimension mean/std of the shoulder-normalised coordinates, over the training corpus.
@@ -199,28 +96,19 @@ def _shoulder_normalised(raw: np.ndarray, conf_thr: float = 0.3, aspect: float |
     return xy
 
 
-def to_release_coords(
-    raw: np.ndarray, stats: dict | None = None, conf_thr: float = 0.3, aspect: float | None = None
-) -> np.ndarray:
+def to_release_coords(raw: np.ndarray, stats: dict, conf_thr: float = 0.3, aspect: float | None = None) -> np.ndarray:
     """Raw DWPose (T,133,3) -> their (T,50,3) normalised coordinates: [x, y, z=0].
 
     Velocity comes AFTER, on these coordinates, exactly as `datasets/common.py` orders it — so the train-only
-    augmentations go in between. DWPose has no depth, so z (and therefore vz) is held at 0: a third of the spatial
-    input their model reads is absent, and no score from this representation is comparable to their published DGS
-    results. `stats` is the fitted table (fit_release_stats); without one the clip's own moments are used, which
-    does NOT reproduce the training coordinates.
+    augmentations go in between. DWPose has no depth, so z (and therefore vz) is held at 0: a 3rd of the spatial
+    input their model reads is absent, and no score from this representation is comparable to their published 
+    DGS results. `stats` is the fitted table (fit_release_stats), the standardisation the arm trained under.
     """
     if raw.ndim != 3 or raw.shape[1:] != (133, 3):
         raise ValueError(f"Expected raw (T,133,3) DWPose keypoints, got {raw.shape}")
     xy = _shoulder_normalised(raw, conf_thr=conf_thr, aspect=aspect)
-    if stats is None:
-        with np.errstate(invalid="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            mean, std = np.nanmean(xy, axis=0, keepdims=True), np.nanstd(xy, axis=0, keepdims=True)
-        mean, std = np.nan_to_num(mean), np.nan_to_num(std)
-    else:
-        mean = np.asarray(stats["mean"], dtype=np.float32)[None]
-        std = np.asarray(stats["std"], dtype=np.float32)[None]
+    mean = np.asarray(stats["mean"], dtype=np.float32)[None]
+    std = np.asarray(stats["std"], dtype=np.float32)[None]
     out = np.zeros((xy.shape[0], len(RELEASE_KP_IDX), 3), dtype=np.float32)
     out[..., :2] = np.nan_to_num((xy - mean) / np.where(std > 1e-6, std, 1.0), nan=0.0)
     return out
@@ -241,26 +129,3 @@ def release_velocity(coords: np.ndarray, timestamps_s: np.ndarray) -> np.ndarray
         inner = np.where((valid[1:] & valid[:-1])[..., None], inner, 0.0)
         velocity = np.concatenate([np.zeros_like(coords[:1], dtype=np.float32), inner], axis=0)
     return np.concatenate([coords.astype(np.float32, copy=False), velocity], axis=-1)
-
-
-def apply_body_part_dropout(poses: np.ndarray, probability: float, rng: np.random.Generator) -> np.ndarray:
-    # Zero left/right hand channels independently (Moryossef repo default train aug).
-    out = poses.copy()
-    if rng.random() < float(probability): out[:, RELEASE_LHAND[0]:RELEASE_LHAND[1], :] = 0.0
-    if rng.random() < float(probability): out[:, RELEASE_RHAND[0]:RELEASE_RHAND[1], :] = 0.0
-    return out
-
-
-def apply_frame_dropout(
-    poses: np.ndarray, timestamps_s: np.ndarray, max_rate: float, rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]: # Drop 0..max_rate of middle frames; edges preserved.
-    if poses.shape[0] <= 2: return poses, timestamps_s
-    drop_rate = float(rng.uniform(0.0, max(0.0, float(max_rate))))
-
-    n_drop = int((poses.shape[0] - 2) * drop_rate)
-    if n_drop <= 0: return poses, timestamps_s
-    middle = np.arange(1, poses.shape[0] - 1)
-    drop = rng.choice(middle, size=n_drop, replace=False)
-    keep = np.ones((poses.shape[0],), dtype=bool)
-    keep[drop] = False
-    return poses[keep], timestamps_s[keep]

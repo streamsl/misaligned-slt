@@ -36,11 +36,9 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
                 nn.SiLU(),
             ))
 
-        stride_to_output_pad = {1: 0, 2: 1, 4: 3, 8: 4}
         self.decoder_layers = nn.ModuleList()
         for conv in reversed(convolutions):
-            if conv.stride not in stride_to_output_pad: 
-                raise ValueError(f"Stride {conv.stride} not supported for output padding. Manually add it!")
+            if conv.stride not in (1, 2, 4, 8): raise ValueError(f"Stride {conv.stride} not supported")
             self.decoder_layers.append(nn.Sequential(
                 nn.ConvTranspose1d(
                     in_channels=conv.out_channels, out_channels=conv.in_channels,
@@ -77,12 +75,13 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
 class MoryossefSegmenter(nn.Module):
     """CNN-medium-attn segmenter with a phrase BIO head.
 
-    The external segmenter for calibration and the RQ2 cascade, not the in-system BIO head. Raw keypoints through a UNet are a different 
-    input space from the in-system Uni-Sign features. (docs/membership_gate.md §4, shared components table).
+    The external segmenter for the RQ2 cascade, not the in-system BIO head. Raw keypoints through a UNet are a different input space 
+    from the in-system Uni-Sign features. (docs/membership_gate.md §4, shared components table).
 
     Moryossef 2026's sign (sub-sentence) head needs sign-level annotations; our corpora carry only sentence boundaries, so it's omitted.
-    1 declared deviation remains: the reference zero-pads a final partial chunk to `num_frames` and attends over the pad, while 
-    `chunked_rope_encode` runs short chunk. Outputs are bit-identical on whole multiples of `num_frames` and differ only on that tail.
+    1 declared deviation remains: the reference runs contiguous `num_frames` chunks and zero-pads the last one, while longer input here
+    is overlap-stitched like S1's whole-video pass (models.bio_head.overlap_windows: each frame keeps `num_frames` window where it is 
+    most interior), and a shorter one is 1 unpadded pass. Every training chunk and every online buffer (<= 40 s) is that 1 pass.
     """
     def __init__(
         self, pose_dims: tuple[int, int] = (50, 6), hidden_dim: int = 384, encoder_depth: int = 4, num_classes: int = 4,
@@ -124,8 +123,9 @@ class MoryossefSegmenter(nn.Module):
         self, pose_data: torch.Tensor, frame_mask: torch.Tensor | None = None, timestamps_s: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
         # frame_mask is accepted and ignored so the wrapper can call this and BioS1Model with 1 signature. No attention pad mask — 
-        # faithful to Moryossef 2026 (README:66: his mask "changes training distribution in a way that does not match inference"), 
-        # and safe here: chunks are near-uniform 1024 frames. The in-system RoPE head DOES key-mask padding.
+        # faithful to Moryossef 2026 (README:66: his mask "changes training distribution in a way that does not match inference").
+        # Cost: fps_aug, frame_dropout and clipped chunks at video ends vary lengths within batch, so part of a training batch is 0
+        # padding that the model attends to and that enters BatchNorm; inference has none. In-system RoPE head DOES key-mask padding.
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)
         return {"phrase": self.phrase_bio_head(encoded)}
 

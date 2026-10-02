@@ -9,11 +9,12 @@ import numpy as np
 import torch
 
 from data.loader import VideoRecord
-from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
+from data.windowing import BIO, make_bio_labels
+from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
+
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
 from infer.duration_decode import DurationDecoder
-from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
@@ -50,7 +51,8 @@ def _phrase_logits(
 
 
 def whole_video_logits(model, record: VideoRecord, device: torch.device, velocity: bool, rope_chunk_s: float | None):
-    """Phrase logits and timestamps. S1 uses one normalization per trained-context chunk.
+    """Phrase logits and timestamps. Both arms overlap-stitch their trained RoPE context 
+    (models.bio_head.overlap_windows); S1 also normalizes per chunk.
 
     The Moryossef arm reads the RELEASED model's own input contract (moryossef26.dataset.to_release_coords):
     their 50 landmarks, their shoulder/standardise normalisation, no face, velocity after — the same representation
@@ -61,7 +63,6 @@ def whole_video_logits(model, record: VideoRecord, device: torch.device, velocit
         raw, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
         if raw.shape[0] == 0: return None, timestamps
         chunk = max(1, round(float(rope_chunk_s) * float(record.pose.fps)))
-        model.bio_head.chunk_size, model.bio_head.chunk_overlap = chunk, True   # a chunk-length input is one RoPE pass
         forward = lambda p, m, t: model(p, frame_mask=m, timestamps_s=t).logits
         return chunk_normalized_logits(forward, raw, timestamps, chunk, device), timestamps
     raw, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
@@ -75,6 +76,7 @@ def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
     rope_chunk_s: float | None = None, duration=None
 ) -> dict[str, list[Segment]]:
+    # 1 decode/stream: spans keyed by record id on the stream's own clock (eval.to_source maps them to the source video).
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -101,8 +103,8 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
         seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
         row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
         # Moryossef 2023's "%" metric: predicted/gold segment-count ratio, threshold-independent (counts come from the 
-        # decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper comparable pair to 
-        # their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are gameable (a right count 
+        # decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper comparable pair 
+        # to their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are gameable (a right count 
         # with wrong placements scores 1.0).
         row.setdefault("phrase_segment_count_ratio", float(seg["phrase_n_pred"]) / max(1.0, float(seg["phrase_n_gold"])))
         for k in seg_keys:
@@ -115,15 +117,15 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
 @torch.no_grad()
 def evaluate_moryossef_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
-    trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,), 
-    return_segments: bool = False, duration=None,
+    tiou_thresholds: tuple[float, ...] = (0.5,), return_segments: bool = False, duration=None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, list[Segment]]]:
-    """Moryossef evaluate.py-style STANDALONE eval: whole videos, GT phrase BIO from caption spans, frame-F1 and
-    1-to-1 tIoU segment P/R/F1 averaged. Phrase only, no sign head; for `--segmenter-arch s1` it scores the
-    pretrained in-system BIO head before joint fine-tuning.
+    """Moryossef evaluate.py-style STANDALONE eval: whole streams, GT phrase BIO from caption spans, frame-F1 and
+    1-to-1 tIoU segment P/R/F1 averaged over streams. A stream is a record: a whole video, or one clean segment of 
+    a cut video (data.loader.split_clean_segments), so this mean is per stream, not per source video. Phrase only, 
+    no sign head; for `--segmenter-arch s1` it scores the pretrained in-system BIO head before joint fine-tuning.
 
     `rope_chunk_s` (S1 only): trained context in SECONDS (= buffer_cap_s) → frames per stream.
-    `trusted_gap_s` defaults to TRUSTED_GAP_S to match training GT: uncaptioned stretches → UNK (excluded), not O,
+    Gold follows both arms' training label rule (TRUSTED_GAP_S): long uncaptioned stretches → UNK (excluded), not O,
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
     `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
 
@@ -133,17 +135,16 @@ def evaluate_moryossef_whole_video(
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []
-    # `return_segments`: the SAME decoded tags, as time-domain spans BEFORE the UNK ignore-region masking —
-    # the caller feeds them to the RQ2 scoring path, whose quarantine rule (drop majority-quarantined events)
-    # replaces the frame-level mask. 1 decode, 2 protocols.
+    # `return_segments`: the SAME decoded tags, as time-domain spans (keyed by record id, stream clock) BEFORE 
+    # the UNK ignore-region masking — the caller feeds them to the RQ2 scoring path, whose quarantine rule 
+    # (drop majority-quarantined events) replaces the frame-level mask. 1 decode, 2 protocols.
     segments_by_video: dict[str, list[Segment]] = {}
 
     for record in records:
         logits, timestamps = whole_video_logits(model, record, device, velocity, rope_chunk_s)
         if logits is None: continue
         gold = make_bio_labels(
-            timestamps, record.sentences, 0.0, float(record.pose.duration_s),
-            trusted_gap_s=trusted_gap_s, video_duration_s=record.pose.duration_s,
+            timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s
         )
         logits = logits.detach().cpu()
         raw_logits = logits
@@ -156,9 +157,12 @@ def evaluate_moryossef_whole_video(
             raw_tags = logits[0].argmax(dim=-1)
             segments_by_video[record.video_id] = bio_tags_to_segments(raw_tags, timestamps.tolist())
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
-        # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right nor
-        # wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
+        # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right 
+        # nor wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
         unk_mask = labels[0] == BIO["UNK"]
+        # A stream with no gold signing (all UNK, or O/UNK only: a clean segment with no reliable unit) gets no row: its F1
+        # is undefined, and a 0 or 1 there would move the mean. Its spans are returned above and still reach rq2_protocol.
+        if not ((labels[0] == BIO["B"]) | (labels[0] == BIO["I"])).any(): continue
         if unk_mask.any():
             logits = logits.clone()
             logits[0, unk_mask] = 0.0

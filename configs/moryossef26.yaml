@@ -1,8 +1,9 @@
-# Faithful Moryossef 2026 external segmenter for error calibration and the RQ2 cascade. It is not the in-system FSM
-# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input
-# contract — their 50 landmarks (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity
-# after — where the in-system head reads Uni-Sign features. The two arms therefore share no preprocessing at all,
-# which is what keeps calibration independent (docs/membership_gate.md §4, shared components table).
+# Faithful Moryossef 2026 external segmenter for the RQ2 cascade. It is not the in-system FSM head (that is train-bio / 
+# bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input contract — their 50 landmarks 
+# (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity after — where the in-system head 
+# reads Uni-Sign features. The two arms share no input representation, which keeps cascade baseline independent of the 
+# method (docs/membership_gate.md §4, shared components table). Everything else is S1's: pool, chunk tiling, augmentation, 
+# labels, dev monitor and best-epoch floor (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`).
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
@@ -10,9 +11,7 @@ checkpoint:
     # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
     dir: checkpoints/moryossef/${corpus}
     save_best: true
-    # 1-to-1 tIoU-matched segment F1 (metrics.segmentation_prf — the metric RQ2 uses): collapse-resistant
-    # (neither all-I nor over-segmentation games it). On clean gap-separated streams a good detector is near-ceiling.
-    monitor: val_phrase_tiou_f1
+    monitor: val_phrase_tiou_f1  # complete-span F1@0.5 over fixed dev chunks, S1's monitor (train.helpers.evaluate_bio_chunks)
     mode: max
     restore_best: true
     from_pretrained: checkpoints/moryossef26.safetensors
@@ -32,30 +31,24 @@ attn_nhead: 8
 attn_ff_mult: 2
 attn_dropout: 0.1
 
-# BIO loss = Dice(1.5) + PLAIN cross-entropy. bio_class_weights null (UNWEIGHTED) is deliberate for THIS UNet-CNN:
-# Moryossef's own ablations show the CNN detects B natively via its skip connections (EXPERIMENTS.md finding 8) and
-# class-weighting it over-segments and collapses tIoU-F1 (findings 7/17/25; E11 unweighted Phrase IoU 0.90 vs E5
-# light-B=2 IoU 0.64). The ~35x B-weight recipe is the ORIGINAL paper's BiLSTM recipe, not the CNN one.
-#   FALLBACK: if THIS UNet-CNN actually collapses to all-I on dev (val_bio_recall=1.0, zero predicted segments),
-#   try {O:1, B:2, I:1} and compare val_phrase_tiou_f1 — an EXPLICIT ablation, not the default.
+# BIO loss = Dice(1.5) + class-weighted cross-entropy. Moryossef's own ablations run THIS UNet-CNN unweighted: it 
+# detects B natively via its skip connections (Moryossef 2026 release, dist/2026/EXPERIMENTS.md, finding 8), and
+# class-weighting it over-segments and collapses tIoU-F1. That evidence is measured WITH the joint sign head, which
+# this corpus cannot supply, and on YouTube-SL-25, the unweighted CNN never predicts B. `balanced` (corpus-measured,
+# same rule S1 uses) keeps baseline matched to the method instead of comparing against a collapsed head; `null` is 
+# the faithful unweighted variant.
 dice_loss_weight: 1.5
-# The FALLBACK above has FIRED: on YouTube-SL-25 this CNN never predicts B. The unweighted evidence cited above
-# was measured WITH the joint sign head, which this corpus cannot supply, so it does not transfer. `balanced`
-# (corpus-measured, same rule S1 uses) keeps the baseline matched to the method instead of comparing against a
-# collapsed head; `null` reproduces the faithful-but-collapsed variant.
 bio_class_weights: balanced
 
-# Whole-video chunk training (Moryossef-style; distinct from the SLT window sampler).
-num_frames: 1024 # chunk length in frames; also the RoPE chunk size for chunked inference
-steps_per_epoch: null # null = cover the corpus once/epoch (sum of video frames / num_frames)
+# Chunk training: each epoch tiles every record from a random phase with chunks of (num_frames - 1) / 24 s, 
+# so a chunk loads at most num_frames frames (data/chunks.py; S1 tiles the same way with U(L_min, C) lengths).
+num_frames: 1024 # chunk length in frames; also the RoPE window for overlap-stitched whole-video inference
 batch_size: 32
-grad_accum_steps: 1     # Effective batch = batch_size * grad_accum_steps, at batch_size activation memory
-augmentation:
-    # fps_aug ONLY (Moryossef 2026: essential; speed_aug hurts). Downsample-only, so the range must dip 
-    # below the source rate to do anything. YouTube-SL-25 poses are 24 fps.
-    fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-    frame_dropout: 0.15 # Moryossef repo default: drop 0-15% middle frames during train.
-    body_part_dropout: 0.1 # Moryossef repo default: zero each hand independently during train.
+grad_accum_steps: 1  # Effective batch = batch_size * grad_accum_steps, at batch_size activation memory
+augmentation:        # TRAIN chunks only; same block as bio_pretrain.yaml (poses/augmentation.py has the recipe).
+    fps: { min_fps: 15.0, max_fps: 30.0 }
+    frame_dropout: 0.15
+    body_part_dropout: 0.1
 
 learning_rate: 2.0e-4
 weight_decay: 1.0e-4
@@ -70,11 +63,11 @@ scheduler:
     warmup_epochs: 4
 mixed_precision: auto
 max_grad_norm: 1.0
-# The pred→GT match bar is an analysis knob (`analyze.SEGMENTER_ERROR_MATCH_TIOU = 0.1`,
-# override with `analyze.py --tiou-threshold`), not a segmenter-training param.
 
 # Matched to configs/bio_pretrain.yaml: the baseline segmenter trains on the SAME language pool as S1, so the RQ2
 # cascade rows compare methods rather than the amount of segmentation data each arm saw. Set both to null together
 # for the monolingual recipe.
 pretrain_languages: [ase, asf, bfi]
-pretrain_temperature: 0.3
+# Same pool rule as bio_pretrain.yaml: τ sets each language's share in records (clean segments), τ=1 proportional,
+# τ=0 uniform; the best-epoch floor (one full rotation) is computed and printed at run time.
+pretrain_temperature: 0.0

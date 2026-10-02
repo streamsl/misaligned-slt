@@ -4,14 +4,11 @@ import yaml, re
 import torch
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
-GEOMETRY_KEY_PATHS = (
-    ("buffer_cap_s",), ("boundary_stability", "delta_enc_frames"), 
-    ("span_selection", "min_span_frames"), ("boundary_stability", "commit_lag_s")
-)
-# Per-language rows with a valid code default: resolved when present, dropped when missing, so the stage  that writes them 
-# can run first. commit_lag_s = 0.0 means "commit as soon as hysteresis passes".
-SOFT_KEY_PATHS = frozenset({("boundary_stability", "commit_lag_s")})
-LAMBDA_MIN_FRAMES = 12  # 0.5s at 24 fps: below the p1 unit duration of every corpus, far above a 1-2 frame flicker
+LAMBDA_MIN_FRAMES = 12  # 0.5s at 24 fps: label-domain floor that rejects flicker; genuine shorter units can't be emitted.
+# Native pose rate of every configured corpus (SignVerse-2M). Λ_min and δ are frame counts at this rate: stage-2 windows,
+# the FSM and eval all stay on it. S1's chunk law converts δ to seconds with it (train/bio_pretrain.py).
+NATIVE_POSE_FPS = 24.0
+
 
 def lambda_min_frames(inference_cfg: dict) -> int:
     # Lambda_min: the shortest span the FSM may commit. A LABEL-domain floor, so it does not move with a noise measurement.
@@ -51,17 +48,6 @@ def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
     if parts and (parts[-1] in langs or parts[-1] == str(cfg.get("language", ""))): parts[-1] = key
     return "/".join(parts)   # an explicit, non-language-templated dir is the caller's choice — never rewritten
 
-def pretrained_checkpoint(cfg: dict, default: str | None = None) -> str | None:
-    # Start weights: released Uni-Sign pose-only checkpoint (mBART ablation uses only its pose encoder; LM starts from base).
-    return cfg_get(cfg, "checkpoint", "from_pretrained", default=default)
-
-def save_best_enabled(cfg: dict, default: bool = True) -> bool:
-    return bool(cfg_get(cfg, "checkpoint", "save_best", default=default))
-
-def language_model_name(cfg: dict) -> str:
-    # ONE key for the text model regardless of family: google/mt5-base OR facebook/mbart-large-cc25.
-    return str(cfg_get(cfg, "language_model", "name", default="google/mt5-base"))
-
 def target_language(data_cfg: dict, language: str, default: str = "en_XX") -> str:
     # Declared TEXT language of a dataset language's captions (`data.yaml languages.<lang>.target_lang`).
     return str(((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("target_lang") or default)
@@ -71,40 +57,6 @@ def _deep_merge(base: dict, override: dict) -> dict: # `override` wins; nested d
     for key, value in override.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict): out[key] = _deep_merge(out[key], value)
         else: out[key] = value
-    return out
-
-
-def resolve_inference(cfg: dict, language: str, strict: bool = True) -> dict:
-    """Resolve inference.yaml's PER-LANGUAGE measured geometry to flat scalars for one language.
-
-    buffer_cap_s / boundary_stability.delta_enc_frames / span_selection.min_span_frames resolves ONCE, right after load; 
-    downstream readers keep seeing plain scalars. A scalar value passes through unchanged (language-independent pins,
-    synthetic test configs).
-    """
-    out = dict(cfg)
-    for key_path in GEOMETRY_KEY_PATHS:
-        parent, node = out, out
-        for key in key_path[:-1]:
-            if not isinstance(node.get(key), dict): node = None; break
-            parent[key] = dict(node[key])   # copy-on-write down the path; never mutate the caller's dict
-            parent, node = parent[key], parent[key]
-
-        if node is None: continue
-        leaf = node.get(key_path[-1])
-        if not isinstance(leaf, dict): continue   # scalar or absent: already resolved / code defaults apply
-        if str(language) not in {str(k) for k in leaf}:
-            # strict=False: bootstrap/smoke mode — drop the unresolved leaf so flat `.get(..., default)` fallbacks
-            # engage (a stage measuring a NEW language runs before its own row exists, by construction).
-            if not strict or key_path in SOFT_KEY_PATHS:
-                node.pop(key_path[-1], None)
-                continue
-            writer = "--stage buffer-cap" if key_path == ("buffer_cap_s",) else "--stage delta-enc"
-            raise SystemExit(
-                f"inference config has no {'.'.join(key_path)} entry for language {language!r} (has: "
-                f"{sorted(map(str, leaf))}). Run `analyze.py {writer} --language {language} --write-config` "
-                f"first — borrowing another language's measured geometry would be silent miscalibration."
-            )
-        node[key_path[-1]] = {str(k): v for k, v in leaf.items()}[str(language)]
     return out
 
 
@@ -121,13 +73,12 @@ def resolve_placeholders(cfg: dict) -> dict:
     scalars = {k: v for k, v in cfg.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
     if not scalars: return cfg
 
-    def sub(s: str) -> str:
-        return _PLACEHOLDER_RE.sub(lambda m: str(scalars[m.group(1)]) if m.group(1) in scalars else m.group(0), s)
-
     def walk(obj):
         if isinstance(obj, dict): return {k: walk(v) for k, v in obj.items()}
         if isinstance(obj, list): return [walk(v) for v in obj]
-        return sub(obj) if isinstance(obj, str) else obj
+        if isinstance(obj, str): 
+            return _PLACEHOLDER_RE.sub(lambda m: str(scalars[m.group(1)]) if m.group(1) in scalars else m.group(0), obj)
+        return obj
 
     return walk(cfg)
 
@@ -169,49 +120,3 @@ def _load_yaml_raw(path: str | Path) -> dict:
         if not parent_path.is_absolute(): parent_path = path.parent / parent_path
         merged = _deep_merge(merged, _load_yaml_raw(parent_path))
     return _deep_merge(merged, cfg)
-
-
-def update_yaml_scalar(path: str | Path, key_path: tuple[str, ...] | list[str], value) -> bool:
-    """Replace one scalar in a YAML file in place, preserving layout and comments.
-
-    Analysis persists the measured buffer cap / delta_enc into configs/inference.yaml. Line-targeted: walks the indentation 
-    stack to `key_path`, rewriting only that value and keeping any inline comment.
-
-    If the FINAL key is missing but its parent mapping exists, the key is INSERTED as a new child line — this is how a new 
-    language gets its per-language geometry row without hand-editing the file. Parents are never created.
-    """
-    path = Path(path)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    target = tuple(str(k) for k in key_path)
-
-    def walk(want: tuple) -> int | None:
-        stack: list[tuple[int, str]] = []
-        for i, line in enumerate(lines):
-            match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", line)
-            if not match: continue
-            indent = len(match.group(1))
-            while stack and stack[-1][0] >= indent: stack.pop()
-            stack.append((indent, match.group(2)))
-            if tuple(key for _, key in stack) == want: return i
-        return None
-
-    i = walk(target)
-    if i is not None:
-        match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", lines[i])
-        rest = match.group(3)
-        comment = f"  #{rest.split('#', 1)[1]}" if "#" in rest else ""
-        lines[i] = f"{match.group(1)}{match.group(2)}: {value}{comment}"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return True
-
-    if len(target) >= 2:
-        j = walk(target[:-1])
-        if j is not None:
-            parent_match = re.match(r"^(\s*)([A-Za-z0-9_]+):(.*)$", lines[j])
-            rest = parent_match.group(3).split("#", 1)[0].strip()
-            if rest: return False   # parent holds a scalar/flow value, not a block mapping — refuse to corrupt it
-            child_indent = parent_match.group(1) + "    "
-            lines.insert(j + 1, f"{child_indent}{target[-1]}: {value}")
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            return True
-    return False

@@ -1,11 +1,13 @@
-# S1: pose-only segmentation pretraining. The shared base supplies the window sampler and BIO architecture.
+# S1: pose-only segmentation pretraining on whole-input random chunks, BIO only (data/chunks.py). 
+# The shared base supplies the BIO architecture (bio_* keys, incl. bio_attention_radius_s); its window-sampler
+# blocks (mode_ratios, mode2_subcase_weights, jitter) are stage-2 only. S1 has its own augmentation block below.
 extends: dlm.yaml
 checkpoint:
     dir: checkpoints/bio_s1/${corpus}
     # Released pose weights for both pooled and target-only S1. A complete S1 model.pt initializes target fine-tuning.
     from_pretrained: checkpoints/openasl_pose_only_slt.pth
     save_best: true
-    monitor: val_mode3_tiou_f1
+    monitor: val_phrase_tiou_f1 # complete-span F1@0.5 over the fixed dev chunks
     mode: max
     restore_best: true
 wandb:
@@ -15,25 +17,24 @@ wandb:
 # For the target-only/fine-tune conditions, set the pool to null and pass --language.
 # The continued-training study keeps all 3 languages, then specializes this same S1 model on each target.
 pretrain_languages: [ase, asf, bfi]
-# τ=1.0  ase 84% / asf 9%  / bfi 8%     (proportional)
-# τ=0.5  ase 62% / asf 20% / bfi 19%
-# τ=0.3  ase 50% / asf 25% / bfi 24% 
-# τ=0.0  ase 33% / asf 33% / bfi 33%    (uniform)
-pretrain_temperature: 0.3
+# τ sets each language's share of the per-epoch pool, counted in records (clean segments): τ=1 proportional, τ=0 uniform
+# (the larger languages' slices rotate). The best-epoch floor (one full rotation) is computed and printed at run time.
+# Training exposure is time; the checkpoint stamps each language's hours per epoch (pretrain_hours).
+pretrain_temperature: 0.0
 
-# A FIXED context, so the trained window never depends on delta_enc_frames: `delta-enc` measures delta only AFTER
-# S1, and a delta that grows later would otherwise lift the deployed cap above the context the head trained on.
-# It must stay at or above every pool language's deployed cap (train p99 + stride + delta/fps) — `analyze --stage
-# buffer-cap` refuses a cap above the stamped context. `auto` re-derives it per run instead, and reintroduces that
-# ordering dependency. Evaluation uses the stamped trained context, not this file.
+# Longest chunk C: each epoch tiles every training record, from a random phase, with chunks of length U(δ + K·stride, C)
+# (data/chunks.py; δ, K and stride from inference.yaml). train-bio refuses a value below deployed cap (inference.yaml 
+# buffer_cap_s), which the stage-2 head and the FSM run at. Evaluation uses the stamped trained context.
 pretrain_geometry:
-    buffer_cap_s: 40   # auto
-    min_span_frames: 1
+    buffer_cap_s: 40
 
 epochs: 100
 batch_size: 32
 grad_accum_steps: 1    # Effective batch = batch_size * grad_accum_steps
-learning_rate: 2.0e-4
+learning_rate: 2.0e-4  # The BIO head (random init)
+# S1's pose encoder starts from the released Uni-Sign weights, so it trains at a smaller rate than the fresh head:
+# 0.5 x learning_rate (discriminative fine-tuning). Only S1 has this key: stage 2 trains every module at one rate.
+backbone_lr: 1.0e-4
 weight_decay: 1.0e-4
 early_stopping:
     enabled: true
@@ -42,6 +43,12 @@ early_stopping:
 scheduler:
     type: cosine
     warmup_epochs: 4
-# The pose encoder and BIO head both train; the encoder uses backbone_lr (default 0.3 × learning_rate).
-freeze_backbone: false
-# backbone_lr: 1.0e-4  # optional override of default 0.3×learning_rate
+# Pose augmentation, TRAIN chunks only (dev chunks are never augmented; data/chunks.py). A full dict: dlm.yaml sets
+# `augmentation: null`, and a child dict replaces a parent null whole (utils.load_yaml), so no key is inherited.
+# The Moryossef 2026 release recipe, identical in moryossef26.yaml so 2 segmentation arms differ only by model 
+# and input contract. BIO labels are rebuilt from the kept timestamps.
+augmentation:
+    fps: { min_fps: 15.0, max_fps: 30.0 }  # density resampling to U(min_fps, max_fps)
+    frame_dropout: 0.15                    # remove U(0, rate) of the interior frames
+    body_part_dropout: 0.1                 # drop each hand with this probability
+    # speed_aug forbidden and no spatial transform

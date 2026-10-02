@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-import os, random
+import os, pickle, random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -66,14 +66,13 @@ def save_train_state(
     Written every epoch so a preemption (Colab session death) loses at most one epoch. The best-model file
     (model.pt / best.json) is separate and unchanged — this file is operational state, never a deliverable.
     """
-    import numpy as np, random
     state = {
         "epoch": int(epoch),
         # step > 0 = MID-epoch snapshot: that many batches of `epoch` are applied, resume re-enters the SAME epoch
         # and fast-forwards; 0 = epoch boundary (the default).
         "step": int(step),
         "epochs": int(epochs),  # schedule horizon: total_steps is baked into the scheduler state, so resume must match
-        # The run's training-critical config, compared on resume: analysis stages rewrite those configs between
+        # The run's training-critical config, compared on resume: configs are live files that can change between
         # sessions, so without this a resumed run changes objective mid-training and nothing records it.
         "meta": dict(meta or {}),
         "model": model.state_dict(),
@@ -89,16 +88,42 @@ def save_train_state(
     return _atomic_torch_save(state, Path(path))
 
 
-def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer) -> dict:
+def _refuse_meta_drift(path, saved: dict, expected: dict) -> None:
+    """Refuse a resume whose training-critical config moved. The configs (inference.yaml, the stage config) are 
+    live files that parameterize the run: resuming across a change trains 2 halves under different objectives, 
+    visible afterwards only as an unexplained break in the loss curve."""
+    drift = sorted(k for k in set(saved) | set(expected) if saved.get(k) != expected.get(k))
+    if not drift: return
+    if set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
+        "--resume: Validation protocol changed; the saved best score is not comparable. Trained weights remain usable. "
+        "Re-evaluate saved checkpoints with corrected dev generation and use a separate checkpoint directory for any "
+        "continuation; don't reuse the old best-score history."
+    )
+    raise SystemExit(
+        f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
+        + "; ".join(f"{k}: {saved.get(k)!r} -> {expected.get(k)!r}" for k in drift[:4])
+        + f". Restore those values to resume, or start a fresh run (move {path}) "
+        f"— resuming across the change trains 2 halves under different objectives."
+    )
+
+
+def load_train_state(
+    path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer, expected_meta: dict | None = None,
+) -> dict:
     """Load a latest.pt snapshot into model+optimizer; returns the raw state for the caller to finish
-    (scheduler/scaler/control/rng), since those objects live in the training loop."""
+    (scheduler/scaler/control/rng), since those objects live in the training loop.
+
+    `expected_meta` is compared BEFORE the weights are loaded. A config edit that changes which parameters exist
+    makes `load_state_dict` raise a raw shape/key error, and a guard placed after it can never report the cause.
+    Drift that does not change the layout (a loss weight, a rate) has no other detector at all."""
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
     state["meta"] = dict(state.get("meta") or {})
+    if expected_meta: _refuse_meta_drift(path, state["meta"], expected_meta)
     model.load_state_dict(state["model"])
     saved_groups, live_groups = len(state["optimizer"]["param_groups"]), len(optimizer.param_groups)
     if saved_groups != live_groups: raise SystemExit(
-        f"--resume: {path} holds optimizer state for {saved_groups} param group(s) but this run builds {live_groups} "
-        f"(the optimizer layout changed, e.g. the main/backbone_lr split); moments cannot be mapped across layouts. "
+        f"--resume: {path} holds optimizer state for {saved_groups} param group(s) but this run builds "
+        f"{live_groups} (the optimizer layout changed); moments cannot be mapped across layouts. "
         f"Start a fresh run, or warm-start from model.pt."
     )
     optimizer.load_state_dict(state["optimizer"])
@@ -118,8 +143,8 @@ def save_model_checkpoint(
     """Weights, plus optional `meta` describing the CONTEXT the weights were trained under.
 
     Anything eval must reproduce but cannot re-derive belongs here rather than in a config: a config is a live
-    file that later stages rewrite, so a value read from it at eval time is whatever the last stage wrote, not
-    what this checkpoint trained under. Travelling with the weights is the only binding that cannot drift.
+    file that can change after training, so a value read from it at eval time need not be what this checkpoint
+    trained under. Travelling with the weights is the only binding that cannot drift.
     """
     payload = {"model": module.state_dict()}
     if meta: payload["meta"] = dict(meta)
@@ -129,13 +154,13 @@ def save_model_checkpoint(
 def s1_layout_state(state: dict) -> dict:
     """A stage-2 (MisalignedSLTModel) state dict re-keyed to the S1 layout (BioS1Model: pose_encoder.* + bio_head.*).
 
-    The deployed FSM head is the ARM's head after joint training, so post-training FSM constants that are not training
-    inputs (the commit lag) may be re-selected on it: tune-stream --checkpoint checkpoints/{ar,dlm}/<lang>/model.pt.
-    LM and decoder tensors are dropped. An S1-layout dict passes through unchanged."""
-    if not any(k.startswith("front_end.pose_encoder.") for k in state): return state
+    The deployed FSM head is the ARM's segmentation branch after joint training (`bio_pose_encoder` + `bio_head`), so joint 
+    head can be scored alone: eval.py --segmenter-eval --segmenter-arch s1 --checkpoint checkpoints/{ar,dlm}/<lang>/model.pt.
+    The translator's encoder, LM and decoder tensors are dropped. An S1-layout dict passes through unchanged."""
+    if not any(k.startswith("bio_pose_encoder.") for k in state): return state
     out = {}
     for k, v in state.items():
-        if k.startswith("front_end.pose_encoder."): out["pose_encoder." + k[len("front_end.pose_encoder."):]] = v
+        if k.startswith("bio_pose_encoder."): out["pose_encoder." + k[len("bio_pose_encoder."):]] = v
         elif k.startswith("bio_head."): out[k] = v
     return out
 
@@ -147,6 +172,43 @@ def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: boo
 
 
 def load_checkpoint_meta(checkpoint: str | Path) -> dict:
-    # `meta` written by save_model_checkpoint; {} when the file carries none.
-    raw = torch.load(str(_resolve_checkpoint_file(checkpoint)), map_location="cpu", weights_only=False)
+    # `meta` written by save_model_checkpoint; {} when the file carries none. mmap: the tensors are not read into memory.
+    # weights_only first, so reading the third-party released Uni-Sign file never runs pickled code (it loads this way).
+    # Only our own training-state files (latest.pt: optimizer and RNG state) need full unpickler, as load_train_state does.
+    path = str(_resolve_checkpoint_file(checkpoint))
+    try: raw = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except pickle.UnpicklingError: raw = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     return dict(raw.get("meta") or {}) if isinstance(raw, dict) else {}
+
+
+def require_fixed_constants(meta: dict, inference_cfg: dict, source) -> None:
+    """Refuse a trained checkpoint whose labels or FSM constants are not the current ones. inference.yaml holds ONE design
+    value per constant (buffer cap, δ, Λ_min) and train-slt stamps the values it trained with, so a stamp that differs means
+    the file trained under other constants. Eval (every model build) and the stage-2 warm-start guard both call this, so they
+    refuse the same files. A file with no meta (the released Uni-Sign checkpoint) passes."""
+    if not meta: return
+    from data.loader import ANNOTATION_PROTOCOL   # lazy: data.loader is heavy, and this module is imported early
+    from utils import lambda_min_frames
+    if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
+        f"{source} stamps annotation_protocol={meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}, "
+        f"so it predates the current labels. Retrain it."
+    )
+    gate = meta.get("gate") or {}
+    live = {
+        "buffer_cap_s": inference_cfg.get("buffer_cap_s"),
+        "delta": (inference_cfg.get("boundary_stability") or {}).get("delta_enc_frames"),
+        "min_span_frames": lambda_min_frames(inference_cfg)
+    }
+    stamped = { # δ is a training parameter only of a gated checkpoint; a clean floor stamps it but never reads it.
+        "buffer_cap_s": meta.get("buffer_cap_s"), 
+        "delta": gate.get("delta") if gate.get("enabled") else None,
+        "min_span_frames": gate.get("min_span_frames")
+    }
+    drift = [
+        f"{k} {stamped[k]} (inference.yaml {live[k]})" for k in live
+        if stamped[k] is not None and live[k] is not None and abs(float(stamped[k]) - float(live[k])) > 1e-6
+    ]
+    if drift: raise SystemExit(
+        f"{source} was trained with other FSM constants than configs/inference.yaml: "
+        f"{'; '.join(drift)}. Retrain it under the fixed constants."
+    )

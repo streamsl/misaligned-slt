@@ -10,9 +10,9 @@ gradients and DDP then needs `find_unused_parameters=True` — extra graph trave
 failure modes. Explicit averaging after `backward()` is correct for ANY call pattern and any graph: parameters
 with no gradient this step contribute an explicit zero, which is exactly their mathematical contribution.
 
-`batch_size` in every config stays the GLOBAL batch and is split across ranks (`per_rank_batch_size`). The same
-config therefore describes the same optimisation on 1 GPU and on 8, which is what keeps a calibrated recipe
-(e.g. Uni-Sign's effective 32 in baseline_train.yaml) reproducible across machines and needs no LR rescaling.
+`batch_size` in every config stays the GLOBAL batch and is split across ranks (`per_rank_batch_size`). 
+The same config therefore describes the same optimisation on 1 GPU and on 8, which is what keeps a 
+recipe (e.g. baseline_train.yaml's batch_size) reproducible across machines and needs no LR rescaling.
 """
 from __future__ import annotations
 import os

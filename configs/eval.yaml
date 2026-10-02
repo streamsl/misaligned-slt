@@ -1,10 +1,8 @@
-seed: 42
-languages: [asf, bfi] # documentation only; eval.py uses --language or data.yaml active_languages[0]
 rq1:
     # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
     # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
     # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative
-    # tail = right-truncation stress test; the range must exceed the measured jitter tail.
+    # tail = right-truncation stress test.
     severity_mode: relative
     severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3] # fractions of sentence duration
     smoke_grid_rel: [-0.2, 0.0, 0.2]

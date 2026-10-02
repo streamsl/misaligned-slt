@@ -3,13 +3,14 @@
 This is the deployed FSM head, not the external Moryossef segmenter. Their input spaces and checkpoints differ.
 
 Two jobs:
-  1. **gate warm start**: S2 starts from sharp head, so the gate couples on-policy from step 1 with
-     `membership_gate.warmup_epochs: 0` (no garbage-conditioning warmup).
+  1. **gate warm start**: S2 starts from a sharp head, so the gate couples on-policy from step 0 (stage 2 
+     refuses to run without `checkpoint.bio_head_init`).
   2. **BIO head init**: S2 loads `bio_head.*` (`checkpoint.bio_head_init` in dlm.yaml) & JOINTLY 
      fine-tunes it under the gate (§1.4 S2).
 
-Recipe (§1.4 S1): use StreamingWindowDataset, the designed pooled corruption distribution, Dice(1.5) + balanced
-CE, fps augmentation and RoPE time. The pose encoder trains at a lower learning rate than the BIO head.
+Recipe (§1.4 S1): whole-input random chunks, length U(δ + K·stride, C) with C = pretrain_geometry.buffer_cap_s (data/chunks.py), 
+BIO only, on the balanced pooled corpus; Dice(1.5) + balanced CE, the augmentation recipe shared with Moryossef arm, RoPE time and 
+the banded attention of dlm.yaml bio_attention_radius_s. The pose encoder trains at `backbone_lr`, the BIO head at `learning_rate`.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -18,48 +19,36 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data.batch import WindowCollator
-from data.loader import (
-    ANNOTATION_PROTOCOL, PooledEpochRecords, StreamingWindowDataset, annotation_fingerprint, 
-    assert_pool_safe, resolve_pretrain_records, sentence_p99_s, streaming_loader
-)
+from data.batch import collate_windows
+from data.chunks import ChunkDataset
+from data.loader import ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records, streaming_loader
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
-from infer.duration_decode import DurationDecoder
-from models.checkpointing import _load_state
+from models.checkpointing import _load_state, load_checkpoint_meta
 
 from train import distributed as dist
-from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
+from train.helpers import build_optimizer, evaluate_bio_chunks, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
-from metrics import bio_frame_metrics, CompleteSpanMetrics
-from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference
-
-PRETRAIN_CONTEXT_MARGIN_S = 3.0  # 72 frames at 24 fps
+from utils import NATIVE_POSE_FPS, cfg_get, checkpoint_dir, load_yaml, pool_key
 
 class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
     def __init__(
-        self, pose_hidden_dim: int = 256, feat_dim: int = 768, bio_hidden_dim: int = 384, bio_depth: int = 4, 
-        bio_nhead: int = 8, bio_dropout: float = 0.1, bio_conv_stem_layers: int = 2, freeze_encoder: bool = True,
+        self, pose_hidden_dim: int = 256, feat_dim: int = 768, bio_hidden_dim: int = 384, bio_depth: int = 4, bio_nhead: int = 8, 
+        bio_dropout: float = 0.1, bio_conv_stem_layers: int = 2, bio_attention_radius_s: float | None = None,
     ):
         super().__init__()
-        self.freeze_encoder = bool(freeze_encoder)
         self.pose_encoder = UniSignPoseEncoder(hidden_dim=int(pose_hidden_dim), out_dim=int(feat_dim))
-        if self.freeze_encoder:
-            for p in self.pose_encoder.parameters(): p.requires_grad_(False)
         self.bio_head = RoPEBIOHead(
             input_dim=int(feat_dim), hidden_dim=int(bio_hidden_dim), depth=int(bio_depth), nhead=int(bio_nhead), 
             dropout=float(bio_dropout), num_classes=4, conv_stem_layers=int(bio_conv_stem_layers),
+            attention_radius_s=bio_attention_radius_s,
         )
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.freeze_encoder: self.pose_encoder.eval()  # BN running stats pinned to the released checkpoint
-        return self
 
     def load_pretrained(self, ckpt_path: str | Path) -> int:
         sd = _load_state(ckpt_path)
         if any(k.startswith("bio_head.") for k in sd):
+            require_attention_radius(load_checkpoint_meta(str(ckpt_path)) or {}, self.bio_head.attention_radius_s, str(ckpt_path))
             self.load_state_dict(sd, strict=True)
             return len(sd)
         sd = released_layout_state(sd)
@@ -68,43 +57,29 @@ class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared 
         return len(pose_sd)
 
     def forward(self, poses, frame_mask, timestamps_s=None):
-        if self.freeze_encoder:
-            with torch.no_grad(): feats = self.pose_encoder(poses, frame_mask)
-        else: feats = self.pose_encoder(poses, frame_mask)
-        return self.bio_head(feats, timestamps_s=timestamps_s, frame_mask=frame_mask)
+        return self.bio_head(self.pose_encoder(poses, frame_mask), timestamps_s=timestamps_s, frame_mask=frame_mask)
 
 
-def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, language: str | None = None) -> dict[str, float] | None:
-    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of
-    train p99 + stride + PRETRAIN_CONTEXT_MARGIN_S. Returns the per-language terms, or None when the cap is a number.
-
-    LABEL-ONLY on purpose. The DEPLOYED cap is train p99 + stride + δ/fps, and `analyze.py --stage buffer-cap` refuses a deployed cap 
-    above the head's trained context, so this margin must DOMINATE δ/fps. It must not READ δ: `delta-enc` measures δ after S1 and from 
-    the S1 head, so a δ-derived context would depend on a number that does not exist yet, and every δ that grew afterwards would demand 
-    a new S1. A δ above the margin is still caught — buffer-cap refuses it, loudly. `inference_cfg` supplies stride_s only.
-    """
-    geometry = dict(cfg.get("pretrain_geometry") or {})
-    langs = cfg.get("pretrain_languages") or ([language] if language else None)
-    if not langs or str(geometry.get("buffer_cap_s", "")).lower() != "auto": return None
-    stride_s = float(inference_cfg.get("stride_s", 1.0))
-    caps = {lang: round(p99 + stride_s + PRETRAIN_CONTEXT_MARGIN_S, 2)
-            for lang, p99 in sentence_p99_s(data_cfg, [str(x) for x in langs], split="train").items()}
-    geometry["buffer_cap_s"] = max(caps.values())
-    cfg["pretrain_geometry"] = geometry
-    return caps
+def require_attention_radius(meta: dict, expected: float | None, source: str) -> None:
+    """Refuse an S1 head trained under another attention band. The band is a mask, not a weight, so a strict state_dict
+    load cannot detect it; a head read at another radius sees contexts it never trained on. No stamp = full attention."""
+    trained = meta.get("bio_attention_radius_s")
+    if trained is None and expected is None: return
+    if trained is not None and expected is not None and abs(float(trained) - float(expected)) < 1e-9: return
+    raise SystemExit(
+        f"{source} was trained with bio_attention_radius_s={trained} (None = full attention), but the config expects {expected}. "
+        f"Retrain S1 at that radius, or set bio_attention_radius_s to the trained value."
+    )
 
 
 def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
-    # Construct S1; optionally initialize from released pose weights or a complete S1 checkpoint.
-    # Inherited dlm.yaml `freeze_backbone`. The SHIPPED S1 recipe is false — the encoder trains, so `bio_head_init`
-    # can carry an ADAPTED encoder into stage 2. The `True` default here is for a config that omits the key entirely
-    # (the frozen-encoder ablation), not for bio_pretrain.yaml, which sets it explicitly.
-    freeze_encoder = bool(cfg.get("freeze_backbone", True))
+    # Construct S1; optionally initialize from released pose weights or a complete S1 checkpoint. The pose 
+    # encoder trains with the head, so `bio_head_init` carries an ADAPTED segmentation encoder into stage 2.
     model = BioS1Model(
         pose_hidden_dim=int(cfg.get("pose_hidden_dim", 256)), feat_dim=int(cfg.get("feat_dim", 768)),
         bio_hidden_dim=int(cfg.get("bio_hidden_dim", 384)), bio_depth=int(cfg.get("bio_depth", 4)),
         bio_nhead=int(cfg.get("bio_nhead", 8)), bio_dropout=float(cfg.get("bio_dropout", 0.1)),
-        bio_conv_stem_layers=int(cfg.get("bio_conv_stem_layers", 2)), freeze_encoder=freeze_encoder,
+        bio_conv_stem_layers=int(cfg.get("bio_conv_stem_layers", 2)), bio_attention_radius_s=cfg.get("bio_attention_radius_s"),
     )
     if pretrained_path:
         n = model.load_pretrained(pretrained_path)
@@ -123,11 +98,10 @@ def build_bio_s1(
     _requested_language = language   # raw CLI value, before defaulting (pooled runs refuse it)
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
-    inference_cfg = resolve_inference(load_yaml(inference_config), language, strict=False)
+    inference_cfg = load_yaml(inference_config)
 
     # Segmentation is language-agnostic (boundaries are prosodic), so S1 may pretrain on a pool of languages;
     # translation stays monolingual in stage 2. `pretrain_languages: null` = the target language alone.
-    assert_pool_safe(cfg)
     train_records, pretrain_mix = resolve_pretrain_records(cfg, data_cfg, language, "train", requested=_requested_language)
     if pretrain_mix:
         cfg["pretrain_mix"] = pretrain_mix   # recorded into the run config for the paper
@@ -140,79 +114,56 @@ def build_bio_s1(
         cfg["checkpoint"] = ckpt
         print(f"bio_s1 | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
         
-    context_caps = resolve_pretrain_context(cfg, data_cfg, load_yaml(inference_config), language)
-    if context_caps:
-        cfg["pretrain_context_caps"] = context_caps   # per-language train p99 + stride + margin, recorded for the paper
-        print(f"bio_s1 | pretrain_geometry.buffer_cap_s auto -> {cfg['pretrain_geometry']['buffer_cap_s']:.2f}s "
-              f"(per language: train p99 + stride + {PRETRAIN_CONTEXT_MARGIN_S:g}s margin = {context_caps})", flush=True)
     resolve_bio_class_weights(cfg, train_records)
-    # A pooled run re-draws its balanced sub-sample each epoch, so the videos a sub-sampled corpus contributes
-    # ROTATE and the whole corpus is covered across epochs. Monolingual runs pass no provider and are unchanged.
-    train_dataset = StreamingWindowDataset(
-        train_records, slt_cfg=cfg, inference_cfg=inference_cfg, pose_augment_cfg=cfg.get("augmentation"),
-        records_for_epoch=PooledEpochRecords(cfg, data_cfg, language) if pretrain_mix else None
+    # Chunk length C is the longest context the head trains on. Checkpoint metadata and whole-video evaluation use this 
+    # stamped value, not a target inference file that may change later. Stage-2 head and FSM run at the one deployed cap 
+    # (inference.yaml buffer_cap_s), so S1 must have trained at least that context.
+    cfg["training_buffer_cap_s"] = chunk_s = float(cfg["pretrain_geometry"]["buffer_cap_s"])
+    if chunk_s + 1e-6 < float(inference_cfg["buffer_cap_s"]): raise SystemExit(
+        f"pretrain_geometry.buffer_cap_s {chunk_s:.2f}s is below the deployed buffer_cap_s "
+        f"{float(inference_cfg['buffer_cap_s']):.2f}s ({inference_config}); raise it and train S1 at that context."
     )
-    # Record the sampler's resolved geometry once. Checkpoint metadata and whole-video evaluation must use the
-    # context the head actually trained on, not a target inference file that may change later.
-    cfg["training_buffer_cap_s"] = float(train_dataset.sampler.buffer_cap_s)
-    cfg["training_min_span_frames"] = int(train_dataset.sampler.min_span_frames)
+    # Shortest interior chunk = the shortest buffer the FSM decides on after a commit: δ of committed context + K strides.
+    stability = inference_cfg["boundary_stability"]
+    cfg["training_min_chunk_s"] = min_chunk_s = float(stability["delta_enc_frames"]) / NATIVE_POSE_FPS + \
+                                                int(stability["hysteresis_strides"]) * float(inference_cfg["stride_s"])
+    seed = int(cfg.get("seed", 42))
+    # A pooled run re-draws its balanced sub-sample each epoch, so the videos a sub-sampled corpus contributes
+    # ROTATE and the whole corpus is covered across epochs. Monolingual runs pass no provider.
+    pool = PooledEpochRecords(cfg, data_cfg, language) if pretrain_mix else None
+    # No epoch before the rotation's first full cycle can become the best checkpoint (train.helpers.TrainControl).
+    cfg["best_epoch_floor"] = pool.cycle_epochs() if pool else 0
+    train_dataset = ChunkDataset(
+        train_records, chunk_s, min_chunk_s, augmentation=cfg["augmentation"], seed=seed, records_for_epoch=pool,
+    )
     # Dev is drawn via the SAME balancing rule as train (`load_multilingual_records`), so the monitor measures what training optimises 
     # rather than the corpus-size prior. A pooled dev taken AS-IS would be ~84% ase, and best-checkpoint selection would then pick the 
     # best-for-ase head out of a run whose whole point is a language-agnostic one. It is a balanced SUB-SAMPLE of dev, not all of dev: 
     # the realised counts are logged and stamped into the checkpoint (`pretrain_dev_mix`) because a monitor is only interpretable next 
-    # to its dev set. It never rotates (no `records_for_epoch`, and dev datasets are deterministic), so every epoch is scored on the
-    # identical windows — a rotating dev would make "best epoch" partly a draw.
+    # to its dev set. Its chunks are drawn once from the seed and never rotate, so every epoch is scored on the identical chunks.
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = dev_mix
-    dev_steps = sum(sum(1 for sp in r.sentences if getattr(sp, 'reliable', True)) for r in dev_records)
-    dev_dataset = StreamingWindowDataset(
-        dev_records, slt_cfg=cfg, inference_cfg=inference_cfg, steps_per_epoch=max(dev_steps, 1), deterministic=True,
-    )
-    collator = WindowCollator(tokenizer=None)  # BIO-only: no text tokenization
+    dev_dataset = ChunkDataset(dev_records, chunk_s, min_chunk_s, seed=seed, deterministic=True)
+
+    # The pool balances records (clean segments); training exposure is time. Stamp the hours each language contributes to an epoch.
+    hours: dict[str, float] = {}
+    for rec, a, b in train_dataset.chunks: hours[rec.language] = hours.get(rec.language, 0.0) + (b - a) / 3600.0
+    cfg["pretrain_hours"] = {k: round(v, 2) for k, v in sorted(hours.items())}
+    print(f"bio_s1 | {len(train_dataset)} train chunks/epoch, {len(dev_dataset)} dev chunks "
+          f"(U({min_chunk_s:g}, {chunk_s:g}) s), train hours {cfg['pretrain_hours']}", flush=True)
     num_workers = int(cfg.get("num_workers", 0))
-    
+    batch_size = dist.per_rank_batch_size(int(cfg.get("batch_size", 8)))
     train_loader = streaming_loader(
-        train_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers,
-        # Group same-length windows so a batch is not padded to a much longer neighbour (data.loader
-        # LengthBucketSampler). Same indices, same once-per-epoch coverage — only the grouping changes.
-        bucket_by_length=bool(cfg.get("bucket_by_length", True)), bucket_seed=int(cfg.get("seed", 42))
+        train_dataset, batch_size, collate_windows, num_workers=num_workers,
+        # Group same-length chunks (short videos) so a batch is not padded to a much longer neighbour 
+        # (data.loader LengthBucketSampler). Same indices, same coverage — only the grouping changes.
+        bucket_by_length=True, bucket_seed=seed,
     )
-    dev_loader = streaming_loader(
-        dev_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers
-    )
+    dev_loader = streaming_loader(dev_dataset, batch_size, collate_windows, num_workers=num_workers)
     # Every S1 recipe has an explicit initialization, independent of the clean translator's per-language re-root.
-    pretrained = pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth")
+    pretrained = cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg
-
-
-@torch.no_grad()
-def evaluate_bio_s1( # Evaluate frame losses and the untuned legal-path monitor before duration calibration.
-    model: BioS1Model, loader: DataLoader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None, 
-) -> dict[str, float]:
-    rows, per_mode = [], {}
-    spans = CompleteSpanMetrics()
-    with eval_mode(model):
-        for batch in loader:
-            poses, mask = batch["poses"].to(device), batch["frame_mask"].to(device)
-            ts, labels = batch["timestamps_s"].to(device), batch["bio_labels"].to(device)
-            out = model(poses, mask, timestamps_s=ts)
-            lengths = mask.long().sum(1)
-            tags = DurationDecoder().decode(out.logits, lengths)
-            row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
-            row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
-            rows.append(row)
-            spans.update(tags, labels, lengths)
-            modes = batch.get("mode_names") or []
-            # mode2 joins mode4 here: both are truncated by construction, so they hold no COMPLETE span and
-            # `CompleteSpanMetrics` scores a PERFECT tagger 0 on them. A logged near-zero column reads as failure.
-            for mode in set(modes) - {"mode2", "mode4"}:
-                idx = [i for i, m in enumerate(modes) if m == mode]
-                per_mode.setdefault(mode, CompleteSpanMetrics()).update(tags[idx], labels[idx], lengths[idx])
-    result = mean_logs(rows, prefix="val")
-    result.update(spans.compute(prefix="val_phrase"))
-    for mode, score in per_mode.items(): result[f"val_{mode}_tiou_f1"] = score.compute()["phrase_tiou_f1"]
-    return result
 
 
 def train_bio_s1_epochs(
@@ -222,11 +173,10 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
-    # Frozen encoder → head only. Unfrozen → head at learning_rate, the pretrained encoder at backbone_lr.
-    print("bio_s1 | monitor: complete-span F1@0.5, pooled window counts, BIO Viterbi without duration scores; " \
-          "deployment: calibrated semi-Markov Viterbi", flush=True)
-    if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
-    else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
+    print("bio_s1 | monitor: complete-span F1@0.5, pooled dev-chunk counts, BIO Viterbi without duration scores; " \
+          "deployment: semi-Markov Viterbi with the train-fitted duration prior", flush=True)
+    # Head at learning_rate, the pretrained pose encoder at backbone_lr (both required keys of bio_pretrain.yaml).
+    optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
     def step_fn(batch, _epoch: int):
         out = model(batch["poses"], batch["frame_mask"], timestamps_s=batch["timestamps_s"])
@@ -237,17 +187,24 @@ def train_bio_s1_epochs(
     training_cap_s = float(cfg["training_buffer_cap_s"])
     meta = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_loader.dataset.records),
-        "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", "rope_eval_chunk_s": training_cap_s, 
-        "buffer_cap_s": training_cap_s, "initialization": pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth"),
+        "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
+        "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, 
+        "initialization": cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth"),
         "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
-        "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")
+        "bio_attention_radius_s": cfg.get("bio_attention_radius_s"),  # a mask, invisible to a strict load: require_attention_radius
+        "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix"),
+        "pretrain_hours": cfg.get("pretrain_hours"), "min_chunk_s": cfg.get("training_min_chunk_s"),
+        # --resume refuses a drifted rate or augmentation: the optimizer load would otherwise restore the saved rates silently.
+        "learning_rate": float(cfg["learning_rate"]), "backbone_lr": float(cfg["backbone_lr"]), 
+        "augmentation": cfg.get("augmentation"), "best_epoch_floor": int(cfg["best_epoch_floor"]),
     }
     # The end-of-training save in train.py reuses THIS dict. A second, independently-built meta drops pretrain_pool/pretrain_mix 
-    # (disarming eval.py's provenance assertion) and re-derives rope_eval_chunk_s from the live inference.yaml — which is the value 
-    # the stamp exists to override, since `analyze --stage buffer-cap --write-config` rewrites buffer_cap_s after training.
+    # (disarming eval.py's provenance assertion) and re-derives rope_eval_chunk_s from the live inference.yaml, which may change
+    # after training; the stamp records the context the head actually trained on.
     cfg["checkpoint_meta"] = meta
     return run_epoch_loop(
-        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, step_fn=step_fn, 
-        evaluate_fn=lambda e: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta
+        name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
+        step_fn=step_fn, evaluate_fn=lambda e: evaluate_bio_chunks(model, dev_loader, device, dice_weight, class_weights),
+        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta,
+        best_epoch_floor=meta["best_epoch_floor"],
     )

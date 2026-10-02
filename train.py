@@ -5,21 +5,21 @@ import argparse
 import json
 
 import torch
+from data.windowing import BIO
 from data.batch import collate_windows
 from data.loader import load_language_records
-from data.windowing import BIO
+from data.sampler import WindowSampler
 
 from models.checkpointing import save_model_checkpoint
 from train import distributed as dist
-from train.sampler import WindowSampler
-from utils import checkpoint_dir, load_yaml, pick_device, resolve_inference
+from utils import checkpoint_dir, load_yaml, pick_device
 
 
 def smoke_data(args: argparse.Namespace) -> dict:
     data_cfg = load_yaml(args.data_config)
     slt_cfg = load_yaml(args.slt_config)
     language = str(args.language or data_cfg.get("active_languages", ["asf"])[0])
-    inference_cfg = resolve_inference(load_yaml(args.inference_config), language, strict=False)
+    inference_cfg = load_yaml(args.inference_config)
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(args.slt_config, language=language)
     records, splits = load_language_records(data_cfg, language, split=args.split)
     if not records: raise RuntimeError(f"No records loaded for language={language} split={args.split}")
@@ -56,7 +56,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
-    parser.add_argument("--baseline-config", default="configs/baseline_eval.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
     parser.add_argument("--device", default=None, help="override device; default cuda -> mps -> cpu")
     parser.add_argument("--output", default=None)
@@ -65,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; without them this is a no-op and everything runs as before.
+    # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; without them this is a no-op and the run is a single process.
     dist_device = dist.init_distributed()
     if args.stage == "smoke-data": result = smoke_data(args)
     elif args.stage == "train-bio":
@@ -82,8 +81,8 @@ if __name__ == "__main__":
         ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-moryossef":
-        # Faithful Moryossef external segmenter for error calibration + RQ2 cascade: their landmarks + UNet.
-        # from the FSM head. Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
+        # Faithful Moryossef external segmenter for the RQ2 cascade: its own landmarks and UNet, independent of the FSM head. 
+        # Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
         from moryossef26.trainer import build_moryossef, build_moryossef_loaders, train_moryossef_epochs
         train_loader, dev_loader, cfg = build_moryossef_loaders(args.data_config, args.moryossef_config, language=args.language)
         model = build_moryossef(args.moryossef_config)
@@ -95,7 +94,8 @@ if __name__ == "__main__":
         ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-slt":
-        from train.slt import build_slt_components, build_slt_optimizer, train_slt_epochs
+        from train.helpers import build_optimizer
+        from train.slt import build_slt_components, train_slt_epochs
         # --language re-points ${language} in checkpoint.dir for training and the save below.
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
@@ -103,8 +103,9 @@ if __name__ == "__main__":
         )
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
+        components.checkpoint_meta["epochs"] = epochs   # the effective horizon, --epochs included
         device = dist_device or pick_device(args.device)
-        optimizer = build_slt_optimizer(slt_cfg, components.model)
+        optimizer = build_optimizer(slt_cfg, components.model.parameters())   # one group: every stage-2 module at learning_rate
         log_rows = train_slt_epochs(
             components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
             dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,

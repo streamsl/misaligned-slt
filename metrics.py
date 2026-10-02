@@ -8,7 +8,7 @@ Frame diagnostics and span diagnostics answer different questions; training moni
 FRAME-DOMAIN: bio_frame_metrics and moryossef_segment_metrics, with a shared span parser for predictions and gold.
 
 TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by eval.py 
-(RQ2 tIoU brackets), analyze.py (segmenter-error analysis pred-vs-GT matching).
+(RQ2 tIoU brackets), report.py and reporting/ (outcome and protocol tables).
 
 TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/BLEURT).
 """
@@ -70,8 +70,8 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
     f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
     acc = ((pred == labels) & valid).sum().float() / valid.sum().clamp(min=1)
     # Predicted-B rate: B is <1% of frames, so an unweighted loss can drive the class to never fire while
-    # precision/recall/accuracy all stay high (they score signing-vs-not, which B and I share). That collapse
-    # shipped undetected once. Gold rate alongside it, so a near-zero value is readable without another run.
+    # precision/recall/accuracy all stay high (they score signing-vs-not, which B and I share). Gold rate
+    # alongside it, so a near-zero value is readable without another run.
     pred_b = (valid & (pred == BIO["B"])).sum().float() / valid.sum().clamp(min=1)
     gold_b = (valid & (labels == BIO["B"])).sum().float() / valid.sum().clamp(min=1)
     return {
@@ -85,47 +85,27 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
     }
 
 
-def _bio_runs(tags, *, split_on_b: bool, open_on_i: bool, close_on_unk: bool) -> list[dict]:
-    """Unified BIO -> [{start,end}] frame-segment decoder. Public decoders parameterize it
-    (split_on_b, open_on_i, close_on_unk):
+def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
+    """PREDICTION/inference decode: signing runs split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
 
-      bio_labels_to_segments      T F F   B-required; full-annotation gold
-      signing_runs_with_b_splits  T T T   inference rule; monitor BOTH sides
-      decode="likeliest"          F T T   pure run, parity ref
-
-    split_on_b: interior B closes and reopens (back-to-back sentences, no O gap); else B opens only if nothing open.
-    open_on_i: I with nothing open opens (sentence start after a gap; headless left-truncated fragment).
-    close_on_unk: UNK closes like O; B-required gold keeps it non-closing (full annotation has no interior UNK).
+    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap): 
+    a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
+    doesn't require one either. Interior `B`s split back-to-back sentences. `I` with nothing open opens (sentence start 
+    after a gap; headless left-truncated fragment). `O` and `UNK` close. Returns [{start, end}] frame segments.
     """
     if isinstance(tags, torch.Tensor): tags = tags.detach().cpu().tolist()
     segments: list[dict] = []
     start: int | None = None
     for i, tag in enumerate(tags):
         if tag == BIO["B"]:
-            if split_on_b:
-                if start is not None: segments.append({"start": start, "end": i - 1})
-                start = i
-            elif start is None: start = i
+            if start is not None: segments.append({"start": start, "end": i - 1})
+            start = i
         elif tag == BIO["I"]:
-            if open_on_i and start is None: start = i
-        elif (tag == BIO["O"] or (tag == BIO["UNK"] and close_on_unk)) and start is not None:
+            if start is None: start = i
+        elif tag in (BIO["O"], BIO["UNK"]) and start is not None:
             segments.append({"start": start, "end": i - 1}); start = None
     if start is not None: segments.append({"start": start, "end": len(tags) - 1})
     return segments
-
-
-def bio_labels_to_segments(bio: torch.Tensor) -> list[dict]:
-    # GOLD decode (Moryossef metrics.py): B-required.
-    return _bio_runs(bio, split_on_b=True, open_on_i=False, close_on_unk=False)
-
-def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """PREDICTION/inference decode: signing runs split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
-
-    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap): 
-    a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
-    doesn't require one either. Interior `B`s split, feeding the segmenter-error over/under-segmentation taxonomy.
-    """
-    return _bio_runs(tags, split_on_b=True, open_on_i=True, close_on_unk=True)
 
 def _frame_segments_to_seconds(segs: list[dict]) -> list["Segment"]:
     # Frame indices -> Segments; end is exclusive (a 1-frame segment spans [start, start+1)).
@@ -181,25 +161,18 @@ class CompleteSpanMetrics:
 
 
 def moryossef_segment_metrics(
-    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", decode: str = "runs_bsplit", 
-    tiou_threshold: float = 0.5, pred_tags: torch.Tensor | None = None
+    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", tiou_threshold: float = 0.5
 ) -> dict[str, float]:
     """External-protocol run overlap: 1 frame score and 1 segment score per item.
 
     `{prefix}_frame_f1`: macro F1 over O/B/I frame classes.
     `{prefix}_tiou_f1`/`_seg_precision`/`_seg_recall`: `segmentation_prf` (the RQ2 metric) on frame-unit segments.
     Clipped fragments can score well on short windows. Training monitors use CompleteSpanMetrics instead.
-    `decode` applies to BOTH sides (`runs_bsplit` = inference, default; `bio` = B-required; `likeliest` = raw run).
-
-    `pred_tags` (B, T) optionally supplies the decoded path instead of logits' argmax.
+    Both sides decode with the inference rule (signing_runs_with_b_splits).
     Binary signing-frame overlap belongs to bio_frame_metrics; it does not test sentence boundaries.
     """
-    # B-required gold fits Moryossef's full annotations (every onset visible) but breaks on OUR misaligned windows:
-    # make_bio_labels tags a left-truncated span as a HEADLESS I-run, so gold emits NO segment where a PERFECT
-    # tagger's run decode emits one — an unavoidable FP capping precision far below 1. Symmetric decode fixes it.
-    if decode == "likeliest": decode_fn = lambda t: _bio_runs(t, split_on_b=False, open_on_i=True, close_on_unk=True)
-    elif decode == "bio": decode_fn = bio_labels_to_segments
-    else: decode_fn = signing_runs_with_b_splits
+    # 1 decode on BOTH sides: make_bio_labels tags a left-truncated span as a HEADLESS I-run, so a B-required gold decode
+    # emits NO segment where a perfect tagger's run decode emits one, an unavoidable FP capping precision far below 1.
 
     frame_f1s, tiou_f1s, precisions, recalls = [], [], [], []
     n_matches = n_pred = n_gold = 0  # raw counts for a caller's micro pooling; the scores below stay per-item macro
@@ -212,15 +185,15 @@ def moryossef_segment_metrics(
         # Trim TRAILING padding (collators pad with UNK on the right); keep interior UNK (untrusted gaps).
         last = int(torch.nonzero(valid).max().item()) + 1
         gold_v = gold[:last]
-        tags_i = (pred_tags[i] if pred_tags is not None else logits[i].argmax(dim=-1))[:last]
+        tags_i = logits[i].argmax(dim=-1)[:last]
         interior_unk = gold_v == BIO["UNK"]
         if bool(interior_unk.any()):
-            # No reliable label in untrusted gaps: mask BOTH sides so `close_on_unk` splits runs identically.
+            # No reliable label in untrusted gaps: mask BOTH sides so UNK splits runs identically on both sides.
             tags_i = torch.where(interior_unk, torch.full_like(tags_i, BIO["UNK"]), tags_i)
         frame_f1s.append(_macro_frame_f1(tags_i[~interior_unk], gold_v[~interior_unk]))
 
-        pred_segs = _frame_segments_to_seconds(decode_fn(tags_i))
-        gold_segs = _frame_segments_to_seconds(decode_fn(gold_v))
+        pred_segs = _frame_segments_to_seconds(signing_runs_with_b_splits(tags_i))
+        gold_segs = _frame_segments_to_seconds(signing_runs_with_b_splits(gold_v))
         prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=tiou_threshold)
         tiou_f1s.append(prf["f1"]); precisions.append(prf["precision"]); recalls.append(prf["recall"])
         n_matches += int(prf["matches"]); n_pred += len(pred_segs); n_gold += len(gold_segs)
@@ -337,8 +310,8 @@ def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> 
 
 def bleu_pair_counts(hyps: list[str], refs: list[str], char_level: bool | None = None) -> list[dict]:
     """Per-pair BLEU-4 ingredients under the shared preprocessing and tokenizer: hypothesis length, reference length,
-    matched and total n-grams for n = 1..4. Corpus BLEU-4 of ANY set of pairs is `bleu_from_counts` of their rows,
-    so a report can show exactly which counts a video or a corpus adds up."""
+    matched and total n-grams for n = 1..4. The unsmoothed corpus BLEU-4 of ANY set of pairs is `bleu_from_counts` of
+    their rows, so a report can show exactly which counts a video or a corpus adds up."""
     scorer = BLEU(tokenize="13a")
     h, r, _ = _uni_sign_preprocess(list(hyps), list(refs), char_level)
     rows = []
@@ -352,17 +325,19 @@ def bleu_pair_counts(hyps: list[str], refs: list[str], char_level: bool | None =
 
 
 def bleu_from_counts(rows: list[dict]) -> float:
-    # Corpus BLEU-4 from summed `bleu_pair_counts` rows (the scorer's own formula and smoothing).
+    """Corpus BLEU-4 from summed `bleu_pair_counts` rows, with NO smoothing: the same number as 1 video's `densevid_bleu4` (see 
+    `densevid_text_metrics`), so reporting/protocol reproduces that column from its counts. The RQ1 corpus BLEU keeps sacrebleu's 
+    default `exp` smoothing; the two differ only when 1 n-gram order has 0 matches in the whole set."""
     if not rows: return 0.0
     return float(BLEU.compute_bleu(
         correct=[sum(r["counts"][n] for r in rows) for n in range(4)], total=[sum(r["totals"][n] for r in rows) for n in range(4)],
-        sys_len=sum(r["sys_len"] for r in rows), ref_len=sum(r["ref_len"] for r in rows), smooth_method="exp",
+        sys_len=sum(r["sys_len"] for r in rows), ref_len=sum(r["ref_len"] for r in rows), smooth_method="none",
     ).score)
 
 
 def sentence_bleu_scores(hyps: list[str], refs: list[str], char_level: bool | None = None) -> list[float]:
     """Smoothed sentence BLEU per pair under the shared preprocessing — the BLEU column of `_sentence_text_scores` alone.
-    The per-gold deployment score (report.py / analyze.py localized_bleu4) needs only this column."""
+    The per-gold deployment score (reporting/outcomes.py localized_bleu4) needs only this column."""
     if not hyps: return []
     pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs, char_level)
     return [float(sentence_bleu(h, [r], tokenize="13a").score) for h, r in zip(pred_proc, ref_proc)]
@@ -380,8 +355,10 @@ def _sentence_text_scores(
     hyps: list[str], refs: list[str], sacrebleu_tokenize: str = "13a", 
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", char_level: bool | None = None,
 ) -> list[dict[str, float]]:
-    """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. 
-    BLEU here is smoothed sentence-BLEU: corpus BLEU pools across pairs and cannot be split per pair."""
+    """Per-pair sentence scores {bleu4(sentence), rougeL, meteor, bleurt} — the primitive the RQ2 fusion sums. BLEU here is 
+    sentence-BLEU with sacrebleu's `exp` smoothing: corpus BLEU pools across pairs and cannot be split per pair, and 1 short 
+    sentence often has no 4-gram match, so unsmoothed sentence BLEU would be 0 for most pairs. The densevid column is corpus 
+    BLEU per video and is NOT smoothed (see `densevid_text_metrics`)."""
     if not hyps: return []
     pred_proc, ref_proc, _ = _uni_sign_preprocess(hyps, refs, char_level)
     bleu = [float(sentence_bleu(h, [r], tokenize=sacrebleu_tokenize).score) for h, r in zip(pred_proc, ref_proc)]
@@ -414,8 +391,10 @@ def densevid_text_metrics(
       * the caller averages thresholds for the headline (our threshold_average does this for every text key).
 
     Deviations, both deliberate and documented: the garbage rng is SEEDED, and tokenization is our shared Uni-Sign preprocessing + 
-    sacrebleu 13a instead of COCO BLEU with PTB tokenization. Shared text preprocessing does not make DVC and RQ1 corpus scores 
-    comparable: matching and aggregation differ. BLEU-4 is corpus BLEU over each video's pairs; CIDEr-D is the official COCO scorer 
+    sacrebleu 13a instead of COCO BLEU with PTB tokenization. Shared text preprocessing does not make DVC and RQ1 corpus scores
+    comparable: matching and aggregation differ. BLEU-4 is corpus BLEU over each video's pairs with NO smoothing, as COCO BLEU:
+    a video with no 4-gram match scores 0 (COCO adds only a 1e-15 epsilon), where sacrebleu's default `exp` smoothing would give
+    it credit. `bleu_from_counts` uses same setting, so its per-video number is this column. CIDEr-D is the official COCO scorer
     over the video's pairs (pycocoevalcap, IDF from that video's references — their Cider semantics); ROUGE-L/METEOR are per-pair 
     means (COCO semantics); BLEURT is not in the original toolkit and follows the same per-pair mean, zeros without a checkpoint.
 
@@ -433,7 +412,9 @@ def densevid_text_metrics(
         refs = [r if r is not None else garbage_reference(rng) for _, r in pairs]
         hyp_p, ref_p, _ = _uni_sign_preprocess(hyps, refs, char_level)
         row = {
-            "bleu4": _corpus_metric("sacrebleu", hyp_p, [[r] for r in ref_p], key="score", tokenize=sacrebleu_tokenize),
+            "bleu4": _corpus_metric(
+                "sacrebleu", hyp_p, [[r] for r in ref_p], key="score", tokenize=sacrebleu_tokenize, smooth_method="none"
+            ),
             "rougeL": float(np.mean([_rouge_l([h], [r]) for h, r in zip(hyp_p, ref_p)])),
             "bleurt": float(np.mean(_bleurt_scores(hyps, refs, bleurt_checkpoint))),
             "cider": _cider_corpus(hyp_p, ref_p),

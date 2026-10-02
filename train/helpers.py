@@ -10,8 +10,11 @@ from contextlib import contextmanager, nullcontext
 import torch
 from torch.utils.data import DataLoader
 from models.checkpointing import load_train_state, save_train_state, save_model_checkpoint
-from utils import checkpoint_dir, save_best_enabled
+from utils import cfg_get, checkpoint_dir
 from train import distributed as dist
+from train.losses import bio_nll_dice_loss
+from metrics import CompleteSpanMetrics, bio_frame_metrics
+from infer.duration_decode import DurationDecoder
 
 
 def move_to_device(value, device: torch.device):
@@ -22,36 +25,27 @@ def move_to_device(value, device: torch.device):
     return value
 
 
-def resolve_lrs(cfg: dict) -> tuple[float, float]:
-    # (learning_rate, backbone_lr): top-level keys first, `optimizer.*` fallback; backbone_lr defaults to 0.3× learning_rate.
-    opt = cfg.get("optimizer", {}) or {}
-    lr = float(cfg.get("learning_rate", opt.get("lr", 1e-4)))
-    return lr, float(cfg.get("backbone_lr", opt.get("backbone_lr", lr * 0.3)))
-
-
 def build_optimizer(cfg: dict, params, backbone_params=None) -> torch.optim.Optimizer:
-    """AdamW from a config, reading the SAME keys for every stage.
+    """AdamW from a config, reading the SAME keys for every stage: `learning_rate` (required) and `weight_decay`.
 
-    Prefers top-level `learning_rate` / `weight_decay`; falls back to `optimizer.lr` / `optimizer.weight_decay`
-    so older configs keep working.
-
-    `backbone_params`: optional second param set at `backbone_lr` (default learning_rate × 0.3) — discriminative
-    fine-tuning for a PRETRAINED encoder unfrozen under a head-scale learning_rate.
+    `backbone_params`: optional second param set at `backbone_lr` (required whenever this set is given) — discriminative
+    fine-tuning for a PRETRAINED encoder under a head-scale learning_rate.
     """
-    opt = cfg.get("optimizer", {}) or {}
-    lr, backbone_lr = resolve_lrs(cfg)
-    weight_decay = float(cfg.get("weight_decay", opt.get("weight_decay", 1e-4)))
+    lr = float(cfg["learning_rate"])
+    backbone_lr = float(cfg["backbone_lr"]) if backbone_params is not None else None
+    weight_decay = float(cfg.get("weight_decay", 1e-4))
 
-    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm): decaying norm gains regularizes the wrong
-    # thing. Same split as Uni-Sign (timm create_optimizer filter_bias_and_bn=True) and standard HF practice.
+    # No weight decay on biases / 1-D params (LayerNorm, RMSNorm, DLM canvas [MASK] row): decaying norm gains regularizes 
+    # the wrong thing. Same split as Uni-Sign (timm create_optimizer filter_bias_and_bn=True) and standard HF practice.
     def wd_split(ps, group_lr):
         ps = [p for p in ps if p.requires_grad]
-        return [g for g in ({"params": [p for p in ps if p.ndim > 1], "weight_decay": weight_decay, "lr": group_lr},
-                            {"params": [p for p in ps if p.ndim <= 1], "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
+        decay = [p for p in ps if p.ndim > 1]
+        plain = [p for p in ps if p.ndim <= 1]
+        return [g for g in ({"params": decay, "weight_decay": weight_decay, "lr": group_lr},
+                            {"params": plain, "weight_decay": 0.0, "lr": group_lr}) if g["params"]]
 
     groups = wd_split(params, lr)
     if backbone_params is not None: groups += wd_split(backbone_params, backbone_lr)
-    # fused=True on CUDA: one multi-tensor kernel per step instead of a Python loop over ~800M trainable params.
     return torch.optim.AdamW(groups, lr=lr, fused=torch.cuda.is_available())
 
 
@@ -166,7 +160,6 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def _configure_history_paths(self, cfg: dict) -> None:
         root = checkpoint_dir(cfg)
         logging_cfg = dict(cfg.get("logging", {}) or {})
-        if logging_cfg.get("history", True) is False: return
         out_dir = logging_cfg.get("dir") or root
         if not out_dir: return
         out_dir = Path(out_dir)
@@ -336,17 +329,18 @@ def run_epoch_loop(
     step_fn: Callable[[dict, int], tuple[torch.Tensor, dict[str, float]]],
     evaluate_fn: Callable[[int], dict[str, float]] | None = None,
     default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min",
-    dev_loader: DataLoader | None = None, resume: bool = False, checkpoint_meta: dict | None = None,
+    dev_loader: DataLoader | None = None, resume: bool = False, 
+    checkpoint_meta: dict | None = None, best_epoch_floor: int = 0,
 ) -> int:
-    """The one training loop every trainer shares (slt / bio_s1).
+    """The one training loop every trainer shares (slt / bio_s1 / moryossef).
 
     Owns scheduler, AMP, best-checkpoint selection, early stop, logging, restore; a stage supplies only:
       step_fn(batch, epoch)  -> (loss_tensor, scalar_log_dict), run under this loop's amp.autocast; the loop does
                                 zero_grad / backward / grad-clip(model.parameters()) / step.
       evaluate_fn(epoch)     -> dev metrics dict (only on control.should_eval epochs), or None.
-
-    Grad clipping covers model.parameters() everywhere: frozen params carry no grad, so clipping the superset is
-    identical to clipping the trainable subset.
+      best_epoch_floor       -> first epoch that may become the best checkpoint and count toward early-stopping patience. 
+                                A pooled segmentation run passes its rotation's cycle length (data.loader.PooledEpochRecords), 
+                                so no epoch before every training record (clean segment) was seen once can ship; others pass 0.
     """
     model.to(device)
     model.train()
@@ -360,7 +354,16 @@ def run_epoch_loop(
     scheduler = build_scheduler(optimizer, cfg, epochs=epochs, steps_per_epoch=opt_steps_per_epoch)
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
-    
+    control.best_epoch_floor = int(best_epoch_floor)
+    # A run shorter than the floor selects no best, and train.py would then ship its last, pre-cycle epoch as model.pt.
+    if control.best_epoch_floor > int(epochs): raise SystemExit(
+        f"{name} | epochs={int(epochs)} ends before the best-epoch floor {control.best_epoch_floor} (1 full pool rotation); "
+        f"train at least {control.best_epoch_floor} epochs."
+    )
+    if control.best_epoch_floor and dist.is_main(): print(
+        f"{name} | best-epoch floor {control.best_epoch_floor} of {int(epochs)} epochs: "
+        f"earlier epochs are neither a best candidate nor a patience step", flush=True
+    )
     # Side effects (checkpoint writes, wandb, history.csv, progress bars) are rank 0's alone: concurrent writers
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
     # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
@@ -392,23 +395,9 @@ def run_epoch_loop(
         if latest_path is None or not latest_path.exists():
             raise SystemExit(f"--resume: no resumable state at {latest_path} (need checkpoint.dir + a prior epoch)")
         
-        state = load_train_state(latest_path, model, optimizer)
-        # Analysis stages rewrite inference.yaml and the jitter artifact between sessions. Both parameterize this run. Resuming across such 
-        # a change trains the 2nd half under a different objective — visible afterwards only as an unexplained discontinuity in loss curves.
-        saved_meta = dict(state.get("meta") or {})
-        if saved_meta and checkpoint_meta:
-            drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))
-            if drift and set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
-                "--resume: the validation protocol changed; the saved best score is not comparable. "
-                "The trained weights remain usable. Re-evaluate saved checkpoints with the corrected dev generation "
-                "and use a separate checkpoint directory for any continuation; do not reuse the old best-score history."
-            )
-            if drift: raise SystemExit(
-                f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
-                + "; ".join(f"{k}: {saved_meta.get(k)!r} -> {checkpoint_meta.get(k)!r}" for k in drift[:4])
-                + f". Restore those values to resume, or start a fresh run (move {latest_path}) — resuming across "
-                f"the change trains the two halves under different objectives."
-            )
+        # The drift comparison runs INSIDE load_train_state, before the weights: an architecture edit changes 
+        # which parameters exist, so `load_state_dict` would raise a raw shape error first and hide the cause.
+        state = load_train_state(latest_path, model, optimizer, expected_meta=checkpoint_meta)
         saved_epochs = int(state.get("epochs", epochs))
         if saved_epochs != int(epochs) and scheduler.scheduler is not None: raise SystemExit(
             f"--resume: run was launched with epochs={saved_epochs} but this invocation says {epochs}; the LR schedule horizon is baked "
@@ -424,9 +413,16 @@ def run_epoch_loop(
         if dist.is_main(): print(f"{name} | resumed {latest_path} -> starting epoch {start_epoch}/{epochs} "
                                  f"(best {control.monitor}={control.best_value} @ epoch {control.best_epoch})", flush=True)
 
+    if not resume and evaluate_fn is not None and dev_loader is not None and control.eval_every_epochs > 0:
+        # Epoch 0 scores the INITIALIZATION under the same monitor, so selection can only keep a fine-tuned 
+        # state that beats its starting point (stage 2 starts exactly at S1 + the clean translator).
+        with amp.autocast(): metrics = dist.reduce_metrics(evaluate_fn(0))
+        control.update(model, metrics, 0)
+        logger.epoch_summary(0, train={}, val=metrics, saved_path=control.last_saved_path)
+
     for epoch in range(start_epoch, int(epochs) + 1):
-        # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler), and advance
-        # the dataset's own epoch cursor (StreamingWindowDataset capped-epoch coverage; no-op when uncapped).
+        # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler), and advance the 
+        # dataset's own epoch (StreamingWindowDataset shifts its per-index seeds, so each epoch draws new modes and edges).
         for ld in (loader, dev_loader):
             # `batch_sampler` too: length bucketing lives there, and without its set_epoch every epoch would
             # replay 1 grouping (and 1 batch order) forever.
@@ -451,13 +447,12 @@ def run_epoch_loop(
             # Every micro-batch's metrics enter epoch mean; only optimizer step is grouped. `step` names the optimizer step 
             # the micro-batch belongs to, so a group shares 1 index and runs at different `accum` are comparable on it.
             opt_step = (step - 1) // accum + 1
-            row = {"epoch": float(epoch), "step": float(opt_step), "lr": scheduler.lr(optimizer), **step_logs}
+            row = {"epoch": float(epoch), "step": float(opt_step), "lr": float(optimizer.param_groups[0]["lr"]), **step_logs}
             epoch_logs.append(row); log_rows += 1
             if step % accum and step != n_micro: continue    # keep accumulating; no step, no scheduler tick
             # Average gradients BEFORE clipping so every rank clips the same (global) gradient and therefore
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
             dist.average_gradients(model.parameters())
-            # Clip only trainable params: iterating all ~1B (frozen included) per step is pure overhead.
             stepped = amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
             if stepped: scheduler.step_batch()
             logger.log_step(epoch, opt_step, row)
@@ -465,13 +460,16 @@ def run_epoch_loop(
         scheduler.step_epoch()
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
-            with amp.autocast():  # dev eval in the same precision as training steps; fp32 eval was ~2x slower
+            with amp.autocast():  # dev eval in the same precision as training steps (fp32 eval takes about 2x as long)
                 eval_metrics = evaluate_fn(epoch)
             metrics = dist.reduce_metrics(eval_metrics)
             control.update(model, metrics, epoch)
             logger.epoch_summary(epoch, train=train_means, val=metrics, saved_path=control.last_saved_path)
             if control.stopped_early:
-                if dist.is_main(): print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
+                if dist.is_main(): print(
+                    f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value} @ "
+                    f"epoch {control.best_epoch})", flush=True
+                )
                 break
         else: logger.epoch_summary(epoch, train=train_means)
         if dist.is_main() and latest_path is not None: save_train_state(
@@ -481,6 +479,13 @@ def run_epoch_loop(
             control_state=control.state_dict(), epoch=epoch, epochs=int(epochs), meta=checkpoint_meta,
         )
     control.restore(model)
+    # train.py saves model.pt with this same dict, so the shipped file names the epoch it holds (0 = the initialization).
+    if checkpoint_meta is not None and control.restore_best and control.best_value is not None:
+        checkpoint_meta["best_epoch"] = int(control.best_epoch)
+        if control.best_epoch == 0 and dist.is_main(): print(
+            f"{name} | WARNING: best epoch is 0, no trained epoch beat the initialization on "
+            f"{control.monitor}: the shipped model is the initialization", flush=True
+        )
     logger.finish()
     return log_rows
 
@@ -494,28 +499,37 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
             sums[key] = sums.get(key, 0.0) + float(value)
             counts[key] = counts.get(key, 0) + 1
     out = {f"{prefix}_{key}": sums[key] / counts[key] for key in sums if counts.get(key, 0) > 0}
-    # Two silent-failure alarms the logged numbers already contained but nobody compared:
-    #   B-class collapse — signing-vs-not P/R/F1 stay high while B never fires, so only its own rate shows it.
-    #   all-I control — compare localization with a constant signing prediction on the same window slice.
+    # Silent-failure alarm: in a B-class collapse, signing-vs-not P/R/F1 stay high while B never fires, so only its own rate shows it.
     b_rate = next((v for k, v in out.items() if k.endswith("_pred_b_rate")), None)
     gold_rate = next((v for k, v in out.items() if k.endswith("_gold_b_rate")), None)
     if b_rate is not None and gold_rate and b_rate < 0.1 * gold_rate: print(
         f"[{prefix}] WARNING: B-class collapse — predicted B rate {b_rate:.5f} vs gold {gold_rate:.5f}. "
         f"Check bio_class_weights (train/losses.py documents this failure).", flush=True
     )
-    # Compare on the MODE-3 slice when present, not the aggregate: mode-1/2 windows are ~one (fragment of a)
-    # jittered sentence, so the all-I control is near-optimal there by construction and the aggregate control
-    # is an easy baseline on that slice. Multi-sentence windows require additional splits;
-    # multi-sentence windows measure what the head adds: splitting adjacent sentences.
-    tiou = next((v for k, v in out.items() if k.endswith("mode3_tiou_f1") and "alli" not in k),
-                next((v for k, v in out.items() if k.endswith("phrase_tiou_f1")), None))
-    alli = next((v for k, v in out.items() if k.endswith("mode3_alli_tiou_f1")),
-                next((v for k, v in out.items() if k.endswith("alli_tiou_f1")), None))
-    if tiou is not None and alli is not None and tiou <= alli: print(
-        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} on multi-sentence windows. "
-        f"This is a diagnostic for this window slice; use whole-video and online evaluation for final claims.", flush=True
-    )
     return out
+
+
+@torch.no_grad()
+def evaluate_bio_chunks( # Both arms' dev monitor: frame losses and complete-span F1 on legal BIO paths (no duration prior).
+    model: torch.nn.Module, loader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None, 
+) -> dict[str, float]:
+    rows = []
+    spans = CompleteSpanMetrics()
+    with eval_mode(model):
+        for batch in loader:
+            poses, mask = batch["poses"].to(device), batch["frame_mask"].to(device)
+            ts, labels = batch["timestamps_s"].to(device), batch["bio_labels"].to(device)
+            out = model(poses, mask, timestamps_s=ts)
+            logits = out["phrase"] if isinstance(out, dict) else out.logits  # MoryossefSegmenter dict vs BIOHeadOutput
+            lengths = mask.long().sum(1)
+            tags = DurationDecoder().decode(logits, lengths)
+            row = {"bio_loss": float(bio_nll_dice_loss(logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
+            row.update(bio_frame_metrics(logits, labels, prefix="bio"))
+            rows.append(row)
+            spans.update(tags, labels, lengths)
+    result = mean_logs(rows, prefix="val")
+    result.update(spans.compute(prefix="val_phrase"))  # val_phrase_tiou_f1: the checkpoint monitor of both arms
+    return result
 
 
 @dataclass
@@ -526,9 +540,10 @@ class TrainControl:
     monitor: str = "val_loss"
     monitor_mode: Literal["min", "max"] = "min"
     restore_best: bool = True
-    best_value: float | None = None
-    best_epoch: int = 0
     best_state: dict[str, torch.Tensor] | None = None
+    best_value: float | None = None
+    best_epoch_floor: int = 0  # run_epoch_loop best_epoch_floor
+    best_epoch: int = 0
     bad_epochs: int = 0
     stopped_early: bool = False
     # Save-on-best: `update()` calls this the moment a new best monitor value appears and writes a best.json
@@ -580,6 +595,7 @@ class TrainControl:
 
         value = float(metrics[self.monitor])
         self.last_saved_path = None
+        if epoch < self.best_epoch_floor: return False
         if self._is_better(value):
             self.best_value = value
             self.best_epoch = int(epoch)
@@ -604,7 +620,7 @@ class TrainControl:
     def restore(self, model: torch.nn.Module) -> None:
         if not self.restore_best: return
         if self.best_state is not None: model.load_state_dict(copy.deepcopy(self.best_state))
-        elif self.best_checkpoint_path and Path(self.best_checkpoint_path).exists() and self.best_epoch > 0:
+        elif self.best_checkpoint_path and Path(self.best_checkpoint_path).exists() and self.best_value is not None:
             # Resumed run whose best epoch predates the resume: the in-memory copy died with the old process,
             # but the save-on-best file survived — restore from disk.
             state = torch.load(self.best_checkpoint_path, map_location="cpu", weights_only=True)
@@ -635,7 +651,8 @@ def attach_save_best(
     """
     control.name = str(name)
     ckpt_dir = checkpoint_dir(cfg)
-    if save_best_enabled(cfg) and ckpt_dir: control.save_fn = lambda model: saver(model, ckpt_dir, meta=meta)
+    if cfg_get(cfg, "checkpoint", "save_best", default=True) and ckpt_dir: 
+        control.save_fn = lambda model: saver(model, ckpt_dir, meta=meta)
     return control
 
 
@@ -654,9 +671,6 @@ class SchedulerBundle:
         if self.scheduler is not None and self.interval == "epoch":
             self.scheduler.step()
 
-    def lr(self, optimizer: torch.optim.Optimizer) -> float:
-        return float(optimizer.param_groups[0]["lr"])
-
 
 def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, steps_per_epoch: int) -> SchedulerBundle:
     sched_cfg = cfg.get("scheduler", {})
@@ -664,27 +678,13 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
     if sched_type in {"", "none", "constant"}: return SchedulerBundle()
 
     total_steps = max(1, int(epochs) * max(1, int(steps_per_epoch)))
-    if sched_type in {"onecycle", "one_cycle", "adamw-onecycle"}:
-        # Per-group peaks: a scalar would drive backbone_lr groups to main rate. `max_lr` rescales all groups together.
-        base = [float(g["lr"]) for g in optimizer.param_groups]
-        max_lr = [lr * float(sched_cfg["max_lr"]) / base[0] for lr in base] if "max_lr" in sched_cfg else base
-        pct_start = float(sched_cfg.get("pct_start", 0.1))
-        div_factor = float(sched_cfg.get("div_factor", 25.0))
-        final_div_factor = float(sched_cfg.get("final_div_factor", 1e4))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=pct_start, 
-            div_factor=div_factor, final_div_factor=final_div_factor,
-        )
-        return SchedulerBundle(scheduler=scheduler, interval="step")
-
     if sched_type in {"cosine", "cosine_annealing"}:
-        # Optional linear warmup (scheduler.warmup_epochs, fractional ok): every A2D/OPUT reference warms up when
-        # retraining a pretrained model (dllm 0.1 of steps, DMax 0.03) — full LR from step one knocks a converged
-        # checkpoint out of its basin. Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
+        # Optional linear warmup (scheduler.warmup_epochs, fractional ok; 0 = none). The segmenters warm up; stage 2 and the 
+        # clean floor start at their configured rate. Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
         warmup_epochs = float(sched_cfg.get("warmup_epochs", 0.0))
         warmup_steps = int(round(warmup_epochs * max(1, int(steps_per_epoch))))
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=float(sched_cfg.get("eta_min", 0.0)),
+            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.0,
         )
         if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine, interval="step")
         warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)

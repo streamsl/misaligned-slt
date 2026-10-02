@@ -5,9 +5,9 @@ but no trainer here calls `forward`: each stage's `step_fn` calls `model.forward
 own signature. Wrapping in DDP and calling `.module.forward_loss(...)` runs a completely UNSYNCHRONISED training
 job that looks fine — every rank silently optimises its own shard. A wrapper module whose `forward` is the loss
 would fix that, but this stack's loss graph is CONDITIONAL (the translation term is routed per window mode, the
-gate/CB terms fire only for the modes that carry them), so ranks disagree about which parameters received
-gradients and DDP then needs `find_unused_parameters=True` — extra graph traversal every step plus its own
-failure modes. Explicit averaging after `backward()` is correct for ANY call pattern and any graph: parameters
+covered and critic text groups depend on each window's prediction), so ranks disagree about which parameters 
+received gradients and DDP then needs `find_unused_parameters=True` — extra graph traversal every step plus its 
+own failure modes. Explicit averaging after `backward()` is correct for ANY call pattern and any graph: parameters
 with no gradient this step contribute an explicit zero, which is exactly their mathematical contribution.
 
 `batch_size` in every config stays the GLOBAL batch and is split across ranks (`per_rank_batch_size`). 
@@ -107,9 +107,9 @@ def reduce_metrics(metrics: dict[str, float]) -> dict[str, float]:
     stop — the ranks would diverge mid-run. Keys are sorted so the reduced vector is order-identical everywhere.
     """
     if not is_distributed() or not metrics: return metrics
-    # Key sets are NOT identical across ranks: cb_*/oput_mode*/val_translation_* only exist on ranks whose batches contained 
-    # that mode. Reducing per-rank sorted vectors would silently pair different keys (or hang on length mismatch), so gather 
-    # the union first and mean each key over the ranks that produced it.
+    # Key sets are NOT identical across ranks: text_*/oput_mode*/val_translation_* only exist on ranks whose batches 
+    # contained that mode. Reducing per-rank sorted vectors would silently pair different keys (or hang on length 
+    # mismatch), so gather the union first and mean each key over the ranks that produced it.
     gathered: list[list[str]] = [None] * world_size()  # type: ignore[list-item]
     dist.all_gather_object(gathered, sorted(metrics))
     keys = sorted(set().union(*gathered))

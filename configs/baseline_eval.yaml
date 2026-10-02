@@ -1,16 +1,13 @@
-# baseline — clean Uni-Sign AR model, greedy decode, NO streaming machinery (no membership gate, no confidence-bound).
-#
+# baseline — clean Uni-Sign AR model, greedy decode, NO streaming machinery (no membership gate, no segmentation branch).
 # `extends: dlm.yaml` so the ~15 shared scalars (seed, language, language_model, checkpoint.*, wandb.*, bio_* head shape, 
 # max_text_tokens, ...) live in 1 place and never drift. This file keeps only what makes it the baseline: AR decoder and 
-# the gate/CB turned off. The inherited streaming blocks (oput / spd / mode_ratios / jitter) are inert on the eval-only 
+# the gate turned off. The inherited streaming blocks (oput / spd / mode_ratios / jitter) are inert on the eval-only 
 # AR path — same tolerated pattern as bio_pretrain.yaml.
 extends: dlm.yaml
 
 decoder: ar
 membership_gate:
     enabled: false # the clean floor is UNGATED (cf. ar.yaml, the GATED AR de-risk of §9.3)
-confidence_bound:
-    enabled: false # no Mode-2a CB term on the baseline
 # EVAL loads the clean translator named by --checkpoint or data.yaml `pretrained_slt` (utils.resolve_pretrained):
 # the released Uni-Sign file before README B2b re-root, this language's trained clean floor after it. It reads
 # no `checkpoint.dir` (eval._build_eval_model), and a trained file must be this language's clean floor under 

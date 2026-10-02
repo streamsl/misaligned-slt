@@ -15,7 +15,7 @@ A front end exposes two frame-aligned/sequence views plus the AR + DLM decode ho
 `bio_tap` is the TRANSLATOR's per-frame pose feature BEFORE the seq2seq encoder; the segmentation branch reads its own pose 
 encoder (MisalignedSLTModel.segment). For Uni-Sign the encoder memory is LONGER than the tap (the task prompt is prepended 
 to the pose tokens), so M = prompt_len + T while the tap stays length T (frame-aligned). Callers that need the OPUT 
-eval-rollout or the confidence-bound re-encode must use the per-frame mask (length T), not the encoder mask (length M).
+eval-rollout re-encode must use the per-frame mask (length T), not the encoder mask (length M).
 """
 from __future__ import annotations
 import torch
@@ -54,8 +54,8 @@ class SLTFrontEnd(nn.Module):
 
     # ── membership gate on the AR path (shared) ───────────────────────────────
     def ar_omega_context(self, omega_bias):
-        # Context manager: within it, every AR cross-attention adds Ω (None → identity). Wraps ar_loss /
-        # ar_generate / the AR confidence-bound forward so all AR decodes see the same conditioning.
+        # Context manager: within it, every AR cross-attention adds Ω (None → identity). 
+        # Wraps ar_loss and ar_generate so every AR forward sees the same conditioning.
         # 1st call attaches the Ω hooks to AR language model (1 injector per stack, shared with the DLM decoder).
         # DLM arm gates in its own manual decode loop; AR arm reuses HF forward/generate, so Ω rides in on these hooks.
         return CrossAttnOmegaInjector.attach(self.lm_model).with_omega(omega_bias)

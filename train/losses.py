@@ -1,18 +1,10 @@
-# Stage losses: BIO Dice+CE (S1 and stage 2 alike) and the confidence-bound term for right-truncated windows.
-# OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
+# Stage losses: BIO Dice+CE (S1 and stage 2 alike). OPUT lives in models/dmax.py (the model's `.dlm_decoder` attribute).
 from __future__ import annotations
-from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from data.windowing import BIO, make_bio_labels
-
-
-@dataclass
-class ConfidenceBoundStats:
-    loss: torch.Tensor
-    active_count: torch.Tensor
 
 
 def masked_cross_entropy(
@@ -130,52 +122,3 @@ def bio_nll_dice_loss(
     ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights) if ce_weight else logits.sum() * 0.0
     dice = binary_sign_dice_loss(logits, targets, ignore_index=ignore_index)
     return ce_weight * ce + dice_weight * dice
-
-
-def confidence_bound_gate(
-    full_tokens: torch.Tensor, trunc_tokens: torch.Tensor, trunc_confidence: torch.Tensor, reference_tokens: torch.Tensor, 
-    valid_mask: torch.Tensor | None = None, tau_cb: float = 0.75, pad_token_id: int | None = None,
-) -> torch.Tensor:
-    """Active-slot gate, decoupled from the CE so the caller can re-mask gated slots before the grad-bearing
-    forward: (π_i > τ) & (t_i != f_i) & (f_i == r_i), minus padding/invalid slots. The verified term (f_i == r_i)
-    keeps only slots where the full-evidence decode is right, so a wrong teacher token never marks a slot."""
-    active = trunc_confidence > float(tau_cb)
-    active = active & (trunc_tokens != full_tokens) & (full_tokens == reference_tokens)
-
-    if valid_mask is not None: active = active & valid_mask.to(device=active.device, dtype=torch.bool)
-    if pad_token_id is not None:
-        active = active & (full_tokens != int(pad_token_id)) & (reference_tokens != int(pad_token_id))
-        # TRUNC pads too: after a committed EOS the decoder back-fills every slot with pad @ FABRICATED confidence 1.0 (infer/decode.py 
-        # bookkeeping — π_j was never computed). A truncated decode legitimately ends earlier than the full-evidence one, so without 
-        # this the post-EOS tail passes the gate and its fabricated-confidence pad slots get a loss they never earned. The early-EOS 
-        # slot ITSELF keeps its real commit confidence and stays eligible: confidently ending where full evidence continues is exactly 
-        # the error the unlikelihood term lowers.
-        active = active & (trunc_tokens != int(pad_token_id))
-    return active
-
-
-def confidence_bound_loss(
-    trunc_logits: torch.Tensor, trunc_tokens: torch.Tensor, active_mask: torch.Tensor, valid_mask: torch.Tensor,
-) -> ConfidenceBoundStats:
-    """Confidence bound for right-truncated (Mode 2a) windows: UNLIKELIHOOD on the truncated decode's OWN token at the slots
-    `confidence_bound_gate` marks active (the truncated decode is confident, and it differs from a full-evidence decode that
-    equals the reference). L = -log(1 - p(t)) lowers the probability of that wrong token and names no target token (unlikelihood 
-    training, Welleck et al., ICLR 2020). The reference only decides WHERE the truncated view is confidently wrong, never WHAT 
-    it should say there, so the truncated input gets no text target (P1): a CE toward the full-evidence token would teach words 
-    whose evidence can lie past the cut. The push fades as p(t) falls, and a slot leaves the gate once p(t) <= tau_cb. The
-    effect is per-token confidence at 1st confidently wrong slot. The FSM commit has no confidence condition: confidence is 
-    a reported score that feeds the reveal policies (infer/stability.py).
-    `trunc_tokens` and `active_mask` cover 1st seq_len slots of `trunc_logits`; `valid_mask` marks the valid reference slots.
-    """
-    seq_len = trunc_tokens.shape[1]
-    logits = trunc_logits[:, :seq_len]
-    if not active_mask.any(): loss = logits.sum() * 0.0
-    else: # -log(1 - p(t)) = logsumexp(all) - logsumexp(all but t): stable even as p(t) -> 1, and exact under bf16 autocast.
-        others = logits.scatter(-1, trunc_tokens.unsqueeze(-1), float("-inf"))
-        token_loss = torch.logsumexp(logits.float(), dim=-1) - torch.logsumexp(others.float(), dim=-1)
-        # Normalize by VALID reference slots, not gated slots: L_cb as a position sum in OPUT's form (per-valid-token).
-        # A per-ACTIVE-slot mean is sparsity-invariant — 1 gated slot would carry the same gradient magnitude as a
-        # fully-gated batch, giving Mode-2a windows most of the translation gradient.
-        denom = valid_mask[:, :seq_len].to(device=token_loss.device, dtype=token_loss.dtype).sum()
-        loss = (token_loss * active_mask.to(token_loss.dtype)).sum() / denom.clamp(min=1)
-    return ConfidenceBoundStats(loss=loss, active_count=active_mask.sum())

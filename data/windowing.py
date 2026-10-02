@@ -48,7 +48,6 @@ class WindowSample:
     bio_labels: np.ndarray
     translation_target: SentenceSpan | None
     anchor_span: SentenceSpan | None = None
-    full_evidence_spec: WindowSpec | None = None
     # χ (membership gate, docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of LEFT-TRUNCATED
     # predecessors — a sentence whose B precedes the window edge is one the FSM already committed (the left edge mimics the
     # post-commit cut). Sampler bookkeeping, not a model belief; at inference the FSM supplies it from its commit log.

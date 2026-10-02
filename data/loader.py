@@ -780,6 +780,16 @@ def resolve_pretrain_records(
     return recs, realised
 
 
+def segmenter_language_fingerprints(cfg: dict, data_cfg: dict, language: str, train_records: list[VideoRecord]) -> dict[str, str]:
+    """Annotation fingerprint of the FULL train split of every language a segmenter trains on: the pool, or the target alone.
+
+    A pooled run trains on a rotating sub-sample, so its epoch-0 records cannot be compared with a stage-2 or eval run, 
+    which reads one whole language. These per-language stamps can (train.bio_pretrain.require_segmenter_data)."""
+    langs = cfg.get("pretrain_languages")
+    if not langs: return {str(language): annotation_fingerprint(train_records)}
+    return {str(l): annotation_fingerprint(_cached_language_records(data_cfg, str(l), "train")) for l in langs}
+
+
 def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[VideoRecord]:
     """Per-language record lists for the pool, parsed ONCE per process.
 
@@ -1163,14 +1173,7 @@ class StreamingWindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         index = self.effective_index(index)
         sample = self.sampler.sample(index)   # anchor = anchors[index % N]
-        item = self.sampler.to_dict(sample)
-        if sample.full_evidence_spec is not None:
-            rec = self.records_by_id[sample.full_evidence_spec.video_id]
-            full = self.sampler.materialize(rec, sample.full_evidence_spec)
-            # CB must compare 2 views of the same complete anchor, after actual frame materialization.
-            item["full_evidence"] = self.sampler.to_dict(full) if full.translation_target == sample.anchor_span else None
-        else: item["full_evidence"] = None
-        return item
+        return self.sampler.to_dict(sample)
 
 
 class LengthBucketSampler(torch.utils.data.Sampler):

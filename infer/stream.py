@@ -79,11 +79,11 @@ class StreamingSLTRunner:
         min_span_frames: int | None = None, gate_enabled: bool = False, gate_eps: float = 1e-4, record_trace: bool = False, 
         translate: bool = True, cascade_model=None
     ):
-        # The joint arm decodes the whole buffer under the Ω soft crop (its stage-2 training conditioning); emitted boundaries come from the 
-        # BIO span. The continuation of a sentence cut by a FORCED (cap) commit is never selected: it arrives as a buffer-start I-run, which 
-        # never opens a span. Mode-2b gives no text supervision on that left-truncated state, so a decode of it is undefined. (Supervision 
-        # covers every state the FSM decodes except one: an anchor longer than buffer_cap_s trains without a CB view, since its full-evidence 
-        # self-target would itself be truncated, yet the cap-forced commit decodes exactly that state, flagged PARTIAL.)
+        # The joint arm decodes the whole buffer under the Ω soft crop (its stage-2 training conditioning); emitted boundaries 
+        # come from BIO span. The continuation of a sentence cut by a FORCED (cap) commit is never selected: it arrives as a 
+        # buffer-start I-run, which never opens a span. Mode-2b gives no text supervision on that left-truncated state, so a 
+        # decode of it is undefined. (Text supervision covers complete units only, P1: a premature or cap-forced commit decodes 
+        # a truncated crop that no text loss trains; a cap-forced one is flagged PARTIAL.)
         self.model = model
         self.cascade_model = cascade_model
         if cascade_model is not None and gate_enabled: raise ValueError("The online cascade uses an ungated clean translator.")

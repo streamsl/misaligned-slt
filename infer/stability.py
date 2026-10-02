@@ -15,9 +15,8 @@ by how many strides of evidence it demands:
 
   reveal_on_agreement(n)             the token at each position must be IDENTICAL across the last n strides
                                      (Local Agreement). Purely a string test; no training counterpart.
-  reveal_on_confidence(n, tau)       the token's own confidence must be >= tau for n consecutive strides, with a
-                                     changed token resetting its run. n=1 reads only the current stride — the
-                                     single-measurement policy the confidence-bound term is meant to license.
+  reveal_on_confidence(n, tau)       the token's own confidence must be >= tau for n consecutive strides, with a changed token
+                                     resetting its run. n=1 reads only the current stride — the single-measurement policy.
   reveal_on_agreement_and_confidence both conditions (conservative).
   reveal_at_commit                   the deployed behaviour: nothing until the gate commits. The latency ceiling.
 
@@ -53,10 +52,10 @@ def display_prefix(token_ids, token_confidence, eos_id: int | None = None, pad_i
     """Cut a decoded canvas down to the tokens a viewer could actually be shown.
 
     The DLM writes a FABRICATED confidence of 1.0 into every slot it back-fills with pad after a committed EOS
-    (infer/decode.py) — pi was never computed there. generate_from_bio_tap already slices at the first EOS on the
-    live path, so this is defence in depth for any caller that records raw decodes; it does NOT explain long
+    (infer/decode.py) — pi was never computed there. generate_from_bio_tap already slices at the first EOS on 
+    the live path, so this is defence in depth for any caller that records raw decodes; it does NOT explain long
     hypotheses. A stride can legitimately decode MORE real tokens than the final commit (a no-EOS canvas — the
-    hallucinated-continuation mode the CB term targets); those are charged via vanished_track_rate, never trimmed.
+    hallucinated-continuation mode); those are charged via vanished_track_rate, never trimmed.
     """
     stop = {int(i) for i in (eos_id, pad_id) if i is not None}
     keep = int(token_ids.numel())
@@ -171,9 +170,9 @@ def build_policies(
     Names carry every parameter that varies (`agreement_n2`, `confidence_n1_tau50`, ...), so no name implies a sibling 
     that was never built. Read the table as 2 curves, not as a winner per row.
 
-    `tau` is SWEPT, never inherited from a config value: `tau_cb` (0.75) scores remasked training logits, so it does not
-    transfer to a per-token display rule. And a single tau produces 1 point, which cannot be compared against 
-    Local Agreement's own curve over n; the comparison only means something at matched operating points. .
+    `tau` is SWEPT, never inherited from a config value: no training threshold transfers to a per-token display rule. 
+    And a single tau produces 1 point, which cannot be compared against Local Agreement's own curve over n; 
+    the comparison only means something at matched operating points. .
     """
     policies: dict[str, object] = {"commit_only": reveal_at_commit}
     for n in agreement_strides:

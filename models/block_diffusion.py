@@ -4,7 +4,7 @@ Layering (so each concept has one home):
   models/block_diffusion.py  (this file)  BD3LM core: the abstract `BlockDiffusionDecoder` (masked-diffusion
                                           training over [xt|x0]) and the attention-mask builders.
   models/dmax.py                          DMax extension: `OPUTBlockDiffusionDecoder` (OPUT training + the block
-                                          decode with SPD + confidence-bound surrogates) and the OPUT loss helpers.
+                                          decode with SPD) and the OPUT loss helpers.
   infer/decode.py                         the block decode itself (DMax decode_uniform semantics).
   models/unisign.py                       mBART binding: `MBartBlockDiffusionDecoder` (concrete `_decode`).
   models/unisign.py                   mT5 binding:  `MT5BlockDiffusionDecoder` (concrete `_decode`).
@@ -185,12 +185,11 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     '''
     def _init_block_diffusion(
         self, *, d_model: int, vocab_size: int, embed_source_weight: torch.Tensor, lm_source_weight: torch.Tensor,
-        pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0, block_size: int = 4, ignore_bos: bool = True,
+        pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0, block_size: int = 4,
     ) -> None:
         self.d_model = d_model
         self.embed_scale = float(embed_scale)
         self.block_size = block_size
-        self.ignore_bos = ignore_bos
         self.neg_infinity = -1e9
 
         # ── Tokenizer info ───────────────────────────────────────────────────
@@ -205,7 +204,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         # ── Extend embedding and language model heads ───────────────────────
         # The input canvas keeps the copied table and the appended [MASK] row as SEPARATE parameters (CanvasEmbedding).
         # Output head keeps 1 (vocab+1, d) table so its shape mirrors the input canvas; its [MASK] column sits outside both 
-        # losses (models/dmax.py slices OPUT and CB logits to real vocabulary) and outside the decode (infer/decode.py forces 
+        # OPUT passes (models/dmax.py slices their logits to real vocabulary) and outside the decode (infer/decode.py forces 
         # it to the dtype minimum). No padding_idx: on mT5, pad id is also the canvas BOS, and padding_idx would freeze BOS 
         # row the AR arm trains. A pad slot never reaches a supervised slot under block-causal attention, so its gradient is 0.
         self.embed_tokens = CanvasEmbedding(embed_source_weight, mask_token_id=vocab_size, embed_scale=self.embed_scale)
@@ -243,20 +242,18 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         '''
         raise NotImplementedError
 
-    
-    def _prepare_x0( # Clean target construction (BOS-prefix, block-pad, supervised EOS tail)
-        self, labels: torch.Tensor, decoder_input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+    # Clean target construction (BOS-prefix, block-pad, supervised EOS tail)
+    def _prepare_x0(self, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch = labels.shape[0]
         x0 = labels.clone()
         x0[x0 == -100] = self.pad_index
-        if decoder_input_ids is not None: bos = decoder_input_ids[:, :1].to(device=labels.device)
-        else: bos = torch.full((batch, 1), self.bos_index, dtype=x0.dtype, device=labels.device)
-        x0 = torch.cat([bos, x0], dim=1)             # (B, L+1)
+        bos = torch.full((batch, 1), self.bos_index, dtype=x0.dtype, device=labels.device)
+        x0 = torch.cat([bos, x0], dim=1)          # (B, L+1)
 
         # Text attention mask: 1 for real tokens, 0 for padding
-        valid = (x0 != self.pad_index)           # (B, L+1) bool
-        if self.ignore_bos: valid[:, 0] = False  # BOS never masked
+        valid = (x0 != self.pad_index)            # (B, L+1) bool
+        valid[:, 0] = False                       # BOS never masked
 
         # Align length to a multiple of block_size
         aligned_len = max(1, math.ceil(x0.shape[1] / self.block_size)) * self.block_size

@@ -10,7 +10,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from data.chunks import ChunkDataset
-from data.loader import ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records, streaming_loader
+from data.loader import (ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records,
+                         segmenter_language_fingerprints, streaming_loader)
 from moryossef26.dataset import collate_moryossef_chunks, fit_release_stats
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
@@ -53,6 +54,7 @@ def build_moryossef_loaders(
     # from a monolingual one at load time and eval.py's pool assertion can never fire for this arm.
     cfg["checkpoint_meta"] = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_records),
+        "language_fingerprints": segmenter_language_fingerprints(cfg, data_cfg, language, train_records),  # require_segmenter_data
         "language": cfg.get("language"), "bio_class_weights": cfg.get("bio_class_weights"),
         "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "release_stats": release_stats,
         "initialization": (cfg.get("checkpoint", {}) or {}).get("from_pretrained"),
@@ -79,7 +81,9 @@ def build_moryossef_loaders(
         train_ds, bs, collate_moryossef_chunks, num_workers=num_workers,
         bucket_by_length=True, bucket_seed=seed,
     )
-    dev_loader = streaming_loader(dev_ds, bs, collate_moryossef_chunks, num_workers=num_workers)
+    # Batch 1: the release model attends to zero padding (no key mask), and whole-video and online inference never pad, 
+    # so a padded dev chunk would score an input that deployment never sees.
+    dev_loader = streaming_loader(dev_ds, 1, collate_moryossef_chunks, num_workers=num_workers)
     return train_loader, dev_loader, cfg
 
 

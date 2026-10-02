@@ -5,10 +5,8 @@ from dataclasses import asdict, dataclass, replace
 import numpy as np
 from data.loader import VideoRecord
 from utils import lambda_min_frames
-from data.windowing import (
-    TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
-    count_complete_spans, first_complete_span, make_bio_labels,
-)
+from data.windowing import (TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
+                            count_complete_spans, make_bio_labels)
 from poses import load_pose_window, normalize_keypoints_unisign
 
 
@@ -46,13 +44,15 @@ def normalized_mode_ratios(raw: dict[str, float]) -> dict[str, float]:
 class WindowSampler:
     """Emit one real-timeline training window per step.
 
-    Each step picks a GT sentence anchor and a mode from the configured coverage mix,
-    then cuts a window on the *real* video timeline — neighbour content and gaps inside the jittered range are the actual 
-    adjacent frames, never concatenated clips (avoids seam artifacts). The 4 modes mirror the inference-time buffer states:
+    Each step picks a GT sentence anchor and a mode from configured coverage mix, then cuts a window on *real* video timeline — neighbour content 
+    and gaps inside the jittered range are the actual adjacent frames, never concatenated clips (avoids seam artifacts). The drawn mode only SHAPES 
+    the window; `materialize` then relabels it from its content, and the text target is the window's first complete eligible unit, which need not 
+    be the anchor (a short complete unit before the anchor in a Mode-1 window, or a complete next unit in a Mode-2-left window, takes the target).
+    The 4 modes mirror the inference-time buffer states:
 
-    - **Mode 1** — anchor fully inside (jittered head/tail). OPUT target = anchor.
-    - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge, → confidence-bound),
-      `left` (no B, no translation loss), `both` (interior, rare).
+    - **Mode 1** — anchor fully inside (head/tail from the uniform context band).
+    - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge),
+      `left` (no B for the anchor), `both` (interior, rare).
     - **Mode 3** — ≥2 complete sentences (the spec spans the anchor and its successor); target = earliest complete span 
       (first-complete-span rule, identical at train and inference).
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
@@ -143,24 +143,6 @@ class WindowSampler:
         return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
 
 
-    def _full_evidence_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec:
-        """Mode-1-equivalent window for full-evidence decode, with 1 extra constraint: anchor must be window's 1st complete span. Full-evidence 
-        decode has no explicit target — the model (trained on first-complete-span rule) translates earliest complete sentence in its conditioning. 
-        A plain `_mode1_spec` window whose head jitter pulls in a complete earlier neighbour would therefore yield y_full for the *neighbour*, not 
-        the anchor the truncated view shows: verified gate (f==r) then never fires (dead CB batch). Falls back to the clean anchor clip, where the 
-        anchor-first is guaranteed (earlier sentence can't have its B inside a window that starts at the anchor's start)."""
-        anchor = rec.sentences[anchor_idx]
-        eps = 1.0 / rec.pose.fps
-        for _ in range(20):
-            dh, dt = self.jitter.sample(self.rng)
-            start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
-            if (classify_anchor_visibility(anchor, start_s, end_s) == "complete" and anchor.end_s + eps <= end_s
-                # (Λ_min - 1) frames: a unit that short can still hold Λ_min frames on the grid, where materialize counts frames.
-                and first_complete_span(rec.sentences, start_s, end_s, eps, min_span_s=(self.min_span_frames - 1) / rec.pose.fps) is anchor):
-                return WindowSpec(rec.video_id, start_s, end_s, "mode1", anchor_idx)
-        return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
-
-
     def _mode2_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Truncated-anchor window
         """`right` keeps the start, cuts before the end (B, no terminator); `left` cuts after the start, keeps the end + its terminator 
         frame (no B); `both` is a strictly-interior slice (all I).
@@ -193,11 +175,9 @@ class WindowSampler:
         else:  # "right": keep the true start, cut before the end. Head jitter only pulls the start outward.
             cut = max(self._cut_time(anchor), anchor.start_s + eps)
             start_lo = max(0.0, anchor.start_s - abs(dh))  # abs: same zero-error-corner removal as the tail above
-            # A COMPLETE earlier sentence inside the right-truncated view is poison for the confidence-bound term: the decoder 
-            # — correctly, per the shared first-complete-span rule — would translate the NEIGHBOUR, while y_full is anchored on 
-            # the anchor (_full_evidence_spec enforces anchor-first), so the gate would penalize correct behaviour. Clamp the 
-            # start past the predecessor's B: the neighbour can then only appear left-truncated (tail I-frames — never a selectable 
-            # target), which is also exactly the post-commit leftover geometry streaming produces.
+            # Clamp the start past the predecessor's B, so the window stays a right-truncation of the anchor (a complete predecessor
+            # would become the window's first complete unit and its text target). The neighbour can then only appear left-truncated
+            # (tail I-frames, never a selectable target), which is the post-commit leftover geometry streaming produces.
             prev_starts = [s.start_s for s in rec.sentences if s.start_s < anchor.start_s]
             if prev_starts: start_lo = max(start_lo, max(prev_starts) + eps)
             start_s, end_s = self._clip_window(rec, start_lo, cut)
@@ -238,9 +218,8 @@ class WindowSampler:
         # an "all-gap" window there could be all-signing, the exact opposite of what Mode 4 trains (stay quiet on non-signing input).
         gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S]
         if not gaps:
-            # Reliable spans only: this is the one path that bypasses `self.anchors`, and a quarantined anchor would
-            # send its multi-sentence text to the confidence-bound reference — the exact label quarantine exists to
-            # withhold. `self.anchors` guarantees at least one reliable span in any record that reaches the sampler.
+            # Reliable spans only: this is the one path that bypasses `self.anchors`, which hold only reliable spans (a quarantined
+            # unit is never an anchor). `self.anchors` guarantees at least one reliable span in any record that reaches the sampler.
             cands = [i for i, sp in enumerate(rec.sentences) if getattr(sp, "reliable", True)]
             return self._mode2_spec(rec, cands[int(self.rng.integers(0, len(cands)))])
 
@@ -285,18 +264,16 @@ class WindowSampler:
 
 
     def materialize(self, rec: VideoRecord, spec: WindowSpec) -> WindowSample:
-        """Realize a `WindowSpec` into tensors: load+normalize pose window, build per-frame BIO labels from GT boundaries, pick translation 
-        target (Mode 1/3 first-complete-span), and for Mode-2a attach the Mode-1-equivalent `full_evidence_spec` the confidence-bound term 
-        decodes under no_grad. The window stays on the native pose grid, as at inference."""
+        """Realize a `WindowSpec` into tensors: load+normalize pose window, build per-frame BIO labels from GT boundaries, 
+        pick translation target (Mode 1/3 first-complete-span). The window stays on the native pose grid, as at inference."""
         poses, timestamps = load_pose_window(rec.pose, spec.start_s, spec.end_s, normalize=False)
-        # The loader floors the start frame, so it can return 1 frame BEFORE spec.start_s. Drop it: the labels, the completeness test and 
-        # the commit frontier below all measure the window from spec.start_s, and a pre-start frame could show an onset that the labels 
-        # call a cut (an illegal O->I). 1 ms absorbs float32 time noise. The drop comes before Uni-Sign normalization (below post-commit
-        # shift), so the dropped frame cannot set the window's body box.
+        # The loader floors the start frame, so it can return 1 frame BEFORE spec.start_s. Drop it: labels, completeness test and commit frontier 
+        # below all measure window from spec.start_s, and a pre-start frame can show an onset that labels call a cut (an illegal O->I). 1 ms absorbs 
+        # float32 time noise. The drop comes before Uni-Sign normalization (below post-commit shift), so dropped frame can't set window's body box.
         keep = timestamps >= spec.start_s - 1e-3
         if keep.any() and not keep.all(): poses, timestamps = poses[keep], timestamps[keep]
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
-        target, full_evidence_spec = None, None
+        target = None
 
         # Eligibility uses the actual sampled frame grid, also used by the gate's GT frame conversion.
         relative_times = (timestamps - spec.start_s).astype(np.float32)
@@ -324,11 +301,10 @@ class WindowSampler:
                 else: subcase = "both"
                 spec = replace(spec, mode="mode2", subcase=subcase)
 
-        # POST-COMMIT SHIFT. The FSM cannot know a unit is quarantined: when 1 (U) ends inside the window before the text target starts (1st candidate, 
-        # or a Mode-2a anchor, the confidence-bound reference), FSM commits U first and restarts its buffer at U's terminator − δ. The window does the 
-        # same, and never moves left: U becomes the straddling committed predecessor that the commit mask below marks, and the target keeps its text. 
-        # Materializing again drops the frames before the new start and relabels from it (P1/P2). The full view (a Mode-1 view of the anchor) takes 
-        # the same shift in its own materialize, so the teacher and the student see the same committed predecessor.
+        # POST-COMMIT SHIFT. FSM can't know a unit is quarantined: when 1 (U) ends inside the window before the text target starts (1st candidate, 
+        # or open anchor of a right-truncated window), FSM commits U first and restarts its buffer at U's terminator − δ. Window does the same, 
+        # and never moves left: U becomes the straddling committed predecessor that the commit mask below marks, and the target keeps its text. 
+        # Materializing again drops the frames before the new start and relabels from it (P1/P2).
         text_start = target.start_s if target is not None else anchor_span.start_s if spec.subcase == "right" else None
         if text_start is not None:
             ends = [span.end_s for span in rec.sentences if not span.reliable and spec.start_s < span.end_s <= text_start]
@@ -339,10 +315,6 @@ class WindowSampler:
             timestamps, rec.sentences, spec.start_s, spec.end_s,
             video_duration_s=rec.pose.duration_s,  # long uncaptioned stretches -> UNK (see make_bio_labels)
         )
-        if spec.mode == "mode2" and spec.subcase == "right" and anchor_span is not None:
-            # A full view needs the anchor and a represented terminator, within the same capacity.
-            if anchor_span.duration_s + 1.0 / rec.pose.fps <= self.buffer_cap_s:
-                full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
 
         # χ from sampler bookkeeping (docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of a PREDECESSOR sentence 
         # straddling the window's left edge. In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's 
@@ -358,7 +330,7 @@ class WindowSampler:
             if straddles and is_predecessor: commit_mask |= timestamps < span.end_s
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, translation_target=target, 
-            anchor_span=anchor_span, full_evidence_spec=full_evidence_spec, commit_mask=commit_mask, candidate_sentences=candidates
+            anchor_span=anchor_span, commit_mask=commit_mask, candidate_sentences=candidates
         )
 
     @staticmethod

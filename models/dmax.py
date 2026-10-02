@@ -1,4 +1,4 @@
-'''DMax extension to the BD3LM substrate: OPUT training, block decoding with SPD, and the confidence-bound surrogate.
+'''DMax extension to the BD3LM substrate: OPUT training and block decoding with SPD.
 
 `OPUTBlockDiffusionDecoder` adds DMax's mechanisms on top of `block_diffusion.BlockDiffusionDecoder`, over a
 precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, `_decode_with_decoder_forward`
@@ -7,7 +7,6 @@ and `_decoder_stack`, so the mBART / mT5 bindings (models/unisign.py) supply onl
   - `oput_forward`     — OPUT two-pass training (mask + on-policy argmax corruption); trains self-correction.
   - `generate`         — block decode (infer/decode.py): DMax's confident-prefix commits, SPD soft state and
                          self-revision inside a block, over a KV cache of the final blocks.
-  - `remasked_logits`  — grad-bearing surrogate for the confidence-bound term.
 
 References: DMax (arXiv 2604.08302; dInfer decode_uniform, train_llada2_bd_oput.py); dLLM A2D (arXiv 2602.22661).
 '''
@@ -93,9 +92,8 @@ def oput_two_pass_loss(
             F.cross_entropy(lg.reshape(-1, lg.shape[-1]), clean_ids.reshape(-1), reduction="none").reshape_as(clean_ids) * m
             for lg in (mask_logits, pred_logits)
         ).sum(dim=1)
-    # MEAN of 2 passes, not their sum: the pooled translation loss weighs OPUT rows and Mode-2a CB rows by
-    # token count, and the AR arm's CE is single-pass — a summed two-pass OPUT would silently double the DLM's
-    # per-token translation scale relative to both (halving CB's share on the DLM arm only).
+    # MEAN of 2 passes, not their sum: the AR arm's CE is single-pass, so a summed two-pass OPUT 
+    # would silently double the DLM's per-token translation scale against the AR arm.
     return OPUTOutput(loss=0.5 * (mask_loss + pred_loss), row_loss_sum=rows, row_valid_count=m.sum(dim=1))
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -111,8 +109,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     '''
     def oput_forward(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
-        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], decoder_input_ids: torch.Tensor | None = None, 
-        t_low: float = 0.3, t_high: float = 0.8, omega_bias: torch.Tensor | None = None, *, label_smoothing: float,
+        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], t_low: float = 0.3, t_high: float = 0.8, 
+        omega_bias: torch.Tensor | None = None, *, label_smoothing: float,
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
@@ -123,7 +121,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         since it depends on BIO posteriors / encoder features, not target tokens. OPUT corrupts *target*, Ω conditions 
         the *input*, so Ω rides every decode here; its gradient into BIO logits flows via the grad-bearing passes only.
         '''
-        x0, valid = self._prepare_x0(labels, decoder_input_ids=decoder_input_ids)
+        x0, valid = self._prepare_x0(labels)
 
         def rollout_decode_fn(noisy_ids: torch.Tensor) -> torch.Tensor:
             # Decoder in eval too (caller's rollout_encode_fn covers the encoder): whole path dropout-off. Encode FIRST:
@@ -144,25 +142,6 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         )
         assert enc_hidden._version == enc_version, "OPUT conditioning mutated between passes (fixed c)"
         return {"translation_loss": out.loss, "row_loss_sum": out.row_loss_sum, "row_valid_count": out.row_valid_count}
-
-
-    def remasked_logits(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor,
-        decoded_tokens: torch.Tensor, remask_positions: torch.Tensor, omega_bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        '''Grad-bearing forward on a committed sequence with the gated slots re-masked (confidence-bound surrogate).
-
-        Gated slots (confident-disagreement under the no-grad truncated decode) become `[MASK]`, every other committed token 
-        stays in context; 1 block-causal forward gives each gated slot's live conditional belief with the slot still open. 
-        Closer to commit-time than an all-`[MASK]` marginal (t = 1, outside OPUT's t ∈ [t_low, t_high]), and costs 1 forward, 
-        not back-prop through the decode. No reference text enters the input, so P1 is preserved.
-        '''
-        remask = remask_positions.to(device=decoded_tokens.device, dtype=torch.bool).clone()
-        remask[:, 0] = False  # BOS fixed
-        token_ids = torch.where(remask, torch.full_like(decoded_tokens, int(self.mask_token_id)), decoded_tokens)
-        # MASK is an input symbol, not an output target. Match OPUT and generation so both the
-        # confidence test and its CE use the same distribution over caption tokens.
-        return self._decode(token_ids, enc_hidden, enc_mask, omega_bias=omega_bias)[..., :self.vocab_size]
 
 
     # ── Block decode over a KV cache of the final blocks (backbone-agnostic) ──

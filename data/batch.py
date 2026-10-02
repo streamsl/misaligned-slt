@@ -72,18 +72,16 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
         # TRAINING forward runs over whole canvas (block decode's block-local forwards are inference only), so padding to 
         # max_text_tokens costs compute on padding: captions are ~15 tokens against a 320 canvas. Dynamic padding sizes it 
-        # to the batch instead, with 1 slot of headroom the DLM path requires and batch-max would not: the confidence-bound 
-        # reference shift (models/streaming_slt.py) drops last column, which must be PAD or longest row loses its real final 
-        # token from the gate. EOS tail needs no reservation here — target builder (models/block_diffusion.py _prepare_x0) 
-        # pads its own canvas to block boundary. Block alignment matters too — BD3LM attends bidirectionally WITHIN a block, 
-        # so canvas ending mid-block change last positions' logits. With headroom + alignment the result matches full canvas.
+        # to the batch instead. EOS tail needs no reservation here — target builder (models/block_diffusion.py _prepare_x0) 
+        # pads its own canvas to block boundary. Block alignment matters — BD3LM attends bidirectionally WITHIN a block, 
+        # so a canvas ending mid-block changes last positions' logits. With alignment the result matches the full canvas.
         encoded = self.tokenizer(texts, truncation=False, return_tensors="pt", padding=True)
         input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
         if input_ids.shape[1] > self.max_text_tokens: raise ValueError(
             f"Caption target needs {input_ids.shape[1]} tokens, exceeding max_text_tokens={self.max_text_tokens}; "
              "increase the text capacity. Complete-caption targets must not be silently truncated."
         )
-        need = input_ids.shape[1] + 1
+        need = input_ids.shape[1]
         width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
         if width > input_ids.shape[1]:
             grow = width - input_ids.shape[1]
@@ -96,7 +94,6 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
     def __call__(self, batch: list[dict]) -> dict[str, torch.Tensor | list | dict]:
         out = collate_windows(batch)
         out["mode_names"] = [spec["mode"] if isinstance(spec, dict) else spec.mode for spec in out["specs"]]
-        out["mode2_subcases"] = [(spec.get("subcase") if isinstance(spec, dict) else spec.subcase) for spec in out["specs"]]
         out["translation_supervised"] = torch.tensor(
             [target is not None for target in out["translation_targets"]], dtype=torch.bool
         )
@@ -105,22 +102,7 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
                 target["text"] if isinstance(target, dict) else (target.text if target is not None else "")
                 for target in out["translation_targets"]
             ]
-            # The reference is read only by the confidence-bound path, and only on rows that carry a full-evidence view
-            # (indexed through full_evidence_indices). Tokenizing every row's anchor would raise on an over-cap anchor
-            # in a truncated window, which never needs its text. Keep a row per item so the indexing stays positional.
-            reference_texts = [
-                (anchor["text"] if isinstance(anchor, dict) else anchor.text)
-                if anchor is not None and item.get("full_evidence") is not None else ""
-                for anchor, item in zip(out["anchor_spans"], batch)
-            ]
             target_tokens = self._tokenize_texts(target_texts)
-            reference_tokens = self._tokenize_texts(reference_texts)
             target_tokens["labels"][~out["translation_supervised"]] = -100
             out["target_tokens"] = target_tokens
-            out["reference_tokens"] = reference_tokens
-
-        full_items = [item["full_evidence"] for item in batch if item.get("full_evidence") is not None]
-        full_indices = [idx for idx, item in enumerate(batch) if item.get("full_evidence") is not None]
-        out["full_evidence_indices"] = torch.tensor(full_indices, dtype=torch.long)
-        out["full_evidence"] = collate_windows(full_items) if full_items else None
         return out

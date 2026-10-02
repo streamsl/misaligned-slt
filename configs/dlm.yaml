@@ -38,21 +38,6 @@ oput:
     # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss).
     # Without it the DLM is the only arm with an unsmoothed CE.
     label_smoothing: 0.2
-confidence_bound:
-    # Right-truncated (Mode 2a) term, only on a predicted premature commit (a closed predicted span inside the open GT unit),
-    # with Ω detached. At slots where the truncated decode is confident (> tau_cb) and differs from a verified full-evidence
-    # decode, an UNLIKELIHOOD loss -log(1 - p(t)) lowers truncated decode's own token t. It names no target token, so truncated
-    # input gets no text label (P1); the reference only decides where the decode is wrong. Slots after 1st student/teacher
-    # divergence are excluded; the gate reads LIVE re-masked logits. See train/losses.py. Gate is always verified (penalize
-    # only where full-evidence decode == reference). It rejects wrong full-evidence tokens, so CB is active from epoch 0 on
-    # the S1/baseline warm start, without warmup. cb_active_count can rise as teacher coverage grows or fall as errors lose
-    # confidence. Effect: lower per-token confidence at 1st confidently wrong slot (read by the reveal policy). The FSM commit
-    # reads no translation confidence, so this term does not change commits.
-    enabled: true
-    tau_cb: 0.75
-    lambda: 1.0
-    # The Mode-2a term runs 2 block decodes per batch (full-evidence + truncated) under the SAME `tau_dec` and block KV
-    # cache as inference, so the full-evidence decode (a gate, never a target) is what the deployed decode would emit.
 membership_gate: # Exact first-complete-span membership from legal BIO paths. Live logits carry caption gradients.
     enabled: true
     eps: 1.0e-4 # finite floor for the log-membership bias
@@ -60,16 +45,14 @@ membership_gate: # Exact first-complete-span membership from legal BIO paths. Li
     # so the gate never couples to an untrained head (garbage conditioning, §1.2).
     detach_omega: false # true = ablation "text doesn't train segmentation", so segmentation branch learns from BIO only.
 # Fixed coverage mix, shared by all datasets. A DESIGN choice, not a measured distribution: it gives each window state mass.
-# mode1+mode3 = 0.65 complete-sentence targets; the extra mode2 mass feeds the CB signal. Edges and Mode-2 cut depths come
-# from the designed `jitter:` block below. A mode-3 window spans the anchor and its successor.
-mode_ratios:
-    mode1: 0.45
-    mode2: 0.30
-    mode3: 0.20
+mode_ratios:     # Edges and Mode-2 cut depths come from the designed `jitter:` block below
+    mode1: 0.45  # mode1+mode3 = 0.65 complete-sentence targets
+    mode2: 0.30  # mode2 trains the head on the truncated buffers the FSM meets at most strides (BIO only, no text, P1).
+    mode3: 0.20  # mode-3 window spans the anchor and its successor
     mode4: 0.05
 # Within Mode 2, each over-segmentation event yields one right-trunc + one left-trunc window, so right~=left dominate;
-# both-truncated is rare and "falls out of the sampler naturally". Uniform 1/3 over-represents the no-translation-supervision
-# "both" case and dilutes the linchpin Mode-2a signal.
+# both-truncated is rare and "falls out of the sampler naturally". Uniform 1/3 would over-represent the interior case, 
+# a buffer state the FSM meets only after a forced cut.
 mode2_subcase_weights:
     right: 0.45
     left: 0.45
@@ -137,7 +120,7 @@ max_grad_norm: 1.0
 # worth running (4, 8, 16, 32, 64), so block-size dial below moves without a 2nd canvas. `train.slt.assert_targets_fit`
 # refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash
 # mid-epoch; when a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes
-# each batch's canvas to its longest target (block-aligned, 1 PAD column for cb shift), so the ceiling costs no compute.
+# each batch's canvas to its longest target (block-aligned), so the ceiling costs no compute.
 max_text_tokens: 320
 validation:
     max_translation_samples: 0 # 0 = score translation on ALL dev windows
@@ -157,14 +140,13 @@ spd: # Block decode (infer/decode.py, DMax decode_uniform) — design spec §7.2
     # committed slot of the block. Block ends once no mask remains and every generated slot's max-prob is >= 0.9 (infer/decode.py 
     # SETTLE_CONFIDENCE, fixed, independent of tau_dec) or a pass changes nothing, with at most 1 revision-only pass per slot 
     # after last commit. tau_dec is the commit threshold inside the block: lower commits more slots per forward and leans on 
-    # SPD + OPUT self-revision to repair them; a value the model cannot reach commits 1 slot/forward. The one tau_dec: Mode-2a
-    # full-evidence decode, dev decoding and inference all read this value (eval from the method config it loads).
+    # SPD + OPUT self-revision to repair them; a value the model cannot reach commits 1 slot/forward.
     # Reachable range is shaped by `oput.label_smoothing`: under smoothing 0.2 the per-token loss MINIMISER sits at max-prob 0.8, 
     # so a threshold at or above it makes most slots wait and the decode approaches 1 commit/pass. 0.8 is not a ceiling, so the 
     # settle test at 0.9 does fire and how often is a property of the trained model. DMax's published points are 0.65 on code, 0.5 
     # on math, 0.3 on LLaDA2-mini (dInfer/evaluations/eval_llada_dmax_{code,math}.sh, eval_llada_mini.sh, all at block_length 32, 
     # all via decode_uniform) and 0.0 in chat.py. 0.5 is their math point and is reachable here. It is a fixed mechanism constant,
     # not dev-tuned; RQ1 reports its cost as `mean_decoder_passes` (AR arm's count in same field is its generate() length).
-    tau_dec: 0.5
-    top_k: 1 # DMax SPD top-k token/mask embedding mixture.
-    renormalize: true # DMax Eq. 10 norm restoration.
+    tau_dec: 0.5       # dev decoding and inference both read this value (eval from the method config it loads)
+    top_k: 1           # DMax SPD top-k token/mask embedding mixture.
+    renormalize: true  # DMax Eq. 10 norm restoration.

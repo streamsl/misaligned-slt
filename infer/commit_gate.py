@@ -18,26 +18,10 @@ def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
 
 
-def first_terminator_index(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """First frame TERMINATING an active span: an `O`, or a new `B`.
-
-    Back-to-back sentences have no `O` gap, so `B` must terminate too (BIO-standard; why a `B` class 
-    exists over binary I/O — Moryossef 2023/2026). `O`-only would bridge such a pair until buffer cap.
-    `windowing.first_complete_span` encodes the same rule on GT timestamps; keep in sync.
-    """
-    if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
-    active, prev = False, None
-    for idx, tag in enumerate(bio_tags.tolist()):
-        if active and tag in (BIO["O"], BIO["B"]): return idx
-        if _span_opens(tag, prev, active): active = True
-        prev = tag
-    return None
-
-
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
     # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O, next B, or UNK.
     # UNK closes like O — the same rule the deployed decode applies by remapping UNK->O before the FSM (infer/stream.py) 
-    # and that `_bio_runs(close_on_unk=True)` uses. It matters only in LABEL domain, where UNK marks a quarantined region: 
+    # and that `metrics.signing_runs_with_b_splits` uses. It matters only in LABEL domain, where UNK marks quarantined region: 
     # without it, reliable sentence abutting a quarantine has no terminator, so its label-domain span swallows the quarantine 
     # and the gate's GT anchor stops matching `first_complete_span`'s time-domain target — the two are required to agree.
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
@@ -53,31 +37,29 @@ def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, in
     return spans
 
 
-def select_target_span(
-    bio_tags: torch.Tensor | list[int], min_span_frames: int = 0, skip_term_before: int = 0,
-) -> tuple[int, int] | None:
-    """First complete span ≥ `min_span_frames` (Λ_min) terminating at/after `skip_term_before` — the FSM's target.
+def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0, skip_term_before: int = 0):
+    """Complete spans ≥ `min_span_frames` (Λ_min) terminating after `skip_term_before`, in order. The first is the target of
+    the FSM and of the membership gate's Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each
+    stride (`CommitGate.vote`).
 
-    `skip_term_before` is the commit frontier χ in frames (= frames committed = index of the first uncommitted frame).
-    A span terminating at or before χ is already emitted — an overlap-cut leftover or a stale re-detection — so skip
-    it. The bound is `term <= χ`, not `<`: the cut geometry (`last_commit_t = event.end_s - δ/fps`) makes equality the
-    common case. This commit-log check is the whole no-re-emission guarantee, replacing the "Λ_min > 2δ" coupling that
-    was infeasible on short-sentence corpora (asf: 2δ > p10 sentence length). Spans STRADDLING χ stay selectable:
-    δ-overlap stops a late terminator estimate eating the successor's onset, and their ≤δ committed prefix is
-    attention-floored by Ω's χ term.
+    `skip_term_before` is the commit frontier χ in frames (= frames committed = index of 1st uncommitted frame). A span 
+    terminating at or before χ is already emitted — an overlap-cut leftover or a stale re-detection — so skip it. The bound 
+    is `term <= χ`, not `<`: the cut geometry (`last_commit_t = event.end_s - δ/fps`) makes equality the common case. This 
+    commit-log check is the whole no-re-emission guarantee, so Λ_min and δ need no coupling ("Λ_min > 2δ" rule is infeasible 
+    on short-sentence corpora: on asf 2δ > p10 sentence length). Spans STRADDLING χ stay selectable: δ-overlap stops a late 
+    terminator estimate eating the successor's onset, and their ≤δ committed prefix is attention-floored by Ω's χ term.
 
-    Λ_min is a LABEL-domain floor: the shortest unit worth emitting, set below the shortest annotated one, so its only
-    job is to reject a 1-2 frame flicker that stability hysteresis alone would pass.
+    Λ_min is a LABEL-domain floor chosen to reject brief flicker. A genuine unit shorter than the floor cannot be
+    emitted exactly; report that exclusion when comparing localization scores.
     """
     for start, term in bio_complete_spans(bio_tags):
         if term <= int(skip_term_before): continue  # term == χ: all content frames (< term) are committed
-        if term - start >= int(min_span_frames): return (start, term)
-    return None
+        if term - start >= int(min_span_frames): yield (start, term)
 
 
 def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation, or a buffer-cap forced
-    commit); None if the buffer ends outside a span.
+    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation, or a buffer-cap 
+    forced commit); None if the buffer ends outside a span.
 
     Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate needs on
     the forced/open path (docs/membership_gate.md §2.8): Ω anchored here gives γ≡γ_s with no right cliff (Ω≈0 for the
@@ -93,81 +75,74 @@ def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
     return start
 
 
-@dataclass
+@dataclass(eq=False)  # identity, not value: two histories with equal votes are still two spans
 class BoundaryHistory:
-    """Terminator hysteresis for ONE candidate span.
-
-    Entries are (start_idx, terminator_idx). Buffer indices are stable between commits (it only grows at the right
-    edge), so `start_idx` identifies the span across strides; a start moving by more than `delta_enc_frames` is a
-    different span and clears the history — mixing spans makes the stability test meaningless.
-    """
+    """Terminator hysteresis for ONE candidate span: its last `hysteresis_strides` votes, (start, terminator) 
+    in absolute stream frames, or None for a stride that did not see it."""
     hysteresis_strides: int = 3
-    delta_enc_frames: int = 3
+    delta_enc_frames: int = 12
     values: deque[tuple[int, int] | None] = field(default_factory=deque)
 
     def push(self, span: tuple[int, int] | None) -> None:
-        if span is not None:
-            last = next((v for v in reversed(self.values) if v is not None), None)
-            if last is not None and abs(int(span[0]) - int(last[0])) > self.delta_enc_frames:
-                self.values.clear()  # target identity changed
         self.values.append(span)
-        while len(self.values) > self.hysteresis_strides:
-            self.values.popleft()
+        while len(self.values) > self.hysteresis_strides: self.values.popleft()
 
-    def stable(self) -> bool:
-        if len(self.values) < self.hysteresis_strides: return False
-        if any(v is None for v in self.values): return False
-        terms = [int(v[1]) for v in self.values if v is not None]
+    def last_seen(self) -> tuple[int, int] | None:
+        return next((v for v in reversed(self.values) if v is not None), None)
+
+    def holds(self, span: tuple[int, int]) -> bool:
+        # K votes, none missing, and the terminator (this observation included) moved ≤ δ over them.
+        if len(self.values) < self.hysteresis_strides or any(v is None for v in self.values): return False
+        terms = [int(v[1]) for v in self.values] + [int(span[1])]
         return max(terms) - min(terms) <= self.delta_enc_frames
-
-    def latest(self) -> tuple[int, int] | None:
-        return self.values[-1] if self.values else None
-
-
-@dataclass
-class CommitDecision:
-    boundary_stable: bool
-    translation_confident: bool
-    terminator_index: int | None
-
-    @property
-    def should_commit(self) -> bool:
-        return self.boundary_stable and self.translation_confident and self.terminator_index is not None
 
 
 class CommitGate:
-    """Two-signal commit gate; both must hold to emit.
+    """Boundary-stability commit gate: a span commits when its terminator moved ≤ `delta_enc_frames` over the last
+    `hysteresis_strides` strides.
 
-    1. **Boundary-stable** — terminator moved ≤ `delta_enc_frames` over the last `hysteresis_strides` strides for the
-       SAME span (identity by start index; `BoundaryHistory` clears on a target change, so one stride's vote — or one
-       inherited from another span — never commits).
-    2. **Translation-hardened** — MEAN per-token confidence of the *current* stride's decode ≥ `token_confidence_tau`.
-       Not edit-distance to previous strides: that rewards the warm-started state the design forbids. Mean, not `all(≥τ)`: 
-       function words sit at 0.2–0.5, so `all(≥0.75)` never commits on AR arm, zeroing its streaming recall while DLM 
-       arm's block-committed tokens pass — the arms become incomparable.
-
-    τ must be CALIBRATED to the model's clean-input confidence (like δ_enc / buffer_cap), see configs/inference.yaml.
-    It floors low-confidence junk only; "confidently wrong" truncated decodes stay high-confidence and are Ω's job.
+    1 history per candidate span, keyed by absolute stream frames (buffer indices shift at every commit). Identity is 
+    the start within δ of the history's last seen start; a start moving further is a different span with its own history, 
+    so 1 stride's vote, or 1 inherited from another span, never commits. A commit retires only the histories it emitted:
+    a later span keeps the votes it earned while it waited, so back-to-back units commit at their own stable time. Token 
+    confidences are not a commit signal; events still carry them (infer/stability.py reveal policies).
     """
-    def __init__(self, delta_enc_frames: int = 3, hysteresis_strides: int = 3, token_confidence_tau: float = 0.3):
-        self.history = BoundaryHistory(hysteresis_strides=int(hysteresis_strides), delta_enc_frames=int(delta_enc_frames))
-        self.token_confidence_tau = float(token_confidence_tau)
+    def __init__(self, delta_enc_frames: int = 12, hysteresis_strides: int = 3):
+        self.delta_enc_frames, self.hysteresis_strides = int(delta_enc_frames), int(hysteresis_strides)
+        self.histories: list[BoundaryHistory] = []
 
-    def confident(self, token_confidence: torch.Tensor | None) -> bool:
-        # Signal 2 alone, so a caller can take the boundary vote — which never reads the decoder — 
-        # and decode only when the answer can still change (infer/stream.py).
-        if token_confidence is None or token_confidence.numel() == 0: return False
-        return bool((token_confidence.float().mean() >= self.token_confidence_tau).item())
-    
-    def update(self, span: tuple[int, int] | None, token_confidence: torch.Tensor | None = None) -> CommitDecision:
-        # `span` must be the one the caller decoded, never recomputed here — the gate scores exactly what is emitted.
-        # 1 call = 1 stride's vote: signal 1 needs the history pushed exactly once per stride.
-        self.history.push(span)
-        latest = self.history.latest()
-        return CommitDecision(
-            boundary_stable=self.history.stable(), translation_confident=self.confident(token_confidence),
-            terminator_index=None if latest is None else int(latest[1]),
-        )
+    def _match(self, span: tuple[int, int], pool: list[BoundaryHistory]) -> BoundaryHistory | None:
+        best, best_gap = None, None
+        for history in pool:
+            last = history.last_seen()
+            gap = None if last is None else abs(int(span[0]) - int(last[0]))
+            if gap is not None and gap <= self.delta_enc_frames and (best_gap is None or gap < best_gap): 
+                best, best_gap = history, gap
+        return best
+
+    def vote(self, spans: list[tuple[int, int]]) -> None:
+        # 1 call = 1 stride: each candidate span pushes 1 vote into its own history; a history whose span is absent gets None.
+        pool = list(self.histories)
+        for span in spans:
+            history = self._match(span, pool)
+            if history is None:
+                history = BoundaryHistory(self.hysteresis_strides, self.delta_enc_frames)
+                self.histories.append(history)
+            else: pool.remove(history)
+            history.push(span)
+        for history in pool: history.push(None)
+        self.histories = [h for h in self.histories if h.last_seen() is not None]  # unseen for K strides: gone
+
+    def stable(self, span: tuple[int, int]) -> bool:
+        # Reads votes only: a pass that adds none (cap, EOF drain, post-commit re-check) commits only stability already earned.
+        history = self._match(span, self.histories)
+        return history is not None and history.holds(span)
+
+    def retire(self, span: tuple[int, int]) -> None:
+        # Drop committed span's own history (matched as `stable` matches it: a vote-free pass can see its terminator up to 
+        # δ earlier than the votes) and any history ending at or before its terminator; later spans keep their votes.
+        own = self._match(span, self.histories)
+        self.histories = [h for h in self.histories if h is not own and int(h.last_seen()[1]) > int(span[1])]
 
     def reset(self) -> None:
-        self.history.values.clear()
+        self.histories.clear()

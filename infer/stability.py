@@ -1,6 +1,6 @@
 """Stable-prefix policies for the streaming display, scored offline from recorded stride hypotheses.
 
-FSM decodes its candidate span only on strides where commit gate can still act, and shows nothing until the gate fires, 
+The FSM decodes its target span only on the stride it commits it, and shows nothing until then, 
 so the displayed text never changes — normalised erasure is 0 by construction and the open question is LATENCY, not flicker. 
 A stable-prefix policy trades that: show a prefix earlier, at the risk of revealing a token later evidence would have changed. 
 Every policy is monotone in prefix LENGTH — the revealed prefix only ever grows. It is NOT monotone in CONTENT: these traces 
@@ -19,7 +19,7 @@ by how many strides of evidence it demands:
                                      changed token resetting its run. n=1 reads only the current stride — the
                                      single-measurement policy the confidence-bound term is meant to license.
   reveal_on_agreement_and_confidence both conditions (conservative).
-  reveal_at_commit                   what ships today: nothing until the gate commits. The latency ceiling.
+  reveal_at_commit                   the deployed behaviour: nothing until the gate commits. The latency ceiling.
 
 THRESHOLD CONVENTION: a token is retained when `confidence >= tau` — at-or-above, not strictly above. Exactly-tau retains.
 """
@@ -28,14 +28,11 @@ from dataclasses import dataclass, field
 from functools import partial
 import numpy as np
 
-# Strides of evidence each family is swept over. Every registry name is generated from these, so there is never a
-# policy whose name implies a sibling that does not exist.
+# Strides of evidence each family is swept over. Every registry name is generated from these, 
+# so there is never a policy whose name implies a sibling that does not exist.
 AGREEMENT_STRIDES = (2, 3)
 CONFIDENCE_STRIDES = (1, 2)
-# Per-token display thresholds. Spans the range the decoder actually produces: commit_gate documents function words
-# sitting at 0.2-0.5 with an AR-arm mean near 0.4, so a 0.75 point alone would reveal almost nothing and read as
-# "confidence loses to Local Agreement" when it was only mis-scaled.
-TAU_GRID = (0.3, 0.5, 0.7, 0.9)
+TAU_GRID = (0.3, 0.5, 0.7, 0.9)  # Per-token display thresholds
 
 
 @dataclass
@@ -72,7 +69,7 @@ def display_prefix(token_ids, token_confidence, eos_id: int | None = None, pad_i
 def group_tracks(trace, delta_s: float) -> list[Track]:
     """Group stride hypotheses by the sentence they concern.
 
-    Same rule the commit gate uses for target identity: a span whose start moves by more than delta is a DIFFERENT target, 
+    Same rule the commit gate uses for span identity: a span whose start moves by more than delta is a DIFFERENT span, 
     not a revision of current one. Using the gate's own criterion keeps the harness consistent with the FSM it measures.
     """
     tracks: list[Track] = []
@@ -174,9 +171,8 @@ def build_policies(
     Names carry every parameter that varies (`agreement_n2`, `confidence_n1_tau50`, ...), so no name implies a sibling 
     that was never built. Read the table as 2 curves, not as a winner per row.
 
-    `tau` is SWEPT, never inherited from a single config value. It is a different quantity from both thresholds already in 
-    configs — `commit_confidence_tau` (0.3) is a MEAN over a whole span, `tau_cb` (0.75) scores remasked training logits — 
-    so neither transfers to a per-token display rule. And a single tau produces 1 point, which cannot be compared against 
+    `tau` is SWEPT, never inherited from a config value: `tau_cb` (0.75) scores remasked training logits, so it does not
+    transfer to a per-token display rule. And a single tau produces 1 point, which cannot be compared against 
     Local Agreement's own curve over n; the comparison only means something at matched operating points. .
     """
     policies: dict[str, object] = {"commit_only": reveal_at_commit}
@@ -195,7 +191,7 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
     """Latency and prefix-correctness for one policy over all tracks.
 
     first_token_latency_s    when the FIRST token becomes visible, relative to the commit the FSM would have made:
-                             negative = the policy showed text EARLIER than today's behaviour (the point of the exercise).
+                             negative = the policy showed text EARLIER than commit_only (the point of the exercise).
     frozen_prefix_error      fraction of revealed tokens that disagree with the sentence finally committed — the price
                              of revealing early. 0 for commit_only by construction. This is the FIRST-ORDER cost only:
                              the traces come from unfrozen re-translation, so it cannot capture a frozen prefix
@@ -219,8 +215,8 @@ def score_policy(tracks: list[Track], policy, **kw) -> dict:
         # CAPPED at 1: this answers "how much of the committed sentence was on screen early", and a sentence can't be more 
         # than fully revealed. A policy that displays MORE tokens than the commit ends up with isn't more informative — 
         # the surplus is text that must vanish, and it is charged in frozen_prefix_error / vanished_track_rate. Uncapped, 
-        # the ratio divided a count taken from one stride's hypothesis by the length of a different (shorter) one, which 
-        # is what produced revealed_fraction > 1 on the DLM.
+        # the ratio divides a count taken from one stride's hypothesis by the length of a different (shorter) one, and 
+        # exceeds 1 whenever the DLM canvas shrinks between strides.
         revealed.append(min(k, len(final)) / max(1, len(final)))
         wrong = 0
         

@@ -1,81 +1,42 @@
+# Streaming FSM constants. Values are in seconds or in frames at the 24 fps pose rate of every configured corpus.
+# The duration prior of the semi-Markov decoder is NOT here: it is fitted on the target language's TRAIN unit
+# durations wherever it is needed (infer.duration_decode.DurationModel.fit), with no dev-tuned weight.
 stride_s: 1.0
-# The in-system S1/joint head uses one duration-aware BIO model for Viterbi and first-span marginals.
-# Measured on the TRAIN split by `analyze.py --stage buffer-cap --split train --write-config` (p99 train sentence
-# duration + stride_s + δ/fps, reliable sentences only; run after delta-enc). Label-only constants are measured on
-# train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
-buffer_cap_s:
-    ase: 34.67
-    asf: 36.66
-    bfi: 38.27
-# Shared hard/soft duration scores. tune-decode writes each complete per-language model.
-# Untuned languages stay absent; joint training refuses to borrow another language's settings.
-duration_model:
-    moryossef:
-        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
-        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 2.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
-        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 1.0, "boundary_logit_weight": 1.5, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
-    s1:
-        ase: {"mu_log_s": 1.6786209916263475, "sd_log_s": 0.8209042592951109, "tail_start_s": 33.16960000000017, "completion_bias": 2.0, "boundary_logit_weight": 0.5, "annotation_signature": "caption_units:b1da8831e97d864651552c4c384e32399647f6fe48c6e225b7fa18439b5d08ba"}
-        bfi: {"mu_log_s": 1.6188655189624548, "sd_log_s": 0.8282108283267934, "tail_start_s": 36.93550000000006, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:05f6e1e54e5b8b40769e9c67e9ae470d3e9b6ac9da2dd38a3e4844418285a945"}
-        asf: {"mu_log_s": 1.825962897399607, "sd_log_s": 0.7866484305288837, "tail_start_s": 35.28973999999983, "completion_bias": 4.0, "boundary_logit_weight": 1.0, "annotation_signature": "caption_units:e37f97c7a177f78813ca275fbf81c4f1ca6325958de90327ab04f4e98893b30a"}
+# Latency/capacity bound: a buffer this long is force-committed (flagged PARTIAL). 40 s covers the train p99 unit
+# duration in current corpora and equals S1 maximum training context (bio_pretrain.yaml), which train-bio refuses 
+# to set below this value. Every translation recipe (clean floor, arms) clamps its windows here.
+# A hysteresis commit needs δ of lead-in (the buffer starts at previous terminator − δ) + (K-1)·stride after the
+# terminator (plus up to 1 stride of quantisation), so a unit longer than about 40 - 0.5 - 2 = 37.5 s commits only
+# through the forced path. A pause before a unit also uses cap space, so a few units shorter than 37.5 s can be cut
+# open. The left-truncated tail of a force-committed unit is never translated: Mode-2b training gives the decoder no
+# translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
+buffer_cap_s: 40.0
 boundary_stability:
-    # delta-enc records which duration model was measured; stage 2 refuses a stale tolerance.
-    duration_model_signature:
-        ase: "7bc4201972c87f37"
-        bfi: "c25dd7e1709d0065"
-        asf: "5317eb577c6811c6"
-    # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
-    # delta-enc writes the measured value here):
-    #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
+    # delta_enc_frames (δ, 12 frames = 0.5 s) plays 3 coupled roles:
+    #   1. terminator-stability tolerance: the commit condition = the target span's terminator (first O-or-B —
     #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
     #      hysteresis_strides strides;
     #   2. post-commit overlap: the buffer is cut at (terminator − δ), so an estimate late by ≤ δ still leaves
     #      the next sentence's B in the buffer (the leftover tail is not re-emitted: buffer-start I does not open
-    #      a span, and select_target_span skips any span terminating at or before the commit frontier χ);
-    #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
-    delta_enc_frames:
-        ase: 12
-        asf: 9
-        bfi: 8
-    hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
-    # Fixed lag for B terminators. O terminators need no extra lag. Selected on dev by the lag-only tune-stream stage.
-    commit_lag_s:
-        ase: 4.0
-        asf: 4.0
-        bfi: 4.0
+    #      a span, and candidate_spans skips any span terminating at or before the commit frontier χ);
+    #   3. span-identity tolerance: each candidate span keeps its own hysteresis history (infer/commit_gate.CommitGate);
+    #      a start that moves > δ is another span with its own history.
+    delta_enc_frames: 12 # 0.5s at 24 fps
+    # K: strides a terminator must hold still before it commits — the ONE right-context requirement, for O and B
+    # terminators alike (spec §7.3, k ≈ 2–3). The sampler's context band (dlm.yaml jitter.context_s = (K+1)·stride)
+    # covers this decision horizon.
+    hysteresis_strides: 3
 
 span_selection:
     # Λ_min: shortest span the FSM may commit, in encoder frames. A LABEL-domain floor: it answers "what is the
     # shortest unit we are willing to emit", which is a property of the annotation, not of the head's boundary noise.
-    # 12 frames = 0.5s at 24 fps sits below the p1 annotated unit duration of every corpus (ase 17, asf 26, bfi 22
-    # frames), so no annotated unit is unreachable, and far above the 1-2 frame flicker the floor exists to reject.
-    # It is NOT the re-emission guard: that is the commit-frontier filter select_target_span(skip_term_before=χ),
-    # which uses the commit log instead of a worst-case length bound.
+    # 12 frames = 0.5s at 24 fps rejects brief flicker. Any genuine unit below this floor cannot be emitted exactly;
+    # report its count and the resulting recall ceiling. A low duration percentile is not a minimum. It is NOT the 
+    # re-emission guard: that is the commit-frontier filter candidate_spans(skip_term_before=χ), which uses the 
+    # commit log instead of a worst-case length bound.
     min_span_frames: 12
-# Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
-# tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
-# undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.
-# "translate_partial" emits the tail's decode flagged PARTIAL once its terminator appears (best-effort recovery,
-# out-of-training-distribution; ablation only).
-forced_tail_policy: skip
-translation:
-    # MEAN per-token confidence floor for the streaming commit gate (infer/commit_gate.CommitGate) — RQ2 only;
-    # unused by RQ1 / --method baseline. CALIBRATE THIS to your deployed model: run the clean point
-    # (`--rq 1 --method dlm --severity-grid-s 0.0`) and read mean_translation_confidence, then set τ a touch below
-    # your model's clean mean so clean sentences commit and genuinely low-confidence decodes defer. It is NOT a
-    # dev-tuned quality knob and it does NOT catch confidently-wrong truncations (Ω does). An all-token floor is
-    # far too high for a mean under label smoothing; 0.3 is a permissive placeholder that won't zero streaming 
-    # recall — tighten it once you've measured your model.
-    commit_confidence_tau: 0.3
-    # window = decode under the full buffer's encoder features (matches training: Mode 1/3 condition on the
-    # whole jittered window and learn to disregard right-context, §5.1/§5.3). span = crop conditioning to the
-    # predicted BIO span (spec §7.1 pseudocode `enc[span]`) — a conditioning shape training never produces
-    # except at the zero-jitter corner; kept as an ablation.
-    decode_conditioning: window
+translation: # the decode reads the whole buffer under the Ω soft crop, the conditioning stage 2 trains
     # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
     # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.
     # The block decode walks blocks until every row has emitted EOS, so an unreached slot costs nothing.
     max_text_tokens: 320
-    # Block-decode commit threshold (configs/dlm.yaml spd.tau_dec explains the dial and the reachable range under
-    # label smoothing). Overrides dlm.yaml as read at eval time; the value stamped in the checkpoint is not consulted.
-    tau_dec: 0.5

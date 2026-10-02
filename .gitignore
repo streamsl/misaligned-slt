@@ -1,6 +1,7 @@
 .ignore/
 .claude/
 .vscode/
+.ipynb_checkpoints/
 auslan-daily/
 bobsl/
 how2sign/

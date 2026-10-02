@@ -1,4 +1,4 @@
-# First-span membership as decoder cross-attention bias.
+# First-span membership as a soft crop: one Ω biases the translator encoder self-attention keys and the decoder cross-attention.
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
@@ -7,27 +7,32 @@ import math, warnings
 import torch
 import torch.nn.functional as F
 from infer.duration_decode import DurationDecoder
-from infer.commit_gate import open_span_start, select_target_span
+from infer.commit_gate import candidate_spans, open_span_start
+
+_MIN_SPAN_PROBABILITY = 1e-6  # Below this P, a row has no span to condition on.
 
 
-def membership_bias(membership, frame_mask, commit_mask=None, eps=1e-4):
-    """Normalize the pose PRIOR weights to sum to the valid frame count.
+def membership_bias(membership, frame_mask, commit_mask=None, eps=1e-4, probability=None):
+    """Ω = log(eps + (1-eps)·clamp(m/P, 0, 1)) on valid, uncommitted frames; log(eps) on committed and padded frames.
 
-    This preserves pairwise pose bias differences and makes a uniform prior neutral on valid frames.
-    It does not fix the pose/prompt attention share: actual weights also depend on query-key scores.
-    Padding and committed frames receive the finite floor; the encoder mask separately excludes padding.
+    P (B,) is the probability that the row's selected span exists, so m/P is membership given that span. The division removes the 
+    channel where the caption loss pays the gate to declare a span. There is no rescale by window length: a point mass gives Ω = 0 
+    on the span and log(eps) elsewhere, a crop on a window of any length (the translator then matches a hard crop up to eps leak 
+    when the span starts right after the prompt; see models/unisign.encode_memory). A row with P < 1e-6 has no span to condition on: 
+    it reads the whole window (m = 1), as an ungated model does. `_condition` sets P = 0 on a row whose decode has no span and no 
+    open start, so that row takes  same fallback. `probability=None` means P = 1 (a point mass or a membership already conditioned 
+    on its span). m and P stay live tensors, so the gradient reaches the posterior through both.
     """
     if not 0 < eps < 1: raise ValueError("eps must lie between 0 and 1")
     valid = frame_mask.bool()
     if commit_mask is not None: valid = valid & ~commit_mask.bool()
-    m = torch.where(valid, membership.clamp(0., 1.), torch.zeros_like(membership))
-    omega = torch.log(eps + (1.-eps)*m).masked_fill(~valid, -torch.inf)
-    # `_lse` rather than a plain logsumexp: a row with no attendable frame is all -inf, and logsumexp's backward would
-    # form 0 * NaN there (zeroed downstream, but anomaly mode raises). _lse keeps that row's gradient exactly 0.
-    total = _lse(omega, dim=-1).unsqueeze(-1)
-    # A row with no attendable frame has no mass to redistribute; leave it at the floor rather than dividing by 0.
-    scale = torch.where(total.isfinite(), valid.sum(-1, keepdim=True).clamp(min=1).log() - total, total.new_zeros(()))
-    return (omega + scale).masked_fill(~valid, math.log(eps))
+    if probability is not None:
+        uncertain = (probability < _MIN_SPAN_PROBABILITY)[:, None]
+        # Divide by 1 on an uncertain row: the unused quotient m/0 would put NaN into the gradient.
+        ratio = membership / torch.where(uncertain, torch.ones_like(probability[:, None]), probability[:, None])
+        membership = torch.where(uncertain, torch.ones_like(ratio), ratio)
+    omega = torch.log(eps + (1.-eps)*membership.clamp(0., 1.))
+    return omega.masked_fill(~valid, math.log(eps))
 
 
 class CrossAttnOmegaInjector:
@@ -103,7 +108,7 @@ class CrossAttnOmegaInjector:
 
 
 def omega_cross_bias(omega: torch.Tensor, memory_len: int, dtype: torch.dtype) -> torch.Tensor:
-    """Expand Ω (B, T) into a (B, 1, 1, M) additive bias for the existing cross-attention mask bias.
+    """Expand Ω (B, T) into a (B, 1, 1, M) additive key bias (encoder self-attention and decoder cross-attention).
 
     Left-pads `prompt_len = M − T` zeros: the prompt is never gated, Ω aligns to pose columns [prompt_len, M)
     and broadcasts over heads and queries (query-independent — doc §2.10).
@@ -129,7 +134,7 @@ def _lse(x, dim=-1): # Unreachable states have 0 gradient, including an all-impo
     return torch.where(reachable.squeeze(dim), value, torch.full_like(value, -torch.inf))
 
 
-class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and decoder cross-attention conditioning.
+class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and the Ω soft crop.
     @staticmethod
     @lru_cache(maxsize=2)
     def _recurrence_steps(device_type):
@@ -155,8 +160,8 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         return run
 
     @staticmethod
-    def _forward_step(previous, emission, end, stay, bonus, residual_end, residual_stay, prefix_closures, valid):
-        finished = (previous[:, :, 2:] + end[:, None] + bonus[:, None]).masked_fill(prefix_closures, -torch.inf)
+    def _forward_step(previous, emission, end, stay, residual_end, residual_stay, prefix_closures, valid):
+        finished = (previous[:, :, 2:] + end[:, None]).masked_fill(prefix_closures, -torch.inf)
         boundary = _lse(torch.cat((previous[:, :, :1], previous[:, :, 1:2] + residual_end[:, None, None], finished), -1))
         grown = previous[:, :, 2:] + stay[:, None]
         continuation = torch.cat((grown[:, :, :-2], _lse(grown[:, :, -2:])[:, :, None]), -1) if end.shape[1] > 1 else grown[:, :, :0]
@@ -173,13 +178,13 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         return torch.where(valid[:, None], values, torch.full_like(values, -torch.inf)).exp()
 
     @staticmethod
-    def _backward_step(beta, close, opened, emission, end, stay, bonus, eligible, next_age, scale, more, active, valid):
+    def _backward_step(beta, close, opened, emission, end, stay, eligible, next_age, scale, more, active, valid):
         boundary = _lse(torch.stack((emission[:, 0] + beta[:, 0], emission[:, 1] + beta[:, 1]), 1))
-        closing = boundary[:, None] + end + bonus
+        closing = boundary[:, None] + end
         age_beta = _lse(torch.stack((closing, emission[:, 2:3] + stay + beta[:, 1:][:, next_age]), -1))
         future = torch.cat((boundary[:, None], age_beta), 1) - scale[:, None]
         close_next = _lse(torch.stack((
-            closing.masked_fill(~eligible[None], -torch.inf), emission[:, 2:3] + stay + close[:, next_age]
+            closing.masked_fill(~eligible, -torch.inf), emission[:, 2:3] + stay + close[:, next_age]
         ), -1)) - scale[:, None]
         open_next = emission[:, 2:3] + stay + opened[:, next_age] - scale[:, None]
         beta = torch.where(more[:, None], future, torch.zeros_like(future))
@@ -188,12 +193,12 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         return beta, close, opened, MembershipGate._members(active, close, opened, valid)
 
     def posterior(self, logits, lengths, min_span_frames=1, commit_mask=None, known_start=False, *, decoder=None, timestamps_s=None):
-        floor = int(min_span_frames)
+        floor = int(min_span_frames)  # Λ_min in frames, 1 value for every row
         if floor < 1: raise ValueError("min_span_frames must be positive")
         scores = (decoder or DurationDecoder()).path_scores(
-            logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s, min_age_states=floor
+            logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s, min_age_states=floor if len(logits) else 1
         )
-        e, factors, bonus, n = scores.emissions, scores.factors, scores.bonus, scores.lengths
+        e, factors, n = scores.emissions, scores.factors, scores.lengths
         b, padded_t, _ = e.shape
         t = int(n.max()) if b else 0
         if not t:
@@ -205,7 +210,7 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         # Separate storage prevents compiler guards on changing residual-column offsets.
         end, stay, residual_end, residual_stay = (x.contiguous() for x in factors.unbind(1))
         ages = end.shape[1]
-        eligible = torch.arange(1, ages + 1, device=e.device) >= floor
+        eligible = (torch.arange(1, ages + 1, device=e.device) >= floor).repeat(b, 1)  # (B, ages)
         initial = scores.initial[:, :ages + 2]
         scale = _lse(initial); full = initial - scale[:, None]
         pref = full
@@ -213,7 +218,7 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
 
         # Carry full-path and no-earlier-completion recurrences together.
         state = torch.stack((full, pref), 1)
-        prefix_closures = torch.stack((torch.zeros_like(eligible), eligible))[None]
+        prefix_closures = torch.stack((torch.zeros_like(eligible), eligible), 1)
         forward_step, backward_step = self._recurrence_steps(e.device.type)
 
         # One unbind joins time-step gradients once; repeated slices scatter into the full sequence per step.
@@ -221,9 +226,7 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         for k in range(1, t):
             age = min(k - 1, ages - 1)
             step = self._forward_step if k == 1 else forward_step
-            state, scale = step(
-                state, emissions[k], end, stay, bonus, residual_end[:, age], residual_stay[:, age], prefix_closures, k < n
-            )
+            state, scale = step(state, emissions[k], end, stay, residual_end[:, age], residual_stay[:, age], prefix_closures, k < n)
             prefixes.append(state[:, 1]); scales.append(scale)
 
         # After a visible start, a suffix can enter O or another sentence, never the initial leading fragment.
@@ -235,8 +238,8 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         for k in range(t - 2, -1, -1): # Initial suffixes and the first-frame view have different gradient/stride layouts.
             step = self._backward_step if k in (t - 2, 0) else backward_step
             beta, close, opened, members = step(
-                beta, close, opened, emissions[k + 1], end, stay, bonus,
-                eligible, next_age, scales[k + 1], k + 1 < n, prefixes[k][:, 2:], k < n
+                beta, close, opened, emissions[k + 1], end, stay, eligible, next_age, 
+                scales[k + 1], k + 1 < n, prefixes[k][:, 2:], k < n
             )
             members_by_time.append(members)
 
@@ -244,14 +247,6 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         p_open = opened.gather(1, (n - 1).clamp(min=0)[:, None]).squeeze(1)
         return SpanPosterior(scores.restore(F.pad(closed, (0, padded_t - t))),
                              scores.restore(F.pad(opened, (0, padded_t - t))), starts.sum(1), p_open)
-
-    @staticmethod
-    def _span_iou(a: tuple[int, int] | None, b: tuple[int, int] | None) -> float: # tIoU of 2 [start, terminator) frame spans.
-        if a is None or b is None: return 0.0
-        lo = max(a[0], b[0]); hi = min(a[1], b[1])
-        inter = max(0, hi - lo)
-        union = (a[1] - a[0]) + (b[1] - b[0]) - inter
-        return inter / union if union > 0 else 0.0
 
     def forward(
         self, bio_logits, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, min_span_frames=1,
@@ -266,7 +261,10 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
                 if not torch.equal(committed, prefix): raise ValueError("Committed frames must form a prefix")
             membership = self._provided_membership(anchor_override, bio_logits.shape[1])
             omega = membership_bias(membership, frame_mask, commit_mask, eps)
-            return omega_cross_bias(omega, int(memory_len), bio_logits.dtype), {"skip": torch.zeros(len(bio_logits), dtype=torch.bool)}
+            return omega_cross_bias(omega, int(memory_len), bio_logits.dtype), {
+                "skip": torch.zeros(len(bio_logits), dtype=torch.bool), "uncertain_rows": 0,
+                "uncertain": torch.zeros(len(bio_logits), dtype=torch.bool),
+            }
         return self._condition( # Inference uses predicted state or an explicitly supplied proposal; no supervision is accepted.
             bio_logits, frame_mask, memory_len, commit_mask=commit_mask, eps=eps, min_span_frames=min_span_frames,
             seam_is_terminator=seam_is_terminator, stream_start=stream_start, anchor_override=anchor_override,
@@ -279,63 +277,46 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         start, end = anchors[:, :1], anchors[:, 1:2]
         return ((positions >= start) & ((end < 0) | (positions < end))).float()
 
-    def for_supervision( # Train/dev loss only: GT selects closed/open state and diagnostics, never mask boundaries.
-        self, bio_logits, bio_labels, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, 
-        min_span_frames=1, gt_spans=None, timestamps_s=None, decoder=None,
-    ):
-        if gt_spans is None:
-            if bio_labels is None: raise ValueError("Supervised membership requires target spans or BIO labels")
-            gt_spans = [
-                select_target_span(row[:int(n)], max(1, min_span_frames))
-                for row, n in zip(bio_labels, frame_mask.long().sum(1))
-            ]
-        if len(gt_spans) != len(bio_logits): raise ValueError("One supervised target state is required per row")
-        return self._condition(
-            bio_logits, frame_mask, memory_len, commit_mask=commit_mask, eps=eps, min_span_frames=min_span_frames,
-            gt_spans=gt_spans, timestamps_s=timestamps_s, decoder=decoder,
-        )
-
     def _condition(
         self, bio_logits, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, min_span_frames=1,
-        seam_is_terminator=True, stream_start=False, anchor_override=None, gt_spans=None, timestamps_s=None, decoder=None,
+        seam_is_terminator=True, stream_start=False, anchor_override=None, timestamps_s=None, decoder=None,
     ):
         lengths = frame_mask.long().sum(1)
         known_start = torch.full_like(lengths, bool(stream_start), dtype=torch.bool)
         if commit_mask is not None and seam_is_terminator: known_start = known_start | commit_mask.any(dim=1)
         decoder = decoder or DurationDecoder()
         tags = decoder.decode(bio_logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s)
-        spans = [select_target_span(tags[b, :int(n)], max(1, min_span_frames)) for b, n in enumerate(lengths)]
+        floor = max(1, int(min_span_frames))
+        spans = [next(candidate_spans(tags[b, :int(n)], floor), None) for b, n in enumerate(lengths)]
         starts, terms, has_term = [], [], []
-        use_open, hits, targets = [], 0, 0
-
         for b, n in enumerate(lengths):
             span = spans[b]
             open_start = open_span_start(tags[b, :int(n)])
             starts.append(span[0] if span else (open_start if open_start is not None else -1))
             terms.append(span[1] if span else -1); has_term.append(span is not None)
-            closed_state = span is not None
-            if gt_spans is not None:
-                gt = gt_spans[b]
-                closed_state = gt is not None
-                if gt is not None: targets += 1; hits += int(self._span_iou(span, gt) >= .5)
-            use_open.append(not closed_state)
 
-        posterior = self.posterior(
-            bio_logits, lengths, max(1, min_span_frames), commit_mask, known_start, decoder=decoder, timestamps_s=timestamps_s
-        )
-        open_rows = torch.tensor(use_open, device=bio_logits.device)[:, None]
-        membership = torch.where(open_rows, posterior.open, posterior.closed)
+        posterior = self.posterior(bio_logits, lengths, floor, commit_mask, known_start, decoder=decoder, timestamps_s=timestamps_s)
+        open_rows = ~torch.tensor(has_term, device=bio_logits.device)
+        membership = torch.where(open_rows[:, None], posterior.open, posterior.closed)
+        probability = torch.where(open_rows, posterior.open_probability, posterior.closed_probability)
+        # No decoded span and no open start: the translator reads the whole window (P = 0 fallback).
+        probability = torch.where(torch.tensor(starts, device=probability.device) < 0, torch.zeros_like(probability), probability)
 
         if anchor_override is not None: # Given-span evaluation conditions on supplied boundaries: a point-mass interval posterior.
             fixed = self._provided_membership(anchor_override, bio_logits.shape[1])
-            membership = torch.where(anchor_override[:, :1] >= 0, fixed, membership)
+            given = anchor_override[:, 0] >= 0
+            membership = torch.where(given[:, None], fixed, membership)
+            probability = torch.where(given, torch.ones_like(probability), probability)
 
-        omega = membership_bias(membership, frame_mask, commit_mask, eps)
+        omega = membership_bias(membership, frame_mask, commit_mask, eps, probability)
         bias = omega_cross_bias(omega, memory_len=int(memory_len), dtype=bio_logits.dtype)
         return bias, {
             "skip": torch.tensor(starts) < 0,
-            "anchor_hit_rate": hits/max(1, targets), "closed_probability": posterior.closed_probability.detach().mean(),
-            "open_probability": posterior.open_probability.detach().mean(), "anchors": (
+            "closed_probability": posterior.closed_probability.detach().mean(),
+            "open_probability": posterior.open_probability.detach().mean(),
+            "uncertain_rows": int((probability < _MIN_SPAN_PROBABILITY).sum()),
+            "uncertain": (probability < _MIN_SPAN_PROBABILITY).detach().cpu(),   # per row: Ω fell back to the whole window
+            "anchors": (
                 torch.tensor(starts, device=bio_logits.device), torch.tensor(terms, device=bio_logits.device),
                 torch.tensor(has_term, device=bio_logits.device)
             )

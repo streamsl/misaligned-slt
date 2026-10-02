@@ -7,16 +7,15 @@
 backbone never touches the shared training/inference code — we implement 1 `SLTFrontEnd` subclass in that backbone's module.
 
 A front end exposes two frame-aligned/sequence views plus the AR + DLM decode hooks:
-  extract_bio_tap(poses, frame_mask)  -> (bio_tap, bio_mask, timestamps)   # per-frame, length T  -> BIO head
-  encode_memory(bio_tap, bio_mask)    -> (enc_hidden, enc_mask)            # cross-attn memory, length M
-  encode(poses, frame_mask)           = the two composed
+  extract_bio_tap(poses, frame_mask)  -> (bio_tap, bio_mask, timestamps)   # translator per-frame features, length T
+  encode_memory(bio_tap, bio_mask, omega_bias=None) -> (enc_hidden, enc_mask)  # memory, length M; Ω biases encoder keys
   ar_loss / ar_generate                                                    # autoregressive decoder
   make_dlm_decoder(block_size) -> dmax.OPUTBlockDiffusionDecoder           # block-diffusion decoder
 
-The BIO tap is the per-frame feature BEFORE the seq2seq encoder. For Uni-Sign the encoder memory is LONGER than the BIO tap 
-(the task prompt is prepended to the pose tokens), so M = prompt_len + T while the BIO tap stays length T (frame-aligned, 
-BIO/streaming safe). Callers that need the OPUT eval-rollout or the confidence-bound re-encode must use the BIO mask 
-(length T), not the encoder mask (length M) — they differ for Uni-Sign.
+`bio_tap` is the TRANSLATOR's per-frame pose feature BEFORE the seq2seq encoder; the segmentation branch reads its own pose 
+encoder (MisalignedSLTModel.segment). For Uni-Sign the encoder memory is LONGER than the tap (the task prompt is prepended 
+to the pose tokens), so M = prompt_len + T while the tap stays length T (frame-aligned). Callers that need the OPUT 
+eval-rollout or the confidence-bound re-encode must use the per-frame mask (length T), not the encoder mask (length M).
 """
 from __future__ import annotations
 import torch
@@ -29,7 +28,7 @@ from models.membership_gate import CrossAttnOmegaInjector
 class SLTFrontEnd(nn.Module):
     """Backbone-agnostic SLT front end. Subclasses set `lm_model`, `tokenizer`, `pad_token_id`, `eos_token_id`,
     `decoder_start_id`, `bio_tap_dim` and implement `extract_bio_tap` / `encode_memory` / `ar_loss` / `make_dlm_decoder` / 
-    `load_pretrained`. The composed `encode`, the AR generation, and the OPUT eval-reencode helper are shared here."""
+    `load_pretrained`. The AR generation and the Ω injector are shared here."""
     lm_model: nn.Module
     bio_tap_dim: int
     pad_token_id: int
@@ -40,7 +39,8 @@ class SLTFrontEnd(nn.Module):
     def extract_bio_tap(self, poses, frame_mask, timestamps_s=None):
         raise NotImplementedError
 
-    def encode_memory(self, bio_tap, bio_mask):
+    def encode_memory(self, bio_tap, bio_mask, omega_bias=None):
+        # omega_bias (B,1,1,M): the membership prior, added to the LM encoder's self-attention keys (None = ungated).
         raise NotImplementedError
 
     def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
@@ -52,43 +52,19 @@ class SLTFrontEnd(nn.Module):
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
         raise NotImplementedError
 
-    def freeze_pose_backbone(self, freeze_projection: bool = False) -> int:
-        return 0
-
     # ── membership gate on the AR path (shared) ───────────────────────────────
-    def _omega_injector(self) -> CrossAttnOmegaInjector:
-        # Lazily attach cross-attention Ω hooks to the AR language model (once). The DLM arm gates in its own
-        # manual decode loop; the AR arm reuses HF forward/generate, so the gate rides in on these hooks.
-        return CrossAttnOmegaInjector.attach(self.lm_model)  # 1 per stack; DLM decoder shares it
-
     def ar_omega_context(self, omega_bias):
         # Context manager: within it, every AR cross-attention adds Ω (None → identity). Wraps ar_loss /
         # ar_generate / the AR confidence-bound forward so all AR decodes see the same conditioning.
-        return self._omega_injector().with_omega(omega_bias)
-
-    # ── shared ────────────────────────────────────────────────────────────────
-    def encode(self, poses, frame_mask, timestamps_s=None):
-        # -> (bio_tap, bio_mask, timestamps, enc_hidden, enc_mask).
-        bio_tap, bio_mask, timestamps = self.extract_bio_tap(poses, frame_mask, timestamps_s)
-        enc_hidden, enc_mask = self.encode_memory(bio_tap, bio_mask)
-        return bio_tap, bio_mask, timestamps, enc_hidden, enc_mask
-
-    def eval_encode_memory_fn(self, bio_tap, bio_mask):
-        # Closure that re-encodes the memory in eval mode (dropout off) — the encoder side of DMax's OPUT
-        # eval-mode rollout. The DLM decoder toggles its own layers to eval around this call.
-        def encode():
-            was_training = self.training
-            self.eval()
-            try: return self.encode_memory(bio_tap, bio_mask)
-            finally: self.train(was_training)
-        return encode
+        # 1st call attaches the Ω hooks to AR language model (1 injector per stack, shared with the DLM decoder).
+        # DLM arm gates in its own manual decode loop; AR arm reuses HF forward/generate, so Ω rides in on these hooks.
+        return CrossAttnOmegaInjector.attach(self.lm_model).with_omega(omega_bias)
 
     @torch.no_grad()
-    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens=128, num_beams=1, decoder_start_id=None, omega_bias=None):
-        # AR generation over a precomputed encoder memory. Returns (tokens, per-token confidence). Under
-        # `omega_bias`, every cross-attention step is membership-gated (same Ω the DLM decode uses).
-        start = decoder_start_id if decoder_start_id is not None else self.decoder_start_id
-        kwargs = {} if start is None else {"decoder_start_token_id": start}
+    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens=128, num_beams=1, omega_bias=None):
+        # AR generation over a precomputed encoder memory. Returns (tokens, per-token confidence). 
+        # Under `omega_bias`, every cross-attention step is membership-gated (same Ω the DLM decode uses).
+        kwargs = {} if self.decoder_start_id is None else {"decoder_start_token_id": self.decoder_start_id}
         with self.ar_omega_context(omega_bias):
             generated = self.lm_model.generate(
                 encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask,

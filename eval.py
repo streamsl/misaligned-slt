@@ -18,7 +18,7 @@ pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blo
 
 from poses import load_pose_window
 from data.windowing import BIO, make_bio_labels
-from data.loader import ANNOTATION_PROTOCOL, VideoRecord, annotation_fingerprint, load_language_records
+from data.loader import ANNOTATION_PROTOCOL, VideoRecord, _cached_language_records, annotation_fingerprint, load_language_records
 from data.batch import repeat_last_frame
 
 from transformers import T5Tokenizer, AutoTokenizer
@@ -79,20 +79,13 @@ def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path
     return path
 
 def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
-    # Predicted-segments JSON: dict {vid: [{start_s,end_s}]} or list-of-rows form.
+    # Predicted-segments JSON: a stamped dict {vid: [{start_s, end_s}]} under `predictions`, `segments` or `events`.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "predictions" in raw: raw = raw["predictions"]  # stamped form
     if isinstance(raw, dict) and "segments" in raw: raw = raw["segments"]  # stamped gold-segments file (write_gold_segments)
     if isinstance(raw, dict) and "events" in raw: raw = raw["events"]  # RQ2 events file: its spans feed the same-span control.
-    if isinstance(raw, dict): return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
-    predictions: dict[str, list[Segment]] = {}
-    for row in raw:
-        if "video_id" in row and "segments" in row:
-            predictions[str(row["video_id"])] = [Segment(float(i["start_s"]), float(i["end_s"])) for i in row["segments"]]
-        elif "video_id" in row and "start_s" in row and "end_s" in row:
-            predictions.setdefault(str(row["video_id"]), []).append(Segment(float(row["start_s"]), float(row["end_s"])))
-        else: raise ValueError(f"Unsupported prediction row format: {row}")
-    return predictions
+    if not isinstance(raw, dict): raise TypeError(f"{path}: a prediction file is a stamped JSON dict, not {type(raw).__name__}")
+    return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
 
 def stamped_annotation(path: str | Path) -> str | None:
     # The annotation fingerprint an artifact was made under: flat (RQ1, segmenter-eval payloads) or under `provenance`.
@@ -207,30 +200,14 @@ def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEven
             flagged_partial=bool(value.get("flagged_partial", False)),
             commit_time_s=float(commit) if commit is not None else None,
         )
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        if video_id is None: raise ValueError("Tuple/list prediction rows require an enclosing video_id")
-        return PredictionEvent(video_id=video_id, start_s=float(value[0]), end_s=float(value[1]))
     raise TypeError(f"Unsupported prediction segment row: {value!r}")
 
 
 def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, dict) and "events" in data: data = data["events"]  # stamped form (see _write_events_json)
-    out: dict[str, list[PredictionEvent]] = {}
-    if isinstance(data, dict):
-        for video_id, segments in data.items():
-            out[str(video_id)] = [_segment_from_any(row, video_id=str(video_id)) for row in segments]
-        return out
-
-    if not isinstance(data, list): raise TypeError("Prediction file must be a dict or list JSON payload")
-    for row in data:
-        if isinstance(row, dict) and "segments" in row:
-            video_id = str(row["video_id"])
-            out[video_id] = [_segment_from_any(seg, video_id=video_id) for seg in row["segments"]]
-        else:
-            event = _segment_from_any(row)
-            out.setdefault(event.video_id, []).append(event)
-    return out
+    if not isinstance(data, dict): raise TypeError(f"{path}: an events file is a stamped JSON dict, not {type(data).__name__}")
+    return {str(video_id): [_segment_from_any(row, video_id=str(video_id)) for row in segments] for video_id, segments in data.items()}
 
 
 def controlled_windows(
@@ -888,8 +865,6 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     if fsm_bio_rows:
         fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
         print("[stream] FSM BIO (stitched decoded FSM tags vs GT): " + " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
-        run_streaming.last_fsm_bio = fsm_bio  # run_rq2 picks this up for the output payload
-    else: run_streaming.last_fsm_bio = None
     return to_source(predicted, records)
 
 
@@ -951,6 +926,10 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             # [start, end + 1 frame]: the crop holds the span's terminator frame unless the span ends at the stream end (as run_offline's 
             # window does), so a joint translator's readout inside it doesn't flip between closed and open with the float rounding of `end`.
             w_end = min(float(record.pose.duration_s), float(span.end_s) - record.pose.offset_s + 1.0 / float(record.pose.fps))
+            # An online span reads only the frames its buffer held at commit (timestamps < commit time). A cap-forced open span ends
+            # at that time and has no terminator frame to add; the epsilon absorbs the float noise of the source-time round trip.
+            commit = (rows[i] if i < len(rows) else {}).get("commit_time_s")
+            if commit is not None: w_end = min(w_end, float(commit) - record.pose.offset_s - 1e-6)
             poses, timestamps = load_pose_window(record.pose, start_s, w_end, normalize=True)
             if poses.shape[0] == 0: continue
             items.append((poses, timestamps, start_s)); kept.append(span)
@@ -1066,11 +1045,11 @@ def rq2_translator_token(args: argparse.Namespace) -> str:
     An ablation run is the same method under another config, so without the config stem it writes the main row's
     events, scores and stability file over the top and prints nothing.
     """
-    if getattr(args, "no_translate", False): return "none"
-    method = "clean" if args.method == "baseline" else str(args.method)
     cfg = getattr(args, "method_config", None)
-    if not cfg or str(cfg) == METHOD_CONFIGS[args.method]: return method
-    return f"{method}-{Path(cfg).stem.removeprefix('ablation_').replace('_', '-')}"
+    suffix = "" if not cfg or str(cfg) == METHOD_CONFIGS[args.method] \
+                else "-" + Path(cfg).stem.removeprefix("ablation_").replace("_", "-")
+    if getattr(args, "no_translate", False): return "none" + suffix
+    return ("clean" if args.method == "baseline" else str(args.method)) + suffix
 
 
 def rq2_output_stem(when: str, spans: str, decode: str, translator: str, language: str, split: str) -> str:
@@ -1178,10 +1157,8 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
             f"--segments {args.segments} carries no segmenter_arch/decode provenance, so this row can't name itself. Span files are written by "
             f"`eval.py --emit-gold-segments` and `analyze.py --stage segmenter-infer`; RQ2 events file without both keys must be regenerated."
         )
-        # Spans an FSM committed online (row 11, online same-span control) keep the name `online`: the crop [start, end + 1 frame] reads only 
-        # frames the buffer held at commit time (the commit needs the terminator), and it uses the span normalization of online cascades, so 
-        # re-translating them moves the translator alone. The events keep their commit times. An exception: a cap-forced cut of an open span 
-        # ends at the buffer's exclusive end, so its crop reads 1 frame more.
+        # Spans an FSM committed online keep the name `online`: run_cascade clamps each crop to frames the buffer held at commit time, and it 
+        # uses span normalization of online cascades, so re-translating them moves translator alone. The events keep their commit times.
         when = "online" if src.get("when") == "online" else "offline"
         stem = rq2_output_stem(when, spans, decode, rq2_translator_token(args), args.language, args.split)
         if Path(f"outputs/{stem}.json").resolve() == Path(args.segments).resolve(): raise SystemExit(
@@ -1305,6 +1282,10 @@ def _load_segmenter(args):
         f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --checkpoint "
         f"at the matching model, or align `pretrain_languages` (a pooled checkpoint is a DIFFERENT model from a monolingual one)."
     )
+    if "pretrain_pool" in _meta:  # a segmenter checkpoint (S1 or Moryossef); a stage-2 arm's head carries the arm's own provenance
+        from train.bio_pretrain import require_segmenter_data
+        train_labels = annotation_fingerprint(_cached_language_records(load_yaml(args.data_config), args.language, "train"))
+        require_segmenter_data(_meta, args.language, train_labels, load_yaml(args.inference_config)["buffer_cap_s"], checkpoint)
     if args.segmenter_arch == "moryossef":
         model.release_stats = _meta.get("release_stats")
         if model.release_stats is None: raise SystemExit(
@@ -1354,7 +1335,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     rq2_rows = evaluate_predicted_events(
         events, gold, list(thresholds), char_level=char_level_for_target(target_language(data_cfg, args.language))
     )["thresholds"]
-    rq2_protocol = {f"{r['tiou_threshold']:g}": r["segmentation"] for r in rq2_rows}
+    rq2_protocol = {f"{r['tiou_threshold']:g}": {
+        **r["segmentation"], "count_ratio": r["total_predictions"] / max(1, r["total_gold"])
+    } for r in rq2_rows}
     for t in thresholds: print(
         f"[segmenter-eval] tIoU {t:g}: moryossef-protocol F1 {metrics.get(f'phrase_tiou_f1@{t:g}', float('nan')):.3f} | "
         f"rq2-protocol F1 {rq2_protocol[f'{t:g}']['f1']:.3f} (quote the rq2-protocol number across tables)", flush=True

@@ -89,6 +89,8 @@ set -e  # Stop the runbook if a training or evaluation command fails.
 #   moryossef26/trainer.py builds data/chunks.py ChunkDataset with release=), augmentation block, BIO labels, dev chunks,
 #   monitor and best-epoch floor. So the cascade compares models and input contracts, not data or recipe.
 #   The offline whole-video pass overlap-stitches its 1024-frame RoPE windows, as S1 does.
+#   Its dev loader uses batch size 1: the release model attends to zero padding (no key mask), and whole-video and
+#   online inference never pad, so a padded dev chunk would score an input that deployment never sees.
 #   Pooled checkpoints live in ${corpus}-named directories (multi_ase-asf-bfi); utils.checkpoint_dir
 #   is the one resolver for every reader and writer. Never build a segmenter checkpoint path by hand.
 python train.py --stage train-moryossef        # -> checkpoints/moryossef/multi_ase-asf-bfi/model.pt
@@ -98,7 +100,7 @@ python train.py --stage train-moryossef        # -> checkpoints/moryossef/multi_
 #   on the pool; translation stays monolingual in Stage B. The encoder trains too; stage 2 loads encoder AND head
 #   via bio_head_init into its SEGMENTATION branch (the translator keeps its own encoder).
 #   Rates (bio_pretrain.yaml sets both; S1 reads no rate from dlm.yaml): BIO head learning_rate 2e-4 (random init),
-#   pose encoder backbone_lr 6e-5 (released Uni-Sign init). The checkpoint stamps learning_rate, backbone_lr and
+#   pose encoder backbone_lr 1e-4 (released Uni-Sign init). The checkpoint stamps learning_rate, backbone_lr and
 #   augmentation, so --resume refuses a drift. backbone_lr is an S1-only key.
 #   Whole-input chunks, BIO only (data/chunks.py): each epoch tiles every record (a clean segment of a video,
 #   docs/data_pipeline.md §5f) from a random phase with chunk
@@ -161,8 +163,8 @@ python train.py --stage train-bio              # -> checkpoints/bio_s1/multi_ase
 #   Changed minimum span (Lambda_min) -> the arms (sampler target, gate and FSM share it), the clean baseline (its
 #     sampler target; it stamps Lambda_min and eval refuses a stamp that differs) and every RQ2 event row.
 #   Changed inference.yaml translation block -> evaluation only; not a training input. max_text_tokens reaches every
-#     RQ1/RQ2 decode. The DLM decode threshold has one source, dlm.yaml spd.tau_dec: stage 2 reads it in the Mode-2a
-#     decodes and eval reads it from the method config, so a change means a fresh DLM arm.
+#     RQ1/RQ2 decode. The DLM decode threshold has one source, dlm.yaml spd.tau_dec: stage 2 reads it in its dev
+#     decodes (checkpoint selection) and eval reads it from the method config, so a change means a fresh DLM arm.
 #   Changed ground truth -> every dependent training/evaluation stage (the duration prior refits from train labels;
 #     the stage-2 warm start refuses a clean translator with another annotation_fingerprint).
 LANG=ase      # ase (ASL) | asf (Auslan) | bfi (BSL)
@@ -209,33 +211,28 @@ python train.py --stage train-slt --language "$LANG" --slt-config configs/baseli
 #   1e-5 only for the MLP + translation network and 1e-3 for their visual heads, so they do not support 1e-5 for the
 #   pose encoders or the BIO head, and no measurement on this model supports it: watch dev BIO loss and translation CE
 #   over epochs 0-3.
-#   BatchNorm: the translator encoder's BatchNorm layers run in train mode on the gradient paths. The no-grad decodes
-#   that must match inference re-extract the translator features in eval mode: the DLM OPUT rollout
-#   (MisalignedSLTModel.eval_encode_memory_fn) and, in both arms, the confidence-bound selection decode and its
-#   full-view teacher (_confidence_bound). Cost: one extra translator ST-GCN forward per OPUT group and per CB call.
+#   BatchNorm: the translator encoder's BatchNorm layers run in train mode on the gradient paths. The one no-grad
+#   decode that must match inference, the DLM OPUT rollout (MisalignedSLTModel.eval_encode_memory_fn), re-extracts
+#   the translator features in eval mode. Cost: one extra translator ST-GCN forward per OPUT group.
 #   Augmentation: none (dlm.yaml augmentation: null; train-slt refuses a non-null block, and the checkpoint stamps
-#   it). The arms and the clean floor then differ only by the method, inference never augments, and the CB student
-#   and teacher get the same preprocessing. Every stage-2 window is on the native 24 fps grid, as in the FSM and eval,
-#   so delta and Λ_min are plain frame counts (12 and 12).
+#   it). The arms and the clean floor then differ only by the method, and inference never augments. Every stage-2
+#   window is on the native 24 fps grid, as in the FSM and eval, so delta and Λ_min are plain frame counts (12 and 12).
 #   The checkpoint stamps learning_rate and augmentation, so --resume refuses a drift.
 #   train-slt refuses lambda_bio > 0 without a segmentation branch and lambda_bio = 0 with one.
 #   The trainer scores the initialization on dev as epoch 0, so the selected checkpoint (monitor val_joint_score) is
 #   never worse on dev than its start. model.pt stamps best_epoch; a best_epoch of 0 prints a warning (the shipped model
 #   is the initialization), and report.py progress prints the stamp per arm.
 #   Text routing follows the model's OWN predicted state; GT decides only which text exists (P1):
-#     complete GT target (Mode 1/3) contained in the predicted first span (delta tolerance at each end) -> the full-text loss
-#       trains the translator and, through Ω, the segmentation branch. The rule has no upper limit on overshoot: a
-#       predicted span that merges the target unit with the next unit is covered, and the translator learns to write only
-#       the first unit's text from it (a deliberate choice, see Key design decisions);
+#     complete GT target (Mode 1/3) covered by the predicted closed first span -> the full-text loss trains the
+#       translator and, through Ω, the segmentation branch. Covered: the span misses at most delta frames of the unit
+#       IN TOTAL (start and end together) and holds at least Λ_min frames of it, so
+#       overlap >= max(Λ_min, unit length - delta) (forward_loss, covers). The rule has no limit past the unit: a
+#       predicted span that merges the target unit with the next unit is covered, and the translator learns to write
+#       only the first unit's text from it (a deliberate choice, see Key design decisions);
 #     not covered -> the same loss as a CRITIC: translator frozen, its features detached, so only Ω and the
 #       segmentation branch learn (logged: text_covered_rate);
-#     GT unit right-truncated with a full view AND a predicted CLOSED span that starts inside it (a premature commit
-#       the FSM would make) -> the confidence-bound term with Ω detached (logged: cb_premature_rate). It is an
-#       UNLIKELIHOOD term, -log(1 - p(t)), on the truncated decode's OWN token t, only at slots where that decode is
-#       confident (> tau_cb 0.75) and differs from a full-evidence decode that equals the reference. It names no target
-#       token, so the truncated input gets no text target (P1). It only lowers the token confidence that the reveal
-#       policies read (B6b); the FSM commit reads no confidence;
-#     right-truncated GT + predicted open span -> no text loss. A complete GT row can still train Ω through the critic.
+#     right-truncated GT (Mode 2a) -> no text loss, whatever the prediction: a truncated window never receives text
+#       (P1), so it is BIO-only. A complete GT row with an open prediction can still train Ω through the critic.
 #   Covered and critic rows are separate per-token means, summed (logged: text_critic_loss), so the translator's step
 #   does not scale with the covered share of the batch. Through Ω, each group's gradient to the segmentation branch is
 #   scaled by its token share n_g/N (N = valid target tokens of the groups that run), so every supervised token pulls
@@ -250,9 +247,9 @@ python train.py --stage train-slt --language "$LANG" --slt-config configs/baseli
 #   measured mode mix is ever a training input (B4b is analysis only).
 #   Post-commit shift (WindowSampler.materialize): when a quarantined unit ends inside a window before the text
 #   target starts, the left edge moves to that unit's end - delta, never to the left, as the FSM's post-commit cut
-#   would. The window is then relabelled from the new edge, and a Mode-2a full view takes the same shift.
+#   would. The window is then relabelled from the new edge.
 #   Interrupted runs of this architecture use --resume. Watch val_phrase_tiou_f1, boundary precision/recall,
-#   val_translation_bleu4, text_covered_rate and cb_premature_rate together.
+#   val_translation_bleu4 and text_covered_rate together.
 python train.py --stage train-slt --language "$LANG" --slt-config configs/ar.yaml    # gated AR de-risk (§9.3)
 python train.py --stage train-slt --language "$LANG" --slt-config configs/dlm.yaml   # DLM -> checkpoints/dlm/$LANG
 
@@ -316,8 +313,6 @@ for M in baseline ar dlm; do python eval.py --rq 1 --method $M --language "$LANG
 #   eval as --method-config. Its stem enters the translator token (dlm-<stem>), so it never overwrites the arm's
 #   events, scores or stability file, and report.py's closed vocabulary keeps it out of the main results table.
 #   Read it under the FSM with --no-translate against row 10 with --no-translate (see "How to read the ladder").
-#   The confidence-bound term has no CB-off arm. Its effect is read from the stage-2 training log: cb_premature_rate
-#   (Mode-2a rows with a predicted premature commit) and cb_active_count (slots where the term fires).
 #   Other controls: --segmenter-decode plain and Moryossef --segmenter-init released/random (B4a), and AR vs DLM
 #   (every joint row).
 
@@ -377,9 +372,8 @@ python eval.py --rq 2 --stream --segmenter-arch s1 --method baseline \
 python eval.py --rq 2 --stream --stability --method ar  --language "$LANG" --split test --allow-test  # row 10 (AR)
 python eval.py --rq 2 --stream --stability --method dlm --language "$LANG" --split test --allow-test  # row 10 (DLM)
 #   Row 11 — online same-span control: row 10's committed spans, re-translated by the clean translator. The crop is
-#   [start, end + 1 frame], so every frame it reads was in the buffer at commit time (a normal commit needs the
-#   terminator). One exception: a cap-forced cut of an open span ends at the buffer end, so its crop reads one frame
-#   more. The crop uses the span normalization of rows 8-9. The events keep row 10's commit times and forced
+#   [start, end + 1 frame], clamped to the frames the buffer held at commit time, so it reads no frame that row 10
+#   did not have. The crop uses the span normalization of rows 8-9. The events keep row 10's commit times and forced
 #   flags, and the row keeps when=online. So 11 vs 10 moves only the translator conditioning (clean translator on a
 #   hard crop against the joint arm's soft crop over the buffer) at the same committed spans.
 python eval.py --rq 2 --segments outputs/rq2_online_joint-ar_duration_ar_${LANG}_test.json   --method baseline --language "$LANG" --split test --allow-test  # row 11 (AR)
@@ -465,7 +459,7 @@ python report.py data --language "$LANG"
 Notes that prevent misreading, in brief:
 
 - Every row uses the same annotation-ignore policy (`eval.scoreable_predictions`). Keep all emitted events, including short correct and false predictions. Λ_min is an event-generation rule, not an evaluation filter. Report localization precision and recall beside DVC.
-- Rows 1–5, 7 and 11 read supplied spans; only the span _boundaries_ are external. `run_cascade` crops each span as [start, end + 1 frame], so the crop holds the span's terminator frame unless the span ends at the stream end (as row 6's window does). The online cascade (rows 8-9) and `report.py predict` crop the same way. `run_cascade` still runs the full model (BIO head and gate included) on `--method ar/dlm` rows. Rows with `--method baseline` use the ungated clean floor — deliberately a different model.
+- Rows 1–5, 7 and 11 read supplied spans; only the span _boundaries_ are external. `run_cascade` crops each span as [start, end + 1 frame], so the crop holds the span's terminator frame unless the span ends at the stream end (as row 6's window does). The online cascade (rows 8-9) and `report.py predict` crop the same way. A span with a commit time (row 11, row 10's online spans) is also clamped to the frames the buffer held at commit time. `run_cascade` still runs the full model (BIO head and gate included) on `--method ar/dlm` rows. Rows with `--method baseline` use the ungated clean floor — deliberately a different model.
 - Row 1 is scored inside the clean translator's own training view (it trains on GT caption spans), so it is an oracle reference, not a bound on the joint arms.
 - Rows 6 and 10 are deterministic: no sampling at eval. Row 6 segments each whole stream, then captions each proposal in its own window; row 10 reads only the capped buffer.
 - Every joint row runs twice, once per decoder family: `--method ar` first, then `--method dlm`. The two arms share one row id because they are the same condition under two decoders; the pair isolates the decoder family. The headline table stays DLM.
@@ -534,18 +528,18 @@ One line each; the full argument lives at the pointer.
 - **Terminator = first O-or-B, never "closing O"** — back-to-back sentences have no gap; same rule at training and inference. → spec §5.3
 - **Decoder controls**: compare plain and enhanced decoding on both heads from the same logits. Use the enhanced Moryossef cascade as the external comparison and the online S1 cascade as the stage-2 comparison (9 → 11 → 10).
 - **First-span coupling**: training sums valid-path probabilities before forming Ω. It does not select a hard training boundary or replace the predicted mask with a GT interval. GT determines only which text exists (a complete or open target); the model's own predicted span decides how that text trains: a covered target trains the translator, an uncovered one trains only Ω and the segmentation branch (critic row), and only when Ω can learn from it (not under `detach_omega`, not on a row whose Ω fell back to the whole window).
-- **A merged span counts as covered.** "Covered" means containment with δ tolerance at each end (predicted start ≤ unit start + δ, predicted end ≥ unit end − δ), with no upper limit on overshoot. So a predicted span that merges the target unit with the next unit trains the translator to write only the first unit's text. Reasons: robustness to merge errors is the thesis (the translator reads the first complete unit and disregards the rest, as Modes 1/3 intend); DVC matches one predicted event to one true sentence, so a merged event scores against one reference; Ω still gets the text gradient on covered rows, so the segmentation branch is still pushed to split. Risk: it can teach the model to drop content. Not adopted: send spans longer than the unit by more than δ to the critic group. State this choice in the paper. → `models/streaming_slt.py` `forward_loss`
+- **A merged span counts as covered.** "Covered" means that the predicted closed first span misses at most δ frames of the unit in total (start and end together) and holds at least Λ_min frames of it: overlap ≥ max(Λ_min, unit length − δ), with δ = Λ_min = 12 frames. δ is a total over both ends, so a short middle part of a unit never counts as the unit, and the translator never learns the full text from a small part of the signs (P1): for the unit [100, 136), the prediction [112, 124) is a critic row and the prediction [100, 124) is covered. There is no limit past the unit. So a predicted span that merges the target unit with the next unit trains the translator to write only the first unit's text. Reasons: robustness to merge errors is the thesis (the translator reads the first complete unit and disregards the rest, as Modes 1/3 intend); DVC matches one predicted event to one true sentence, so a merged event scores against one reference; Ω still gets the text gradient on covered rows, so the segmentation branch is still pushed to split. Risk: it can teach the model to drop content. Not adopted: send spans longer than the unit by more than δ to the critic group. State this choice in the paper. → `models/streaming_slt.py` `forward_loss`
 - **S1 pretrains competence before coupling**, pooled, on whole-input chunks with no window modes, jitter or anchors, so cuts are not placed from caption boundaries. Stage 2 uses the anchored sampler with a designed mode mix and a flat context band. No measured jitter or mode mix is a training input; `segmenter-errors` is the analysis that motivates the mode design. → `configs/bio_pretrain.yaml`, `data/chunks.py`
 - **The two segmenters differ only by model and input contract.** The Moryossef arm uses S1's pool, chunk tiling (the same `ChunkDataset` with `release`, fixed 1023/24 s chunks), augmentation block, BIO labels, dev chunks, complete-span monitor and best-epoch floor, and both overlap-stitch the offline whole-video pass. So a cascade difference comes from the model and its input, not from exposure or selection. → `data/chunks.py`, `moryossef26/dataset.py`
 - **No epoch before one full pool rotation can ship.** A pooled segmenter run sees every training record (clean segment) only after `cycle_epochs` epochs, computed from the record counts and printed at run time, so earlier epochs are not best candidates and do not count toward patience. → `train/helpers.py` `run_epoch_loop`
-- **Stage 2 trains every module at one rate, 1e-5**, in one optimizer group, both pose encoders included; no freeze key exists. S1 trains its head at 2e-4 and its encoder at 6e-5 (`backbone_lr`, an S1-only key); the clean floor trains everything at 2e-4 in one group. `learning_rate` is a required key. Stage 2 requires a trained S1 at `checkpoint.bio_head_init`, so the gate is on from step 0 with no warmup. → `configs/dlm.yaml`, `configs/bio_pretrain.yaml`
+- **Stage 2 trains every module at one rate, 1e-5**, in one optimizer group, both pose encoders included; no freeze key exists. S1 trains its head at 2e-4 and its encoder at 1e-4 (`backbone_lr`, an S1-only key); the clean floor trains everything at 2e-4 in one group. `learning_rate` is a required key. Stage 2 requires a trained S1 at `checkpoint.bio_head_init`, so the gate is on from step 0 with no warmup. → `configs/dlm.yaml`, `configs/bio_pretrain.yaml`
 - **No pose augmentation in stage 2 or the clean floor** (`augmentation: null`, refused otherwise). Only the two segmenters augment, with one shared recipe (fps 15-30, frame dropout, hand dropout, no rotation). So the arms and the clean floor differ only by the method, inference never augments, and δ and Λ_min are plain frame counts on the native 24 fps grid. → `configs/dlm.yaml`, `train/slt.py`
-- **The confidence-bound term is Mode-2a only, and only where the model predicts a premature commit** (a closed span that starts inside the open GT unit) — the FSM never decodes the other states. It is an unlikelihood term (Welleck et al., ICLR 2020): -log(1 − p(t)) on the truncated decode's own token t, at slots where that decode is confident (> `tau_cb`), differs from a full-evidence decode that equals the reference, and agrees with it on every earlier slot. It names no target token: the reference decides only WHERE the truncated view is confidently wrong, never WHAT it should say, so the truncated input gets no text target (P1). Its effect is lower per-token confidence at the first confidently wrong slot (the reveal policy reads it). The FSM commit reads no confidence, so the term does not change commits. Training logs `cb_premature_rate` and `cb_active_count` (slots where the term fires). → spec §5, `train/losses.py` `confidence_bound_loss`
+- **A truncated window gets no text.** A right-truncated (Mode 2a) window is BIO-only, whatever the model predicts, so P1 holds through text routing alone. No loss acts on the translator's confidence on a truncated crop: the FSM commit reads no confidence (it commits when the terminator is stable for K = 3 strides), so such a loss could not change an emitted event. → `models/streaming_slt.py` `forward_loss`
 - **Best-checkpoint monitor**: clean translation uses dev BLEU; joint arms use `val_joint_score` (dev-window F1 times BLEU). This is a trade-off score, not DVC or a retention guarantee. Report both components.
 - **Text scoring level is declared per language, never sniffed from references** (`char_level_for_target`; `tests/test_scoring_level.py` enforces every call site).
 - **Segmenter-error artifacts are keyed by (segmenter, language, split)** so an `--segmenter-arch s1` run or another split can never overwrite the independent measurement (`tests/test_calibration_provenance.py`). They are analysis only; no training stage reads them.
 - **Pose timing comes from `video_meta.csv`** (SignVerse resolves to exactly 24 fps). → `docs/run_real_data.md`
-- **One body per frame, with short detector flickers removed.** The converter keeps slot 0 (the detector's top-scored person), except where slot 0 jumps to another real body for less than 0.5 s; body size is no guide, because a largest-body rule picks a still bystander. Hands bind to the kept body's wrists; in a frame with 2 or more real bodies, a hand that no wrist claims is zero. → `docs/data_pipeline.md` §5e2
+- **One body per frame, with short detector flickers removed.** The converter keeps slot 0 (the detector's top-scored person), except where slot 0 jumps to another real body for less than 0.5 s, and except where slot 0 is not a real body (a fragment): there it keeps the real slot nearest the tracked body. Body size is no guide, because a largest-body rule picks a still bystander. Hands bind to the kept body's wrists in the wrist order that fits better, so two touching hands are not swapped; in a frame with 2 or more real bodies, a hand that no wrist claims is zero. → `docs/data_pipeline.md` §5e2
 - **Frames with a moving second person or with no person are cut out of every stream.** The converter writes `masked_runs` (runs of frames with 2 or more real bodies, with gaps under 12 frames bridged and at least 12 frames long, scored per 2 s block of 48 frames: a block is cut when the arm variation of the real bodies other than the kept one, in the kept body's shoulder widths, is above 0.7 or cannot be measured, and adjacent cut blocks merge) and `empty_runs` (runs of frames with no real body, gaps under 12 frames bridged, at least 24 frames long) to `video_meta.csv`. On every split the loader cuts each video at both, and each clean segment is a record and a stream (`<vid>@<first frame>`, a pose view). No person or detection rule drops a whole video; `undetected_ratio` is an audit diagnostic only. The loader refuses a `video_meta.csv` without the `masked_runs` and `empty_runs` columns and names the `prepare_yt25.py --stage all --overwrite` command. A unit that crosses a segment edge is quarantined (`reliable=False`, UNK on every frame). In a stage-2 window, a quarantined unit that ends before the text target moves the left edge to its end − δ, as the FSM's post-commit cut would. Captions define no cut: an uncaptioned stretch longer than 8 s stays in its stream as UNK. Scores and artifacts stay on the source video id and source time. → `docs/data_pipeline.md` §5f
 - **A caption unit with no visible hands is quarantined, and no frame is cut.** The converter also writes `handless_runs` (runs of at least 12 frames where the kept body shows no hand: fewer than 10 of 21 keypoints above confidence 0.3 on both hands) to `video_meta.csv`. On every split the loader quarantines a reliable unit with at least `poses.handless_unit_share` (0.9) of its frames inside them (credits, a URL, an end card, lyrics over a person whose hands are out of shot). The frames stay in the stream, so the neighbouring units and the transitions into and out of the unit stay intact. The loader refuses a `video_meta.csv` without the `handless_runs` column. → `docs/data_pipeline.md` §5f2
 
@@ -560,7 +554,7 @@ rq2_{when}_{spans}_{decode}_{translator}_{language}_{split}_scores.json   what t
 
 | field | values | meaning |
 |---|---|---|
-| `when` | `offline`, `online` | how THIS run decided: `offline` reads the whole stream, `online` decides from the past alone. A re-translation of saved spans is `offline`, except spans an FSM committed online (provenance `when=online`): row 11 keeps `online`, because its crop reads only frames that were in the buffer at commit time (one frame more after a cap-forced cut of an open span) |
+| `when` | `offline`, `online` | how THIS run decided: `offline` reads the whole stream, `online` decides from the past alone. A re-translation of saved spans is `offline`, except spans an FSM committed online (provenance `when=online`): row 11 keeps `online`, because its crop reads only frames that were in the buffer at commit time |
 | `spans` | `gold`, `moryossef`, `s1`, `joint-ar`, `joint-dlm` | which model cut the video; the joint head carries its arm, so the same-span controls of the two arms are different files |
 | `decode` | `duration`, `plain`, `none` | the segmentation decode that produced them; `none` is the annotation |
 | `translator` | `clean`, `ar`, `dlm`, `none` | which translator read them; `none` is a segmentation-only run. An ablation appends its config stem (`dlm-<stem>`), so it cannot overwrite the arm it is compared with |
@@ -579,7 +573,7 @@ data/        records → samples: loader (YouTube-SL-25 + pooling + dedup) · wi
              sampler (stage-2 window modes + jitter) · chunks (segmenter whole-input chunks) · batch
 models/      block_diffusion · dmax (OPUT + block decode) · membership_gate (soft first-span Ω) · front_end · unisign ·
              streaming_slt (MisalignedSLTModel) · bio_head
-train/       slt (AR/DLM trainer) · bio_pretrain (S1) · losses (Dice+CE, CB) · helpers (epoch loop, segmenter dev monitor) ·
+train/       slt (AR/DLM trainer) · bio_pretrain (S1) · losses (Dice+CE) · helpers (epoch loop, segmenter dev monitor) ·
              distributed
 moryossef26/ faithful external segmenter (raw-kp UNet): model · dataset · trainer · infer. NOT the FSM head.
 infer/       duration_decode (semi-Markov BIO Viterbi) · commit_gate · decode (DMax block decode + SPD) · stream (FSM) · stability
@@ -600,9 +594,9 @@ docs/        membership_gate.md · segmentation_decoding.md · data_pipeline.md 
 | `dlm.yaml`                | the DLM method; single source of truth for sampler, BIO-head arch, gate, optimizer keys | —                                                |
 | `inference.yaml`          | FSM design constants: one value per constant for every corpus; no stage writes it       | standalone                                       |
 | `ar.yaml`                 | gated AR de-risk (§9.3)                                                                 | `extends: dlm.yaml` (decoder + output dir only)  |
-| `baseline_eval.yaml`      | clean baseline: ungated greedy AR, eval-only                                            | `extends: dlm.yaml` (gate/CB off)                |
+| `baseline_eval.yaml`      | clean baseline: ungated greedy AR, eval-only                                            | `extends: dlm.yaml` (gate off)                   |
 | `baseline_train.yaml`     | trains the clean floor: mode1-only, zero context band, `lambda_bio: 0`, one rate (2e-4), no augmentation | `extends: baseline_eval.yaml`                    |
-| `bio_pretrain.yaml`       | S1 pooled segmentation pretraining on whole-input chunks (`train-bio`); own rates (head 2e-4, encoder 6e-5); the segmenter augmentation block, the same as in `moryossef26.yaml` | `extends: dlm.yaml` (BIO-head arch and BIO loss; not the sampler blocks) |
+| `bio_pretrain.yaml`       | S1 pooled segmentation pretraining on whole-input chunks (`train-bio`); own rates (head 2e-4, encoder 1e-4); the segmenter augmentation block, the same as in `moryossef26.yaml` | `extends: dlm.yaml` (BIO-head arch and BIO loss; not the sampler blocks) |
 | `moryossef26.yaml`        | external Moryossef segmenter (`train-moryossef`)                                        | standalone                                       |
 | `data.yaml` / `eval.yaml` | corpora, splits, `target_lang`, `pretrained_slt`, subtitle pipeline / RQ grids          | —                                                |
 
@@ -626,8 +620,8 @@ Stage-2 keys in `dlm.yaml` (S1 and the clean floor set their own optimizer value
 | `jitter.context_s` | 4.0 s = (K+1) × stride: window edges ~ Uniform(−4, +4) s around the anchor's boundaries. The clean floor sets 0.0 |
 | `jitter.cut_range` | `[0.15, 0.85]`: uniform relative Mode-2 cut depth |
 | `augmentation` | `null`: no pose augmentation in stage 2 or the clean floor; train-slt refuses a non-null block. The two segmenters set one shared block in `bio_pretrain.yaml` and `moryossef26.yaml` |
-| `learning_rate` | 1e-5 for every module in one optimizer group, both pose encoders and the BIO head included. Required key (no default). S1: 2e-4 head, 6e-5 encoder (`backbone_lr`, S1 only). Clean floor: 2e-4 for everything |
-| `spd.tau_dec` | 0.5, the one DLM commit threshold (stage-2 Mode-2a decodes, dev decoding and eval all read it). A fixed mechanism constant (DMax's math point; spec §12), never dev-tuned. `block_size` bounds the arm's parallelism and is fixed at training; `tau_dec` is the dial inside it, and label smoothing 0.2 puts the per-token loss minimiser at max-prob 0.8, so a threshold at or above it approaches one commit per pass. RQ1 reports its cost as `mean_decoder_passes` (read it at `eval.yaml rq1.batch_size 1`); no speed claim without it |
+| `learning_rate` | 1e-5 for every module in one optimizer group, both pose encoders and the BIO head included. Required key (no default). S1: 2e-4 head, 1e-4 encoder (`backbone_lr`, S1 only). Clean floor: 2e-4 for everything |
+| `spd.tau_dec` | 0.5, the one DLM commit threshold (stage-2 dev decoding and eval read it). A fixed mechanism constant (DMax's math point; spec §12), never dev-tuned. `block_size` bounds the arm's parallelism and is fixed at training; `tau_dec` is the dial inside it, and label smoothing 0.2 puts the per-token loss minimiser at max-prob 0.8, so a threshold at or above it approaches one commit per pass. RQ1 reports its cost as `mean_decoder_passes` (read it at `eval.yaml rq1.batch_size 1`); no speed claim without it |
 | `lambda_bio` | 1.0 |
 | `membership_gate.detach_omega` | `false`; `true` is the ablation "text does not train segmentation" |
 
@@ -643,7 +637,7 @@ Rules that are not optional: no stage writes `inference.yaml` and there are no p
 
 Λ_min is the one constant whose source matters more than its value. It is the eligibility rule shared by the sampler's target, the gate posterior's first-complete span and the FSM's commit, so it decides which units the system can ever supervise or emit. It comes from the unit-duration distribution, never from a model measurement: δ answers "how far can a terminator estimate move", Λ_min answers "what is the shortest unit we will emit", and tying the second to the first makes the reachable part of the test set a function of a trained head's noise. Re-check the 0.5 s value only if a preprocessing change moves the p1 unit duration below it.
 
-Watch `text_covered_rate` during stage-2 training (the share of complete text targets that the predicted first span contains, with δ tolerance at each end, so a span that merges the target with the next unit counts; the rest train as critic rows when Ω can learn from them) beside `cb_premature_rate` (the share of Mode-2a rows where the head predicts a premature commit). A falling covered rate means the head localizes fewer text targets; find the cause before spending more GPU.
+Watch `text_covered_rate` during stage-2 training (the share of complete text targets that the predicted first span covers: it misses at most δ frames of the unit in total, and a span that merges the target with the next unit counts; the rest train as critic rows when Ω can learn from them). A falling covered rate means the head localizes fewer text targets; find the cause before spending more GPU.
 
 ### Normalization and comparison contract
 

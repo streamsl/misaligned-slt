@@ -65,17 +65,16 @@ poses:
     # Visual cuts, 1 rule for every split and language (data.loader.split_clean_segments): the loader cuts every stream 
     # at video_meta.csv masked_runs (2+ real bodies and extra arms move) and empty_runs (no real body), and each clean 
     # segment between them is a record. A multi-body run is scored in 2s windows at 1s steps (prepare_yt25._MOTION_BLOCK): 
-    # a window is cut when extra slots' shoulder-normalized arm variation over it exceeds this threshold, or cannot be 
-    # measured over whole run (a window too sparse to measure takes whole run's value), so a still picture of a person is 
-    # no run. Motion is in shoulder widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` 
-    # apply it when they write masked_runs, so a change needs `--stage convert --overwrite`.
+    # a window is cut when the arm variation of every real body other than the kept one, in KEPT body's shoulder widths,
+    # exceeds this threshold over it, or can't be measured over whole run (a window too sparse to measure takes whole run's
+    # value). A still picture of a person, or a body that never shows an elbow or wrist, is no run. Motion is in shoulder
+    # widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` apply it when they write
+    # masked_runs, so a change needs `prepare_yt25.py --stage person-counts --overwrite` (or `--stage all --overwrite`).
     min_extra_person_motion: 0.7
     # No-hand quarantine, 1 rule for every split and language (data.loader.quarantine_handless): a reliable caption unit 
     # with at least this share of its frames inside video_meta.csv handless_runs (12+ frames where the kept body shows no 
-    # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. On 250 train videos per language asf has no unit 
-    # between 0.70-0.99 and bfi has 6 at 0.8-0.95; at 0.9 the rule flags asf 8/5,579 and bfi 8/7,641 units, all non-signing 
-    # captions. These counts are on whole source videos, before visual cuts, which already remove most of these units (empty 
-    # run is also handless run); `report.py data` units_quarantined_handless gives the count that the rule adds after cuts.
+    # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. Per-unit handless share is bimodal and 0.9 sits
+    # in its empty band; `report.py data` units_quarantined_handless gives the count after cuts.
     handless_unit_share: 0.9
     # Exclude when fewer than this share of grouped caption intervals fits inside the supplied pose timeline
     # (1s end tolerance). This doesn't infer the cause, clip offset, or caption source. 0.0 disables it.

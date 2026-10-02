@@ -59,7 +59,7 @@ def _atomic_torch_save(obj: dict, path: Path) -> Path:
 
 def save_train_state(
     path: str | Path, *, model: nn.Module, optimizer: torch.optim.Optimizer, scheduler_state: dict | None, 
-    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, step: int = 0, meta: dict | None = None,
+    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, meta: dict | None = None,
 ) -> Path:
     """Full resumable snapshot (latest.pt): weights + optimizer moments + scheduler/scaler + best-tracking.
 
@@ -68,9 +68,6 @@ def save_train_state(
     """
     state = {
         "epoch": int(epoch),
-        # step > 0 = MID-epoch snapshot: that many batches of `epoch` are applied, resume re-enters the SAME epoch
-        # and fast-forwards; 0 = epoch boundary (the default).
-        "step": int(step),
         "epochs": int(epochs),  # schedule horizon: total_steps is baked into the scheduler state, so resume must match
         # The run's training-critical config, compared on resume: configs are live files that can change between
         # sessions, so without this a resumed run changes objective mid-training and nothing records it.

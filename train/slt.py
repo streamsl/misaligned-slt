@@ -15,7 +15,7 @@ from models.checkpointing import load_checkpoint_meta, require_fixed_constants
 from infer.duration_decode import DurationModel, DurationDecoder
 
 from train import distributed as dist
-from train.bio_pretrain import require_attention_radius
+from train.bio_pretrain import require_attention_radius, require_segmenter_data
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, CompleteSpanMetrics
@@ -25,7 +25,7 @@ from utils import cfg_get, checkpoint_dir, lambda_min_frames, load_yaml, pool_ke
 # DEFAULT S1 config. `checkpoint.bio_head_init: auto` resolves the S1 checkpoint through it, and the pool-provenance check reads its 
 # `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
-# Gate options; delta and minimum eligible length come from resolved inference geometry.
+# Gate options; delta and the minimum eligible length come from the fixed inference.yaml constants.
 GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "detach_omega"})
 SPD_CONFIG_KEYS = frozenset({"tau_dec", "top_k", "renormalize"})
 
@@ -77,9 +77,8 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
         # Which files initialized the translator and the segmentation branch, and the head's attention band.
         "resolved_inits": slt_cfg.get("resolved_inits"), "bio_attention_radius_s": slt_cfg.get("bio_attention_radius_s"),
         "early_stopping": slt_cfg.get("early_stopping"), "scheduler": slt_cfg.get("scheduler"), "epochs": slt_cfg.get("epochs"),
-        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), 
+        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), "duration_model": slt_cfg.get("duration_model"),
         "segmentation_decode": "semi_markov_viterbi" if slt_cfg.get("duration_model") else "none",
-        "duration_model": slt_cfg.get("duration_model"), "confidence_bound": slt_cfg.get("confidence_bound", {}), 
         "oput": slt_cfg.get("oput", {}), "spd": slt_cfg.get("spd", {}), 
         # Training geometry of the text canvas: the block-causal mask and the OPUT corruption read block_size, so eval
         # refuses a decoder built at another block (eval.py _build_eval_model), and the decode canvas must not shrink.
@@ -104,8 +103,7 @@ def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: f
             if not getattr(span, "reliable", True) or span.duration_s + 1.0 / record.pose.fps > float(buffer_cap_s): continue
             n = len(tokenizer(span.text)["input_ids"])
             if n > longest: longest, culprit = n, span
-    # +1: decode canvas holds BOS in slot 0, so a target of exactly max_text_tokens could be trained on but never emitted, 
-    # and the collator's confidence-bound shift column would drop its last token.
+    # +1: decode canvas holds BOS in slot 0, so a target of exactly max_text_tokens could be trained on but never emitted.
     if longest + 1 > int(max_text_tokens): raise ValueError(
         f"{split}: a complete caption target needs {longest} tokens plus the BOS slot but max_text_tokens is {max_text_tokens} "
         f"({culprit.video_id} {culprit.start_s:.1f}-{culprit.end_s:.1f}s). Set max_text_tokens >= {longest + 1}: the collator "
@@ -272,6 +270,8 @@ def build_slt_components(
         )
         # The band is an architecture property a strict state_dict load cannot see (no tensor carries it).
         require_attention_radius(_s1_meta, slt_cfg.get("bio_attention_radius_s"), str(bio_init))
+        # Labels are not in any tensor either: an S1 trained before a re-convert or re-measured cuts would load silently.
+        require_segmenter_data(_s1_meta, language, slt_cfg["annotation_fingerprint"], inference_cfg["buffer_cap_s"], str(bio_init))
         model.bio_head.load_state_dict(head_sd, strict=True)
         slt_cfg["resolved_inits"]["segmentation"] = _file_stamp(bio_init)
         # S1's pose encoder goes into SEGMENTATION branch; the translator keeps the clean translator's encoder. 
@@ -296,7 +296,6 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
     rows: list[dict[str, float]] = []
     spans = CompleteSpanMetrics()
 
-    confidence_cfg = slt_cfg.get("confidence_bound", {})
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
@@ -317,9 +316,6 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
             dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
             oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.2)),
-            cb_enabled=bool(confidence_cfg.get("enabled", True)), cb_lambda=float(confidence_cfg.get("lambda", 1.0)),
-            cb_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
-            cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
             gate_delta_frames=int(gate_cfg.get("delta", 12)), gate_detach_omega=bool(gate_cfg.get("detach_omega", False)),
             **gate_kwargs,
         )
@@ -375,21 +371,14 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
 
 
 def training_loss(model, batch: dict, slt_cfg: dict) -> SLTLossOutput: # The actual AR/DLM training objective.
-    confidence_cfg = slt_cfg.get("confidence_bound", {})
     oput_cfg = slt_cfg.get("oput", {})
-    spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
-    cb_lambda = float(confidence_cfg.get("lambda", 1.0))
     return model.forward_loss(
         batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), lambda_bio=float(slt_cfg.get("lambda_bio", 1.0)),
         dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
         oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
         oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.2)),
-        # The confidence bound runs in every epoch whenever enabled: its verified gate rejects wrong full-evidence tokens.
-        cb_enabled=bool(confidence_cfg.get("enabled", True)), cb_lambda=cb_lambda, 
-        cb_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
-        cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
         gate_enabled=bool(gate_cfg.get("enabled", False)),
         # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml): the coverage tolerance of text routing.
         gate_eps=float(gate_cfg.get("eps", 1e-4)), gate_min_span_frames=int(gate_cfg["min_span_frames"]),

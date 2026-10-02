@@ -212,7 +212,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         if delta: self._progress.update(delta)
 
         postfix = {}
-        for key in ("loss", "total_loss", "phrase_bio_loss", "vlp_loss", "baseline_ce_loss"):
+        for key in ("loss", "bio_loss"):  # stage 2 logs `loss`; the segmenters log `bio_loss`
             if key in numeric:
                 postfix["loss"] = _fmt_metric(numeric[key])
                 break
@@ -340,7 +340,8 @@ def run_epoch_loop(
       evaluate_fn(epoch)     -> dev metrics dict (only on control.should_eval epochs), or None.
       best_epoch_floor       -> first epoch that may become the best checkpoint and count toward early-stopping patience. 
                                 A pooled segmentation run passes its rotation's cycle length (data.loader.PooledEpochRecords), 
-                                so no epoch before every training record (clean segment) was seen once can ship; others pass 0.
+                                so no epoch before the rotation selected every training record (clean segment) once can ship;
+                                others pass 0. A selected record can still lose a chunk tail to fixed epoch size (data.chunks).
     """
     model.to(device)
     model.train()
@@ -457,7 +458,6 @@ def run_epoch_loop(
             if stepped: scheduler.step_batch()
             logger.log_step(epoch, opt_step, row)
 
-        scheduler.step_epoch()
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
             with amp.autocast():  # dev eval in the same precision as training steps (fp32 eval takes about 2x as long)
@@ -634,13 +634,6 @@ class TrainControl:
         self.best_epoch = int(state.get("best_epoch", 0))
         self.bad_epochs = int(state.get("bad_epochs", 0))
 
-    def summary(self) -> dict[str, float | int | bool | None | str]:
-        return {
-            "monitor": self.monitor, "monitor_mode": self.monitor_mode,
-            "best_value": self.best_value, "best_epoch": self.best_epoch, "stopped_early": self.stopped_early,
-        }
-
-
 def attach_save_best(
     control: TrainControl, cfg: dict, name: str, saver: Callable[[torch.nn.Module, str | Path], Path], meta: dict | None = None,
 ) -> TrainControl:
@@ -656,20 +649,12 @@ def attach_save_best(
     return control
 
 
-SchedulerInterval = Literal["step", "epoch", "none"]
-
 @dataclass
-class SchedulerBundle:
+class SchedulerBundle: # Every schedule steps per optimizer step.
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-    interval: SchedulerInterval = "none"
 
     def step_batch(self) -> None:
-        if self.scheduler is not None and self.interval == "step":
-            self.scheduler.step()
-
-    def step_epoch(self) -> None:
-        if self.scheduler is not None and self.interval == "epoch":
-            self.scheduler.step()
+        if self.scheduler is not None: self.scheduler.step()
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, steps_per_epoch: int) -> SchedulerBundle:
@@ -686,8 +671,8 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.0,
         )
-        if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine, interval="step")
+        if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine)
         warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
-        return SchedulerBundle(scheduler=scheduler, interval="step")
+        return SchedulerBundle(scheduler=scheduler)
     raise ValueError(f"Unsupported scheduler type: {sched_type}")

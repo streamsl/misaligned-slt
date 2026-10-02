@@ -54,8 +54,6 @@ class CrossAttnOmegaInjector:
             m.register_forward_pre_hook(self._pre_hook, with_kwargs=True) 
             for m in self._cross_attn_modules(lm_model)
         ]
-        if not self.handles:
-            raise ValueError(f"CrossAttnOmegaInjector found no cross-attention modules on {type(lm_model).__name__}")
 
     @classmethod
     def attach(cls, lm_model: torch.nn.Module) -> "CrossAttnOmegaInjector":

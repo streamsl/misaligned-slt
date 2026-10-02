@@ -21,7 +21,8 @@ from torch.utils.data import DataLoader
 
 from data.batch import collate_windows
 from data.chunks import ChunkDataset
-from data.loader import ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records, streaming_loader
+from data.loader import (ANNOTATION_PROTOCOL, PooledEpochRecords, resolve_pretrain_records, streaming_loader, 
+                         annotation_fingerprint, segmenter_language_fingerprints)
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
@@ -72,6 +73,27 @@ def require_attention_radius(meta: dict, expected: float | None, source: str) ->
     )
 
 
+def require_segmenter_data(meta: dict, language: str, train_fingerprint: str, buffer_cap_s: float, source: str) -> None:
+    """Refuse a segmenter (S1 or Moryossef) whose labels are not the current ones. A re-convert, a person-counts re-measure or 
+    a caption rule changes the train labels; a strict state_dict load cannot see that, and the stale model would load silently.
+    `train_fingerprint` is the annotation fingerprint of `language`'s whole train split. A language outside the stamped pool is
+    zero-shot for this segmenter, so it has nothing to compare. S1 must also have trained at the deployed cap or longer."""
+    if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
+        f"{source} was trained under annotation protocol {meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}: retrain it."
+    )
+    stamped = meta.get("language_fingerprints")
+    if stamped is None: raise SystemExit(f"{source} stamps no language_fingerprints (trained before the data guard): retrain it.")
+    if language in stamped and stamped[language] != train_fingerprint: raise SystemExit(
+        f"{source} was trained on other {language} train labels "
+        f"(a re-convert, re-measured cuts or a caption rule changed them): retrain it."
+    )
+    trained_chunk = meta.get("rope_eval_chunk_s")
+    if trained_chunk is not None and float(trained_chunk) + 1e-6 < float(buffer_cap_s): raise SystemExit(
+        f"{source} trained on chunks of at most {float(trained_chunk):.2f}s, "
+        f"below the deployed buffer_cap_s {float(buffer_cap_s):.2f}s: retrain it."
+    )
+
+
 def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
     # Construct S1; optionally initialize from released pose weights or a complete S1 checkpoint. The pose 
     # encoder trains with the head, so `bio_head_init` carries an ADAPTED segmentation encoder into stage 2.
@@ -115,6 +137,7 @@ def build_bio_s1(
         print(f"bio_s1 | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
         
     resolve_bio_class_weights(cfg, train_records)
+    cfg["language_fingerprints"] = segmenter_language_fingerprints(cfg, data_cfg, language, train_records)
     # Chunk length C is the longest context the head trains on. Checkpoint metadata and whole-video evaluation use this 
     # stamped value, not a target inference file that may change later. Stage-2 head and FSM run at the one deployed cap 
     # (inference.yaml buffer_cap_s), so S1 must have trained at least that context.
@@ -187,6 +210,7 @@ def train_bio_s1_epochs(
     training_cap_s = float(cfg["training_buffer_cap_s"])
     meta = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_loader.dataset.records),
+        "language_fingerprints": cfg.get("language_fingerprints"),  # whole train split per language: require_segmenter_data
         "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
         "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, 
         "initialization": cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth"),

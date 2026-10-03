@@ -53,7 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--resume", action="store_true",
                         help="continue from <checkpoint.dir>/latest.pt (full optimizer/scheduler state, epoch granularity)")
-    parser.add_argument("--decoder", default=None, choices=["ar", "dlm"])
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
@@ -99,7 +98,7 @@ if __name__ == "__main__":
         # --language re-points ${language} in checkpoint.dir for training and the save below.
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
-            decoder=args.decoder, include_dev=True, language=args.language, bio_config=args.bio_config
+            include_dev=True, language=args.language, bio_config=args.bio_config
         )
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))

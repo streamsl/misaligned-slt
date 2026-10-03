@@ -1,12 +1,11 @@
-"""Window primitives: BIO labels from GT boundaries, plus the first-complete-span rule shared by Mode-3 training and
-streaming inference. UNK is the padding/ignore class — padding is never labelled O."""
+"""Window primitives: BIO labels from GT boundaries, plus the complete-span count of the sampler's Mode-3 draws.
+UNK is the padding/ignore class — padding is never labelled O."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 import numpy as np
 
 BIO = {"UNK": 0, "O": 1, "B": 2, "I": 3}
-BIO_IGNORE_INDEX = BIO["UNK"]
 # Names the labelling rule; `annotation_fingerprint` adds the content hash. Both travel with every checkpoint and
 # artifact, and the name is what a POOLED S1 can be checked against when its fingerprint covers other languages.
 ANNOTATION_PROTOCOL = "caption_units"
@@ -47,7 +46,7 @@ class WindowSample:
     timestamps_s: np.ndarray
     bio_labels: np.ndarray
     translation_target: SentenceSpan | None
-    anchor_span: SentenceSpan | None = None
+    fps: float   # the record's pose rate: the window's frame grid, on which Λ_min and δ become frame counts (train/slt.py)
     # χ (membership gate, docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of LEFT-TRUNCATED
     # predecessors — a sentence whose B precedes the window edge is one the FSM already committed (the left edge mimics the
     # post-commit cut). Sampler bookkeeping, not a model belief; at inference the FSM supplies it from its commit log.
@@ -69,8 +68,8 @@ def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, tr
 
 
 def make_bio_labels(
-    frame_times_s: np.ndarray, spans: tuple[SentenceSpan, ...],
-    window_start_s: float, window_end_s: float, video_duration_s: float | None = None,
+    frame_times_s: np.ndarray, spans: tuple[SentenceSpan, ...], window_start_s: float, window_end_s: float, 
+    video_duration_s: float | None = None, untrusted: tuple[tuple[float, float], ...] | None = None,
 ) -> np.ndarray:
     """Label caption-unit membership on the supplied frame grid.
 
@@ -80,8 +79,9 @@ def make_bio_labels(
     labels = np.full((len(frame_times_s),), BIO["O"], dtype=np.int64)
 
     # A clean segment with no unit (data.loader.split_clean_segments) is 1 uncaptioned stretch: UNK when longer than the gap.
+    # `untrusted` (VideoRecord.untrusted_s) carries a cut segment's source-time gaps; an uncut record's gaps are found here.
     duration = float(video_duration_s) if video_duration_s is not None else max([float(window_end_s), *(span.end_s for span in spans)])
-    for a, b in untrusted_o_intervals(spans, duration, TRUSTED_GAP_S):
+    for a, b in (untrusted if untrusted is not None else untrusted_o_intervals(spans, duration, TRUSTED_GAP_S)):
         labels[(frame_times_s >= a) & (frame_times_s < b)] = BIO["UNK"]
 
     spans_overlapping_window = [span for span in spans if span.end_s > window_start_s and span.start_s < window_end_s]
@@ -103,30 +103,6 @@ def make_bio_labels(
     return labels
 
 
-def first_complete_span(
-    spans: tuple[SentenceSpan, ...],
-    window_start_s: float, window_end_s: float,
-    min_tail_s: float = 1e-6, min_span_s: float = 0.0,
-) -> SentenceSpan | None:
-    """Earliest span whose B and TERMINATOR are inside the same window (first-complete-span).
-
-    Complete = end lies ≥ `min_tail_s` inside the window, i.e. the window holds the frame AFTER the span's last — the frame 
-    carrying terminator label (`O` on a gap, or next sentence's `B` when back-to-back; adjacent sentences have no closing `O`, 
-    and requiring one would misread a completed anchor as right-truncated). Must stay in sync with its label-space twin 
-    `infer.commit_gate.bio_complete_spans` (terminate on O-or-B) so training (GT) and inference (predicted) select alike.
-
-    `min_span_s` = Λ_min in seconds. The deployed gate's `candidate_spans` skips complete spans shorter than
-    `span_selection.min_span_frames`, so the TRAINING rule must too: without the same floor a window supervises a
-    sentence the gate never anchors, silently conditioning the decoder on the wrong sentence's Ω mask.
-    """
-    for span in sorted(spans, key=lambda s: (s.start_s, s.end_s)):
-        if not getattr(span, "reliable", True): continue     # quarantined: never a translation target
-        if span.end_s - span.start_s < min_span_s: continue  # Λ_min: never a deployable commit target
-        has_b = span.start_s >= window_start_s
-        has_terminator = span.end_s + min_tail_s <= window_end_s
-        if has_b and has_terminator: return span
-    return None
-
 def classify_anchor_visibility(span: SentenceSpan, start_s: float, end_s: float) -> str:
     has_start = span.start_s >= start_s and span.start_s < end_s
     has_end = span.end_s > start_s and span.end_s < end_s
@@ -141,8 +117,8 @@ def count_complete_spans(
     window_start_s: float, window_end_s: float,
     min_tail_s: float = 1e-6, min_span_s: float = 0.0,
 ) -> int:
-    # Same terminator semantics AND Λ_min floor as first_complete_span — the sampler's mode-relabel counts with this and targets
-    # with that; a floor on only 1 leaves a sub-Λ_min-only window a nominal mode1 with target=None (silently unsupervised).
+    # Same terminator semantics AND Λ_min floor as the target rule in WindowSampler.materialize: _mode3_spec accepts a 
+    # draw by this count, and a floor on only 1 of the 2 accepts a Mode-3 window whose second unit materialize never selects.
     return sum(
         1 for span in spans if getattr(span, "reliable", True) and span.end_s - span.start_s >= min_span_s
         and span.start_s >= window_start_s and span.end_s + min_tail_s <= window_end_s

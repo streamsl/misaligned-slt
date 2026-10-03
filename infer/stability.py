@@ -52,10 +52,9 @@ def display_prefix(token_ids, token_confidence, eos_id: int | None = None, pad_i
     """Cut a decoded canvas down to the tokens a viewer could actually be shown.
 
     The DLM writes a FABRICATED confidence of 1.0 into every slot it back-fills with pad after a committed EOS
-    (infer/decode.py) — pi was never computed there. generate_from_bio_tap already slices at the first EOS on 
-    the live path, so this is defence in depth for any caller that records raw decodes; it does NOT explain long
-    hypotheses. A stride can legitimately decode MORE real tokens than the final commit (a no-EOS canvas — the
-    hallucinated-continuation mode); those are charged via vanished_track_rate, never trimmed.
+    (infer/decode.py). generate_from_bio_tap already slices at 1st EOS on live path, so this is defence in depth 
+    for any caller that records raw decodes. A stride can legitimately decode MORE real tokens than final commit 
+    (a no-EOS canvas — hallucinated-continuation mode); those are charged via vanished_track_rate, never trimmed.
     """
     stop = {int(i) for i in (eos_id, pad_id) if i is not None}
     keep = int(token_ids.numel())

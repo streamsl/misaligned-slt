@@ -52,19 +52,14 @@ class RoPETransformerEncoderLayer(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
 
-    def forward(
-        self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
-        key_mask: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """`attn_mask` is a prebuilt `attention_mask(...)` (chunked_rope_encode builds it once for all layers); 
-        without it the layer builds the key-padding mask from `key_mask` itself."""
+    def forward(self, x: torch.Tensor, timestamps_s: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # `attn_mask` is prebuilt `attention_mask(...)` that chunked_rope_encode builds once for all layers (None = attend everywhere).
         batch, frames, hidden_dim = x.shape
         # Assume 50fps when no timestamps provided (1/50s per frame → *50 → 1 unit/frame).
         if timestamps_s is None: timestamps_s = torch.arange(frames, device=x.device, dtype=torch.float32) / self.REFERENCE_FPS
         if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
         timestamps_s = timestamps_s.to(device=x.device)
         cos, sin = self._compute_rope(timestamps_s)
-        if attn_mask is None: attn_mask = attention_mask(timestamps_s, key_mask, None)
         if attn_mask is not None: attn_mask = attn_mask.to(device=x.device)
 
         # fp32 RMSNorm (cast back): autocast excludes rms_norm, so bf16 input + fp32 weight warns and falls back to
@@ -136,7 +131,7 @@ def chunked_rope_encode(
         chunk_ts = timestamps_s[:, start:end] if timestamps_s is not None else None
         chunk_mask = key_mask[:, start:end] if key_mask is not None else None
         mask = attention_mask(chunk_ts, chunk_mask, attention_radius_s)
-        for layer in layers: chunk = layer(chunk, chunk_ts, key_mask=chunk_mask, attn_mask=mask)
+        for layer in layers: chunk = layer(chunk, chunk_ts, attn_mask=mask)
         return chunk
 
     if chunk_size is None or x.shape[1] <= int(chunk_size): return run(0, x.shape[1])

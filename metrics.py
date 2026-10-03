@@ -348,7 +348,9 @@ def _corpus_metric(name: str, predictions, references, *, key: str, **kw) -> flo
     metric = _load_evaluate_metric(name)
     if metric is None: return 0.0
     try: return float(metric.compute(predictions=predictions, references=references, **kw)[key])
-    except Exception: return 0.0
+    except Exception as err:  # a silent 0 would read as a real score in every table
+        print(f"[metrics] WARNING: {name} compute failed ({type(err).__name__}: {err}); this score is 0.0", flush=True)
+        return 0.0
     
 
 def _sentence_text_scores(

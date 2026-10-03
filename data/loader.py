@@ -10,12 +10,12 @@ import re, os, random, csv, html, json, unicodedata, zlib, hashlib, inspect
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from data.windowing import SentenceSpan, ANNOTATION_PROTOCOL, TRUSTED_GAP_S
+from data.windowing import SentenceSpan, ANNOTATION_PROTOCOL, TRUSTED_GAP_S, untrusted_o_intervals
 
 from poses import PoseIndex, build_pose_index
 from poses.pose_io import META_FILENAME, base_video_id, load_video_meta
 from train import distributed as dist
-from utils import LAMBDA_MIN_FRAMES
+from utils import LAMBDA_MIN_S, seconds_to_frames
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -82,8 +82,10 @@ class VideoRecord:
     language: str
     video_id: str
     pose: PoseIndex
-    subtitle_path: Path
     sentences: tuple[SentenceSpan, ...]
+    # UNK stretches of a clean segment in segment time: the source video's uncaptioned gaps longer than TRUSTED_GAP_S, clipped. 
+    # None on an uncut video, whose labeller finds them itself. A cut must not shorten a long source gap into a trusted O gap.
+    untrusted_s: tuple[tuple[float, float], ...] | None = None
 
 def _is_pronoun_i(word: str) -> bool:
     return word == "I" or word.startswith("I'")
@@ -375,7 +377,7 @@ def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> tuple[list[tupl
 def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s: float = 1.0) -> list[tuple]:
     """Captions that START inside pose stream but END well past it become QUARANTINED spans over visible frames, instead of being dropped.
 
-    Streams end before the caption timeline (duration = frames/24 underestimates the video), so this straddle is systematic, not an edge 
+    Streams end before the caption timeline (duration = frames/fps underestimates the video), so this straddle is systematic, not an edge 
     case. Dropping caption relabels its visible frames as uncaptioned — and a leftover tail gap of trusted_gap_s or less is then supervised 
     as trusted `O` over frames the caption says are signing. Clipping to `duration_s` as a RELIABLE span would instead mint an end boundary 
     no cue marks, with text for signing partly outside the poses. Marking the coverage unsupported (reliable=False) is the one honest option: 
@@ -388,22 +390,24 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
 def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
     """The clean segments of `rec` between pose-invalid frame `runs` (half-open .npy frames [a, b), any order, may overlap).
 
-    Runs closer than Λ_min frames merge, and a run within Λ_min frames of a video end reaches it, so no segment is shorter than Λ_min. No run: 
-    `[rec]`, unchanged. Otherwise segment [a, b) is the record `f"{vid}@{a}"` whose pose is the view `start_frame=a, num_frames=b - a` and 
-    whose units are in segment time (source time - a/fps). A unit wholly inside a run is gone. A unit that crosses a segment edge stays in 
-    each segment it touches, QUARANTINED, with its true times (so start < 0 or end > the segment duration). A unit may end past the LAST 
-    segment by the loader's pose-end tolerance.
+    Runs closer than Λ_min merge, and a run within Λ_min of a video end reaches it, so no segment is shorter than Λ_min (in frames at the 
+    record's fps). No run: `[rec]`, unchanged. Otherwise segment [a, b) is the record `f"{vid}@{a}"` whose pose is the view `start_frame=a, 
+    num_frames=b - a` and whose units are in segment time (source time - a/fps). A unit wholly inside a run is gone. A unit that crosses a 
+    segment edge stays in each segment it touches, QUARANTINED, with its true times (so start < 0 or end > the segment duration). A unit 
+    may end past the LAST segment by the loader's pose-end tolerance.
     """
     n, fps = rec.pose.total_frames, float(rec.pose.fps)
+    floor = seconds_to_frames(LAMBDA_MIN_S, fps)
     cuts: list[list[int]] = []
     for a, b in sorted(runs):
-        if cuts and a - cuts[-1][1] < LAMBDA_MIN_FRAMES: cuts[-1][1] = max(cuts[-1][1], b)
+        if cuts and a - cuts[-1][1] < floor: cuts[-1][1] = max(cuts[-1][1], b)
         else: cuts.append([a, b])
 
     if not cuts: return [rec]
-    if cuts[0][0] < LAMBDA_MIN_FRAMES: cuts[0][0] = 0
-    if n - cuts[-1][1] < LAMBDA_MIN_FRAMES: cuts[-1][1] = n
+    if cuts[0][0] < floor: cuts[0][0] = 0
+    if n - cuts[-1][1] < floor: cuts[-1][1] = n
     edges = [0, *(x for cut in cuts for x in cut), n]
+    untrusted = untrusted_o_intervals(rec.sentences, rec.pose.duration_s, TRUSTED_GAP_S)
     out = []
 
     for a, b in zip(edges[::2], edges[1::2]):
@@ -413,7 +417,8 @@ def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
             s, video_id=sid, start_s=s.start_s - lo, end_s=s.end_s - lo, 
             reliable=s.reliable and lo <= s.start_s and (b == n or s.end_s <= hi)
         ) for s in rec.sentences if s.end_s > lo and s.start_s < hi)
-        out.append(replace(rec, video_id=sid, pose=replace(rec.pose, start_frame=a, num_frames=b - a), sentences=spans))
+        gaps = tuple((max(x, lo) - lo, min(y, hi) - lo) for x, y in untrusted if x < hi and y > lo)
+        out.append(replace(rec, video_id=sid, pose=replace(rec.pose, start_frame=a, num_frames=b - a), sentences=spans, untrusted_s=gaps))
     return out
 
 
@@ -976,8 +981,8 @@ def load_language_records(
         source_cues = parse_vtt(subtitle_path, drop_noise=drop_noise)
         # A SCROLLING display (more than half the cues start before previous one ends: YouTube's rolling two-line auto-captions) encodes 
         # DISPLAY times at both ends of every cue: a cue leaves the screen when line 2 later arrives, so its end runs a median 1.9-2.6 s 
-        # (p90 3.0-3.9 s) past the next cue's start — 5-10x delta_enc. Punctuation can fix the grouping of such cues into units; it cannot 
-        # move their timestamps, so the whole track is dropped, not repaired (bfi/0cw4rELLAtc, ase/T9C4QbZ7qOs).
+        # (p90 3.0-3.9 s) past the next cue's start — 3.8-7.8x the 0.5 s δ. Punctuation can fix the grouping of such cues into units; 
+        # it cannot move their timestamps, so the whole track is dropped, not repaired (bfi/0cw4rELLAtc, ase/T9C4QbZ7qOs).
         if drop_scrolling and is_scrolling_display(source_cues):
             n = len(source_cues)
             dropped_scrolling.append((video_id, sum(1 for a, b in zip(source_cues, source_cues[1:]) if b[0] < a[1] - 1e-6) / max(1, n - 1)))
@@ -991,9 +996,9 @@ def load_language_records(
         # outside it has no pose evidence. This comparison does not identify why the source poses stop.
         dur = pose_index[video_id].duration_s
         # Some source VTTs ship genuinely OVERLAPPING cues with distinct text. merge_rolling_captions only fuses overlapping DUPLICATES, 
-        # so these survive, and overlapping SentenceSpans corrupt BIO labels — a neighbour's `I` overwrites the closing `O`, and 
-        # first_complete_span becomes ill-defined. Clamp each start to the previous end: it trims the disputed frames from the LATER
-        # sentence (whose onset is the less certain of the two) and never invents a boundary.
+        # so these survive, and overlapping SentenceSpans corrupt BIO labels — a neighbour's `I` overwrites the closing `O`, and the 
+        # first-complete-span target becomes ill-defined. Clamp each start to the previous end: it trims the disputed frames from the 
+        # LATER sentence (whose onset is the less certain of the two) and never invents a boundary.
         ordered = sorted(captions, key=lambda c: (c[0], c[1]))
         # Measure temporal coverage before any text removal or overlap repair. Otherwise a short or textless
         # unit would count as missing pose data. Use the same one-second end tolerance as the span filter.
@@ -1035,7 +1040,7 @@ def load_language_records(
         if not any(sp.reliable for sp in spans):
             dropped_all_quarantined += 1
             continue
-        records.append(VideoRecord(language, video_id, pose_index[video_id], subtitle_path, spans))
+        records.append(VideoRecord(language, video_id, pose_index[video_id], spans))
         per_video[video_id] = {
             "source_cues": len(source_cues), "rolling_duplicates_merged": len(source_cues) - len(raw_cues),
             "units_after_grouping": len(ordered), "overlaps_swallowed": swallowed, "overlaps_clamped": clamped,

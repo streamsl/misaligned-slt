@@ -49,7 +49,7 @@ def bio_label_counts(records) -> list[int]:
     for rec in records:
         fps = float(rec.pose.fps); duration = float(rec.pose.duration_s)
         n = max(1, int(round(duration * fps)))
-        labels = make_bio_labels(np.arange(n) / fps, rec.sentences, 0.0, duration, video_duration_s=duration)
+        labels = make_bio_labels(np.arange(n) / fps, rec.sentences, 0.0, duration, video_duration_s=duration, untrusted=rec.untrusted_s)
         counts += np.bincount(np.asarray(labels), minlength=4)[:4]
     return [int(c) for c in counts]
 
@@ -88,16 +88,13 @@ def balanced_bio_class_weights(label_counts) -> list[float]:
     return [float(x) for x in w]
 
 
-def bio_class_weight_tensor(class_weights: dict | list | str | None, label_counts=None) -> torch.Tensor | None:
-    """Length-4 BIO class-weight tensor (indexed UNK/O/B/I) from a {"O","B","I"} dict, a 4-element list, or
-    "balanced" (derived from `label_counts` — see `balanced_bio_class_weights`; portable across corpora).
-    UNK forced to 0 (ignored). None when no weights given → unweighted CE, Moryossef's default recipe."""
+def bio_class_weight_tensor(class_weights: dict | list | None) -> torch.Tensor | None:
+    """Length-4 BIO class-weight tensor (indexed UNK/O/B/I) from a {"O","B","I"} dict or a 4-element list; `resolve_bio_class_weights` turns 
+    "balanced" into that list at setup. UNK forced to 0 (ignored). None when no weights given → unweighted CE, Moryossef's default recipe."""
     if not class_weights: return None
-    if isinstance(class_weights, str):
-        if class_weights.lower() != "balanced": raise ValueError(f"Unknown bio_class_weights: {class_weights!r}")
-        if label_counts is None: raise ValueError("bio_class_weights: balanced needs label_counts from the train split")
-        w = balanced_bio_class_weights(label_counts)
-    elif isinstance(class_weights, dict):
+    if isinstance(class_weights, str): 
+        raise ValueError(f"bio_class_weights {class_weights!r} is unresolved; run resolve_bio_class_weights first")
+    if isinstance(class_weights, dict):
         w = [0.0, float(class_weights.get("O", 1.0)), float(class_weights.get("B", 1.0)), float(class_weights.get("I", 1.0))]
     else:
         w = [float(x) for x in class_weights]
@@ -108,7 +105,7 @@ def bio_class_weight_tensor(class_weights: dict | list | str | None, label_count
 
 def bio_nll_dice_loss(
     logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = BIO["UNK"],
-    dice_weight: float = 1.5, ce_weight: float = 1.0, class_weights: torch.Tensor | None = None,
+    dice_weight: float = 1.5, class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """BIO loss: CE + weighted binary-signing Dice. Padding/UNK ignored by both terms, never relabelled O.
 
@@ -119,6 +116,6 @@ def bio_nll_dice_loss(
     """
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0
-    ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights) if ce_weight else logits.sum() * 0.0
+    ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights)
     dice = binary_sign_dice_loss(logits, targets, ignore_index=ignore_index)
-    return ce_weight * ce + dice_weight * dice
+    return ce + dice_weight * dice

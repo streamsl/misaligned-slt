@@ -21,7 +21,6 @@ RELEASE_BODY_IDX = (5, 6, 7, 8, 9, 10, 11, 12)
 RELEASE_KP_IDX = RELEASE_BODY_IDX + tuple(UNISIGN_LEFT_IDX) + tuple(UNISIGN_RIGHT_IDX)
 RELEASE_LHAND = (len(RELEASE_BODY_IDX), len(RELEASE_BODY_IDX) + len(UNISIGN_LEFT_IDX))     # their 8:29
 RELEASE_RHAND = (RELEASE_LHAND[1], RELEASE_LHAND[1] + len(UNISIGN_RIGHT_IDX))              # their 29:50
-RELEASE_POSE_DIMS = (len(RELEASE_KP_IDX), 6)
 
 
 def collate_moryossef_chunks(batch: list[dict]) -> dict:

@@ -18,12 +18,12 @@ pd.set_option("display.expand_frame_repr", False)  # don't wrap columns into blo
 
 from poses import load_pose_window
 from data.windowing import BIO, make_bio_labels
-from data.loader import ANNOTATION_PROTOCOL, VideoRecord, annotation_fingerprint, load_language_records
+from data.loader import ANNOTATION_PROTOCOL, VideoRecord, _cached_language_records, annotation_fingerprint, load_language_records
 from data.batch import repeat_last_frame
 
-from transformers import T5Tokenizer, AutoTokenizer
+from transformers import T5Tokenizer
 from models.bio_head import chunk_normalized_logits
-from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, PROMPT_LANG_BY_TARGET
+from models.unisign import UniSignMT5FrontEnd, PROMPT_LANG_BY_TARGET
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import _load_state, s1_layout_state, load_checkpoint_meta, load_model_checkpoint, require_fixed_constants
 
@@ -35,7 +35,7 @@ from metrics import (
     Segment, densevid_text_metrics, match_segments, temporal_iou, 
     moryossef_segment_metrics, segmentation_prf, compute_text_metrics, char_level_for_target
 )
-from utils import cfg_get, checkpoint_dir, lambda_min_frames, load_yaml, pick_device, pool_key, resolve_pretrained, target_language
+from utils import cfg_get, checkpoint_dir, lambda_min_s, load_yaml, pick_device, pool_key, resolve_pretrained, seconds_to_frames, target_language
 
 @dataclass(frozen=True)
 class PredictionEvent:
@@ -65,34 +65,27 @@ class ControlledWindow:
     grid_tail: float = 0.0
 
 
-def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict | None = None) -> Path:
-    # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the 
+def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict) -> Path:
+    # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the
     # arch/decode that made it is unrecoverable — a cascade row could silently inherit the wrong decode.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {"video_id": video_id, "segments": [{"start_s": float(s.start_s), "end_s": float(s.end_s)} for s in segments]}
+    rows = {
+        video_id: [{"start_s": float(s.start_s), "end_s": float(s.end_s)} for s in segments]
         for video_id, segments in sorted(predictions.items())
-    ]
-    payload = {"provenance": dict(provenance), "predictions": rows} if provenance else rows
+    }
+    payload = {"provenance": dict(provenance), "predictions": rows}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
-    # Predicted-segments JSON: dict {vid: [{start_s,end_s}]} or list-of-rows form.
+    # Predicted-segments JSON: a stamped dict {vid: [{start_s, end_s}]} under `predictions`, `segments` or `events`.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "predictions" in raw: raw = raw["predictions"]  # stamped form
     if isinstance(raw, dict) and "segments" in raw: raw = raw["segments"]  # stamped gold-segments file (write_gold_segments)
     if isinstance(raw, dict) and "events" in raw: raw = raw["events"]  # RQ2 events file: its spans feed the same-span control.
-    if isinstance(raw, dict): return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
-    predictions: dict[str, list[Segment]] = {}
-    for row in raw:
-        if "video_id" in row and "segments" in row:
-            predictions[str(row["video_id"])] = [Segment(float(i["start_s"]), float(i["end_s"])) for i in row["segments"]]
-        elif "video_id" in row and "start_s" in row and "end_s" in row:
-            predictions.setdefault(str(row["video_id"]), []).append(Segment(float(row["start_s"]), float(row["end_s"])))
-        else: raise ValueError(f"Unsupported prediction row format: {row}")
-    return predictions
+    if not isinstance(raw, dict): raise TypeError(f"{path}: a prediction file is a stamped JSON dict, not {type(raw).__name__}")
+    return {str(vid): [Segment(float(r["start_s"]), float(r["end_s"])) for r in rows] for vid, rows in raw.items()}
 
 def stamped_annotation(path: str | Path) -> str | None:
     # The annotation fingerprint an artifact was made under: flat (RQ1, segmenter-eval payloads) or under `provenance`.
@@ -199,7 +192,7 @@ def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
 def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEvent:
     if isinstance(value, dict):
         vid = str(value.get("video_id", video_id or ""))
-        text = value.get("text", value.get("prediction", value.get("translation")))
+        text = value.get("text")
         commit = value.get("commit_time_s")
         return PredictionEvent(
             video_id=vid, start_s=float(value["start_s"]), end_s=float(value["end_s"]),
@@ -207,30 +200,14 @@ def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEven
             flagged_partial=bool(value.get("flagged_partial", False)),
             commit_time_s=float(commit) if commit is not None else None,
         )
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        if video_id is None: raise ValueError("Tuple/list prediction rows require an enclosing video_id")
-        return PredictionEvent(video_id=video_id, start_s=float(value[0]), end_s=float(value[1]))
     raise TypeError(f"Unsupported prediction segment row: {value!r}")
 
 
 def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, dict) and "events" in data: data = data["events"]  # stamped form (see _write_events_json)
-    out: dict[str, list[PredictionEvent]] = {}
-    if isinstance(data, dict):
-        for video_id, segments in data.items():
-            out[str(video_id)] = [_segment_from_any(row, video_id=str(video_id)) for row in segments]
-        return out
-
-    if not isinstance(data, list): raise TypeError("Prediction file must be a dict or list JSON payload")
-    for row in data:
-        if isinstance(row, dict) and "segments" in row:
-            video_id = str(row["video_id"])
-            out[video_id] = [_segment_from_any(seg, video_id=video_id) for seg in row["segments"]]
-        else:
-            event = _segment_from_any(row)
-            out.setdefault(event.video_id, []).append(event)
-    return out
+    if not isinstance(data, dict): raise TypeError(f"{path}: an events file is a stamped JSON dict, not {type(data).__name__}")
+    return {str(video_id): [_segment_from_any(row, video_id=str(video_id)) for row in segments] for video_id, segments in data.items()}
 
 
 def controlled_windows(
@@ -429,9 +406,8 @@ def _build_eval_model(
     if method == "baseline":
         # Released Uni-Sign mT5 pose-only model, or the in-domain baseline_train checkpoint.
         # Same `MisalignedSLTModel(decoder="ar")` as ar, without a segmentation branch (no BIO head, no second pose encoder).
-        mt5_name = lm_name if "mt5" in lm_name.lower() else "google/mt5-base"
-        tokenizer = T5Tokenizer.from_pretrained(mt5_name, legacy=False)
-        front_end = UniSignMT5FrontEnd(mt5_name=mt5_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+        tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
+        front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
         model = MisalignedSLTModel(front_end=front_end, decoder="ar", segmentation_branch=False)
         # --checkpoint or data.yaml pretrained_slt ONLY (the released file, or this language's clean floor after the B2b re-root) 
         # — no `checkpoint.dir` fallback, so a concurrent train-slt run can't slip trained weights in.
@@ -456,13 +432,9 @@ def _build_eval_model(
         model.checkpoint_path = str(ckpt)   # the file actually loaded, for provenance
         return model, tokenizer
 
-    # Trained ar / dlm: same pose encoder + prompt, only the LM differs (clean mT5-vs-mBART ablation).
-    if "mbart" in lm_name.lower():
-        tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
-        front_end = UniSignMBartFrontEnd(mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer)
-    else:
-        tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
-        front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+    # Trained ar / dlm: the same pose encoder + prompt + mT5 front end as the baseline.
+    tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
+    front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
     model = MisalignedSLTModel(
         front_end=front_end, decoder="ar" if method == "ar" else "dlm",
         bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
@@ -496,10 +468,10 @@ def _decode_provenance(method: str, method_cfg: dict) -> dict:
             "spd_top_k": int(spd_cfg.get("top_k", 1)), "spd_renormalize": bool(spd_cfg.get("renormalize", True))}
 
 
-def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int) -> dict:
-    # Main AR rows are greedy; only DLM uses the block-decode params.
+def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_tokens: int, fps) -> dict:
+    # Main AR rows are greedy; only DLM uses the block-decode params. `fps`: the window's pose rate, or 1 per row of a batch.
     if method == "baseline":
-        num_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
+        num_beams = int(method_cfg.get("validation", {}).get("num_beams", 1))
         return {"max_text_tokens": max_tokens, "num_beams": num_beams}
 
     spd_cfg = method_cfg.get("spd", {})
@@ -511,18 +483,18 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
         # Same first-eligible-unit rule as the training sampler and streaming runner.
         "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
-        "gate_min_span_frames": lambda_min_frames(inference_cfg),
+        "gate_min_span_frames": seconds_to_frames(lambda_min_s(inference_cfg), fps),
     }
 
 
 @torch.no_grad()
 def _translate_windows(
-    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]], device: torch.device,
+    model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float, float]], device: torch.device,
     inference_cfg: dict, method_cfg: dict, batch_size: int | None = None, stream_start: bool = False,
     commit_frontier_s: list[float] | None = None, anchor_frames: list[tuple[int, int] | None] | None = None,
 ) -> list[tuple[str, float, bool]]:
-    """Pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)]. The loop-decode entry point:
-    ONE `generate_from_poses` path for every method.
+    """Pre-trimmed pose windows (poses, timestamps, start_s, fps) -> [(text, mean_token_confidence, gate_would_skip)]. The loop-decode
+    entry point: ONE `generate_from_poses` path for every method.
 
     Confidence is the real softmax prob of the model's own tokens, so "confidently wrong" is measured. Rows are right-padded and 
     `frame_mask`-masked, so each row's result matches translating it alone. `batch_size` None = 1 batch padded to its longest row; 
@@ -536,7 +508,7 @@ def _translate_windows(
             anchor_frames=anchor_frames[i:i + max(1, int(batch_size))] if anchor_frames else None,
         ))
         return out
-    prepped = [_prep_window(p, ts, start_s) for (p, ts, start_s) in items]
+    prepped = [_prep_window(p, ts, start_s) for (p, ts, start_s, _) in items]
     max_t = max(int(p.shape[0]) for p, _, _ in prepped)
     
     # Same repeat-last-frame pad + frame-mask contract as the training collator (data.batch).
@@ -544,9 +516,8 @@ def _translate_windows(
     timestamps = torch.stack([torch.nn.functional.pad(ts, (0, max_t - int(ts.shape[0]))) for _, ts, _ in prepped]).to(device)
     frame_mask = torch.stack([torch.nn.functional.pad(m, (0, max_t - int(m.shape[0]))) for _, _, m in prepped]).to(device)
 
-    # inference.yaml overrides the method default, as in the RQ2 runner.
-    max_tokens = int(inference_cfg.get("translation", {}).get("max_text_tokens", method_cfg.get("max_text_tokens", 320)))
-    gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens)
+    max_tokens = int(inference_cfg["translation"]["max_text_tokens"])  # the decode canvas, as in the RQ2 runner
+    gen_kwargs = _generation_kwargs(method, inference_cfg, method_cfg, max_tokens, [fps for *_, fps in items])
     # Whether frame 0 is a genuine sentence ONSET is a property of how the caller cut this window, not a constant:
     # a window that starts BEFORE the sentence opens inside the predecessor, and minting a B there would anchor Ω
     # on the predecessor's tail and floor the sentence being scored. Baseline is ungated, so the flag is inert.
@@ -588,7 +559,7 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     method_cfg = load_yaml(_method_config_path(args), language=args.language)
     # Optional per-run search override. Main comparisons use the greedy default.
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
-    _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
+    _rq1_beams = int(method_cfg.get("validation", {}).get("num_beams", 1))
     if args.method == "baseline" and _rq1_beams != 1: print(
         f"[rq1] WARNING: baseline decodes with num_beams={_rq1_beams} while the ar/dlm arms are greedy — "
         f"this run is not search-budget matched.", flush=True
@@ -643,9 +614,8 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             chunk.append((window, poses, timestamps))
         if not chunk: continue
         results = _translate_windows(
-            model=model, tokenizer=tokenizer, method=args.method,
-            items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
-            inference_cfg=inference_cfg, method_cfg=method_cfg,
+            model=model, tokenizer=tokenizer, method=args.method, method_cfg=method_cfg, inference_cfg=inference_cfg, device=device, 
+            items=[(poses, timestamps, w.window_start_s, float(records_by_id[w.video_id].pose.fps)) for (w, poses, timestamps) in chunk],
         )
         # Sequential decoder passes of the chunk's decode (one decode per chunk). Rows decode together, so at
         # batch_size > 1 this is the chunk's count; measure latency at rq1.batch_size 1, where it is per window.
@@ -719,13 +689,11 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
             # Decode provenance, mirroring RQ2's events stamp, so 2 sweeps under different flags stay distinguishable
             # and cross-method RQ1 comparisons never mix decode budgets.
             "provenance": {
-                "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1)))
-                             if args.method == "baseline" else 1,
+                "num_beams": int(method_cfg.get("validation", {}).get("num_beams", 1)) if args.method == "baseline" else 1,
                 **_decode_provenance(args.method, method_cfg),
                 "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
                 "checkpoint": getattr(model, "checkpoint_path", None),   # the file actually loaded
                 "segmentation_decode": "none" if args.method == "baseline" else "semi_markov_viterbi",
-                "conditioning_state": "predicted_from_window",
                 "batch_size": batch_size,  # the unit of mean_decoder_passes: per window at 1, per chunk above
             },
             "windows": len(rows), "severity": severity, "rows": rows,
@@ -737,20 +705,19 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
 def _build_streaming_runner(
     model, inference_cfg: dict, method_cfg: dict, translate: bool = True, cascade_model=None, record_trace: bool = False
 ) -> StreamingSLTRunner:
-    trans = inference_cfg.get("translation", {})
     spd = method_cfg.get("spd", {})
     boundary = inference_cfg.get("boundary_stability", {})
 
     return StreamingSLTRunner(
         model, stride_s=float(inference_cfg.get("stride_s", 1.0)),
         buffer_cap_s=float(inference_cfg["buffer_cap_s"]),
-        delta_enc_frames=int(boundary["delta_enc_frames"]),
+        delta_s=float(boundary["delta_s"]),
         hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
-        min_span_frames=lambda_min_frames(inference_cfg),
+        min_span_s=lambda_min_s(inference_cfg),
         # Ω from the method config's membership_gate; χ from the runner's commit log.
         gate_enabled=bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
         gate_eps=float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
-        max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 320))),
+        max_text_tokens=int(inference_cfg["translation"]["max_text_tokens"]),
         tau_dec=float(spd.get("tau_dec", 0.5)),  # same source and default as _generation_kwargs
         spd_top_k=int(spd.get("top_k", 1)), spd_renormalize=bool(spd.get("renormalize", True)),
         translate=bool(translate), cascade_model=cascade_model, record_trace=bool(record_trace),
@@ -848,7 +815,10 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         # BIO P/R/F1 on the runner's stitched legal tags (including committed frontier, 
         # as FSM read them; not raw argmax) vs GT captions: latest estimate per frame.
         if runner._bio_timeline is not None:
-            gold = make_bio_labels(timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s)
+            gold = make_bio_labels(
+                timestamps, record.sentences, 0.0, float(record.pose.duration_s), 
+                video_duration_s=record.pose.duration_s, untrusted=record.untrusted_s,
+            )
             tags = runner._bio_timeline.clone()
             # Ignore-region: where gold is UNK (quarantine / untrusted gap) the pred is neither right nor wrong —
             # mask it too, or every phantom "segment" there deflates precision for a region that has no GT.
@@ -888,8 +858,6 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     if fsm_bio_rows:
         fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
         print("[stream] FSM BIO (stitched decoded FSM tags vs GT): " + " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
-        run_streaming.last_fsm_bio = fsm_bio  # run_rq2 picks this up for the output payload
-    else: run_streaming.last_fsm_bio = None
     return to_source(predicted, records)
 
 
@@ -951,9 +919,13 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             # [start, end + 1 frame]: the crop holds the span's terminator frame unless the span ends at the stream end (as run_offline's 
             # window does), so a joint translator's readout inside it doesn't flip between closed and open with the float rounding of `end`.
             w_end = min(float(record.pose.duration_s), float(span.end_s) - record.pose.offset_s + 1.0 / float(record.pose.fps))
+            # An online span reads only the frames its buffer held at commit (timestamps < commit time). A cap-forced open span ends
+            # at that time and has no terminator frame to add; the epsilon absorbs the float noise of the source-time round trip.
+            commit = (rows[i] if i < len(rows) else {}).get("commit_time_s")
+            if commit is not None: w_end = min(w_end, float(commit) - record.pose.offset_s - 1e-6)
             poses, timestamps = load_pose_window(record.pose, start_s, w_end, normalize=True)
             if poses.shape[0] == 0: continue
-            items.append((poses, timestamps, start_s)); kept.append(span)
+            items.append((poses, timestamps, start_s, float(record.pose.fps))); kept.append(span)
             kept_rows.append(rows[i] if i < len(rows) else {})
         results = _translate_windows( # Cascade windows are cut exactly at the predicted span start, so frame 0 is that span's onset.
             model, tokenizer, args.method, items, device, inference_cfg, method_cfg, batch_size=int(args.batch_size), stream_start=True,
@@ -995,7 +967,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     # head a frame's logits depend only on its receptive field, so overlap-stitched chunks are exact once chunk/4 >= that field, for 
     # fixed per-frame features: each chunk has its own Uni-Sign body box, so the features themselves differ slightly between chunks.
     seg_chunk_cap_s = buffer_cap_s
-    min_span_frames = lambda_min_frames(inference_cfg)
+    min_span_s = lambda_min_s(inference_cfg)
     predicted: dict[str, list[PredictionEvent]] = {}
     n_sub_lambda = 0
     for record in tqdm(records, desc="Offline (self-segment + translate)"):
@@ -1018,14 +990,15 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         # Deployed span floor, offline too: Λ_min is POLICY (span_selection — a sub-floor span is unresolvable from boundary evidence and FSM 
         # never emits one), not streaming machinery. Without it this row emits flicker spans the deployed system cannot produce, each charged 
         # by SODA as a spurious prediction plus a junk translation — so (10 − 6) would partly measure the missing floor, not streaming.
-        kept = [s for s in segments if span_ge_lambda(float(s.end_s) - float(s.start_s), float(record.pose.fps), min_span_frames)]
+        floor = seconds_to_frames(min_span_s, record.pose.fps)
+        kept = [s for s in segments if span_ge_lambda(float(s.end_s) - float(s.start_s), float(record.pose.fps), floor)]
         n_sub_lambda += len(segments) - len(kept)
         segments = kept
 
         # Load and translate in batches (1 window/span), the same inversion run_rq1 uses.
         bounds, frontiers, anchors, results = [], [], [], []
         pending: list = []
-        delta_lead_s = float(inference_cfg["boundary_stability"]["delta_enc_frames"]) / float(record.pose.fps)
+        delta_lead_s = seconds_to_frames(inference_cfg["boundary_stability"]["delta_s"], record.pose.fps) / float(record.pose.fps)
 
         def _drain():
             if not pending: return
@@ -1041,7 +1014,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             w_end = min(float(record.pose.duration_s), float(span.end_s) + 1.0 / float(record.pose.fps))
             span_poses, span_ts = load_pose_window(record.pose, w_start, w_end, normalize=True)
             if span_poses.shape[0] == 0: continue
-            pending.append((span_poses, span_ts, w_start))
+            pending.append((span_poses, span_ts, w_start, float(record.pose.fps)))
             bounds.append((float(span.start_s), float(span.end_s)))
             # χ for this window: the δ lead is the PREDECESSOR's tail — already handled, exactly the FSM's post-commit leftover. 
             # Without it, a back-to-back lead is mid-signing, the merged I-run cannot open a span, and Ω anchors on NEXT sentence.
@@ -1055,7 +1028,7 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             if len(pending) >= int(args.batch_size): _drain()
         _drain()
         predicted[record.video_id] = _translated_events(record.video_id, [Segment(s0, s1) for s0, s1 in bounds], results)
-    if n_sub_lambda: print(f"[offline] dropped {n_sub_lambda} sub-Λ_min span(s) (< {min_span_frames} frames) — "
+    if n_sub_lambda: print(f"[offline] dropped {n_sub_lambda} sub-Λ_min span(s) (< {min_span_s:g} s in frames of the stream) — "
                            f"parity with the FSM's span selection, which can never commit them.", flush=True)
     return to_source(predicted, records)
 
@@ -1066,11 +1039,11 @@ def rq2_translator_token(args: argparse.Namespace) -> str:
     An ablation run is the same method under another config, so without the config stem it writes the main row's
     events, scores and stability file over the top and prints nothing.
     """
-    if getattr(args, "no_translate", False): return "none"
-    method = "clean" if args.method == "baseline" else str(args.method)
     cfg = getattr(args, "method_config", None)
-    if not cfg or str(cfg) == METHOD_CONFIGS[args.method]: return method
-    return f"{method}-{Path(cfg).stem.removeprefix('ablation_').replace('_', '-')}"
+    suffix = "" if not cfg or str(cfg) == METHOD_CONFIGS[args.method] \
+                else "-" + Path(cfg).stem.removeprefix("ablation_").replace("_", "-")
+    if getattr(args, "no_translate", False): return "none" + suffix
+    return ("clean" if args.method == "baseline" else str(args.method)) + suffix
 
 
 def rq2_output_stem(when: str, spans: str, decode: str, translator: str, language: str, split: str) -> str:
@@ -1112,7 +1085,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     thresholds = _parse_grid(args.tiou_thresholds, eval_cfg.get("rq2", {}).get("tiou_thresholds", [0.5, 0.7, 0.9]))
     provenance = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), "method": args.method, 
-        "num_beams": int(method_cfg.get("validation", {}).get("num_beams", method_cfg.get("num_beams", 1))) if args.method == "baseline" else 1,
+        "num_beams": int(method_cfg.get("validation", {}).get("num_beams", 1)) if args.method == "baseline" else 1,
         "language": args.language, "split": args.split, "checkpoint": getattr(args, "checkpoint", None),
         "segments": getattr(args, "segments", None), "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
     }
@@ -1122,14 +1095,14 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     online_arch = _online_segmenter_arch(args) if args.stream else None
     if online_arch is not None:
         provenance.update(method="baseline", segmenter_arch=online_arch, gate=False, num_beams=1)
-        provenance["min_span_frames"] = lambda_min_frames(score_cfg)
+        provenance["min_span_s"] = lambda_min_s(score_cfg)
     # The decode stamp follows the EFFECTIVE translator (an online cascade translates with the clean AR baseline
     # whatever --method says); a saved-event rescore reads no model geometry, the events carry their own.
     if not args.predictions: provenance.update(_decode_provenance(provenance["method"], method_cfg))
     if not args.predictions and getattr(args, "offline", False):
         # Λ_min is the offline joint row's GENERATION floor (run_offline drops shorter proposals). Scoring applies no floor,
         # and the cascade rows take external spans and declare none, so the stamp records how the events were made.
-        provenance["generation_min_span_frames"] = lambda_min_frames(score_cfg)
+        provenance["generation_min_span_s"] = lambda_min_s(score_cfg)
     # A deliberate beam override changes the search budget and cannot enter a main row delta.
     if args.method == "baseline" and int(provenance["num_beams"]) != 1: print(
         f"[rq2] WARNING: baseline decodes with num_beams={provenance['num_beams']} while the ar/dlm arms are greedy — "
@@ -1148,10 +1121,10 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         provenance["segmentation_decode"] = run_streaming.last_segmentation_decode
         provenance["velocity"] = run_streaming.last_velocity
         # The FSM's commit geometry as run (the live inference.yaml tolerance).
-        provenance["delta_enc_frames"] = int(score_cfg["boundary_stability"]["delta_enc_frames"])
+        provenance["delta_s"] = float(score_cfg["boundary_stability"]["delta_s"])
         provenance["stream_geometry"] = {
             "buffer_cap_s": score_cfg.get("buffer_cap_s"), "stride_s": score_cfg.get("stride_s", 1.0),
-            "boundary_stability": score_cfg.get("boundary_stability", {}), "min_span_frames": lambda_min_frames(score_cfg),
+            "boundary_stability": score_cfg.get("boundary_stability", {}), "min_span_s": lambda_min_s(score_cfg),
             "segmentation_decode": run_streaming.last_segmentation_decode,
         }
         if online_arch is not None:
@@ -1178,10 +1151,8 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
             f"--segments {args.segments} carries no segmenter_arch/decode provenance, so this row can't name itself. Span files are written by "
             f"`eval.py --emit-gold-segments` and `analyze.py --stage segmenter-infer`; RQ2 events file without both keys must be regenerated."
         )
-        # Spans an FSM committed online (row 11, online same-span control) keep the name `online`: the crop [start, end + 1 frame] reads only 
-        # frames the buffer held at commit time (the commit needs the terminator), and it uses the span normalization of online cascades, so 
-        # re-translating them moves the translator alone. The events keep their commit times. An exception: a cap-forced cut of an open span 
-        # ends at the buffer's exclusive end, so its crop reads 1 frame more.
+        # Spans an FSM committed online keep the name `online`: run_cascade clamps each crop to frames the buffer held at commit time, and it 
+        # uses span normalization of online cascades, so re-translating them moves translator alone. The events keep their commit times.
         when = "online" if src.get("when") == "online" else "offline"
         stem = rq2_output_stem(when, spans, decode, rq2_translator_token(args), args.language, args.split)
         if Path(f"outputs/{stem}.json").resolve() == Path(args.segments).resolve(): raise SystemExit(
@@ -1226,7 +1197,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     rank = lambda k: (0 if k.startswith("segmentation.") else 1 if ".densevid_" in k else 2 if ".soda_" in k else 3, k)
     table = table.loc[sorted(table.index, key=rank)]
     if not bool(getattr(args, "no_densevid", False)):
-        print("[rq2] headline = densevid_* rows, threshold average (original densevid_eval protocol); "
+        print("[rq2] headline = densevid_* rows, threshold average (densevid_eval matching and aggregation over the configured tIoU set); "
               "soda_* charges missed gold and is reported beside it.", flush=True)
     return _format_threshold_table(table)
 
@@ -1282,12 +1253,7 @@ def _load_segmenter(args):
         ckpt_default = f"checkpoints/moryossef/{args.language}"
         velocity, rope_chunk_s = bool(cfg.get("velocity", True)), None  # UNet chunks internally at num_frames
 
-    # checkpoint.dir expanded ${language} from the config's OWN `language:` key, so a differing CLI --language
-    # would load another corpus's checkpoint.
     ckpt_dir = checkpoint_dir(cfg, default=ckpt_default)
-    # A differing CLI --language would otherwise read another corpus's checkpoint (the config expanded ${language}
-    # from its OWN key). Pooled runs are exempt: the pool IS language-agnostic, so every --language reads it.
-    if (args.language and not pool_key(cfg) and str(cfg.get("language", args.language)) != str(args.language)): ckpt_dir = ckpt_default
     checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
     if args.segmenter_arch == "s1":
         # A stage-2 checkpoint (the deployed arm) is accepted for the S1 arch: its segmentation branch is re-keyed 
@@ -1305,6 +1271,10 @@ def _load_segmenter(args):
         f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --checkpoint "
         f"at the matching model, or align `pretrain_languages` (a pooled checkpoint is a DIFFERENT model from a monolingual one)."
     )
+    if "pretrain_pool" in _meta:  # a segmenter checkpoint (S1 or Moryossef); a stage-2 arm's head carries the arm's own provenance
+        from train.bio_pretrain import require_segmenter_data
+        train_labels = annotation_fingerprint(_cached_language_records(load_yaml(args.data_config), args.language, "train"))
+        require_segmenter_data(_meta, args.language, train_labels, load_yaml(args.inference_config)["buffer_cap_s"], checkpoint)
     if args.segmenter_arch == "moryossef":
         model.release_stats = _meta.get("release_stats")
         if model.release_stats is None: raise SystemExit(
@@ -1354,7 +1324,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     rq2_rows = evaluate_predicted_events(
         events, gold, list(thresholds), char_level=char_level_for_target(target_language(data_cfg, args.language))
     )["thresholds"]
-    rq2_protocol = {f"{r['tiou_threshold']:g}": r["segmentation"] for r in rq2_rows}
+    rq2_protocol = {f"{r['tiou_threshold']:g}": {
+        **r["segmentation"], "count_ratio": r["total_predictions"] / max(1, r["total_gold"])
+    } for r in rq2_rows}
     for t in thresholds: print(
         f"[segmenter-eval] tIoU {t:g}: moryossef-protocol F1 {metrics.get(f'phrase_tiou_f1@{t:g}', float('nan')):.3f} | "
         f"rq2-protocol F1 {rq2_protocol[f'{t:g}']['f1']:.3f} (quote the rq2-protocol number across tables)", flush=True

@@ -3,14 +3,15 @@ active_languages: [asf]
 # Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. pose.fps is a 
 # FALLBACK only. Real pose fps is resolved per video as total_pose_frames/video_duration from <root>/video_meta.csv. 
 # ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_yt25.py` writes their video_meta.csv (duration = 
-# frames/24, exact). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are extracted at the 
-# NATIVE rate varies per YouTube video. You can generate its labels once with:
+# frames / 24, rounded to 1 ms). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are 
+# extracted at the NATIVE rate varies per YouTube video. You can generate its labels once with:
 # `python prepare_yt25.py --stage meta --languages <lang> [--format SEL]` (yt-dlp metadata fetch, no video download).
 languages:
     # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
     # `python prepare_yt25.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
-    # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in the shards) and <root>/video_meta.csv (duration 
-    # from frame_count/24, so per-video fps calibration recovers exactly 24.0). pose.fps stays the fallback only.
+    # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in shards) and <root>/video_meta.csv (duration 
+    # from frame_count / 24 rounded to 1 ms, so per-video fps calibration recovers 24.0 within 0.001; 
+    # utils.seconds_to_frames absorbs that). pose.fps stays the fallback only.
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
     # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
     # init on both axes. OpenASL uses the same architecture and strict-loads.
@@ -20,7 +21,7 @@ languages:
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
         # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
+        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
         # pretrained_slt: checkpoints/baseline_train/ase/model.pt
         root: data/youtube-sl-25/ase
         pose:
@@ -33,7 +34,7 @@ languages:
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
         # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
+        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
         # pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
         pose:
@@ -46,7 +47,7 @@ languages:
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
         # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at the released checkpoint and the local baseline exists.
+        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
         # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
         pose:
@@ -64,18 +65,17 @@ splits:
 poses:
     # Visual cuts, 1 rule for every split and language (data.loader.split_clean_segments): the loader cuts every stream 
     # at video_meta.csv masked_runs (2+ real bodies and extra arms move) and empty_runs (no real body), and each clean 
-    # segment between them is a record. A multi-body run is scored in 2s windows at 1s steps (prepare_yt25._MOTION_BLOCK): 
-    # a window is cut when extra slots' shoulder-normalized arm variation over it exceeds this threshold, or cannot be 
-    # measured over whole run (a window too sparse to measure takes whole run's value), so a still picture of a person is 
-    # no run. Motion is in shoulder widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` 
-    # apply it when they write masked_runs, so a change needs `--stage convert --overwrite`.
+    # segment between them is a record. A multi-body run is scored in 2s windows at 1s steps (prepare_yt25._MOTION_BLOCK_S): 
+    # a window is cut when the arm variation of every real body other than the kept one, in KEPT body's shoulder widths,
+    # exceeds this threshold over it, or can't be measured over whole run (a window too sparse to measure takes whole run's
+    # value). A still picture of a person, or a body that never shows an elbow or wrist, is no run. Motion is in shoulder
+    # widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` apply it when they write
+    # masked_runs, so a change needs `prepare_yt25.py --stage person-counts --overwrite` (or `--stage all --overwrite`).
     min_extra_person_motion: 0.7
     # No-hand quarantine, 1 rule for every split and language (data.loader.quarantine_handless): a reliable caption unit 
     # with at least this share of its frames inside video_meta.csv handless_runs (12+ frames where the kept body shows no 
-    # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. On 250 train videos per language asf has no unit 
-    # between 0.70-0.99 and bfi has 6 at 0.8-0.95; at 0.9 the rule flags asf 8/5,579 and bfi 8/7,641 units, all non-signing 
-    # captions. These counts are on whole source videos, before visual cuts, which already remove most of these units (empty 
-    # run is also handless run); `report.py data` units_quarantined_handless gives the count that the rule adds after cuts.
+    # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. Per-unit handless share is bimodal and 0.9 sits
+    # in its empty band; `report.py data` units_quarantined_handless gives the count after cuts.
     handless_unit_share: 0.9
     # Exclude when fewer than this share of grouped caption intervals fits inside the supplied pose timeline
     # (1s end tolerance). This doesn't infer the cause, clip offset, or caption source. 0.0 disables it.
@@ -99,9 +99,9 @@ subtitles:
         cover: 0.5        # flag a pair sharing more than this fraction of the smaller video's identifying captions
     # SCROLLING caption tracks (YouTube's rolling two-line auto-captions: more than half the cues start before previous 
     # one ends). Every cue time on such a track is a DISPLAY event: a line leaves the screen when line 2 later arrives, 
-    # so its end runs a median 1.9-2.6 s (p90 3.0-3.9 s) past the next cue's start — 5-10x delta_enc — and clamping the 
-    # overlap would only move the next unit's start late by the same amount. Punctuation fixes the grouping of such cues, 
-    # so the track is dropped whole rather than repaired: 0 asf, 4 ase, 1 bfi videos.
+    # so its end runs a median 1.9-2.6 s (p90 3.0-3.9 s) past the next cue's start and clamping the overlap would only 
+    # move the next unit's start late by the same amount. Punctuation fixes the grouping of such cues, so the track is 
+    # dropped whole rather than repaired: 0 asf, 4 ase, 1 bfi videos.
     drop_scrolling_tracks: true
     human_only_splits: [test]
     human_only_exclude_sources: [mt]

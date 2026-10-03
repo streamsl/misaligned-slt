@@ -144,7 +144,8 @@ def evaluate_moryossef_whole_video(
         logits, timestamps = whole_video_logits(model, record, device, velocity, rope_chunk_s)
         if logits is None: continue
         gold = make_bio_labels(
-            timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s
+            timestamps, record.sentences, 0.0, float(record.pose.duration_s), 
+            video_duration_s=record.pose.duration_s, untrusted=record.untrusted_s,
         )
         logits = logits.detach().cpu()
         raw_logits = logits

@@ -8,14 +8,13 @@ from poses import normalize_keypoints_unisign
 from infer.duration_decode import DurationDecoder
 from infer.commit_gate import CommitGate, candidate_spans, open_span_start
 from infer.stability import display_prefix
-from utils import LAMBDA_MIN_FRAMES
+from utils import LAMBDA_MIN_S, seconds_to_frames
 
 
 @dataclass
 class StrideHypothesis: # One stride's candidate decode for the span the FSM is currently considering (committed or not).
     commit_time_s: float      # evidence-clock time of the stride that produced it (stride end, not wall-clock)
-    span_start_s: float       # absolute span bounds; used to group strides that concern the same sentence
-    span_end_s: float
+    span_start_s: float       # absolute span start; used to group strides that concern the same sentence
     token_ids: torch.Tensor
     token_confidence: torch.Tensor
     committed: bool
@@ -74,9 +73,9 @@ class StreamingSLTRunner:
     the selected target span (first complete span ≥ Λ_min); only the commit log and the per-span boundary votes persist.
     """
     def __init__(
-        self, model, stride_s: float = 1.0, buffer_cap_s: float = 40.0, delta_enc_frames: int = 12, hysteresis_strides: int = 3, 
+        self, model, stride_s: float = 1.0, buffer_cap_s: float = 40.0, delta_s: float = 0.5, hysteresis_strides: int = 3, 
         max_text_tokens: int = 320, tau_dec: float = 0.5, spd_top_k: int = 1, spd_renormalize: bool = True, 
-        min_span_frames: int | None = None, gate_enabled: bool = False, gate_eps: float = 1e-4, record_trace: bool = False, 
+        min_span_s: float = LAMBDA_MIN_S, gate_enabled: bool = False, gate_eps: float = 1e-4, record_trace: bool = False, 
         translate: bool = True, cascade_model=None
     ):
         # The joint arm decodes the whole buffer under the Ω soft crop (its stage-2 training conditioning); emitted boundaries 
@@ -94,29 +93,34 @@ class StreamingSLTRunner:
         self.max_text_tokens = int(max_text_tokens)
         self.tau_dec = float(tau_dec)
 
-        # Λ_min (min_span_frames): shortest selectable span in encoder frames — a LABEL-domain floor that rejects flicker; 
-        # genuine shorter units cannot be emitted. Not the re-emission guard (candidate_spans(skip_term_before=χ) is).
-        self.min_span_frames = int(min_span_frames) if min_span_frames is not None else LAMBDA_MIN_FRAMES
-        if self.min_span_frames < 1: raise ValueError(f"min_span_frames ({self.min_span_frames}) must be >= 1")
+        # Λ_min (min_span_s): shortest selectable span — a LABEL-domain floor that rejects flicker; genuine shorter units 
+        # can't be emitted. Not the re-emission guard (candidate_spans(skip_term_before=χ) is). Λ_min and δ are seconds; 
+        # `start_stream` converts them to the frames of each stream's fps.
+        self.min_span_s, self.delta_s, self.hysteresis_strides = float(min_span_s), float(delta_s), int(hysteresis_strides)
         # translate=False: segmentation-only dry run, no decoder call. Scores FSM's segmentation alone in minutes; events carry empty text.
         self.translate = bool(translate)
 
         self.spd_top_k = int(spd_top_k)
         self.spd_renormalize = bool(spd_renormalize)
-        self.commit_gate = CommitGate(delta_enc_frames=delta_enc_frames, hysteresis_strides=hysteresis_strides)
         # Membership gate: per stride, Ω from the BIO posteriors (on-policy, no GT) + χ from commit log — decoder's training conditioning. 
         self.gate_enabled = bool(gate_enabled)
         self.gate_eps = float(gate_eps)
-        self._committed_until_s = 0.0 # χ frontier: abs end of last committed span. Earlier buffer frames already emitted (≤δ overlap kept).
-        # Did the LAST commit end at a real BIO terminator (O-or-B) rather than a cap cut? Only that certifies "a sentence
-        # ENDED here", the χ-restoration's premise. Persistent: the seam is re-examined while the leftover lives.
-        self._committed_is_terminator = False
         # Per-stride candidate hypotheses for offline stable-prefix analysis; None = disabled (the default).
         self.trace: list[StrideHypothesis] | None = [] if record_trace else None
         # Why-did-it-(not)-commit counters across run() calls. Low streaming recall with near-perfect frame BIO is usually the gate:
         # boundary_ok (of spans_seen) is how often target's terminator was stable; forced_commit (of committed) how often the cap or EOF cut.
         self.gate_stats: dict[str, int] = {}
-        self._bio_timeline: torch.Tensor | None = None  # per-stream stitched decoded BIO tags; set by run()
+
+    def start_stream(self, fps: float, n_frames: int) -> None:
+        # Per-stream state, before the first `step` of a stream: Λ_min and δ in frames of its `fps`, an empty commit log.
+        if not 0.0 < float(fps) < float("inf"): raise ValueError("FPS must be finite and positive.")
+        self.min_span_frames = seconds_to_frames(self.min_span_s, fps)
+        self.commit_gate = CommitGate(seconds_to_frames(self.delta_s, fps), self.hysteresis_strides)
+        self._committed_until_s = 0.0 # χ frontier: abs end of last committed span. Earlier buffer frames already emitted (≤δ overlap kept).
+        # Did the LAST commit end at a real BIO terminator (O-or-B) rather than a cap cut? Only that certifies "a sentence ENDED here", 
+        # the χ-restoration's premise. Persistent: the seam is re-examined while the leftover lives.
+        self._committed_is_terminator = False
+        self._bio_timeline = torch.full((int(n_frames),), int(BIO["UNK"]), dtype=torch.long)  # per-stream stitched decoded BIO tags
 
     def _bump(self, key: str, n: int = 1) -> None:
         self.gate_stats[key] = self.gate_stats.get(key, 0) + int(n)
@@ -244,9 +248,9 @@ class StreamingSLTRunner:
         # offline (infer/stability.py). It is the one consumer of strides the gate defers, so it also turns the skip above off and pays 
         # for their decodes. Off by default; never affects the FSM.
         if self.trace is not None:
-            # Defensive trim only: generate_from_bio_tap already slices DLM output at 1st EOS (models/streaming_slt.py), and AR arm 
-            # returns no trailing pad, so there is normally nothing here to cut. Kept so a future decode path that DID leak post-EOS pad 
-            # (fabricated confidence 1.0, infer/decode.py) can't silently feed a reveal policy padding. It doesn't explain DLM over-reveal.
+            # Defensive trim only: generate_from_bio_tap already slices DLM output at 1st EOS (models/streaming_slt.py), 
+            # and AR arm returns no trailing pad, so there is normally nothing here to cut. A decode that leaks post-EOS 
+            # pad (fabricated confidence 1.0, infer/decode.py) must not feed a reveal policy padding.
             tk = getattr(self.model, "tokenizer", None)
             tok_row, conf_row = display_prefix(
                 tokens[0].detach().cpu(), confidence[0].detach().cpu(),
@@ -254,8 +258,7 @@ class StreamingSLTRunner:
                 pad_id=getattr(tk, "pad_token_id", None) if tk is not None else None,
             )
             self.trace.append(StrideHypothesis(
-                commit_time_s=emission_time_s,
-                span_start_s=float(start_s + ts_b[0, s_idx].item()), span_end_s=float(start_s + ts_b[0, term_idx].item()),
+                commit_time_s=emission_time_s, span_start_s=float(start_s + ts_b[0, s_idx].item()),
                 token_ids=tok_row.clone(), token_confidence=conf_row.clone(), committed=stable or forced,
             ))
         # A complete cap/drain event cuts at its terminator, retaining all later buffered sentences and their votes.
@@ -271,7 +274,7 @@ class StreamingSLTRunner:
 
     @torch.no_grad()
     def run(self, poses: torch.Tensor, fps: float) -> list[StreamingEvent]:
-        if not 0.0 < float(fps) < float("inf"): raise ValueError("FPS must be finite and positive.")
+        self.start_stream(fps, poses.shape[0])
         timestamps = torch.arange(poses.shape[0], device=poses.device, dtype=torch.float32) / float(fps)
         events: list[StreamingEvent] = []
         duration = poses.shape[0] / float(fps)  # exclusive endpoint, including the final frame
@@ -282,12 +285,6 @@ class StreamingSLTRunner:
         frame_s = 1.0 / float(fps)
         last_commit_t = 0.0
         end_s, next_stride_s = 0.0, self.stride_s
-
-        self.commit_gate.reset()
-        self._committed_until_s = 0.0  # χ commit log resets per stream
-        self._committed_is_terminator = False
-        self._bio_timeline = torch.full((poses.shape[0],), int(BIO["UNK"]), dtype=torch.long)  # stitched tags
-        self._fps = float(fps)
 
         def absorb(event) -> None:
             nonlocal last_commit_t

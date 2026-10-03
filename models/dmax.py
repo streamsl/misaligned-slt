@@ -2,7 +2,7 @@
 
 `OPUTBlockDiffusionDecoder` adds DMax's mechanisms on top of `block_diffusion.BlockDiffusionDecoder`, over a
 precomputed encoder memory (`enc_hidden`/`enc_mask`); it stays abstract on `_decode`, `_decode_with_decoder_forward`
-and `_decoder_stack`, so the mBART / mT5 bindings (models/unisign.py) supply only the backbone forwards.
+and `_decoder_stack`, so the mT5 binding (models/unisign.py) supplies only the backbone forwards.
 
   - `oput_forward`     — OPUT two-pass training (mask + on-policy argmax corruption); trains self-correction.
   - `generate`         — block decode (infer/decode.py): DMax's confident-prefix commits, SPD soft state and
@@ -104,7 +104,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     '''BD3LM decoder with DMax's OPUT training and block decoding, over fixed encoder conditioning.
 
     Abstract on `_decode` (the custom-mask forward that training needs), `_decode_with_decoder_forward` (native HF forward 
-    that carries a KV cache) and `_decoder_stack` (the stack the Ω injector hooks); the `MBart`/`MT5` bindings supply all 3. 
+    that carries a KV cache) and `_decoder_stack` (the stack the Ω injector hooks); the `MT5` binding supplies all 3. 
     Block decode is cold-start per call — no state crosses streaming strides.
     '''
     def oput_forward(
@@ -154,14 +154,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         raise NotImplementedError(f"{type(self).__name__} has no cache-capable decoder.forward")
 
     def _decoder_stack(self) -> torch.nn.Module:
-        # Backbone hook: the HF decoder stack (T5Stack / MBartDecoder) the Ω cross-attention injector hooks into.
+        # Backbone hook: the HF decoder stack (T5Stack) the Ω cross-attention injector hooks into.
         raise NotImplementedError(f"{type(self).__name__} exposes no decoder stack")
-
-    def _omega_injector(self):
-        # The one injector of this decoder stack (shared with AR arm's hooks on same modules). Pre-hooks
-        # are inert outside `with_omega`, so the custom `_decode` path (which adds Ω itself) is untouched.
-        from models.membership_gate import CrossAttnOmegaInjector
-        return CrossAttnOmegaInjector.attach(self._decoder_stack())
 
     def _block_decoder(self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, omega_bias: torch.Tensor | None = None):
         '''`forward` / `finalize` for `block_diffusion_decode`, over a KV cache of the final blocks.
@@ -175,7 +169,12 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
         '''
         assert not self.training, "the block decode is an eval-mode operation (dropout would break cache exactness)"
         state = {"past": None, "length": 0}
-        injector = self._omega_injector() if omega_bias is not None else None
+        injector = None
+        if omega_bias is not None:
+            # The one injector of this decoder stack (shared with AR arm's hooks on same modules). Pre-hooks
+            # are inert outside `with_omega`, so the custom `_decode` path (which adds Ω itself) is untouched.
+            from models.membership_gate import CrossAttnOmegaInjector
+            injector = CrossAttnOmegaInjector.attach(self._decoder_stack())
 
         def native(**kw):
             if injector is None: return self._decode_with_decoder_forward(**kw)
@@ -185,7 +184,7 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
             assert state["length"] == lo, "the block decode extends its cache in order"
             # All-attend over [final prefix | block]: bidirectional inside the block, causal across blocks.
             mask = torch.zeros((ids.shape[0], 1, hi - lo, hi), dtype=enc_hidden.dtype, device=ids.device)
-            # Always embed here: the canvas embedding carries the [MASK] row (and mBART's scale) the backbone's own does not.
+            # Always embed here: the canvas embedding carries the [MASK] row the backbone's own does not.
             embeds = self.embed_tokens(ids[:, lo:hi]) if soft is None else soft
             return native(
                 decoder_input_ids=ids[:, lo:hi], inputs_embeds=embeds, enc_hidden=enc_hidden, 

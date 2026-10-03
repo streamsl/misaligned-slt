@@ -47,8 +47,8 @@ scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent).
 
 The converter reads the flat `person_<k>_*_keypoints (18,2)` + `_scores` schema. Slot 0 is the detector's top-scored person, chosen again 
 in every frame, so slot order does not certify body size, signing activity, or a persistent identity. Detector boxes and signer identities 
-are not present in this schema. `_primary_slots` keeps slot 0 except where it flickers to another real body for < 0.5s. Other slots supply 
-candidate hand crops and the masked-run measurement.
+are not present in this schema. `_primary_slots` keeps slot 0 except where it flickers to another real body for < 0.5s, or where slot 0
+holds no real body and another slot does. Other slots supply candidate hand crops and the masked-run measurement.
 
 Verified quirks handled here (real bytes, shards 000006 + 000270):
   - body_scores always hold upstream DWPose index code 18*i+j (joint visible, detector conf > 0.3) or -1, never a confidence → 1.0 in-frame / 
@@ -69,7 +69,7 @@ from pathlib import Path
 from data.loader import best_subtitle
 from poses.pose_io import (META_FILENAME, base_video_id, build_pose_index, drop_from_page_cache, 
                            load_pose_frames, load_video_meta, save_video_meta)
-from utils import load_yaml
+from utils import load_yaml, seconds_to_frames
 
 HF_BASE = "https://huggingface.co/datasets/SignerX/SignVerse-2M/resolve/main"
 PROGRESS_JSON = "runtime_state/archive_upload_progress.json"
@@ -109,13 +109,14 @@ _HAND_GATE = 0.08                                # normalized-image distance: a 
 _OP_UPPER_TORSO = [0, 1, 2, 5]                   # OpenPose-18 nose, neck, R/L shoulder: the tracked body centre
 _REAL_BODY_JOINTS = 8                            # visible body joints for a slot to count as a real body
 _SLOT_JUMP, _SLOT_NEAR = 0.10, 0.05              # frame heights: slot-0 jump / other-slot match to the last chosen centre
-_SLOT_HOLD_MAX = 12                              # frames (0.5 s at 24 fps): a longer hold is the detector's real choice
-_MASK_RUN = 12                                   # frames (0.5 s at 24 fps): runs closer than this merge; shorter masked runs drop
-_EMPTY_RUN = 24                                  # frames (1 s at 24 fps): shorter empty runs drop
-_MOTION_BLOCK = 48                               # frames (2 s at 24 fps): a masked run is scored and cut per window this long
-_HAND_CONF = 0.3                                 # a hand keypoint counts when its confidence is above Uni-Sign's validity threshold (poses.preprocessing.normalize_keypoints_unisign thr)
+# Run rules in seconds; each function converts them with the video's fps (utils.seconds_to_frames: 12/24/48 frames at 24 fps).
+_SLOT_HOLD_MAX_S = 0.5                           # a longer hold is the detector's real choice
+_MASK_RUN_S = 0.5                                # runs closer than this merge; shorter masked runs drop
+_EMPTY_RUN_S = 1.0                               # shorter empty runs drop
+_MOTION_BLOCK_S = 2.0                            # a masked run is scored and cut per window this long, at half-window steps
+_HAND_CONF = 0.3                                 # a hand keypoint counts when its confidence is above Uni-Sign's validity threshold 
 _HAND_MIN_POINTS = 10                            # of a hand's 21 keypoints: half a hand is a visible hand
-_HANDLESS_RUN = _MASK_RUN                        # frames (0.5 s at 24 fps): a shorter no-hand stretch is a sign transition, an occlusion or motion blur, not an absent signer
+_HANDLESS_RUN_S = _MASK_RUN_S                    # a shorter no-hand stretch is a sign transition, an occlusion or motion blur, not an absent signer
 
 def _part_arrays(payload: dict, part: str, count: int, who: str = "person_000") -> tuple[np.ndarray, np.ndarray] | None:
     kp = payload.get(f"{who}_{part}_keypoints")
@@ -196,17 +197,37 @@ def _shoulders(xy: np.ndarray) -> tuple[np.ndarray, float] | None:
     width = float(np.linalg.norm(right - left))
     return ((right + left) / 2.0, width) if width > 1e-6 else None
 
-def _extra_arms(payload, kept: int) -> tuple[bool, float | None, list[tuple[int, np.ndarray]]]:
-    # What `_arm_motion` reads from 1 frame: whether a real body other than the kept slot exists, the KEPT body's shoulder width (the
-    # scale of every arm), and per other real body with both shoulders visible, (slot, elbows and wrists minus its shoulder midpoint).
+def _extra_arms(payload, kept: int) -> tuple[bool, float | None, list[tuple[np.ndarray, np.ndarray]]]:
+    # What `_arm_motion` reads from 1 frame: whether a real body other than the kept slot shows an arm, the KEPT body's shoulder width
+    # (the scale of every arm), and per such body with both shoulders visible, (shoulder midpoint in frame heights, elbows and wrists
+    # minus its shoulder midpoint). A body with no visible elbow or wrist (a head-and-shoulders photo, an inset cut at the chest) can't
+    # sign in this frame, so it is not an extra body here: otherwise its arms are unmeasurable and the whole run is cut.
     kept_shoulders = _shoulders(_person_keypoints(payload, f"person_{kept:03d}"))
+    width, height = float(payload.get("frame_width", 0) or 0), float(payload.get("frame_height", 0) or 0)
+    aspect = width / height if width > 0 and height > 0 else 16 / 9   # as `_body_centres`
     extra, arms = False, []
     for slot in range(num_persons(payload)):
         if slot == kept or _real_body(payload, slot) is None: continue
-        extra = True
         xy = _person_keypoints(payload, f"person_{slot:03d}")
-        if (shoulders := _shoulders(xy)) is not None: arms.append((slot, xy[list(_OP_ARMS)] - shoulders[0]))
+        if not np.isfinite(xy[list(_OP_ARMS)]).any(): continue
+        extra = True
+        if (shoulders := _shoulders(xy)) is not None: arms.append((shoulders[0] * (aspect, 1.0), xy[list(_OP_ARMS)] - shoulders[0]))
     return extra, (kept_shoulders[1] if kept_shoulders else None), arms
+
+
+def _person_tracks(rows) -> list[list[np.ndarray]]:
+    # The other bodies of `_extra_arms` rows linked into people: each body joins the nearest person whose last shoulder midpoint is within
+    # _SLOT_JUMP, else starts a new one. Slots are detector ranks that the detector re-orders every frame, so pooling arms by slot made 2
+    # still people who swap ranks look like 1 moving person.
+    people: list[tuple[np.ndarray, list]] = []
+    for _, _, arms in rows:
+        free = list(range(len(people)))
+        for centre, xy in arms:
+            near = min(((float(np.linalg.norm(centre - people[k][0])), k) for k in free), default=(np.inf, -1))
+            if near[0] <= _SLOT_JUMP: k = near[1]; free.remove(k); people[k] = (centre, people[k][1])
+            else: people.append((centre, [])); k = len(people) - 1
+            people[k][1].append(xy)
+    return [joints for _, joints in people]
 
 
 def _arm_motion(per_frame) -> float | None:
@@ -215,20 +236,21 @@ def _arm_motion(per_frame) -> float | None:
     Each frame is scaled by the kept body's shoulder width in that frame, floored at half its median over the frames (a frame without 
     it takes the median), so a camera zoom cancels. The scale is the signer's, not the other body's own: a partial or false detection 
     (a profile, a body cut at the frame edge, an object) has shoulders near 0 wide, and its own scale turned jitter into tens of widths.
-    A joint needs 10 observations. None means that other bodies exist but cannot be measured (no visible arms, or no kept shoulders in
-    any frame). Zero covers no other body or measured arms with no variation. Slots are detector ranks, not tracked identities.
+    A joint needs 10 observations. None means that other bodies show arms but can't be measured (too few arm observations, no shoulders 
+    on other body, or no kept shoulders in any frame). Zero covers no other body with a visible arm, or measured arms with no variation. 
+    Each other body is followed as a person across the frames (`_person_tracks`), not as a detector slot.
     """
     rows = list(per_frame)
     has_extra = any(extra for extra, _, _ in rows)
     known = [width for _, width, _ in rows if width is not None]
     if not known: return None if has_extra else 0.0
     median = float(np.median(known))
-    frames = {}
-    for _, width, arms in rows:
-        scale = max(median if width is None else width, 0.5 * median)
-        for slot, xy in arms: frames.setdefault(slot, []).append(xy / scale)
+    scaled = [
+        (extra, width, [(centre, xy / max(median if width is None else width, 0.5 * median)) for centre, xy in arms]) 
+        for extra, width, arms in rows
+    ]
     scores = []
-    for joints in frames.values():
+    for joints in _person_tracks(scaled):
         arms = np.stack(joints)
         seen = np.isfinite(arms).all(axis=-1)
         keep = seen.sum(axis=0) >= 10
@@ -249,29 +271,31 @@ def _real_bodies(payload) -> int:
     return sum(_real_body(payload, slot) is not None for slot in range(num_persons(payload)))
 
 
-def masked_runs(frames, slots: np.ndarray, min_motion: float) -> list[list[int]]:
+def masked_runs(frames, slots: np.ndarray, min_motion: float, fps: float) -> list[list[int]]:
     """Half-open .npy frame runs [a, b) where a real body other than the kept one is present AND moves.
 
-    `frames` gives (0-based frame, payload) in frame order; an absent frame has no body. `slots[t]` is the slot the .npy keeps in frame t
-    (`_primary_slots`), so signer's own motion never counts, whichever slot holds it. Frame qualifies with >=2 real bodies. Runs separated 
-    by fewer than _MASK_RUN frames merge, and runs shorter than _MASK_RUN frames are dropped. Each run is scored in windows of _MOTION_BLOCK 
-    frames at half-window steps, the last one ending at the run end (a run shorter than 1 window is 1 window), so a still picture beside the 
-    signer neither hides a short mover nor gets cut with it, and a mover off the window grid is still covered. A window whose own frames are 
-    too few to measure (`_arm_motion` None) takes the motion of the whole run, so a picture the detector finds only now and then is not cut.
-    A window is cut when its motion is None (the whole run is unmeasurable) or above `min_motion` (data.yaml poses.min_extra_person_motion); 
-    overlapping and adjacent cut windows merge. A still second body (a picture) is therefore no run.
+    `frames` gives (0-based frame, payload) in frame order; an absent frame has no body. `slots[t]` is the slot the .npy keeps in 
+    frame t (`_primary_slots`), so signer's own motion never counts, whichever slot holds it. Frame qualifies with >=2 real bodies. 
+    Runs separated by less than _MASK_RUN_S merge, and runs shorter than _MASK_RUN_S are dropped. Each run is scored in windows of 
+    _MOTION_BLOCK_S at half-window steps (frame counts at the video's `fps`), the last one ending at the run end (a run shorter than 
+    1 window is 1 window), so a still picture beside the signer neither hides a short mover nor gets cut with it, and a mover off the 
+    window grid is still covered. A window whose own frames are too few to measure (`_arm_motion` None) takes the motion of whole run, 
+    so a picture the detector finds only now and then is not cut. A window is cut when its motion is None (whole run is unmeasurable) 
+    or above `min_motion` (data.yaml poses.min_extra_person_motion); overlapping and adjacent cut windows merge. A still 2nd body 
+    (picture), or one that never shows an elbow or wrist, is therefore no run.
     """
+    mask_run, block = seconds_to_frames(_MASK_RUN_S, fps), seconds_to_frames(_MOTION_BLOCK_S, fps)
     runs: list[list[int]] = []
     run: list = []   # [a, b, (frame, _extra_arms) rows since a]: the arm rows, not the payloads, bound memory on a long run
 
     def close() -> None:
         a, b, rows = run
-        if b - a < _MASK_RUN: return
+        if b - a < mask_run: return
         rows = [row for row in rows if row[0] < b]
         times, arms = [t for t, _ in rows], [row[1] for row in rows]
         whole = _arm_motion(arms)
-        for lo in [*range(a, b - _MOTION_BLOCK, _MOTION_BLOCK // 2), max(a, b - _MOTION_BLOCK)]:
-            hi = min(lo + _MOTION_BLOCK, b)
+        for lo in [*range(a, b - block, block // 2), max(a, b - block)]:
+            hi = min(lo + block, b)
             motion = _arm_motion(arms[bisect.bisect_left(times, lo):bisect.bisect_left(times, hi)])
             if motion is None: motion = whole
             if motion is None or motion > min_motion:
@@ -279,7 +303,7 @@ def masked_runs(frames, slots: np.ndarray, min_motion: float) -> list[list[int]]
                 else: runs.append([lo, hi])
 
     for t, payload in frames:
-        if run and t - run[1] >= _MASK_RUN: close(); run = []  # no later frame can merge into this run
+        if run and t - run[1] >= mask_run: close(); run = []  # no later frame can merge into this run
         qualifies = _real_bodies(payload) >= 2
         if run or qualifies:
             if not run: run = [t, t + 1, []]
@@ -289,24 +313,25 @@ def masked_runs(frames, slots: np.ndarray, min_motion: float) -> list[list[int]]
     return runs
 
 
-def empty_runs(frames, n_frames: int) -> list[list[int]]:
+def empty_runs(frames, n_frames: int, fps: float) -> list[list[int]]:
     """Half-open .npy frame runs [a, b) with no real body (no slot with _REAL_BODY_JOINTS visible joints).
 
-    `frames` gives (0-based frame, payload) for frames < `n_frames`; a frame it omits has no body. 
-    Runs separated by fewer than _MASK_RUN frames merge, and runs shorter than _EMPTY_RUN frames are dropped.
+    `frames` gives (0-based frame, payload) for frames < `n_frames`; a frame it omits has no body. Runs separated by less than 
+    _MASK_RUN_S merge, and runs shorter than _EMPTY_RUN_S are dropped (frame counts at the video's `fps`).
     """
+    mask_run, empty_run = seconds_to_frames(_MASK_RUN_S, fps), seconds_to_frames(_EMPTY_RUN_S, fps)
     empty = np.ones(n_frames, dtype=np.int8)
     for t, payload in frames: empty[t] = _real_bodies(payload) == 0
     edges = np.flatnonzero(np.diff(np.concatenate([[0], empty, [0]])))
     runs: list[list[int]] = []
     for a, b in zip(edges[::2].tolist(), edges[1::2].tolist()):
-        if runs and a - runs[-1][1] < _MASK_RUN: runs[-1][1] = b
+        if runs and a - runs[-1][1] < mask_run: runs[-1][1] = b
         else: runs.append([a, b])
-    return [run for run in runs if run[1] - run[0] >= _EMPTY_RUN]
+    return [run for run in runs if run[1] - run[0] >= empty_run]
 
 
-def handless_runs(poses: np.ndarray) -> list[list[int]]:
-    """Half-open .npy frame runs [a, b) of at least _HANDLESS_RUN frames in which the kept body shows no hand.
+def handless_runs(poses: np.ndarray, fps: float) -> list[list[int]]:
+    """Half-open .npy frame runs [a, b) of at least _HANDLESS_RUN_S (in frames at the video's `fps`) in which the kept body shows no hand.
 
     `poses` is the converted (T, 133, 3) array, so the hands are the ones `_primary_slots` kept. A hand is present in a frame when at least 
     _HAND_MIN_POINTS of its 21 keypoints have confidence above _HAND_CONF; a frame with no body has no hand. Runs never merge across a frame 
@@ -315,20 +340,23 @@ def handless_runs(poses: np.ndarray) -> list[list[int]]:
     hands = (poses[:, COCO_LEFT_SLICE, 2] > _HAND_CONF).sum(axis=1) >= _HAND_MIN_POINTS
     hands |= (poses[:, COCO_RIGHT_SLICE, 2] > _HAND_CONF).sum(axis=1) >= _HAND_MIN_POINTS
     edges = np.flatnonzero(np.diff(np.concatenate([[0], (~hands).astype(np.int8), [0]])))
-    return [[a, b] for a, b in zip(edges[::2].tolist(), edges[1::2].tolist()) if b - a >= _HANDLESS_RUN]
+    shortest = seconds_to_frames(_HANDLESS_RUN_S, fps)
+    return [[a, b] for a, b in zip(edges[::2].tolist(), edges[1::2].tolist()) if b - a >= shortest]
 
 
-def fill_handless_runs(lang_root: Path, meta: dict[str, dict]) -> int:
-    """Fill every blank handless_runs value of `meta` from the pose files under <lang_root>/poses; return the count.
+def fill_handless_runs(lang_root: Path, meta: dict[str, dict], remeasure: bool = False) -> int:
+    """Fill every blank handless_runs value of `meta` (every value under `remeasure`) from pose files under <lang_root>/poses; return count.
 
-    A video's `_segment_N` files are read in order as one stream, as the loader reads them. No archive is read, so
-    `--stage person-counts` (SignVerse) and `--stage meta` (poses extracted outside SignVerse) both fill the column.
+    A video's `_segment_N` files are read in order as one stream, as the loader reads them. No archive is read, so `--stage person-counts` 
+    (SignVerse) and `--stage meta` (poses extracted outside SignVerse) both fill the column. The fps of a video is its frames / duration_s, 
+    as the loader reads it: every `meta` row has a duration (load_video_meta keeps no row without one), so the fallback rate can reach only 
+    a 0-frame file, which has no run at any rate.
     """
-    blank = [vid for vid, row in meta.items() if row.get("handless_runs") is None]
+    blank = [vid for vid, row in meta.items() if remeasure or row.get("handless_runs") is None]
     if not blank: return 0
-    index = build_pose_index(lang_root / "poses", fps=1.0)   # frame counts only: fps is not read
+    index = build_pose_index(lang_root / "poses", fps=SIGNVERSE_DEFAULT_FPS, video_meta=meta)
     blank = [vid for vid in blank if vid in index]
-    for vid in blank: meta[vid]["handless_runs"] = handless_runs(load_pose_frames(index[vid], 0, index[vid].total_frames))
+    for vid in blank: meta[vid]["handless_runs"] = handless_runs(load_pose_frames(index[vid], 0, index[vid].total_frames), index[vid].fps)
     return len(blank)
 
 
@@ -344,33 +372,44 @@ def _body_centres(payload, width: float, height: float) -> list[np.ndarray | Non
     return out
 
 
-def _primary_slots(centres: list[list[np.ndarray | None]]) -> np.ndarray:
-    """Per frame, the slot whose body and face the .npy keeps (`centres[t]` from `_body_centres`).
+def _primary_slots(centres: list[list[np.ndarray | None]], fps: float) -> np.ndarray:
+    """Per frame, the slot whose body and face the .npy keeps (`centres[t]` from `_body_centres`; _SLOT_HOLD_MAX_S in frames at `fps`).
 
-    The detector re-ranks persons every frame, and slot 0 briefly flickers to another real body. Pass 1 tracks chosen body: where slot 0 
-    jumps > _SLOT_JUMP from last chosen centre and another real slot is within _SLOT_NEAR of it, that slot is kept. A hold stops at 
-    _SLOT_HOLD_MAX frames and tracking moves to slot 0, so a later flicker back to old body is smoothed too. Pass 2 gives every hold of >= 
-    _SLOT_HOLD_MAX frames back to slot 0, so detector's sustained choice stays. Frame with at most 1 real body keeps slot 0, so single-person 
-    video is unchanged. Body size is no guide: largest-body rule picks a still, handless bystander in most frames of some videos.
+    The detector re-ranks persons every frame, and slot 0 briefly flickers to another real body. Pass 1 tracks chosen body: where slot 
+    0 jumps > _SLOT_JUMP from last chosen center and another real slot is within _SLOT_NEAR of it, that slot is kept. A hold stops at 
+    _SLOT_HOLD_MAX_S and tracking moves to slot 0, so a later flicker back to old body is smoothed too. Pass 2 gives every hold of >= 
+    _SLOT_HOLD_MAX_S back to slot 0, so detector's sustained choice stays. A frame whose slot 0 holds no real body keeps the real slot 
+    nearest to the tracked body when it lies within _SLOT_JUMP of it, and pass 2 never gives such a frame back to slot 0. Farther real 
+    body is another person: frame keeps slot 0 (tracked signer's partial skeleton) until tracked body is unseen for _SLOT_HOLD_MAX_S; 
+    then, as before any body is tracked, 1st real slot is kept. A single-person video whose body is in slot 0 is unchanged. Body size 
+    is no guide: largest-body rule picks a still, handless bystander in most frames of some videos.
     """
+    hold_max = seconds_to_frames(_SLOT_HOLD_MAX_S, fps)
     slots = np.zeros(len(centres), dtype=np.int64)
-    last, held = None, 0
+    forced = np.zeros(len(centres), dtype=bool)   # slot 0 holds no real body here, so slot 0 is not a choice
+    last, held, unseen = None, 0, 0
     for t, frame in enumerate(centres):
-        if frame and frame[0] is not None and last is not None \
-                 and held < _SLOT_HOLD_MAX and np.linalg.norm(frame[0] - last) > _SLOT_JUMP:
+        if frame and frame[0] is None:
+            free = last is None or unseen >= hold_max
+            real = [(0.0 if free else float(np.linalg.norm(c - last)), k) for k, c in enumerate(frame) if c is not None]
+            real = [(d, k) for d, k in real if free or d <= _SLOT_JUMP]
+            if real: slots[t], forced[t] = min(real)[1], True
+        elif frame and last is not None and held < hold_max and np.linalg.norm(frame[0] - last) > _SLOT_JUMP:
             d, k = min((
                 (np.linalg.norm(c - last), k) for k, c in enumerate(frame[1:], 1) if c is not None
             ), default=(np.inf, 0))
             if d <= _SLOT_NEAR: slots[t] = k
-        held = held + 1 if slots[t] else 0
-        if frame and frame[slots[t]] is not None: last = frame[slots[t]]
+        held = held + 1 if slots[t] and not forced[t] else 0
+        if frame and frame[slots[t]] is not None: last, unseen = frame[slots[t]], 0
+        else: unseen += 1
 
+    held_frames = (slots != 0) & ~forced
     t = 0
     while t < len(slots):
         u = t + 1
-        if slots[t]:
-            while u < len(slots) and slots[u]: u += 1
-            if u - t >= _SLOT_HOLD_MAX: slots[t:u] = 0
+        if held_frames[t]:
+            while u < len(slots) and held_frames[u]: u += 1
+            if u - t >= hold_max: slots[t:u] = 0
         t = u
     return slots
 
@@ -380,12 +419,13 @@ def _primary_hands(payload: dict, body: tuple[np.ndarray, np.ndarray] | None) ->
 
     DWPose crops hands from WHOLE IMAGE and distributes crops over person slots in an order unrelated to body slot, so `person_000_left_hand` 
     is regularly another body's hand. Reading slot would put a painting's frozen hand on the signer in half the frames of 1/4 the corpus. 
-    So each of the kept body's 2 wrists claims the crop whose root (point 0) is nearest to it, over every slot in the frame, and a crop 
-    further than `_HAND_GATE` is left out. A side that no wrist claims (no crop within the gate, or an invisible wrist) is absent from 
-    the result, and `payload_to_coco133` decides it: zero in a frame with 2 or more real bodies, the kept slot's own crop otherwise.
+    So the kept body's 2 wrists claim 2 crops whose roots (point 0) are nearest to them, over every slot in the frame, and a crop further 
+    than `_HAND_GATE` is left out. The pairing claims the most sides, then has smallest total wrist-to-root distance, so 2 touching hands 
+    are not swapped (with 2 wrists, the better of 2 one-wrist-first greedy orders is that pairing). A side that no wrist claims (no crop 
+    within the gate, or an invisible wrist) is absent from the result, and `payload_to_coco133` decides it: 0 in a frame with 2 or more 
+    real bodies, the kept slot's own crop otherwise.
     """
-    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    if body is None: return out
+    if body is None: return {}
     body_kp, body_sc = body
     offered: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -394,30 +434,36 @@ def _primary_hands(payload: dict, body: tuple[np.ndarray, np.ndarray] | None) ->
             got = _part_arrays(payload, part, 21, who=f"person_{slot:03d}")
             if got is not None and float(np.abs(got[0]).max()) > 0.0: offered.append(got)
 
-    taken: set[int] = set()
-    for part, op_idx in _OP_WRIST.items():
-        if body_sc[op_idx] <= 0.0: continue
-        wrist = body_kp[op_idx]
-        best, best_d = None, _HAND_GATE
-        for i, (kp, _) in enumerate(offered):
-            if i in taken: continue
-            d = float(np.linalg.norm(kp[0] - wrist))
-            if d < best_d: best, best_d = i, d
-        if best is not None:
-            taken.add(best)
-            out[part] = offered[best]
-    return out
+    def claim(order):
+        out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        taken, total = set(), 0.0
+        for part, op_idx in order:
+            if body_sc[op_idx] <= 0.0: continue
+            wrist = body_kp[op_idx]
+            best, best_d = None, _HAND_GATE
+            for i, (kp, _) in enumerate(offered):
+                if i in taken: continue
+                d = float(np.linalg.norm(kp[0] - wrist))
+                if d < best_d: best, best_d = i, d
+            if best is not None:
+                taken.add(best)
+                out[part], total = offered[best], total + best_d
+        return out, total
+
+    order = list(_OP_WRIST.items())
+    return min((claim(order), claim(order[::-1])), key=lambda r: (-len(r[0]), r[1]))[0]
 
 
 def payload_to_coco133(payload: dict, who: str = "person_000") -> np.ndarray:
     # 1 frame payload → (133, 3) COCO-WholeBody (x, y, conf), coords NORMALIZED [0,1] as stored (see module docstring); zeros where absent. 
-    # Body/face from slot `who`; bind hands by wrist location across all slots. A hand that no wrist claims is 0 in a frame with 2+ real 
-    # bodies, because the slot's own crop can be another person's hand. With at most 1 real body the slot's own crop stays: no second real 
-    # body is there to own it, though the crop can sit far from a visible wrist (crops are not tied to their slot, `_primary_hands`).
+    # Body/face from slot `who`; bind hands by wrist location across all slots. A hand that no wrist claims is 0 when a real body other 
+    # than `who` is in the frame, because the slot's own crop can be that person's hand (also when `who` is a kept fragment beside one). 
+    # With no other real body the slot's own crop stays, though it can sit far from a visible wrist (crops are not tied to their slot).
     out = np.zeros((133, 3), dtype=np.float32)
     if num_persons(payload) < 1: return out
     parts = {p: _part_arrays(payload, p, n, who=who) for p, n in _PARTS}
-    if _real_bodies(payload) >= 2: parts["left_hand"] = parts["right_hand"] = None
+    if any(_real_body(payload, slot) is not None for slot in range(num_persons(payload)) if f"person_{slot:03d}" != who):
+        parts["left_hand"] = parts["right_hand"] = None
     parts.update(_primary_hands(payload, parts["body"]))   # a hand belongs to wrist it sits on, not to the slot
     body = parts["body"]
     if body is not None:
@@ -459,7 +505,7 @@ def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int, int
     poses = np.zeros((n_frames, 133, 3), dtype=np.float32)
     frame_w = frame_h = detected = 0
     rows = _frame_rows(z, payloads)
-    slots = _kept_slots(rows, n_frames)
+    slots = _kept_slots(rows, n_frames, fps)
     for t, payload, w, h in rows:
         detected += num_persons(payload) >= 1
         poses[t] = payload_to_coco133(payload, who=f"person_{slots[t]:03d}") # normalized coords — no W/H scaling
@@ -489,7 +535,7 @@ def _load_per_frame(npz_dir: Path) -> tuple[np.ndarray, float, int, int, int]:
         centres[frame_no - 1] = _body_centres(body, w, h)
         if w > 0 and h > 0: frame_w, frame_h = int(w), int(h)  # recorded in video_meta (feeds Moryossef aspect correction only)
 
-    slots = _primary_slots(centres)
+    slots = _primary_slots(centres, SIGNVERSE_DEFAULT_FPS)
     checked = False
     for frame_no, path in frames:
         with np.load(path) as z: payload = {k: z[k] for k in z.files}
@@ -513,7 +559,7 @@ def convert_video(npz_dir: str | Path, out_npy: str | Path, min_motion: float) -
     # Convert 1 video → `<out_npy>` ((T,133,3) float32) + summary stats for reporting. 
     # `min_motion` is the masked-run motion threshold (data.yaml poses.min_extra_person_motion).
     poses, fps, width, height, detected, slots = load_signverse_video(npz_dir)
-    masked, empty = _person_measures(Path(npz_dir), min_motion, poses.shape[0], slots)
+    masked, empty = _person_measures(Path(npz_dir), min_motion, poses.shape[0], slots, fps)
     out_npy = Path(out_npy)
     out_npy.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_npy, poses)
@@ -521,8 +567,8 @@ def convert_video(npz_dir: str | Path, out_npy: str | Path, min_motion: float) -
     # unusable joints is still counted; missing sparse frames count as undetected.
     return {
         "frames": int(poses.shape[0]), "fps": float(fps), "duration_s": float(poses.shape[0] / fps) if fps > 0 else 0.0, 
-        "empty_frames": int(poses.shape[0] - detected), "masked_runs": masked, "empty_runs": empty, "handless_runs": handless_runs(poses), 
-        "width": int(width), "height": int(height),
+        "empty_frames": int(poses.shape[0] - detected), "masked_runs": masked, "empty_runs": empty, 
+        "handless_runs": handless_runs(poses, fps), "width": int(width), "height": int(height),
     }
 
 def _frame_rows(z, payloads) -> list[tuple[int, dict, float, float]]:
@@ -541,13 +587,15 @@ def _frame_rows(z, payloads) -> list[tuple[int, dict, float, float]]:
         rows.append((int(f) - 1, p, w, h))
     return sorted(rows, key=lambda r: r[0])
 
-def _kept_slots(rows, n_frames: int) -> np.ndarray:
+def _kept_slots(rows, n_frames: int, fps: float) -> np.ndarray:
     # The slot `_primary_slots` keeps per frame, from `_frame_rows` rows: the same choice in --stage convert and --stage person-counts.
     centres: list[list] = [[] for _ in range(n_frames)]
     for t, payload, w, h in rows: centres[t] = _body_centres(payload, w, h)
-    return _primary_slots(centres)
+    return _primary_slots(centres, fps)
 
-def _person_measures(npz_dir: Path, min_motion: float, n_frames: int, slots: np.ndarray) -> tuple[list[list[int]], list[list[int]]]:
+def _person_measures(
+    npz_dir: Path, min_motion: float, n_frames: int, slots: np.ndarray, fps: float
+) -> tuple[list[list[int]], list[list[int]]]:
     # The masked and the empty runs, from the source payloads: the .npy keeps one body per frame (`slots`, from the loader).
     consolidated = npz_dir / "poses.npz"
     if consolidated.exists():
@@ -558,14 +606,15 @@ def _person_measures(npz_dir: Path, min_motion: float, n_frames: int, slots: np.
         def frames():   # read twice, 1 file at a time, in frame order (numeric, as `_load_per_frame`)
             for path in sorted((p for p in npz_dir.glob("*.npz") if p.stem.isdigit() and int(p.stem) >= 1), key=lambda p: int(p.stem)):
                 with np.load(path) as z: yield int(path.stem) - 1, {k: z[k] for k in z.files}
-    return masked_runs(frames(), slots, min_motion), empty_runs(frames(), n_frames)
+    return masked_runs(frames(), slots, min_motion, fps), empty_runs(frames(), n_frames, fps)
 
 
 def sidecar_stats_from_npz(z, min_motion: float) -> dict:
     """The video_meta columns only the SHARD carries: detection count, masked and empty runs, pixel frame size.
 
     Reads person counts, frame size and body keypoints. `.npy` keeps only the primary pose, so these measurements use the source archive. 
-    No pose file is written. The runs use same code as `convert_video` (`_frame_rows`, `masked_runs` at same `min_motion`, `empty_runs`).
+    No pose file is written. The runs use same code as `convert_video` (`_frame_rows`, `masked_runs` at same `min_motion`, `empty_runs`), 
+    at the same pinned SIGNVERSE_DEFAULT_FPS as `_load_consolidated`.
     """
     files = set(z.files)
     payloads = z["frame_payloads"] if "frame_payloads" in files else []
@@ -590,7 +639,8 @@ def sidecar_stats_from_npz(z, min_motion: float) -> dict:
     rows = _frame_rows(z, payloads)
     pairs = [(t, p) for t, p, _, _ in rows]
     return {"frames": frames, "detected": sum(1 for c in counts if c >= 1), "width": width, "height": height, 
-            "masked_runs": masked_runs(pairs, _kept_slots(rows, frames), min_motion), "empty_runs": empty_runs(pairs, frames)}
+            "masked_runs": masked_runs(pairs, _kept_slots(rows, frames, SIGNVERSE_DEFAULT_FPS), min_motion, SIGNVERSE_DEFAULT_FPS),
+            "empty_runs": empty_runs(pairs, frames, SIGNVERSE_DEFAULT_FPS)}
 
 
 def _lang_targets(data_cfg: dict, languages) -> dict[str, str]:  # en_XX->en, de_DE->de, zh_CN->zh
@@ -914,7 +964,7 @@ def stage_person_counts(args, plan: dict) -> None:
     # handless_runs reads the kept body, which the .npy holds (`handless_runs`, as in `--stage convert`): no archive needed.
     handless_filled = 0
     for lang in sorted({v["language"] for v in plan["videos"].values()}):
-        if filled_here := fill_handless_runs(root / lang, _meta_for(lang)):
+        if filled_here := fill_handless_runs(root / lang, _meta_for(lang), remeasure):
             save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
             handless_filled += filled_here
     print(f"person-counts | handless_runs filled {handless_filled} from the pose files", flush=True)

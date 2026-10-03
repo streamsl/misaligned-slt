@@ -158,12 +158,8 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
 
 
     def _configure_history_paths(self, cfg: dict) -> None:
-        root = checkpoint_dir(cfg)
-        logging_cfg = dict(cfg.get("logging", {}) or {})
-        out_dir = logging_cfg.get("dir") or root
-        if not out_dir: return
-        out_dir = Path(out_dir)
-        self._history_csv = out_dir / "history.csv"
+        out_dir = checkpoint_dir(cfg)
+        if out_dir: self._history_csv = Path(out_dir) / "history.csv"
 
     def _init_wandb(self, wandb, wandb_cfg: dict, cfg: dict) -> None:
         if wandb.run is not None: self._wandb = wandb; return
@@ -212,7 +208,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         if delta: self._progress.update(delta)
 
         postfix = {}
-        for key in ("loss", "total_loss", "phrase_bio_loss", "vlp_loss", "baseline_ce_loss"):
+        for key in ("loss", "bio_loss"):  # stage 2 logs `loss`; the segmenters log `bio_loss`
             if key in numeric:
                 postfix["loss"] = _fmt_metric(numeric[key])
                 break
@@ -340,7 +336,8 @@ def run_epoch_loop(
       evaluate_fn(epoch)     -> dev metrics dict (only on control.should_eval epochs), or None.
       best_epoch_floor       -> first epoch that may become the best checkpoint and count toward early-stopping patience. 
                                 A pooled segmentation run passes its rotation's cycle length (data.loader.PooledEpochRecords), 
-                                so no epoch before every training record (clean segment) was seen once can ship; others pass 0.
+                                so no epoch before the rotation selected every training record (clean segment) once can ship;
+                                others pass 0. A selected record can still lose a chunk tail to fixed epoch size (data.chunks).
     """
     model.to(device)
     model.train()
@@ -378,8 +375,8 @@ def run_epoch_loop(
     )
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
-        "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about "
-        "the loss scale (and about skipping a step) and drift apart. Use amp: bf16 (A100/H100) or amp: none."
+        "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about the loss scale "
+        "(and about skipping a step) and drift apart. Use mixed_precision: bf16 (A100/H100) or mixed_precision: none."
     )
     # Preemption safety (Colab): latest.pt = full resumable state, rewritten every epoch; loses at most one epoch.
     ckpt_dir = checkpoint_dir(cfg)
@@ -457,7 +454,6 @@ def run_epoch_loop(
             if stepped: scheduler.step_batch()
             logger.log_step(epoch, opt_step, row)
 
-        scheduler.step_epoch()
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
             with amp.autocast():  # dev eval in the same precision as training steps (fp32 eval takes about 2x as long)
@@ -560,12 +556,11 @@ class TrainControl:
         # Separate concerns:
         #   checkpoint: monitor / mode / restore_best      -> best-model SELECTION (active whenever a dev set exists)
         #   early_stopping: enabled / patience / min_delta -> TERMINATION only (opt-in; drop the block to disable)
-        validation = cfg.get("validation", {})
         ckpt = cfg.get("checkpoint", {})
         early = cfg.get("early_stopping", {})
         early_enabled = bool(early.get("enabled", False))
         return cls(
-            eval_every_epochs=int(cfg.get("eval_every_epochs", validation.get("eval_every_epochs", 0)) or 0),
+            eval_every_epochs=int(cfg.get("eval_every_epochs", 0) or 0),
             early_stopping_patience=int(early.get("patience", 0) or 0) if early_enabled else 0,
             early_stopping_min_delta=float(early.get("min_delta", 0.0)),
             monitor=str(ckpt.get("monitor", default_monitor)),
@@ -634,20 +629,13 @@ class TrainControl:
         self.best_epoch = int(state.get("best_epoch", 0))
         self.bad_epochs = int(state.get("bad_epochs", 0))
 
-    def summary(self) -> dict[str, float | int | bool | None | str]:
-        return {
-            "monitor": self.monitor, "monitor_mode": self.monitor_mode,
-            "best_value": self.best_value, "best_epoch": self.best_epoch, "stopped_early": self.stopped_early,
-        }
-
-
 def attach_save_best(
     control: TrainControl, cfg: dict, name: str, saver: Callable[[torch.nn.Module, str | Path], Path], meta: dict | None = None,
 ) -> TrainControl:
     """Wire save-on-best into a TrainControl from the `checkpoint:` block.
 
-    `checkpoint.dir`: where the best checkpoint and `best.json` land. `save_best: false` disables mid-training
-    saves. `saver(model, dir)` does the stage-appropriate write (full model vs visual backbone).
+    `checkpoint.dir`: where the best checkpoint and `best.json` land. `save_best: false` disables mid-training saves. 
+    `saver(model, dir)` writes the stage's checkpoint.
     """
     control.name = str(name)
     ckpt_dir = checkpoint_dir(cfg)
@@ -656,29 +644,21 @@ def attach_save_best(
     return control
 
 
-SchedulerInterval = Literal["step", "epoch", "none"]
-
 @dataclass
-class SchedulerBundle:
+class SchedulerBundle: # Every schedule steps per optimizer step.
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-    interval: SchedulerInterval = "none"
 
     def step_batch(self) -> None:
-        if self.scheduler is not None and self.interval == "step":
-            self.scheduler.step()
-
-    def step_epoch(self) -> None:
-        if self.scheduler is not None and self.interval == "epoch":
-            self.scheduler.step()
+        if self.scheduler is not None: self.scheduler.step()
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, steps_per_epoch: int) -> SchedulerBundle:
     sched_cfg = cfg.get("scheduler", {})
     sched_type = str(sched_cfg.get("type", "none")).lower()
-    if sched_type in {"", "none", "constant"}: return SchedulerBundle()
+    if sched_type == "none": return SchedulerBundle()
 
     total_steps = max(1, int(epochs) * max(1, int(steps_per_epoch)))
-    if sched_type in {"cosine", "cosine_annealing"}:
+    if sched_type == "cosine":
         # Optional linear warmup (scheduler.warmup_epochs, fractional ok; 0 = none). The segmenters warm up; stage 2 and the 
         # clean floor start at their configured rate. Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
         warmup_epochs = float(sched_cfg.get("warmup_epochs", 0.0))
@@ -686,8 +666,8 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.0,
         )
-        if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine, interval="step")
+        if warmup_steps <= 0: return SchedulerBundle(scheduler=cosine)
         warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
-        return SchedulerBundle(scheduler=scheduler, interval="step")
+        return SchedulerBundle(scheduler=scheduler)
     raise ValueError(f"Unsupported scheduler type: {sched_type}")

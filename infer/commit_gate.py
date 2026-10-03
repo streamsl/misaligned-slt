@@ -20,10 +20,10 @@ def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
     # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O, next B, or UNK.
-    # UNK closes like O — the same rule the deployed decode applies by remapping UNK->O before the FSM (infer/stream.py) 
-    # and that `metrics.signing_runs_with_b_splits` uses. It matters only in LABEL domain, where UNK marks quarantined region: 
-    # without it, reliable sentence abutting a quarantine has no terminator, so its label-domain span swallows the quarantine 
-    # and the gate's GT anchor stops matching `first_complete_span`'s time-domain target — the two are required to agree.
+    # UNK closes like O, as in `metrics.signing_runs_with_b_splits`. It matters only in LABEL domain, where UNK marks 
+    # quarantined region: without it, reliable sentence abutting a quarantine has no terminator, so its label-domain 
+    # span swallows the quarantine and the gate's GT anchor stops matching the sampler's target (WindowSampler.materialize) 
+    # — the two are required to agree.
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
@@ -79,8 +79,8 @@ def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
 class BoundaryHistory:
     """Terminator hysteresis for ONE candidate span: its last `hysteresis_strides` votes, (start, terminator) 
     in absolute stream frames, or None for a stride that did not see it."""
-    hysteresis_strides: int = 3
-    delta_enc_frames: int = 12
+    hysteresis_strides: int
+    delta_enc_frames: int
     values: deque[tuple[int, int] | None] = field(default_factory=deque)
 
     def push(self, span: tuple[int, int] | None) -> None:
@@ -99,7 +99,7 @@ class BoundaryHistory:
 
 class CommitGate:
     """Boundary-stability commit gate: a span commits when its terminator moved ≤ `delta_enc_frames` over the last
-    `hysteresis_strides` strides.
+    `hysteresis_strides` strides. δ is in frames of stream (StreamingSLTRunner.start_stream converts inference delta_s).
 
     1 history per candidate span, keyed by absolute stream frames (buffer indices shift at every commit). Identity is 
     the start within δ of the history's last seen start; a start moving further is a different span with its own history, 
@@ -107,7 +107,7 @@ class CommitGate:
     a later span keeps the votes it earned while it waited, so back-to-back units commit at their own stable time. Token 
     confidences are not a commit signal; events still carry them (infer/stability.py reveal policies).
     """
-    def __init__(self, delta_enc_frames: int = 12, hysteresis_strides: int = 3):
+    def __init__(self, delta_enc_frames: int, hysteresis_strides: int = 3):
         self.delta_enc_frames, self.hysteresis_strides = int(delta_enc_frames), int(hysteresis_strides)
         self.histories: list[BoundaryHistory] = []
 

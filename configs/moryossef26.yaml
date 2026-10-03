@@ -40,8 +40,9 @@ attn_dropout: 0.1
 dice_loss_weight: 1.5
 bio_class_weights: balanced
 
-# Chunk training: each epoch tiles every record from a random phase with chunks of (num_frames - 1) / 24 s, 
-# so a chunk loads at most num_frames frames (data/chunks.py; S1 tiles the same way with U(L_min, C) lengths).
+# Chunk training: each epoch tiles every record from a random phase with chunks of (num_frames - 1) / fps s, 
+# fps the highest record rate, so a chunk loads at most num_frames frames (data/chunks.py; S1 tiles the same 
+# way with U(L_min, C) lengths).
 num_frames: 1024 # chunk length in frames; also the RoPE window for overlap-stitched whole-video inference
 batch_size: 32
 grad_accum_steps: 1  # Effective batch = batch_size * grad_accum_steps, at batch_size activation memory

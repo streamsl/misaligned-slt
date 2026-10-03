@@ -11,7 +11,7 @@ from infer.duration_decode import DurationModel
 from metrics import Segment, match_segments
 from eval import (PredictionEvent, _drop_quarantined_predictions, _gold_events, _load_segmenter, 
                   load_prediction_file, require_annotation_match, save_prediction_file, to_source)
-from utils import lambda_min_frames, load_yaml
+from utils import lambda_min_s, load_yaml
 
 # Low on purpose: a near-miss is a boundary offset (a matched pair), not a phantom or skipped event; a high bar would
 # push near-misses into the error classes and bias the offset distribution towards zero. Override: --tiou-threshold.
@@ -170,7 +170,7 @@ def dataset_summary(args: argparse.Namespace) -> dict:
     cfg = load_yaml(args.data_config)
     records, splits = load_language_records(cfg, args.language, split=args.split)
     durations = [span.duration_s for rec in records for span in rec.sentences if getattr(span, "reliable", True)]
-    # Λ_min is a fixed label-domain floor (utils.LAMBDA_MIN_FRAMES, inference.yaml span_selection.min_span_frames) 
+    # Λ_min is a fixed label-domain floor (utils.LAMBDA_MIN_S, inference.yaml span_selection.min_span_s) 
     # that no stage writes; train/slt._inject_gate_geometry copies it into the gate.
     p1_s = float(np.percentile(durations, 1)) if durations else 0.0
     median_fps = float(np.median([float(rec.pose.fps) for rec in records])) if records else 0.0
@@ -244,14 +244,12 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     gold_segments = {vid: [ev.segment for ev in evs] for vid, evs in _gold_events(records).items()}
     durations = {record.pose.video_id: sum(record.pose.frame_counts) / float(record.pose.fps) for record in records}
 
-    # Convert the frame floor to this corpus's time base.
-    median_fps = float(np.median([float(record.pose.fps) for record in records])) if records else 24.0
-    lam_s = lambda_min_frames(load_yaml(args.inference_config)) / median_fps
+    lam_s = lambda_min_s(load_yaml(args.inference_config))   # a time threshold on overlaps: no frame grid to round to
     analysis = analyze_segmenter_errors(
         predicted=predictions, gold=gold_segments, durations=durations, material_overlap_s=lam_s,
         tiou_threshold=float(args.tiou_threshold if args.tiou_threshold is not None else SEGMENTER_ERROR_MATCH_TIOU)
     )
-    print(f"[segmenter-errors] event taxonomy with material_overlap_s={lam_s:.3f}s (= span_selection.min_span_frames/{median_fps:g}fps): "
+    print(f"[segmenter-errors] event taxonomy with material_overlap_s={lam_s:.3f}s (= span_selection.min_span_s): "
           f"a graze shorter than the minimum selectable span is boundary jitter, not a second sentence.", flush=True)
     paths = write_segmenter_error_outputs(analysis, args.output_dir, args.language, args.segmenter_arch, split=args.split)
     return {

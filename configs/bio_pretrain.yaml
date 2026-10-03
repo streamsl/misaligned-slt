@@ -4,8 +4,7 @@
 extends: dlm.yaml
 checkpoint:
     dir: checkpoints/bio_s1/${corpus}
-    # Released pose weights for both pooled and target-only S1. A complete S1 model.pt initializes target fine-tuning.
-    from_pretrained: checkpoints/openasl_pose_only_slt.pth
+    from_pretrained: checkpoints/openasl_pose_only_slt.pth  # Released Uni-Sign pose weights initialize S1 pose encoder
     save_best: true
     monitor: val_phrase_tiou_f1 # complete-span F1@0.5 over the fixed dev chunks
     mode: max
@@ -14,8 +13,6 @@ wandb:
     name: bio_s1_${corpus}
 
 # Main recipe: same pool and temperature as the external segmenter. No subtitle text enters S1.
-# For the target-only/fine-tune conditions, set the pool to null and pass --language.
-# The continued-training study keeps all 3 languages, then specializes this same S1 model on each target.
 pretrain_languages: [ase, asf, bfi]
 # τ sets each language's share of the per-epoch pool, counted in records (clean segments): τ=1 proportional, τ=0 uniform
 # (the larger languages' slices rotate). The best-epoch floor (one full rotation) is computed and printed at run time.

@@ -6,14 +6,13 @@ Layering (so each concept has one home):
   models/dmax.py                          DMax extension: `OPUTBlockDiffusionDecoder` (OPUT training + the block
                                           decode with SPD) and the OPUT loss helpers.
   infer/decode.py                         the block decode itself (DMax decode_uniform semantics).
-  models/unisign.py                       mBART binding: `MBartBlockDiffusionDecoder` (concrete `_decode`).
-  models/unisign.py                   mT5 binding:  `MT5BlockDiffusionDecoder` (concrete `_decode`).
+  models/unisign.py                       mT5 binding: `MT5BlockDiffusionDecoder` (concrete `_decode`).
 
 A decoder is built per language-model family by subclassing `dmax.OPUTBlockDiffusionDecoder` and implementing
 ONLY `_decode` / `__init__`. Conditioning is uniform: every decoder consumes a precomputed encoder memory 
 (`enc_hidden`/`enc_mask`); encoding is the front end's job (models/front_end.py).
 
-Implements BD3LM (block diffusion) adapted to mBART / mT5 via the A2D recipe from dLLM:
+Implements BD3LM (block diffusion) adapted to mT5 via the A2D recipe from dLLM:
   - Architecture: the pretrained decoder with block-causal self-attention.
   - Training: the [xt | x0] forward with the BD3LM attention mask (M_BD + M_OBC + M_BC) and repeated
               position IDs. The OBJECTIVE over it is DMax's OPUT (models/dmax.py), not the BD3LM ELBO.
@@ -142,14 +141,11 @@ class CanvasEmbedding(nn.Module):
 
     [MASK] row is drawn at the copied table's scale, using its per-dimension mean and scalar standard deviation.
     The table and the new row are separate parameters; both train.
-
-    `embed_scale` is the backbone's own word-embedding factor (mBART: sqrt(d); mT5: 1), applied here so the
-    custom forward and the HF cached forward embed a token identically without a second scaled copy of the table.
     """
-    def __init__(self, source_weight: torch.Tensor, mask_token_id: int, embed_scale: float = 1.0):
+    def __init__(self, source_weight: torch.Tensor, mask_token_id: int):
         super().__init__()
         vocab, d_model = source_weight.shape
-        self.mask_token_id, self.embed_scale = int(mask_token_id), float(embed_scale)
+        self.mask_token_id = int(mask_token_id)
         self.base = nn.Embedding(vocab, d_model)
         with torch.no_grad():
             self.base.weight.copy_(source_weight)
@@ -166,8 +162,7 @@ class CanvasEmbedding(nn.Module):
         is_mask = (ids == self.mask_token_id)
         # Send [MASK] to row 0 rather than clamping the whole tensor: a clamp would also swallow an id 
         # ABOVE [MASK], which one (vocab+1) table would raise on. Only the [MASK] id is substituted here.
-        out = torch.where(is_mask.unsqueeze(-1), self.mask_row, self.base(torch.where(is_mask, 0, ids)))
-        return out * self.embed_scale if self.embed_scale != 1.0 else out
+        return torch.where(is_mask.unsqueeze(-1), self.mask_row, self.base(torch.where(is_mask, 0, ids)))
 
 
 class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
@@ -185,10 +180,9 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     '''
     def _init_block_diffusion(
         self, *, d_model: int, vocab_size: int, embed_source_weight: torch.Tensor, lm_source_weight: torch.Tensor,
-        pad_index: int, eos_index: int, bos_index: int, embed_scale: float = 1.0, block_size: int = 4,
+        pad_index: int, eos_index: int, bos_index: int, block_size: int = 4,
     ) -> None:
         self.d_model = d_model
-        self.embed_scale = float(embed_scale)
         self.block_size = block_size
         self.neg_infinity = -1e9
 
@@ -207,8 +201,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         # OPUT passes (models/dmax.py slices their logits to real vocabulary) and outside the decode (infer/decode.py forces 
         # it to the dtype minimum). No padding_idx: on mT5, pad id is also the canvas BOS, and padding_idx would freeze BOS 
         # row the AR arm trains. A pad slot never reaches a supervised slot under block-causal attention, so its gradient is 0.
-        self.embed_tokens = CanvasEmbedding(embed_source_weight, mask_token_id=vocab_size, embed_scale=self.embed_scale)
-        self.embed_scale = 1.0  # the canvas applies the backbone's scale itself; never apply it twice
+        self.embed_tokens = CanvasEmbedding(embed_source_weight, mask_token_id=vocab_size)
         self.lm_head = nn.Linear(d_model, vocab_size + 1, bias=False)
         with torch.no_grad():
             self.lm_head.weight[:vocab_size].copy_(lm_source_weight)
@@ -277,7 +270,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
         bd3lm_mask = build_bd3lm_mask(length, self.block_size, enc_hidden.dtype, clean_ids.device)
 
         # Repeated position IDs: [0..L-1, 0..L-1] (no sigma/time conditioning — A2D is not time-aware; dLLM
-        # BD3LMTrainer passes no sigma, and TimestepEmbedder/AdaLN is DDiT-specific, absent from mBART/mT5).
+        # BD3LMTrainer passes no sigma, and TimestepEmbedder/AdaLN is DDiT-specific, absent from mT5).
         base_pos = torch.arange(length, device=clean_ids.device).unsqueeze(0).expand(batch, -1)
         position_ids = torch.cat([base_pos, base_pos], dim=1)  # (B, 2L)
 

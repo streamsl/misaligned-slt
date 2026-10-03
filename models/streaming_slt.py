@@ -53,7 +53,7 @@ class MisalignedSLTModel(nn.Module):
         pretrained_path: str | None = None, segmentation_branch: bool = True,
     ):
         super().__init__()
-        # Caller passes UniSignMT5FrontEnd / UniSignMBartFrontEnd (models/unisign.py).
+        # Caller passes UniSignMT5FrontEnd (models/unisign.py).
         self.front_end = front_end
         self.tokenizer = self.front_end.tokenizer
         self.decoder_type = decoder
@@ -130,8 +130,8 @@ class MisalignedSLTModel(nn.Module):
                 if hits.numel(): seq, conf = seq[:, : int(hits[0]) + 1], conf[:, : int(hits[0]) + 1]
             return seq, conf
 
-        # AR arm: the front end owns generation (mBART lang-code start / mT5 prompt-conditioned) and returns REAL
-        # per-token confidence. `num_beams>1` is the clean baseline's beam search; the SLT AR arm stays greedy.
+        # AR arm: the front end owns generation (mT5, prompt-conditioned) and returns REAL per-token confidence. 
+        # `num_beams>1` is the clean baseline's beam search; the SLT AR arm stays greedy.
         generated, confidence = self.front_end.ar_generate(
             enc_hidden, enc_mask, max_new_tokens=max_text_tokens, num_beams=num_beams, omega_bias=omega_bias,
         )
@@ -209,7 +209,7 @@ class MisalignedSLTModel(nn.Module):
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_label_smoothing: float,
         gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int,
-        gate_delta_frames: int = 12, gate_detach_omega: bool = False,
+        gate_delta_frames: int, gate_detach_omega: bool = False,
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch: ``L = lambda_bio * L_BIO + lambda_trans * L_translation``.
 
@@ -225,7 +225,7 @@ class MisalignedSLTModel(nn.Module):
           test, not proof that all semantic evidence receives high membership.
         - Other rows (truncated, headless, interior, gap): BIO only. A truncated window never receives text (P1).
         
-        Gate off (clean floor, no-gate ablation): every complete target trains the translator on the whole window.
+        Gate off (clean floor): every complete target trains the translator on the whole window.
         `gate_detach_omega` (ablation): Ω carries no text gradient, so the segmentation branch learns from BIO only.
         """
         # Translator features and the segmentation branch read the same frames through separate pose encoders.
@@ -248,7 +248,8 @@ class MisalignedSLTModel(nn.Module):
         supervised = batch.get("translation_supervised")
 
         # The model's own state, exactly as inference reads it (docs/membership_gate.md): Ω from the predicted readout, plus the predicted 
-        # 1st span. Λ_min and δ are frame counts on the native 24 fps grid (stage 2 has no fps augmentation), same integers the FSM uses.
+        # 1st span. Λ_min and δ are frame counts on the batch's native pose grid (stage 2 has no fps augmentation): the caller converts
+        # the seconds of inference.yaml with the batch's fps (train/slt.py _gate_frames), as the FSM does with its stream's fps.
         omega_bias, pred = None, None
         if bio_out is not None and gate_enabled:
             omega_bias, gate_stats = self.membership_gate(

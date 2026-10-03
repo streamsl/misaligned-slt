@@ -42,8 +42,6 @@ class CrossAttnOmegaInjector:
 
       T5 / mT5 : cross-attn folds its mask into `encoder_decoder_position_bias` at block 0 and reuses it across
                  blocks, so adding Ω to each block's cross `attention_mask` kwarg reaches every layer.
-      mBART    : each `MBartDecoderLayer` adds `encoder_attention_mask` to the cross-attn scores directly
-                 (eager `attn_weights += attention_mask`; SDPA `attn_mask`), so Ω gates every layer.
 
     Ω is (B,1,1,M), broadcasts over heads and queries, re-applied every decode step. Beam expands the batch to
     B·beams — the hook repeats Ω to match. Use via `with_omega(omega_bias)`, inert when no gate is active.
@@ -54,8 +52,6 @@ class CrossAttnOmegaInjector:
             m.register_forward_pre_hook(self._pre_hook, with_kwargs=True) 
             for m in self._cross_attn_modules(lm_model)
         ]
-        if not self.handles:
-            raise ValueError(f"CrossAttnOmegaInjector found no cross-attention modules on {type(lm_model).__name__}")
 
     @classmethod
     def attach(cls, lm_model: torch.nn.Module) -> "CrossAttnOmegaInjector":
@@ -71,13 +67,11 @@ class CrossAttnOmegaInjector:
 
     @staticmethod
     def _cross_attn_modules(lm_model: torch.nn.Module) -> list[torch.nn.Module]:
-        # Accepts a full HF encoder-decoder OR a bare decoder stack (T5Stack / MBartDecoder) — the DLM's
+        # Accepts a full HF encoder-decoder OR a bare decoder stack (T5Stack) — the DLM's
         # prefix-KV-cache path holds only the stack, and Ω injection is identical either way.
-        dec = getattr(lm_model, "decoder", None) or getattr(getattr(lm_model, "model", None), "decoder", None) or lm_model
+        dec = getattr(lm_model, "decoder", None) or lm_model
         if hasattr(dec, "block"):   # T5 / mT5 stack: block[i].layer[1] == T5LayerCrossAttention
             return [blk.layer[1] for blk in dec.block]
-        if hasattr(dec, "layers"):  # mBART: layers[i].encoder_attn == MBartAttention (cross)
-            return [layer.encoder_attn for layer in dec.layers]
         return []
 
     def _pre_hook(self, _module, args, kwargs):

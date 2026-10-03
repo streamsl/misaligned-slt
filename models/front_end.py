@@ -1,7 +1,6 @@
 """The abstract SLT front-end contract. Concrete front ends live with their backbone:
 
-  models/unisign.py -> UniSignMT5FrontEnd    (Uni-Sign pose encoder + mT5, with the task prompt; default)
-  models/unisign.py -> UniSignMBartFrontEnd  (same pose encoder + prompt + mBART; the mT5-vs-mBART ablation)
+  models/unisign.py -> UniSignMT5FrontEnd    (Uni-Sign pose encoder + mT5, with the task prompt)
 
 `MisalignedSLTModel` (models/streaming_slt.py) and the eval/train entry points depend only on this interface, so adding a 
 backbone never touches the shared training/inference code — we implement 1 `SLTFrontEnd` subclass in that backbone's module.

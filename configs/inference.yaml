@@ -1,4 +1,5 @@
-# Streaming FSM constants. Values are in seconds or in frames at the 24 fps pose rate of every configured corpus.
+# Streaming FSM constants, all in seconds. Code converts each to frames with the stream's own fps 
+# (utils.seconds_to_frames), so a corpus at another frame rate keeps the same times.
 # The duration prior of the semi-Markov decoder is NOT here: it is fitted on the target language's TRAIN unit
 # durations wherever it is needed (infer.duration_decode.DurationModel.fit), with no dev-tuned weight.
 stride_s: 1.0
@@ -12,7 +13,7 @@ stride_s: 1.0
 # translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
 buffer_cap_s: 40.0
 boundary_stability:
-    # delta_enc_frames (δ, 12 frames = 0.5 s) plays 3 coupled roles:
+    # delta_s (δ) plays 3 coupled roles:
     #   1. terminator-stability tolerance: the commit condition = the target span's terminator (first O-or-B —
     #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
     #      hysteresis_strides strides;
@@ -21,20 +22,19 @@ boundary_stability:
     #      a span, and candidate_spans skips any span terminating at or before the commit frontier χ);
     #   3. span-identity tolerance: each candidate span keeps its own hysteresis history (infer/commit_gate.CommitGate);
     #      a start that moves > δ is another span with its own history.
-    delta_enc_frames: 12 # 0.5s at 24 fps
+    delta_s: 0.5 # 12 frames at 24 fps, 13 at 25 fps, 15 at 30 fps
     # K: strides a terminator must hold still before it commits — the ONE right-context requirement, for O and B
     # terminators alike (spec §7.3, k ≈ 2–3). The sampler's context band (dlm.yaml jitter.context_s = (K+1)·stride)
     # covers this decision horizon.
     hysteresis_strides: 3
 
 span_selection:
-    # Λ_min: shortest span the FSM may commit, in encoder frames. A LABEL-domain floor: it answers "what is the
-    # shortest unit we are willing to emit", which is a property of the annotation, not of the head's boundary noise.
-    # 12 frames = 0.5s at 24 fps rejects brief flicker. Any genuine unit below this floor cannot be emitted exactly;
-    # report its count and the resulting recall ceiling. A low duration percentile is not a minimum. It is NOT the 
-    # re-emission guard: that is the commit-frontier filter candidate_spans(skip_term_before=χ), which uses the 
-    # commit log instead of a worst-case length bound.
-    min_span_frames: 12
+    # Λ_min: the shortest span the FSM may commit. A LABEL-domain floor: it answers "what is the shortest unit we are 
+    # willing to emit", which is a property of the annotation, not of the head's boundary noise. 0.5s rejects brief 
+    # flicker. Any genuine unit below this floor cannot be emitted exactly; report its count and the resulting recall 
+    # ceiling. A low duration percentile is not a minimum. It is NOT the re-emission guard: that is the commit-frontier 
+    # filter candidate_spans(skip_term_before=χ), which uses the commit log instead of a worst-case length bound.
+    min_span_s: 0.5
 translation: # the decode reads the whole buffer under the Ω soft crop, the conditioning stage 2 trains
     # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
     # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.

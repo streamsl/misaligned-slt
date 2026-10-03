@@ -28,7 +28,7 @@ def collate_windows(batch: list[dict]) -> dict[str, torch.Tensor | list]:
     max_len = max(poses_i.shape[0] for _, poses_i, _, _, _ in prepared)
     pose_shape = prepared[0][1].shape[1:]
     poses, frame_masks, timestamps  = [], [], []
-    bio_labels, specs, targets, anchor_spans = [], [], [], []
+    bio_labels, specs, targets = [], [], []
     commit_masks, candidates = [], []
 
     for item, poses_i, ts_i, mask_i, labels_i in prepared:
@@ -44,18 +44,18 @@ def collate_windows(batch: list[dict]) -> dict[str, torch.Tensor | list]:
         bio_labels.append(torch.cat([labels_i, torch.full((pad,), BIO["UNK"], dtype=torch.long)]))
         specs.append(item["spec"])
         targets.append(item.get("translation_target"))
-        anchor_spans.append(item.get("anchor_span"))
         candidates.append(list(item.get("candidate_sentences") or []))
 
     return {
         "poses": torch.stack(poses).reshape(len(batch), max_len, *pose_shape),
         "frame_mask": torch.stack(frame_masks), "timestamps_s": torch.stack(timestamps),
         "bio_labels": torch.stack(bio_labels), "specs": specs, "commit_mask": torch.stack(commit_masks),
-        "translation_targets": targets, "anchor_spans": anchor_spans, "candidate_sentences": candidates,
+        "translation_targets": targets, "candidate_sentences": candidates,
+        "fps": [item.get("fps") for item in batch],   # per row: a stage-2 window's pose rate; S1 chunks carry none
     }
 
 
-class WindowCollator:# Collate windows and optionally tokenize complete-anchor references.
+class WindowCollator:# Collate windows and optionally tokenize the text target of each window.
     def __init__(self, tokenizer=None, max_text_tokens: int = 128, block_size: int = 1):
         self.tokenizer = tokenizer
         self.max_text_tokens = int(max_text_tokens)

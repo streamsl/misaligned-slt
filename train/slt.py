@@ -5,27 +5,27 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, T5Tokenizer
+from transformers import T5Tokenizer
 
 from data.batch import WindowCollator
 from data.loader import ANNOTATION_PROTOCOL, StreamingWindowDataset, annotation_fingerprint, load_language_records, streaming_loader 
-from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, PROMPT_LANG_BY_TARGET
+from models.unisign import UniSignMT5FrontEnd, PROMPT_LANG_BY_TARGET
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
 from models.checkpointing import load_checkpoint_meta, require_fixed_constants
 from infer.duration_decode import DurationModel, DurationDecoder
 
 from train import distributed as dist
-from train.bio_pretrain import require_attention_radius
+from train.bio_pretrain import require_attention_radius, require_segmenter_data
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import mean_logs, move_to_device, run_epoch_loop
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, CompleteSpanMetrics
-from utils import cfg_get, checkpoint_dir, lambda_min_frames, load_yaml, pool_key, resolve_pretrained
+from utils import cfg_get, checkpoint_dir, lambda_min_s, load_yaml, pool_key, resolve_pretrained, seconds_to_frames
 
 
 # DEFAULT S1 config. `checkpoint.bio_head_init: auto` resolves the S1 checkpoint through it, and the pool-provenance check reads its 
 # `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
-# Gate options; delta and minimum eligible length come from resolved inference geometry.
+# Gate options; delta and the minimum eligible length come from the fixed inference.yaml constants.
 GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "detach_omega"})
 SPD_CONFIG_KEYS = frozenset({"tau_dec", "top_k", "renormalize"})
 
@@ -53,8 +53,14 @@ def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
     if unknown: raise ValueError(f"membership_gate: unknown key(s) {sorted(unknown)}; accepted: {sorted(GATE_CONFIG_KEYS)}")
     unknown = set(slt_cfg.get("spd", {}) or {}) - SPD_CONFIG_KEYS  # same reason: a misspelled tau_dec would decode at default
     if unknown: raise ValueError(f"spd: unknown key(s) {sorted(unknown)}; accepted: {sorted(SPD_CONFIG_KEYS)}")
-    gate["delta"] = int(inference_cfg["boundary_stability"]["delta_enc_frames"])
-    gate["min_span_frames"] = lambda_min_frames(inference_cfg)
+    gate["delta_s"] = float(inference_cfg["boundary_stability"]["delta_s"])
+    gate["min_span_s"] = lambda_min_s(inference_cfg)
+
+
+def _gate_frames(gate_cfg: dict, batch: dict) -> dict:
+    # Λ_min and δ in frames of this batch's pose grid. A stage-2 batch holds 1 language; seconds_to_frames refuses rows of other rates.
+    return {"gate_min_span_frames": seconds_to_frames(gate_cfg["min_span_s"], batch["fps"]),
+            "gate_delta_frames": seconds_to_frames(gate_cfg["delta_s"], batch["fps"])}
 
 
 def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
@@ -65,21 +71,18 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """
     gate_cfg = slt_cfg.get("membership_gate", {}) or {}
     return {
-        # A changed generated-dev protocol invalidates cached best scores, not the learned weights.
-        **({"validation_conditioning": "predicted_from_window"} if gate_cfg.get("enabled") else {}),
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": slt_cfg.get("annotation_fingerprint"),
         "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
         # two_stream_slt: separate segmentation/translation pose encoders, Ω on encoder keys and cross-attention. 
         # Eval refuses a stage-2 file with any other tag rather than load it into the wrong layout.
         "architecture": "two_stream_slt" if float(slt_cfg.get("lambda_bio", 1.0)) else "clean_translation",
         "bio_objective": "ce_dice", "dice_loss_weight": float(slt_cfg.get("dice_loss_weight", 1.5)),
-        "gate": {k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps", "detach_omega")},
+        "gate": {k: gate_cfg.get(k) for k in ("enabled", "delta_s", "min_span_s", "eps", "detach_omega")},
         # Which files initialized the translator and the segmentation branch, and the head's attention band.
         "resolved_inits": slt_cfg.get("resolved_inits"), "bio_attention_radius_s": slt_cfg.get("bio_attention_radius_s"),
         "early_stopping": slt_cfg.get("early_stopping"), "scheduler": slt_cfg.get("scheduler"), "epochs": slt_cfg.get("epochs"),
-        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), 
+        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), "duration_model": slt_cfg.get("duration_model"),
         "segmentation_decode": "semi_markov_viterbi" if slt_cfg.get("duration_model") else "none",
-        "duration_model": slt_cfg.get("duration_model"), "confidence_bound": slt_cfg.get("confidence_bound", {}), 
         "oput": slt_cfg.get("oput", {}), "spd": slt_cfg.get("spd", {}), 
         # Training geometry of the text canvas: the block-causal mask and the OPUT corruption read block_size, so eval
         # refuses a decoder built at another block (eval.py _build_eval_model), and the decode canvas must not shrink.
@@ -104,8 +107,7 @@ def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: f
             if not getattr(span, "reliable", True) or span.duration_s + 1.0 / record.pose.fps > float(buffer_cap_s): continue
             n = len(tokenizer(span.text)["input_ids"])
             if n > longest: longest, culprit = n, span
-    # +1: decode canvas holds BOS in slot 0, so a target of exactly max_text_tokens could be trained on but never emitted, 
-    # and the collator's confidence-bound shift column would drop its last token.
+    # +1: decode canvas holds BOS in slot 0, so a target of exactly max_text_tokens could be trained on but never emitted.
     if longest + 1 > int(max_text_tokens): raise ValueError(
         f"{split}: a complete caption target needs {longest} tokens plus the BOS slot but max_text_tokens is {max_text_tokens} "
         f"({culprit.video_id} {culprit.start_s:.1f}-{culprit.end_s:.1f}s). Set max_text_tokens >= {longest + 1}: the collator "
@@ -116,15 +118,13 @@ def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: f
 def require_translator_init(pretrained_path, segmentation_branch: bool, language: str, inference_cfg: dict, fingerprint) -> None:
     """The translator warm start of a train-slt run. The clean floor starts from the released Uni-Sign weights; an arm
     starts from THIS language's clean floor, trained on the current annotations under the fixed constants."""
-    # A released Uni-Sign file while a trained clean translator exists for the language means 
-    # the data.yaml re-root was forgotten: the arm would start elsewhere.
-    local_floor = Path(f"checkpoints/baseline_train/{language}/model.pt")
-    if segmentation_branch and Path(str(pretrained_path)).name.endswith("_pose_only_slt.pth") and local_floor.exists(): raise SystemExit(
-        f"Stage 2 would warm-start the translator from the released {pretrained_path}, but {local_floor} exists. Set data.yaml "
-        f"languages.{language}.pretrained_slt: {local_floor} (README B2b) so the arm starts at the clean translator."
-    )
     # A trained warm start carries meta; the released Uni-Sign file carries none.
     init_meta = load_checkpoint_meta(pretrained_path) if Path(str(pretrained_path)).exists() else {}
+    if segmentation_branch and not init_meta: raise SystemExit(
+        f"Stage 2 must warm-start the translator from this language's trained clean floor, but {pretrained_path} "
+        f"carries no training meta (the released file, or no file). Train the clean baseline, then set data.yaml "
+        f"languages.{language}.pretrained_slt: checkpoints/baseline_train/{language}/model.pt."
+    )
     # After the B2b re-root, data.yaml pretrained_slt names the previous clean floor: warm-starting the floor from it would
     # silently fine-tune the old floor a second time.
     if not segmentation_branch and init_meta: raise SystemExit(
@@ -145,7 +145,7 @@ def require_translator_init(pretrained_path, segmentation_branch: bool, language
 
 def build_slt_components(
     data_config: str = "configs/data.yaml", slt_config: str = "configs/dlm.yaml", inference_config: str = "configs/inference.yaml",
-    decoder: str | None = None, include_dev: bool = False, language: str | None = None, bio_config: str = BIO_S1_CONFIG,
+    include_dev: bool = False, language: str | None = None, bio_config: str = BIO_S1_CONFIG,
 ) -> SLTComponents:
     data_cfg = load_yaml(data_config)
     slt_cfg = load_yaml(slt_config)
@@ -184,7 +184,7 @@ def build_slt_components(
         f"Run `train.py --stage train-bio` first, or fix the path/cwd."
     )
     
-    slt_cfg["decoder"] = decoder or str(slt_cfg.get("decoder", "dlm"))
+    slt_cfg["decoder"] = str(slt_cfg.get("decoder", "dlm"))
     train_records, _ = load_language_records(data_cfg, language, split="train")
     slt_cfg["annotation_fingerprint"] = annotation_fingerprint(train_records)
     # Label-only duration prior of this language's train units; stamped in the checkpoint, so eval decodes with it.
@@ -193,16 +193,11 @@ def build_slt_components(
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     slt_cfg["target_lang"] = target_lang  # metric scoring level is declared, not sniffed (metrics.char_level_for_target)
-    # Uni-Sign front end. language_model.name picks the LM + tokenizer: mT5 (Path A default) or mBART
-    # (mT5-vs-mBART ablation); same pose encoder + prompt either way.
+    # Uni-Sign front end. language_model.name picks the mT5 checkpoint and its tokenizer.
     lm_name = str(cfg_get(slt_cfg, "language_model", "name", default="google/mt5-base"))
     prompt_lang = PROMPT_LANG_BY_TARGET.get(str(target_lang or ""), "English")
-    if "mbart" in lm_name.lower():
-        tokenizer = AutoTokenizer.from_pretrained(lm_name, src_lang=target_lang, tgt_lang=target_lang)
-        front_end = UniSignMBartFrontEnd(mbart_name=lm_name, prompt_lang=prompt_lang, target_lang=target_lang, tokenizer=tokenizer)
-    else:
-        tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
-        front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
+    tokenizer = T5Tokenizer.from_pretrained(lm_name, legacy=False)
+    front_end = UniSignMT5FrontEnd(mt5_name=lm_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
 
     resolve_bio_class_weights(slt_cfg, train_records)
     train_dataset = StreamingWindowDataset(train_records, slt_cfg=slt_cfg, inference_cfg=inference_cfg)
@@ -236,7 +231,7 @@ def build_slt_components(
     # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
     # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).
     model = MisalignedSLTModel(
-        front_end=front_end, decoder=decoder or str(slt_cfg.get("decoder", "dlm")), block_size=int(slt_cfg.get("block_size", 16)),
+        front_end=front_end, decoder=slt_cfg["decoder"], block_size=int(slt_cfg.get("block_size", 16)),
         # Shape MUST match S1 (train/bio_pretrain.py) or `bio_head_init` fails to strict-load — same keys build_bio_s1 reads.
         bio_hidden_dim=int(slt_cfg.get("bio_hidden_dim", 384)), bio_depth=int(slt_cfg.get("bio_depth", 4)),
         bio_nhead=int(slt_cfg.get("bio_nhead", 8)), bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
@@ -253,14 +248,13 @@ def build_slt_components(
         blob = torch.load(str(bio_init), map_location="cpu")
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
         head_sd = {k[len("bio_head."):]: v for k, v in sd.items() if k.startswith("bio_head.")}
-        # S1's head reads feat_dim; this bio_head reads front_end.bio_tap_dim (LM d_model: 768 mT5 / 1024 mBART). Must match for 
-        # "S1 features == S2 initial features" and the strict-load. Released Uni-Sign checkpoints (which seed train-bio) are mT5-768, 
-        # so mBART arm needs S1 at bio_pretrain feat_dim=1024 + a 1024 pose encoder; no 1024 release exists to warm-start from.
+        # S1's head reads feat_dim; this bio_head reads front_end.bio_tap_dim (mT5 d_model, 768). 
+        # Must match for "S1 features == S2 initial features" and the strict-load.
         s1_dim = head_sd.get("input_proj.weight")
         if s1_dim is not None and int(s1_dim.shape[1]) != int(front_end.bio_tap_dim): raise ValueError(
             f"bio_head_init dim mismatch: S1 head reads {int(s1_dim.shape[1])}-d features but this SLT model's "
             f"bio_tap is {int(front_end.bio_tap_dim)}-d ({lm_name}). Retrain train-bio with feat_dim="
-            f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml), or use the mT5 arm (the released checkpoints are mT5-768)."
+            f"{int(front_end.bio_tap_dim)} (bio_pretrain.yaml)."
         )
         # PROVENANCE, same rule as eval.py: the checkpoint records which pool trained it. Stage 2 must not warm-start
         # the gate from a head trained on a different pool — that is a different model, and the failure is silent.
@@ -272,6 +266,8 @@ def build_slt_components(
         )
         # The band is an architecture property a strict state_dict load cannot see (no tensor carries it).
         require_attention_radius(_s1_meta, slt_cfg.get("bio_attention_radius_s"), str(bio_init))
+        # Labels are not in any tensor either: an S1 trained before a re-convert or re-measured cuts would load silently.
+        require_segmenter_data(_s1_meta, language, slt_cfg["annotation_fingerprint"], inference_cfg["buffer_cap_s"], str(bio_init))
         model.bio_head.load_state_dict(head_sd, strict=True)
         slt_cfg["resolved_inits"]["segmentation"] = _file_stamp(bio_init)
         # S1's pose encoder goes into SEGMENTATION branch; the translator keeps the clean translator's encoder. 
@@ -296,32 +292,23 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
     rows: list[dict[str, float]] = []
     spans = CompleteSpanMetrics()
 
-    confidence_cfg = slt_cfg.get("confidence_bound", {})
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
 
-    gate_kwargs = dict(
-        gate_enabled=bool(gate_cfg.get("enabled", False)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
-        gate_min_span_frames=int(gate_cfg["min_span_frames"]),
-    )
+    gate_kwargs = dict(gate_enabled=bool(gate_cfg.get("enabled", False)), gate_eps=float(gate_cfg.get("eps", 1e-4)))
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
-    validation_cfg = slt_cfg.get("validation", {})
-    max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0) # <= 0: translate ALL supervised dev windows.
     pred_texts: list[str] = []
     ref_texts: list[str] = []
     for batch in loader:
         batch = move_to_device(batch, device)
+        frames = _gate_frames(gate_cfg, batch)
         output: SLTLossOutput = model.forward_loss(
             batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), lambda_bio=float(slt_cfg.get("lambda_bio", 1.0)), 
             dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
             oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
             oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.2)),
-            cb_enabled=bool(confidence_cfg.get("enabled", True)), cb_lambda=float(confidence_cfg.get("lambda", 1.0)),
-            cb_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
-            cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-            gate_delta_frames=int(gate_cfg.get("delta", 12)), gate_detach_omega=bool(gate_cfg.get("detach_omega", False)),
-            **gate_kwargs,
+            gate_detach_omega=bool(gate_cfg.get("detach_omega", False)), **gate_kwargs, **frames,
         )
         row = {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
         if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0 and output.bio_logits is not None:
@@ -335,26 +322,23 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
             spans.update(tags, batch["bio_labels"], _lengths)
         rows.append(row)
 
-        cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples
-        if not cap_reached:
-            supervised = batch.get("translation_supervised")
-            targets = batch.get("translation_targets", [])
-
-            if isinstance(supervised, torch.Tensor) and supervised.any():
-                idx = supervised.nonzero(as_tuple=False).flatten()
-                if max_translation_samples > 0: idx = idx[: max_translation_samples - len(pred_texts)]
-                if idx.numel() > 0: # A dev window has no observed commit history; sampler labels are supervision only.
-                    _, tokens, _, _ = model.generate_from_poses(
-                        poses=batch["poses"][idx], frame_mask=batch["frame_mask"][idx],
-                        timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
-                        max_text_tokens=int(slt_cfg.get("max_text_tokens", 320)), tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
-                        spd_top_k=int(spd_cfg.get("top_k", 1)), spd_renormalize=bool(spd_cfg.get("renormalize", True)),
-                        **gate_kwargs,
-                    )
-                    pred_texts.extend(model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True))
-                    for item_idx in idx.detach().cpu().tolist():
-                        target = targets[int(item_idx)]
-                        ref_texts.append(str(target.get("text", "")) if isinstance(target, dict) else str(getattr(target, "text", "")))
+        # Every supervised dev window is translated and scored.
+        supervised = batch.get("translation_supervised")
+        targets = batch.get("translation_targets", [])
+        if isinstance(supervised, torch.Tensor) and supervised.any():
+            idx = supervised.nonzero(as_tuple=False).flatten()
+            # A dev window has no observed commit history; sampler labels are supervision only.
+            _, tokens, _, _ = model.generate_from_poses(
+                poses=batch["poses"][idx], frame_mask=batch["frame_mask"][idx],
+                timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
+                max_text_tokens=int(slt_cfg.get("max_text_tokens", 320)), tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
+                spd_top_k=int(spd_cfg.get("top_k", 1)), spd_renormalize=bool(spd_cfg.get("renormalize", True)),
+                gate_min_span_frames=frames["gate_min_span_frames"], **gate_kwargs,
+            )
+            pred_texts.extend(model.tokenizer.batch_decode(tokens.detach().cpu(), skip_special_tokens=True))
+            for item_idx in idx.detach().cpu().tolist():
+                target = targets[int(item_idx)]
+                ref_texts.append(str(target.get("text", "")) if isinstance(target, dict) else str(getattr(target, "text", "")))
 
     if was_training: model.train()
     metrics = mean_logs(rows, prefix="val")
@@ -375,25 +359,18 @@ def evaluate_slt(model: MisalignedSLTModel, loader: DataLoader, device: torch.de
 
 
 def training_loss(model, batch: dict, slt_cfg: dict) -> SLTLossOutput: # The actual AR/DLM training objective.
-    confidence_cfg = slt_cfg.get("confidence_bound", {})
     oput_cfg = slt_cfg.get("oput", {})
-    spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
-    cb_lambda = float(confidence_cfg.get("lambda", 1.0))
     return model.forward_loss(
         batch, lambda_trans=float(slt_cfg.get("lambda_trans", 1.0)), lambda_bio=float(slt_cfg.get("lambda_bio", 1.0)),
         dice_weight=dice_weight, bio_class_weights=bio_class_weight_tensor(slt_cfg.get("bio_class_weights")),
         oput_t_low=float(oput_cfg.get("t_low", 0.3)), oput_t_high=float(oput_cfg.get("t_high", 0.8)),
         oput_label_smoothing=float(oput_cfg.get("label_smoothing", 0.2)),
-        # The confidence bound runs in every epoch whenever enabled: its verified gate rejects wrong full-evidence tokens.
-        cb_enabled=bool(confidence_cfg.get("enabled", True)), cb_lambda=cb_lambda, 
-        cb_tau=float(confidence_cfg.get("tau_cb", 0.75)), cb_tau_dec=float(spd_cfg.get("tau_dec", 0.5)),
-        cb_spd_top_k=int(spd_cfg.get("top_k", 1)), cb_spd_renormalize=bool(spd_cfg.get("renormalize", True)),
         gate_enabled=bool(gate_cfg.get("enabled", False)),
-        # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml): the coverage tolerance of text routing.
-        gate_eps=float(gate_cfg.get("eps", 1e-4)), gate_min_span_frames=int(gate_cfg["min_span_frames"]),
-        gate_delta_frames=int(gate_cfg.get("delta", 12)), gate_detach_omega=bool(gate_cfg.get("detach_omega", False)),
+        # Same δ as the inference commit gate's delta_s (configs/inference.yaml): the coverage tolerance of text routing.
+        gate_eps=float(gate_cfg.get("eps", 1e-4)), gate_detach_omega=bool(gate_cfg.get("detach_omega", False)),
+        **_gate_frames(gate_cfg, batch),
     )
 
 

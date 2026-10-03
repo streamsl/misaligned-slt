@@ -18,7 +18,7 @@ from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
 from train.helpers import build_optimizer, evaluate_bio_chunks, run_epoch_loop
-from utils import NATIVE_POSE_FPS, load_yaml, checkpoint_dir, pool_key
+from utils import load_yaml, checkpoint_dir, pool_key
 
 
 def build_moryossef_loaders(
@@ -67,8 +67,10 @@ def build_moryossef_loaders(
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = cfg["checkpoint_meta"]["pretrain_dev_mix"] = dev_mix
     # One fixed chunk length, C = L_min = (num_frames - 1) / fps: a floored-and-ceiled window loads at most num_frames frames,
-    # so a training chunk is one RoPE pass. The release contract (50 landmarks, fitted table, velocity) replaces Uni-Sign's.
-    chunk_s = (int(cfg.get("num_frames", 1024)) - 1) / NATIVE_POSE_FPS
+    # so a training chunk is one RoPE pass. fps is the highest record rate, so no record's chunk holds more than num_frames; 
+    # a pool that mixes rates gives its slower records shorter chunks. The release contract (50 landmarks, fitted table, 
+    # velocity) replaces Uni-Sign's.
+    chunk_s = (int(cfg.get("num_frames", 1024)) - 1) / max(float(rec.pose.fps) for rec in (*train_records, *dev_records))
     release = {"stats": release_stats, "velocity": bool(cfg.get("velocity", True))}
     train_ds = ChunkDataset(
         train_records, chunk_s, chunk_s, augmentation=cfg["augmentation"], seed=seed, records_for_epoch=pool, release=release
@@ -102,8 +104,10 @@ def build_moryossef(moryossef_config: str, pretrained: bool = True, seed: int | 
     # Optional warm start from the released Moryossef 2026 weights (vs random init). See load_moryossef_pretrained:
     # not zero-shot — train-moryossef fine-tunes after, and the untrained control is eval --segmenter-init released.
     weights = (cfg.get("checkpoint", {}) or {}).get("from_pretrained") if pretrained else None
-    if weights and Path(weights).exists(): load_moryossef_pretrained(model, weights)
-    elif weights: print(f"segmenter | WARNING: from_pretrained {weights} not found — random init", flush=True)
+    # A missing release file is an error, as for S1's Uni-Sign file: a silent random init would train under a meta that stamps
+    # `initialization` as the release. The random control is the explicit `pretrained=False` path.
+    if weights and not Path(weights).exists(): raise FileNotFoundError(f"checkpoint.from_pretrained {weights} not found")
+    if weights: load_moryossef_pretrained(model, weights)
     elif not pretrained: print(f"segmenter | RANDOM init (seed {seed}), no released weights", flush=True)
     return model
 

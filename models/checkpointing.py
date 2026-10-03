@@ -59,7 +59,7 @@ def _atomic_torch_save(obj: dict, path: Path) -> Path:
 
 def save_train_state(
     path: str | Path, *, model: nn.Module, optimizer: torch.optim.Optimizer, scheduler_state: dict | None, 
-    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, step: int = 0, meta: dict | None = None,
+    scaler_state: dict | None, control_state: dict, epoch: int, epochs: int, meta: dict | None = None,
 ) -> Path:
     """Full resumable snapshot (latest.pt): weights + optimizer moments + scheduler/scaler + best-tracking.
 
@@ -68,9 +68,6 @@ def save_train_state(
     """
     state = {
         "epoch": int(epoch),
-        # step > 0 = MID-epoch snapshot: that many batches of `epoch` are applied, resume re-enters the SAME epoch
-        # and fast-forwards; 0 = epoch boundary (the default).
-        "step": int(step),
         "epochs": int(epochs),  # schedule horizon: total_steps is baked into the scheduler state, so resume must match
         # The run's training-critical config, compared on resume: configs are live files that can change between
         # sessions, so without this a resumed run changes objective mid-training and nothing records it.
@@ -94,11 +91,6 @@ def _refuse_meta_drift(path, saved: dict, expected: dict) -> None:
     visible afterwards only as an unexplained break in the loss curve."""
     drift = sorted(k for k in set(saved) | set(expected) if saved.get(k) != expected.get(k))
     if not drift: return
-    if set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
-        "--resume: Validation protocol changed; the saved best score is not comparable. Trained weights remain usable. "
-        "Re-evaluate saved checkpoints with corrected dev generation and use a separate checkpoint directory for any "
-        "continuation; don't reuse the old best-score history."
-    )
     raise SystemExit(
         f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
         + "; ".join(f"{k}: {saved.get(k)!r} -> {expected.get(k)!r}" for k in drift[:4])
@@ -188,21 +180,26 @@ def require_fixed_constants(meta: dict, inference_cfg: dict, source) -> None:
     refuse the same files. A file with no meta (the released Uni-Sign checkpoint) passes."""
     if not meta: return
     from data.loader import ANNOTATION_PROTOCOL   # lazy: data.loader is heavy, and this module is imported early
-    from utils import lambda_min_frames
+    from utils import lambda_min_s
     if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
         f"{source} stamps annotation_protocol={meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}, "
         f"so it predates the current labels. Retrain it."
     )
     gate = meta.get("gate") or {}
+    # δ and Λ_min are seconds now (a frame count meant another time at another fps).
+    if frame_keys := sorted({"delta", "min_span_frames"} & set(gate)): raise SystemExit(
+        f"{source} stamps {'/'.join(frame_keys)} in frames, but δ and Λ_min are now seconds "
+        f"(inference.yaml delta_s, min_span_s). Retrain it under the current constants."
+    )
     live = {
         "buffer_cap_s": inference_cfg.get("buffer_cap_s"),
-        "delta": (inference_cfg.get("boundary_stability") or {}).get("delta_enc_frames"),
-        "min_span_frames": lambda_min_frames(inference_cfg)
+        "delta_s": (inference_cfg.get("boundary_stability") or {}).get("delta_s"),
+        "min_span_s": lambda_min_s(inference_cfg)
     }
     stamped = { # δ is a training parameter only of a gated checkpoint; a clean floor stamps it but never reads it.
         "buffer_cap_s": meta.get("buffer_cap_s"), 
-        "delta": gate.get("delta") if gate.get("enabled") else None,
-        "min_span_frames": gate.get("min_span_frames")
+        "delta_s": gate.get("delta_s") if gate.get("enabled") else None,
+        "min_span_s": gate.get("min_span_s")
     }
     drift = [
         f"{k} {stamped[k]} (inference.yaml {live[k]})" for k in live

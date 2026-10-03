@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 from data.loader import VideoRecord
-from utils import lambda_min_frames
+from utils import lambda_min_s, seconds_to_frames
 from data.windowing import (TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
                             count_complete_spans, make_bio_labels)
 from poses import load_pose_window, normalize_keypoints_unisign
@@ -63,19 +63,24 @@ class WindowSampler:
 
     def __init__(
         self, records: list[VideoRecord], jitter: JitterSampler, mode_ratios: dict[str, float], buffer_cap_s: float,
-        mode2_subcase_weights: dict[str, float], min_span_frames: int = 0, delta_frames: int = 0, seed: int = 42
+        mode2_subcase_weights: dict[str, float], min_span_s: float, delta_s: float, seed: int = 42
     ):
         self.records = records
         self.jitter = jitter
         self.mode_ratios = normalized_mode_ratios(mode_ratios)
         self.buffer_cap_s = float(buffer_cap_s)
-        # Λ_min mirror of the commit gate's span_selection.min_span_frames: the training target/complete-span rules must skip sub-Λ_min sentences 
-        # exactly like the deployed candidate_spans, or a window whose earliest complete span is sub-Λ_min supervises a sentence the gate never 
-        # anchors (wrong-sentence Ω). Stage-2 windows stay on the native 24 fps grid (no fps augmentation), so this is a plain frame count.
-        self.min_span_frames = int(min_span_frames)
-        # δ of the FSM's post-commit cut (inference.yaml delta_enc_frames): after committing a unit, the buffer restarts 
-        # at its terminator − δ. `materialize` gives a window the same left edge after a quarantined unit (see there).
-        self.delta_frames = int(delta_frames)
+        # Λ_min mirror of the commit gate's span_selection.min_span_s: the training target/complete-span rules must skip sub-Λ_min sentences 
+        # exactly like the deployed candidate_spans, or a window whose earliest complete span is sub-Λ_min supervises a sentence the gate 
+        # never anchors (wrong-sentence Ω). Stage-2 windows stay on the record's native pose grid (no fps augmentation), so each rule below 
+        # uses the frame count of the record's fps (utils.seconds_to_frames), the count the gate and the FSM apply to that stream.
+        self.min_span_s = float(min_span_s)
+        # δ of the FSM's post-commit cut (inference.yaml boundary_stability.delta_s): after committing a unit, the buffer restarts at its 
+        # terminator − δ. `materialize` gives a window the same left edge after a quarantined unit (see there).
+        self.delta_s = float(delta_s)
+
+        # A batch has 1 frame floor (train/slt.py _gate_frames): refuse a pool whose rates give different counts here, not mid-epoch.
+        rates = [float(r.pose.fps) for r in records]
+        seconds_to_frames(self.min_span_s, rates); seconds_to_frames(self.delta_s, rates)
         self.rng = np.random.default_rng(seed)
         # Base for index-seeded per-window draws (spec_for): every draw of a window comes from draw_seed + index, 
         # so an index maps to ONE window in the main process and in any DataLoader worker.
@@ -96,9 +101,9 @@ class WindowSampler:
     @classmethod
     def from_slt_config(cls, records: list[VideoRecord], slt_cfg: dict, inference_cfg: dict) -> "WindowSampler":
         return cls( # Stage 2 only (S1 trains on whole-input chunks, data/chunks.py): windows use the deployed cap and floor.
-            records=records, jitter=JitterSampler.from_config(slt_cfg["jitter"]), mode_ratios=slt_cfg["mode_ratios"],
-            buffer_cap_s=float(inference_cfg["buffer_cap_s"]), min_span_frames=lambda_min_frames(inference_cfg),
-            delta_frames=int(inference_cfg["boundary_stability"]["delta_enc_frames"]),
+            records=records, jitter=JitterSampler.from_config(slt_cfg["jitter"]), 
+            mode_ratios=slt_cfg["mode_ratios"], buffer_cap_s=float(inference_cfg["buffer_cap_s"]), 
+            min_span_s=lambda_min_s(inference_cfg), delta_s=float(inference_cfg["boundary_stability"]["delta_s"]),
             mode2_subcase_weights=slt_cfg["mode2_subcase_weights"], seed=int(slt_cfg.get("seed", 42)),
         )
 
@@ -136,8 +141,8 @@ class WindowSampler:
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, anchor.end_s + dt)
-            # The end check mirrors first_complete_span(min_tail_s=1/fps) in materialize(); a looser check here
-            # would classify the window complete yet yield no translation target (silently unsupervised Mode 1).
+            # The end check mirrors materialize(), which needs the terminator frame inside the window; a looser check 
+            # here would classify the window complete yet yield no translation target (silently unsupervised Mode 1).
             if classify_anchor_visibility(anchor, start_s, end_s) == "complete" and anchor.end_s + eps <= end_s:
                 return WindowSpec(rec.video_id, start_s, end_s, "mode1", anchor_idx)
         return WindowSpec(rec.video_id, *self._clip_window(rec, anchor.start_s, anchor.end_s + eps), "mode1", anchor_idx)
@@ -186,22 +191,21 @@ class WindowSampler:
 
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
         """Span the anchor and its successor, so 2 sentences are fully inside; degrade to Mode 1 if the pair yields no 2 complete spans. 
-        The translation target is later chosen by `first_complete_span`. Edges carry the designed jitter like every other mode — an exact 
-        [anchor B, successor end] window would train a boundary distribution (B at frame 0) the buffer never produces."""
+        materialize() later picks the translation target. Edges carry the designed jitter like every other mode — an exact [anchor B, 
+        successor end] window would train a boundary distribution (B at frame 0) the buffer never produces."""
         anchor = rec.sentences[anchor_idx]
         end_anchor = rec.sentences[min(anchor_idx + 1, len(rec.sentences) - 1)]
         eps = 1.0 / rec.pose.fps
+        min_span_s = seconds_to_frames(self.min_span_s, rec.pose.fps) / rec.pose.fps   # Λ_min on the record's frame grid
 
         for _ in range(20):
             dh, dt = self.jitter.sample(self.rng)
             start_s, end_s = self._clip_window(rec, anchor.start_s + dh, end_anchor.end_s + dt)
-            if count_complete_spans(rec.sentences, start_s, end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps) >= 2:
+            if count_complete_spans(rec.sentences, start_s, end_s, eps, min_span_s=min_span_s) >= 2:
                 return WindowSpec(rec.video_id, start_s, end_s, "mode3", anchor_idx)
 
         start_s, end_s = self._clip_window(rec, anchor.start_s, end_anchor.end_s + eps)
-        if count_complete_spans(
-            rec.sentences, start_s, end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps
-        ) < 2: return self._mode1_spec(rec, anchor_idx)
+        if count_complete_spans(rec.sentences, start_s, end_s, eps, min_span_s=min_span_s) < 2: return self._mode1_spec(rec, anchor_idx)
         return WindowSpec(rec.video_id, start_s, end_s, "mode3", anchor_idx)
 
 
@@ -216,7 +220,7 @@ class WindowSampler:
         if prev < rec.pose.duration_s: gaps.append((prev, rec.pose.duration_s))
         # Trusted gaps only: long uncaptioned stretches (> TRUSTED_GAP_S, mostly intros/outros) may contain uncaptioned signing — 
         # an "all-gap" window there could be all-signing, the exact opposite of what Mode 4 trains (stay quiet on non-signing input).
-        gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S]
+        gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S and not any(a < e and s < b for a, b in rec.untrusted_s or ())]
         if not gaps:
             # Reliable spans only: this is the one path that bypasses `self.anchors`, which hold only reliable spans (a quarantined
             # unit is never an anchor). `self.anchors` guarantees at least one reliable span in any record that reaches the sampler.
@@ -283,8 +287,8 @@ class WindowSampler:
             begin, end = np.searchsorted(relative_times, np.asarray([span.start_s - spec.start_s, span.end_s - spec.start_s], dtype=np.float32))
             if begin < end < len(relative_times): complete.append((span, int(end - begin)))
             
-        # Λ_min in frames of the native grid, the same count the gate and the FSM apply.
-        candidates = tuple(span for span, frames in complete if frames >= self.min_span_frames)
+        # Λ_min in frames of the record's grid, the same count the gate and the FSM apply.
+        candidates = tuple(span for span, frames in complete if frames >= seconds_to_frames(self.min_span_s, rec.pose.fps))
         if candidates:
             spec = replace(spec, mode="mode3" if len(candidates) >= 2 else "mode1", subcase=None)
             target = candidates[0]
@@ -308,12 +312,12 @@ class WindowSampler:
         text_start = target.start_s if target is not None else anchor_span.start_s if spec.subcase == "right" else None
         if text_start is not None:
             ends = [span.end_s for span in rec.sentences if not span.reliable and spec.start_s < span.end_s <= text_start]
-            cut = max(ends, default=-np.inf) - self.delta_frames / rec.pose.fps
+            cut = max(ends, default=-np.inf) - seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
             if cut > spec.start_s: return self.materialize(rec, replace(spec, start_s=cut))
         if poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses).astype(np.float32, copy=False)
         labels = make_bio_labels(
             timestamps, rec.sentences, spec.start_s, spec.end_s,
-            video_duration_s=rec.pose.duration_s,  # long uncaptioned stretches -> UNK (see make_bio_labels)
+            video_duration_s=rec.pose.duration_s, untrusted=rec.untrusted_s,  # long uncaptioned stretches -> UNK (see make_bio_labels)
         )
 
         # χ from sampler bookkeeping (docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of a PREDECESSOR sentence 
@@ -330,16 +334,15 @@ class WindowSampler:
             if straddles and is_predecessor: commit_mask |= timestamps < span.end_s
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, translation_target=target, 
-            anchor_span=anchor_span, commit_mask=commit_mask, candidate_sentences=candidates
+            fps=float(rec.pose.fps), commit_mask=commit_mask, candidate_sentences=candidates
         )
 
     @staticmethod
     def to_dict(sample: WindowSample) -> dict:
         return {
             "spec": asdict(sample.spec), "poses": sample.poses, "timestamps_s": sample.timestamps_s,
-            "bio_labels": sample.bio_labels, "commit_mask": sample.commit_mask,
+            "bio_labels": sample.bio_labels, "commit_mask": sample.commit_mask, "fps": sample.fps,
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
-            "anchor_span": asdict(sample.anchor_span) if sample.anchor_span else None,
             "candidate_sentences": [
                 {"start_s": float(sp.start_s - sample.spec.start_s), "end_s": float(sp.end_s - sample.spec.start_s), "text": sp.text} 
                 for sp in sample.candidate_sentences

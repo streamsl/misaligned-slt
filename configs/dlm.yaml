@@ -1,7 +1,6 @@
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
-# The pose encoder is always Uni-Sign; the LANGUAGE MODEL is selected here: google/mt5-base (Path A default, the
-# released Uni-Sign weights load on top) | facebook/mbart-large-cc25 (the mT5-vs-mBART ablation; mBART starts from base).
+# The pose encoder is always Uni-Sign; the language model is mT5 (google/mt5-base; the released Uni-Sign weights load on top).
 language_model:
     name: google/mt5-base
 checkpoint:
@@ -14,8 +13,8 @@ checkpoint:
     # this file never carries a stale copy of the pool name. An explicit path still wins.
     bio_head_init: auto
     # Translator warm start: data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained), which must be re-rooted to
-    # this language's clean translator (README B2b). train-slt refuses the released file while the local clean translator exists,
-    # and refuses a local file of another language, cap or annotation set.
+    # this language's clean translator. train-slt refuses a file without clean-floor meta (the released file), and refuses a 
+    # local file of another language, cap or annotation set.
     save_best: true # write on every new best dev value (not just end of training)
     monitor: val_joint_score # Dev-window F1 times translation BLEU: a joint selection surrogate, not DVC.
     mode: max
@@ -58,8 +57,9 @@ mode2_subcase_weights:
     left: 0.45
     both: 0.10
 # No pose augmentation in stage 2 (and, by inheritance, the clean floor): both translators and the segmentation branch see
-# the native 24 fps grid and unrotated poses, as at inference, so Λ_min and δ are plain frame counts. S1 sets its own
-# block (bio_pretrain.yaml); it must be a full dict, because a child dict replaces this null whole (utils.load_yaml).
+# each record's native frame grid and unrotated poses, as at inference, so Λ_min and δ (seconds) become the frame counts of
+# the record's fps, as in the FSM. S1 sets its own block (bio_pretrain.yaml); it must be a full dict, because a child dict 
+# replaces this null whole (utils.load_yaml).
 augmentation: null
 # BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries O/I imbalance but gives
 # NO B-vs-I signal; B is ~1 frame/unit (under 1% of frames), so unweighted CE lets the class collapse. Inverse frequency
@@ -80,7 +80,7 @@ bio_nhead: 8
 bio_dropout: 0.1
 bio_conv_stem_layers: 2
 # Banded attention: each RoPE layer attends only to frames within +-r seconds (models/bio_head.attention_mask). Receptive
-# field R <= 4 x 0.375 + (6 ST-GCN + 4 stem frames)/24 = 1.92 s at native fps, within 2s between 3 stride observations.
+# field R <= 4 x 0.375 + (6 ST-GCN + 4 stem frames)/24 = 1.92 s at 24 fps (less at higher rate), within 2s between 3 strides.
 # This bounds direct neural look-ahead for fixed normalization and eval-mode features. Buffer normalization and the global
 # Viterbi path can still change; stability is checked, not guaranteed.
 bio_attention_radius_s: 0.375
@@ -122,8 +122,6 @@ max_grad_norm: 1.0
 # mid-epoch; when a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes
 # each batch's canvas to its longest target (block-aligned), so the ceiling costs no compute.
 max_text_tokens: 320
-validation:
-    max_translation_samples: 0 # 0 = score translation on ALL dev windows
 # Block size: BD3LM's interpolation dial between autoregression (block 1: 1 slot/block — AR order, with at most 1 soft-state 
 # revision pass/slot) and full diffusion (block = canvas). It bounds DLM arm's parallelism and is a TRAINING parameter — the 
 # block-causal mask, OPUT corruption and canvas alignment all read it — so it is stamped in the checkpoint and eval refuses 

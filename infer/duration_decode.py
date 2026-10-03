@@ -11,7 +11,7 @@ import math
 import numpy as np
 import torch
 from scipy.special import log_ndtr
-from data.loader import annotation_fingerprint, load_language_records
+from data.loader import _cached_language_records, annotation_fingerprint
 from data.windowing import BIO
 
 
@@ -50,9 +50,9 @@ class DurationModel:
 
     @classmethod
     def for_language(cls, data_cfg, language):
-        # Target language's prior, fitted on its train split: what stage 2 trains with and every cascade decodes with.
-        records, _ = load_language_records(data_cfg, language, split="train")
-        return cls.fit(records)
+        # Target language's prior, fitted on its train split: what stage 2 trains with and every cascade decodes with. 
+        # The split is parsed once per process (eval's segmenter data guard reads the same records).
+        return cls.fit(_cached_language_records(data_cfg, language, "train"))
 
     @lru_cache(maxsize=128)
     def factors(self, fps: float):

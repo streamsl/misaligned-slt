@@ -1,9 +1,9 @@
-"""Uni-Sign backbone stack (Path A), arXiv 2501.15187: pose encoder + mT5 (default) / mBART (ablation).
+"""Uni-Sign backbone stack (Path A), arXiv 2501.15187: pose encoder + mT5.
 
 Everything Uni-Sign lives here:
-  - `MT5BlockDiffusionDecoder` / `MBartBlockDiffusionDecoder` — per-LM block-diffusion (BD3LM/OPUT/SPD block decode)
-    decoder bindings (each implements `_decode`, `_decode_with_decoder_forward`, `_decoder_stack`).
-  - `UniSignMT5FrontEnd` / `UniSignMBartFrontEnd` — pose encoder + task prompt + LM encoder; the SAME front end
+  - `MT5BlockDiffusionDecoder` — the mT5 block-diffusion (BD3LM/OPUT/SPD block decode) decoder binding
+    (implements `_decode`, `_decode_with_decoder_forward`, `_decoder_stack`).
+  - `UniSignMT5FrontEnd` — pose encoder + task prompt + mT5 encoder; the SAME front end
     serves the AR baseline and the AR/DLM SLT model via `MisalignedSLTModel`.
   - `UniSignFrontEndBase.load_pretrained` — load a released `*_pose_only_slt.pth` into the front end.
 
@@ -14,120 +14,20 @@ DLM arms differ only in the decoder objective (dLLM A2D).
 """
 from __future__ import annotations
 from contextlib import contextmanager
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import MT5Config, MT5ForConditionalGeneration, T5Tokenizer
-from transformers import MBartConfig, MBartForConditionalGeneration, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 from backbones import UniSignPoseEncoder
 from models.block_diffusion import build_block_causal_mask
 from models.dmax import OPUTBlockDiffusionDecoder
 from models.front_end import SLTFrontEnd
 
-__all__ = [
-    "MT5BlockDiffusionDecoder", "MBartBlockDiffusionDecoder", "resolve_decoder_start_id",
-    "UniSignFrontEndBase", "UniSignMT5FrontEnd", "UniSignMBartFrontEnd", "PROMPT_LANG_BY_TARGET",
-]
+__all__ = ["MT5BlockDiffusionDecoder", "UniSignFrontEndBase", "UniSignMT5FrontEnd", "PROMPT_LANG_BY_TARGET"]
 PROMPT_LANG_BY_TARGET = {"en_XX": "English"}
-
-# ════════════════════════════════════════════════════════════════════════════
-# mBART language model: decoder-start resolver + the block-diffusion decoder binding
-# ════════════════════════════════════════════════════════════════════════════
-
-def resolve_decoder_start_id(tokenizer) -> int | None:
-    """Target-language decoder start id for mBART; None -> HF model default.
-
-    shift_tokens_right wraps the LAST non-pad label token — the language code — to position 0, so the pretrained
-    decoder has only ever started from the language code.
-    """
-    lang = getattr(tokenizer, "tgt_lang", None) or getattr(tokenizer, "src_lang", None)
-    if not lang: return None
-    mapping = getattr(tokenizer, "lang_code_to_id", None)
-    if mapping and lang in mapping: return int(mapping[lang])
-    lang_id = tokenizer.convert_tokens_to_ids(lang)
-    return int(lang_id) if lang_id is not None and lang_id != tokenizer.unk_token_id else None
-
-
-class MBartBlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
-    '''BD3LM/OPUT decoder on pretrained mBART decoder (learned absolute positions, layernorm_embedding, sqrt(d_model) embed scale). 
-    `decoder_start_id` (DLM canvas BOS) is mBART's target LANGUAGE CODE, not `<s>` — see `resolve_decoder_start_id`.'''
-    def __init__(self, mbart_model, pad_index: int, decoder_start_id: int, eos_id: int, block_size: int = 4, **kw):
-        super().__init__()
-        self.mbart_decoder = mbart_model.model.decoder  # MBartDecoder layers + norms
-        # mBART (scale_embedding=True for mbart-large-cc25) scales token embeddings by sqrt(d_model).
-        embed_scale = mbart_model.config.d_model ** 0.5 if getattr(mbart_model.config, "scale_embedding", False) else 1.0
-        self._init_block_diffusion(
-            d_model=mbart_model.config.d_model, vocab_size=mbart_model.config.vocab_size,
-            embed_source_weight=mbart_model.model.shared.weight, lm_source_weight=mbart_model.lm_head.weight,
-            pad_index=pad_index, eos_index=eos_id, bos_index=decoder_start_id, embed_scale=embed_scale,
-            block_size=block_size, **kw,
-        )
-        # The canvas carries mBART's sqrt(d_model) word-embedding scale itself (CanvasEmbedding), so `_decode` and
-        # the HF `decoder.forward` behind the block KV cache embed a token identically; hand it to the HF stack too.
-        self.mbart_decoder.embed_tokens = self.embed_tokens
-        print(f"MBartBlockDiffusionDecoder (mBART A2D): d_model={self.d_model}, "
-              f"vocab={self.vocab_size}+1(MASK), block_size={self.block_size}")
-
-
-    def _decode(
-        self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask=None, 
-        position_ids=None, inputs_embeds=None, omega_bias=None, logits_len=None,
-    ):
-        batch_size, tgt_len = decoder_input_ids.shape
-        device = decoder_input_ids.device
-        dtype = enc_hidden.dtype
-        if inputs_embeds is None: inputs_embeds = self.embed_tokens(decoder_input_ids)
-        hidden = inputs_embeds * self.embed_scale
-        if position_ids is not None:
-            # [xt|x0]: positions for both halves are [0..L-1, 0..L-1] (mBART uses a +2 pad offset on learned positions).
-            positions = self.mbart_decoder.embed_positions.weight[position_ids + 2]
-        else:
-            positions = self.mbart_decoder.embed_positions(decoder_input_ids)
-
-        hidden = hidden + positions
-        hidden = self.mbart_decoder.layernorm_embedding(hidden)
-        hidden = F.dropout(hidden, p=self.mbart_decoder.dropout, training=self.training)
-
-        # Self-attn: BD3LM mask (training) or block-causal (inference)
-        if self_attn_mask is None: self_mask = build_block_causal_mask(batch_size, tgt_len, self.block_size, dtype, device)
-        else: self_mask = self_attn_mask.to(dtype=dtype, device=device)
-        cross_mask = AttentionMaskConverter._expand_mask(enc_mask, dtype, tgt_len=tgt_len) if enc_mask is not None else None
-        # Membership gate: add Ω(t) (query-independent, (B,1,1,M)) to the cross-attn key bias; broadcasts over
-        # the query axis, so every layer/head sees it (docs/membership_gate.md §2.9).
-        if omega_bias is not None:
-            ob = omega_bias.to(dtype=dtype, device=device)
-            cross_mask = ob if cross_mask is None else cross_mask + ob
-
-        for layer in self.mbart_decoder.layers:
-            hidden = layer(
-                hidden, attention_mask=self_mask, encoder_hidden_states=enc_hidden, encoder_attention_mask=cross_mask
-            )[0]
-        if getattr(self.mbart_decoder, "layer_norm", None) is not None: hidden = self.mbart_decoder.layer_norm(hidden)
-        if logits_len is not None: hidden = hidden[:, :logits_len]
-        return self.lm_head(hidden)
-
-
-    def _decode_with_decoder_forward(
-        self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask, inputs_embeds=None,
-        past_key_values=None, use_cache=False, cache_position=None, logits=True,
-    ):
-        # Block KV-cache hook (cache logic in dmax; only this KV-cache-capable decoder.forward is backbone-specific). 
-        # MBartDecoder takes 4D mask verbatim and embeds via the canvas, so the cached path matches the no-cache `_decode`.
-        out = self.mbart_decoder(
-            input_ids=None if inputs_embeds is not None else decoder_input_ids,
-            inputs_embeds=inputs_embeds, attention_mask=self_attn_mask,
-            encoder_hidden_states=enc_hidden, encoder_attention_mask=enc_mask,
-            past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position, return_dict=True,
-        )
-        return (self.lm_head(out.last_hidden_state) if logits else None), out.past_key_values
-
-    def _decoder_stack(self):
-        return self.mbart_decoder  # MBartDecoder — the stack the Ω injector hooks (layers[i].encoder_attn)
 
 # ════════════════════════════════════════════════════════════════════════════
 # mT5 block-diffusion decoder
@@ -150,7 +50,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         self._init_block_diffusion(
             d_model=self.config.d_model, vocab_size=self.config.vocab_size, embed_source_weight=self.decoder.embed_tokens.weight, 
             lm_source_weight=mt5_model.lm_head.weight, pad_index=pad_index, eos_index=eos_id, bos_index=decoder_start_id, 
-            embed_scale=1.0, block_size=block_size, **kw,
+            block_size=block_size, **kw,
         )
         print(f"MT5BlockDiffusionDecoder (mT5 A2D): d_model={self.d_model}, "
               f"vocab={self.vocab_size}+1(MASK), block_size={self.block_size}")
@@ -201,7 +101,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         dtype = enc_hidden.dtype
         device = decoder_input_ids.device
         if inputs_embeds is None: inputs_embeds = self.embed_tokens(decoder_input_ids)
-        hidden = self.decoder.dropout(inputs_embeds * self.embed_scale)  # embed_scale = 1.0 for mT5; T5Stack entry dropout
+        hidden = self.decoder.dropout(inputs_embeds)  # T5Stack entry dropout
         self_pos_bias = self._self_position_bias(tgt_len, dtype, device, self_attn_mask, position_ids, batch_size)
         cross_pos_bias = self._cross_position_bias(enc_mask.to(device), dtype)
         # Membership gate: ADD Ω(t) to the cross-attention key bias (query-independent → every layer and head,
@@ -227,7 +127,7 @@ class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
         return self.decoder  # T5Stack — the stack the Ω injector hooks (block[i].layer[1])
 
 # ════════════════════════════════════════════════════════════════════════════
-# Uni-Sign front end — shared pose+prompt base; mT5 (primary) / mBART (ablation) LM variants
+# Uni-Sign front end — shared pose+prompt base and the mT5 binding
 # ════════════════════════════════════════════════════════════════════════════
 
 @contextmanager
@@ -273,13 +173,9 @@ def released_layout_state(sd: dict) -> dict:
 
 
 class UniSignFrontEndBase(SLTFrontEnd):
-    """Shared Uni-Sign front end: UniSignPoseEncoder -> verbatim task prompt + pose tokens -> LM encoder.
-
-    Subclasses bind the LM (mT5 / mBART) and supply `_prompt_token_embeds`, `_run_lm_encoder`, `make_dlm_decoder`,
-    `_load_lm_pretrained`, `pose_embed_scale` (mBART scales word embeddings by sqrt(d), so pose tokens match the
-    prompt-embed magnitude; mT5 -> 1.0). Only the LM differs, so mT5-vs-mBART is a clean ablation."""
+    # Shared Uni-Sign front end: UniSignPoseEncoder -> verbatim task prompt + pose tokens -> LM encoder.
+    # The LM binding (UniSignMT5FrontEnd) supplies `_prompt_token_embeds`, `_run_lm_encoder`, `make_dlm_decoder`, `_load_lm_pretrained`.
     prompt_lang: str = "Chinese"
-    pose_embed_scale: float = 1.0  # mBART overrides to sqrt(d_model)
 
     # ── LM-specific hooks ─────────────────────────────────────────────────────
     def _prompt_token_embeds(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -290,7 +186,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
         raise NotImplementedError
 
     def _load_lm_pretrained(self, sd: dict, strict: bool) -> tuple[int, int, int]:
-        return (0, 0, 0)  # (tensors, missing, unexpected); mBART stays at base init (no released Uni-Sign+mBART weights)
+        raise NotImplementedError  # returns (tensors, missing, unexpected)
 
     # ── shared ────────────────────────────────────────────────────────────────
     def extract_bio_tap(self, poses, frame_mask, timestamps_s=None):
@@ -318,7 +214,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
             [f"Translate sign language video to {self.prompt_lang}: "] * b, padding="longest", return_tensors="pt"
         ).to(device)
         prefix_embeds = self._prompt_token_embeds(prefix["input_ids"])
-        inputs_embeds = torch.cat([prefix_embeds, bio_tap * self.pose_embed_scale], dim=1)
+        inputs_embeds = torch.cat([prefix_embeds, bio_tap], dim=1)
         attention_mask = torch.cat([prefix["attention_mask"], bio_mask.long()], dim=1)
         if omega_bias is not None and tuple(omega_bias.shape) != (b, 1, 1, attention_mask.shape[1]): raise ValueError(
             f"omega_bias {tuple(omega_bias.shape)} does not match the encoder memory {(b, 1, 1, attention_mask.shape[1])}"
@@ -346,7 +242,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
 
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
         """Load a released `*_pose_only_slt.pth` or trainer `model.pt` (normalized by `released_layout_state`):
-        pose keys -> `pose_encoder`, mT5 arm also `mt5_model.*` (mBART: pose only). Call BEFORE building the DLM
+        pose keys -> `pose_encoder`, `mt5_model.*` -> the mT5 LM. Call BEFORE building the DLM
         decoder — it copies the loaded LM into the vocab+1 canvas."""
         blob = torch.load(str(ckpt_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
@@ -361,46 +257,6 @@ class UniSignFrontEndBase(SLTFrontEnd):
         }
 
 
-class UniSignMBartFrontEnd(UniSignFrontEndBase):
-    # mBART LM ablation: same pose encoder + task prompt as the mT5 arm. Init: pose from the released Uni-Sign
-    # ckpt (`load_pretrained`), mBART from base (no released Uni-Sign+mBART weights); decoder-start = mBART target-language code.
-    def __init__(
-        self, mbart_name: str = "facebook/mbart-large-cc25", prompt_lang: str = "Chinese",
-        target_lang: str = "zh_CN", tokenizer=None, pose_hidden_dim: int = 256, init_mbart_weights: bool = True,
-    ):
-        super().__init__()
-        self.prompt_lang = str(prompt_lang)
-        if init_mbart_weights: self.mbart = MBartForConditionalGeneration.from_pretrained(mbart_name)
-        else: self.mbart = MBartForConditionalGeneration(MBartConfig.from_pretrained(mbart_name))
-        self.tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
-            mbart_name, src_lang=target_lang, tgt_lang=target_lang,
-        )
-        d_model = int(self.mbart.config.d_model)
-        self.pose_embed_scale = math.sqrt(d_model)  # match mBART's sqrt(d) scaled word embeddings
-        self.pose_encoder = UniSignPoseEncoder(hidden_dim=int(pose_hidden_dim), out_dim=d_model)
-        self.lm_model = self.mbart
-        self.bio_tap_dim = d_model
-        self.pad_token_id = int(self.mbart.config.pad_token_id)
-        self.eos_token_id = int(self.mbart.config.eos_token_id)
-        self.decoder_start_id = resolve_decoder_start_id(self.tokenizer)  # mBART lang-code decoder start
-
-    def _prompt_token_embeds(self, input_ids):
-        return self.mbart.model.shared(input_ids)  # MBartScaledWordEmbedding — matches pose * sqrt(d)
-
-    def _run_lm_encoder(self, inputs_embeds, attention_mask, key_bias=None):
-        # mBART layers share no position bias, so the key bias enters every encoder layer's own mask.
-        with added_attention_bias(self.mbart.model.encoder.layers, key_bias, arg_index=1, kwarg="attention_mask"):
-            return self.mbart.model.encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
-
-    def make_dlm_decoder(self, block_size: int) -> OPUTBlockDiffusionDecoder:
-        # DLM canvas BOS = the mBART target language code (resolve_decoder_start_id); fall back to <s>/0 only if the
-        # tokenizer has no language code, mirroring how HF shift_tokens_right starts the pretrained decoder.
-        bos = self.decoder_start_id if self.decoder_start_id is not None else (getattr(self.tokenizer, "bos_token_id", None) or 0)
-        return MBartBlockDiffusionDecoder(
-            self.mbart, pad_index=self.pad_token_id, decoder_start_id=bos, eos_id=self.eos_token_id, block_size=block_size,
-        )
-
-
 class UniSignMT5FrontEnd(UniSignFrontEndBase):
     # Bound each inference score tile; all keys remain visible. This is a workspace limit, not a context limit.
     _ATTENTION_TILE_ELEMENTS = 64 * 1024 * 1024
@@ -412,7 +268,6 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         # `init_mt5_weights=False` builds from config only — correct when a Uni-Sign checkpoint overwrites every mT5 tensor anyway.
         super().__init__()
         self.prompt_lang = str(prompt_lang)
-        self.pose_embed_scale = 1.0  # mT5 does not scale word embeddings
         if init_mt5_weights: self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_name)
         else: self.mt5 = MT5ForConditionalGeneration(MT5Config.from_pretrained(mt5_name))
         # Defensive untie for TIED configs: if tie_word_embeddings resolved True, the plain constructor aliases

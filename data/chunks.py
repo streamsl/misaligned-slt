@@ -106,7 +106,9 @@ class ChunkDataset(Dataset):
         # BIO from the kept frame times: UNK over untrusted gaps, a fragment cut by the left edge is I (no B).
         # The left edge is the first LOADED frame (the loader floors the start frame; frame dropout keeps both edges), so an 
         # onset after it keeps its B. The collator pads with UNK, never O.
-        labels = make_bio_labels(timestamps, rec.sentences, float(timestamps[0]), end_s, video_duration_s=rec.pose.duration_s)
+        labels = make_bio_labels(
+            timestamps, rec.sentences, float(timestamps[0]), end_s, video_duration_s=rec.pose.duration_s, untrusted=rec.untrusted_s
+        )
         if rel is not None and rel["velocity"]: poses = release_velocity(poses, timestamps)
         return {
             "poses": poses, "timestamps_s": timestamps - start_s, "bio_labels": labels,

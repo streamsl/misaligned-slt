@@ -1,18 +1,31 @@
 from __future__ import annotations
 from pathlib import Path
-import yaml, re
+import math, yaml, re
 import torch
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
-LAMBDA_MIN_FRAMES = 12  # 0.5s at 24 fps: label-domain floor that rejects flicker; genuine shorter units can't be emitted.
-# Native pose rate of every configured corpus (SignVerse-2M). Λ_min and δ are frame counts at this rate: stage-2 windows,
-# the FSM and eval all stay on it. S1's chunk law converts δ to seconds with it (train/bio_pretrain.py).
-NATIVE_POSE_FPS = 24.0
+LAMBDA_MIN_S = 0.5  # label-domain floor that rejects flicker; genuine shorter units can't be emitted.
 
 
-def lambda_min_frames(inference_cfg: dict) -> int:
+def seconds_to_frames(seconds: float, fps) -> int:
+    """`seconds` as a frame count at `fps`, at least 1: the one conversion of every time constant (Λ_min, δ, the run rules).
+
+    Every constant is in seconds. `fps` may be a list, 1 rate/row of a batch: rows must then give 2 count, because a batch 
+    has 1 frame floor. The 0.01-frame slack absorbs loader's per-video fps (frames / a duration_s rounded to 1 ms, within 
+    0.002 frame of 24 fps on SignVerse), so 0.5s at that rate stays 12 frames.
+    """
+    rates = fps if isinstance(fps, (list, tuple)) else [fps]
+    counts = {max(1, math.ceil(float(seconds) * float(rate) - 0.01)) for rate in rates}
+    if len(counts) != 1: raise ValueError(
+        f"{seconds}s is {sorted(counts)} frames across the rows of 1 batch (fps {sorted({float(r) for r in rates})}); "
+        f"a batch has 1 frame floor, so its rows must share a frame rate"
+    )
+    return counts.pop()
+
+
+def lambda_min_s(inference_cfg: dict) -> float:
     # Lambda_min: the shortest span the FSM may commit. A LABEL-domain floor, so it does not move with a noise measurement.
-    return int(((inference_cfg or {}).get("span_selection") or {}).get("min_span_frames", LAMBDA_MIN_FRAMES))
+    return float(inference_cfg["span_selection"]["min_span_s"])
 
 def pick_device(preferred: str | None = None):
     # TF32 matmuls for the fp32 residue outside AMP autocast (Ampere+; no-op elsewhere). 

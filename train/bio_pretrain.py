@@ -21,7 +21,8 @@ from torch.utils.data import DataLoader
 
 from data.batch import collate_windows
 from data.chunks import ChunkDataset
-from data.loader import ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records, streaming_loader
+from data.loader import (ANNOTATION_PROTOCOL, PooledEpochRecords, resolve_pretrain_records, streaming_loader, 
+                         annotation_fingerprint, segmenter_language_fingerprints)
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
@@ -30,7 +31,7 @@ from models.checkpointing import _load_state, load_checkpoint_meta
 from train import distributed as dist
 from train.helpers import build_optimizer, evaluate_bio_chunks, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
-from utils import NATIVE_POSE_FPS, cfg_get, checkpoint_dir, load_yaml, pool_key
+from utils import cfg_get, checkpoint_dir, load_yaml, pool_key
 
 class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
     def __init__(
@@ -69,6 +70,27 @@ def require_attention_radius(meta: dict, expected: float | None, source: str) ->
     raise SystemExit(
         f"{source} was trained with bio_attention_radius_s={trained} (None = full attention), but the config expects {expected}. "
         f"Retrain S1 at that radius, or set bio_attention_radius_s to the trained value."
+    )
+
+
+def require_segmenter_data(meta: dict, language: str, train_fingerprint: str, buffer_cap_s: float, source: str) -> None:
+    """Refuse a segmenter (S1 or Moryossef) whose labels are not the current ones. A re-convert, a person-counts re-measure or 
+    a caption rule changes the train labels; a strict state_dict load cannot see that, and the stale model would load silently.
+    `train_fingerprint` is the annotation fingerprint of `language`'s whole train split. A language outside the stamped pool is
+    zero-shot for this segmenter, so it has nothing to compare. S1 must also have trained at the deployed cap or longer."""
+    if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
+        f"{source} was trained under annotation protocol {meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}: retrain it."
+    )
+    stamped = meta.get("language_fingerprints")
+    if stamped is None: raise SystemExit(f"{source} stamps no language_fingerprints (trained before the data guard): retrain it.")
+    if language in stamped and stamped[language] != train_fingerprint: raise SystemExit(
+        f"{source} was trained on other {language} train labels "
+        f"(a re-convert, re-measured cuts or a caption rule changed them): retrain it."
+    )
+    trained_chunk = meta.get("rope_eval_chunk_s")
+    if trained_chunk is not None and float(trained_chunk) + 1e-6 < float(buffer_cap_s): raise SystemExit(
+        f"{source} trained on chunks of at most {float(trained_chunk):.2f}s, "
+        f"below the deployed buffer_cap_s {float(buffer_cap_s):.2f}s: retrain it."
     )
 
 
@@ -115,6 +137,7 @@ def build_bio_s1(
         print(f"bio_s1 | multilingual pretraining -> {ckpt['dir']} (--language ignored)", flush=True)
         
     resolve_bio_class_weights(cfg, train_records)
+    cfg["language_fingerprints"] = segmenter_language_fingerprints(cfg, data_cfg, language, train_records)
     # Chunk length C is the longest context the head trains on. Checkpoint metadata and whole-video evaluation use this 
     # stamped value, not a target inference file that may change later. Stage-2 head and FSM run at the one deployed cap 
     # (inference.yaml buffer_cap_s), so S1 must have trained at least that context.
@@ -123,9 +146,10 @@ def build_bio_s1(
         f"pretrain_geometry.buffer_cap_s {chunk_s:.2f}s is below the deployed buffer_cap_s "
         f"{float(inference_cfg['buffer_cap_s']):.2f}s ({inference_config}); raise it and train S1 at that context."
     )
-    # Shortest interior chunk = the shortest buffer the FSM decides on after a commit: δ of committed context + K strides.
+    # Shortest interior chunk = the shortest buffer the FSM decides on after a commit: δ of committed context + K strides. 
+    # A chunk is a time span over pooled records, so δ stays in seconds here (FSM rounds it up to whole frames of each stream).
     stability = inference_cfg["boundary_stability"]
-    cfg["training_min_chunk_s"] = min_chunk_s = float(stability["delta_enc_frames"]) / NATIVE_POSE_FPS + \
+    cfg["training_min_chunk_s"] = min_chunk_s = float(stability["delta_s"]) + \
                                                 int(stability["hysteresis_strides"]) * float(inference_cfg["stride_s"])
     seed = int(cfg.get("seed", 42))
     # A pooled run re-draws its balanced sub-sample each epoch, so the videos a sub-sampled corpus contributes
@@ -187,6 +211,7 @@ def train_bio_s1_epochs(
     training_cap_s = float(cfg["training_buffer_cap_s"])
     meta = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_loader.dataset.records),
+        "language_fingerprints": cfg.get("language_fingerprints"),  # whole train split per language: require_segmenter_data
         "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
         "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, 
         "initialization": cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth"),

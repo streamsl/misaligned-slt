@@ -14,3 +14,13 @@ rq1:
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
 rq2:
     tiou_thresholds: [0.5, 0.7, 0.9]
+split_rule:              # the paired video bootstrap that judges every unit-split candidate against the word share (implementation notes, Merged spans)
+    bootstrap_resamples: 2000
+    bootstrap_seed: 0
+likelihood_cut:          # eval.py --resplit likelihood: SegFree-style re-cut of split spans, a candidate rule (the method rule stays the word share)
+    refine_step_s: 0.08  # after the δ-grid DP, each cut moves in steps of this many seconds within ±δ (2 frames at 24 fps)
+    frame_budget: 6000   # padded pose frames per encoder batch (memory only; no effect on any score)
+    token_budget: 1500   # label tokens per decoder call (memory only)
+attention_cut:           # eval.py --resplit attention: Whisper-style cross-attention re-cut of split spans, a candidate rule (the method rule stays the word share)
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # decoder layers (1-based) read, heads averaged; chosen on asf train by eval.py --resplit attention --fit-layer
+    median_half_width_s: 0.125  # the median filter along frames spans 2 x seconds_to_frames(this) + 1 frames (7 at 24 fps; Whisper's 7 frames are 20 ms each)

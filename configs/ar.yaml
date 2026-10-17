@@ -1,11 +1,11 @@
-# AR variant must share EVERYTHING with our DLM except the decoder family: same 2 pose encoders, BIO head, Ω gate 
+# AR variant must share EVERYTHING with our DLM except the decoder family: same 2 pose encoders, BIO head, Ω gate
 # and prompt + LM-encoder front end, same window sampler (`mode_ratios` + designed `jitter` + `mode2_subcase_weights`),
-# same covered/critic text routing, same optimization. Otherwise the result conflates "diffusion vs AR" with 
-# "robust-window vs clean-window training". This file only overrides the decoder + outputs and inherits the rest 
-# from dlm.yaml (OPUT/SPD blocks it inherits are simply unused by the AR path).
+# same GT-anchored text routing, same optimization. Otherwise the result conflates "diffusion vs AR" with "robust-window
+# vs clean-window training". This file only overrides the decoder + outputs and inherits the rest from dlm.yaml
+# (OPUT/SPD blocks it inherits are simply unused by the AR path).
 extends: dlm.yaml
 decoder: ar
 checkpoint:
-    dir: checkpoints/ar/${language} # override only the save dir; from_pretrained + save_best inherited from dlm
+    dir: checkpoints/ar/${language} # override only the save dir; the rest is dlm.yaml's (translator warm start: data.yaml pretrained_slt)
 wandb:
     name: ar_${language}

@@ -7,11 +7,15 @@ import numpy as np
 from data.loader import ANNOTATION_PROTOCOL, annotation_fingerprint, load_language_records
 from moryossef26.infer import predict_phrase_segments
 from infer.duration_decode import DurationModel
+from models.checkpointing import _without_annotation
 
 from metrics import Segment, match_segments
-from eval import (PredictionEvent, _drop_quarantined_predictions, _gold_events, _load_segmenter, 
-                  load_prediction_file, require_annotation_match, save_prediction_file, to_source)
-from utils import lambda_min_s, load_yaml
+from evaluation.predictions import (
+    _drop_quarantined_predictions, _gold_events, load_prediction_file, PredictionEvent, 
+    save_prediction_file, to_source, warn_annotation_mismatch
+)
+from evaluation.systems import _load_segmenter
+from utils import lambda_min_s, load_yaml, output_dir
 
 # Low on purpose: a near-miss is a boundary offset (a matched pair), not a phantom or skipped event; a high bar would
 # push near-misses into the error classes and bias the offset distribution towards zero. Override: --tiou-threshold.
@@ -128,10 +132,10 @@ def analyze_segmenter_errors(
 
 
 def write_segmenter_error_outputs(
-    analysis: SegmenterErrorAnalysis, output_dir: str | Path, language: str, arch: str, split: str = "dev"
+    analysis: SegmenterErrorAnalysis, out_dir: str | Path, language: str, arch: str, split: str = "dev"
 ) -> dict[str, str]:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     jitter_rows = [asdict(sample) for sample in analysis.jitter_samples]
     jitter_payload = {
@@ -156,9 +160,9 @@ def write_segmenter_error_outputs(
         },
     }
     paths = {
-        "jitter": str(output_dir / f"a_jitter_{arch}_{language}_{split}.json"),
-        "mode_ratios": str(output_dir / f"a_mode_ratios_{arch}_{language}_{split}.json"),
-        "taxonomy": str(output_dir / f"a_error_taxonomy_{arch}_{language}_{split}.json"),
+        "jitter": str(out_dir / f"jitter_{arch}_{language}_{split}.json"),
+        "mode_ratios": str(out_dir / f"mode_ratios_{arch}_{language}_{split}.json"),
+        "taxonomy": str(out_dir / f"error_taxonomy_{arch}_{language}_{split}.json"),
     }
     Path(paths["jitter"]).write_text(json.dumps(jitter_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     Path(paths["mode_ratios"]).write_text(json.dumps(mode_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -198,7 +202,8 @@ def segmenter_infer(args: argparse.Namespace) -> dict: # Upstream segmenter for 
         for vid, segs in segments.items()
     }, records)
     predictions = {vid: [ev.segment for ev in evs] for vid, evs in events.items()}
-    output = Path(args.output or f"outputs/segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json")
+    output = Path(args.output) if args.output else \
+             output_dir("segmenter") / f"segmenter_predictions_{args.segmenter_arch}_{args.language}_{args.split}.json"
     save_prediction_file(predictions, output, provenance={
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
         "segmenter_arch": args.segmenter_arch, "decode": decode, "duration_model": duration.to_dict() if duration else None,
@@ -222,7 +227,11 @@ def _assert_predictions_match_decode(args: argparse.Namespace) -> None:
     if expected not in {"plain", "duration"}: raise ValueError("Regenerate predictions with a current plain or duration decoder")
     if expected == "duration":
         fitted = DurationModel.for_language(load_yaml(args.data_config), args.language).to_dict()
-        if prov.get("duration_model") != fitted: raise ValueError("Regenerate predictions with the train-fitted duration prior")
+        if _without_annotation(prov.get("duration_model")) != _without_annotation(fitted):
+            raise ValueError("Regenerate predictions with the train-fitted duration prior")
+        if prov.get("duration_model") != fitted: print(   # the same fitted numbers on other train labels: a fingerprint warning
+            f"WARNING: {args.predictions} decoded under a duration prior fitted on other train labels; regenerate it before you report it.",
+            flush=True)
     if arch != args.segmenter_arch or prov.get("decode") != expected:
         raise ValueError(f"Regenerate {args.segmenter_arch} predictions with its {expected} BIO decoder")
 
@@ -234,7 +243,7 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     )
     cfg = load_yaml(args.data_config)
     records, _ = load_language_records(cfg, args.language, split=args.split)
-    require_annotation_match(args.predictions, records, "--predictions")
+    warn_annotation_mismatch(args.predictions, records, "--predictions")
 
     predictions = load_prediction_file(args.predictions)  # the segmenter-infer output file
     _assert_predictions_match_decode(args)
@@ -251,7 +260,9 @@ def segmenter_errors(args: argparse.Namespace) -> dict:
     )
     print(f"[segmenter-errors] event taxonomy with material_overlap_s={lam_s:.3f}s (= span_selection.min_span_s): "
           f"a graze shorter than the minimum selectable span is boundary jitter, not a second sentence.", flush=True)
-    paths = write_segmenter_error_outputs(analysis, args.output_dir, args.language, args.segmenter_arch, split=args.split)
+    paths = write_segmenter_error_outputs(
+        analysis, args.output_dir or output_dir("analysis"), args.language, args.segmenter_arch, split=args.split
+    )
     return {
         "language": args.language, "split": args.split, "segmenter_arch": args.segmenter_arch, "event_counts": analysis.event_counts, 
         "mode_ratios": analysis.mode_ratios, "matched_pairs": analysis.matched_pairs, "outputs": paths,
@@ -275,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--predictions", default=None)
     parser.add_argument("--output", default=None)
-    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--output-dir", default=None, help="segmenter-errors: the folder of its 3 files (default outputs/analysis)")
     parser.add_argument("--tiou-threshold", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")

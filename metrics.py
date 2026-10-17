@@ -6,9 +6,8 @@ on full videos. Whole-video segmenter evaluation also reports its spans through 
 Frame diagnostics and span diagnostics answer different questions; training monitors are not final results.
 
 FRAME-DOMAIN: bio_frame_metrics and moryossef_segment_metrics, with a shared span parser for predictions and gold.
-
-TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by eval.py 
-(RQ2 tIoU brackets), report.py and reporting/ (outcome and protocol tables).
+TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; 
+used by evaluation/ (RQ2 tIoU brackets), report.py and reporting/ (outcome and protocol tables).
 
 TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/BLEURT).
 """

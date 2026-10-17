@@ -919,7 +919,7 @@ def load_language_records(
         f"masked_runs/empty_runs then warn as unknown)."
     )
     pose_cfg = lang_cfg.get("pose", {}) or {}
-    fps_fallback = float(pose_cfg.get("fps", 25.0))
+    fps_fallback = pose_cfg.get("fps")   # optional: every video's rate is its frames / video_meta.csv duration_s
     pose_index = build_pose_index(
         root / "poses", fps=fps_fallback, video_meta=video_meta,
         width=int(pose_cfg["width"]) if pose_cfg.get("width") is not None else None,
@@ -931,7 +931,7 @@ def load_language_records(
         f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
     )
     missing_meta = [vid for vid in pose_index if vid not in video_meta]
-    if missing_meta: print(
+    if missing_meta and fps_fallback is not None: print(
         f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from {root / META_FILENAME}; falling back "
         f"to pose.fps={fps_fallback} for them — run `python prepare_yt25.py --stage meta --root {root.parent} --languages {root.name}` "
         f"(yt-dlp metadata fetch, no video download)."
@@ -1237,19 +1237,21 @@ def streaming_loader(
     anchors[index % N]). Every anchor is realized exactly once per epoch however indices are partitioned — no duplication or lost coverage. 
     Every per-window draw is seeded from the index (WindowSampler.spec_for, ChunkDataset.__getitem__), so forked workers need no reseed.
     """
+    deterministic = bool(getattr(dataset, "deterministic", False))
     # A dataset whose __getitem__ depends on the epoch cannot use persistent workers.
-    epoch_stateful = hasattr(dataset, "set_epoch") and not bool(getattr(dataset, "deterministic", False))
+    epoch_stateful = hasattr(dataset, "set_epoch") and not deterministic
     persistent = num_workers > 0 and not epoch_stateful
-    sampler = None
-    # A training set is shuffled per epoch (the trainer's set_epoch reseeds it), so a global batch is 
-    # not a block of consecutive anchors from 1 or 2 videos; a deterministic (dev) set keeps its order.
-    if dist.is_distributed(): sampler = DistributedSampler(
-        dataset, num_replicas=dist.world_size(), rank=dist.rank(),
-        shuffle=not bool(getattr(dataset, "deterministic", False)), seed=int(bucket_seed),
-    )
-    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour. Incompatible with DistributedSampler 
+    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour. Incompatible with DistributedSampler
     # (both decide the index order), so it is single-process only; multi-GPU already splits the batch and gets its speed there.
-    if bucket_by_length and sampler is None and hasattr(dataset, "sampler"): return DataLoader(
+    bucketed = bucket_by_length and not dist.is_distributed() and hasattr(dataset, "sampler")
+    sampler = None
+    # Any other training set is shuffled per epoch by a DistributedSampler (the trainer's set_epoch reseeds it), with world size 1 on 1
+    # process: global batch k is the same block of the same seeded permutation on 1 or N processes, so 1 GPU and N GPUs draw the same
+    # global batches, and a batch is not a run of consecutive anchors from 1 or 2 videos. A deterministic (dev) set keeps its order.
+    if dist.is_distributed() or not (deterministic or bucketed): sampler = DistributedSampler(
+        dataset, num_replicas=dist.world_size(), rank=dist.rank(), shuffle=not deterministic, seed=int(bucket_seed),
+    )
+    if bucketed: return DataLoader(
         dataset, batch_sampler=LengthBucketSampler(dataset, int(batch_size), seed=int(bucket_seed)), 
         num_workers=int(num_workers), persistent_workers=persistent, collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(), prefetch_factor=4 if num_workers > 0 else None,

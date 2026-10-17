@@ -11,6 +11,9 @@ from poses import normalize_keypoints_unisign
 @dataclass
 class BIOHeadOutput:
     logits: torch.Tensor
+    # With a residual: the mean per-frame ||residual|| / ||normalized input|| on valid frames (detached), i.e. 
+    # how much the added features weigh against the head's own input. None without a residual.
+    residual_share: torch.Tensor | None = None
 
 
 class RoPETransformerEncoderLayer(nn.Module):
@@ -251,17 +254,28 @@ class RoPEBIOHead(nn.Module):
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(
-        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None, residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm (see layer note)
+        # A residual (stage 2's bio_adapter) joins AFTER the norm, so its weight acts at the scale of the normalized input,
+        # whatever the size of the encoder's tokens.
+        if residual is not None:
+            valid = frame_mask.bool() if frame_mask is not None else torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+            ratio = residual.detach().float().norm(dim=-1) / x.detach().float().norm(dim=-1).clamp(min=1e-6)
+            self.last_residual_share = ratio[valid].mean() if bool(valid.any()) else ratio.new_zeros(())
+            x = x + residual.to(x.dtype)
         # Mask-aware conv stem (see TemporalConvStem), then one banded RoPE pass: whole-video callers window 
         # the input to the trained context first (`chunk_normalized_logits`), so the head never chunks.
         x = self.conv_stem(x, key_mask=frame_mask)
         return chunked_rope_encode(self.layers, x, timestamps_s, None, key_mask=frame_mask, attention_radius_s=self.attention_radius_s)
 
     def forward(
-        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None, residual: torch.Tensor | None = None,
     ) -> BIOHeadOutput:
-        hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
-        return BIOHeadOutput(logits=self.phrase_bio_head(hidden))
+        hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask, residual=residual)
+        return BIOHeadOutput(
+            logits=self.phrase_bio_head(hidden), residual_share=self.last_residual_share if residual is not None else None
+        )

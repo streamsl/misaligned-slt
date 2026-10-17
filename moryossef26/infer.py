@@ -76,7 +76,8 @@ def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
     rope_chunk_s: float | None = None, duration=None
 ) -> dict[str, list[Segment]]:
-    # 1 decode/stream: spans keyed by record id on the stream's own clock (eval.to_source maps them to the source video).
+    # 1 decode/stream: spans keyed by record id on the stream's own clock 
+    # (evaluation.predictions.to_source maps them to the source video).
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -129,9 +130,9 @@ def evaluate_moryossef_whole_video(
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
     `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
 
-    The current window monitor pools complete-span counts at 1 threshold. Whole-video scoring uses different context, 
-    units and aggregation. Compare checkpoints under both protocols before attributing a gap to training; a protocol 
-    difference does not rule out a model or implementation failure.
+    The segmenters' checkpoint monitor (`val_video_f1`, evaluation.segmenter_eval.segmenter_dev_scores) decodes the 
+    same whole-video pass with the duration prior and scores it with the RQ2 rows of `--segmenter-eval`. The dev-chunk 
+    numbers it also logs use other context, units and aggregation and are diagnostics only.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []

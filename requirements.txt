@@ -14,6 +14,10 @@ einops>=0.7
 huggingface_hub>=0.23
 tqdm>=4.66            # HF-style global training progress bar
 
+# eval.py (imported by the stage-2 and segmenter dev monitors too) and report.py
+pandas>=2.0
+ipython>=8.0          # eval.py's notebook display of results
+
 # Metrics (lazy-loaded; eval degrades gracefully if a backend is missing)
 evaluate>=0.4
 sacrebleu>=2.4

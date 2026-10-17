@@ -1,9 +1,11 @@
-# Faithful Moryossef 2026 external segmenter for the RQ2 cascade. It is not the in-system FSM head (that is train-bio / 
-# bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input contract — their 50 landmarks 
-# (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity after — where the in-system head 
-# reads Uni-Sign features. The two arms share no input representation, which keeps cascade baseline independent of the 
-# method (docs/membership_gate.md §4, shared components table). Everything else is S1's: pool, chunk tiling, augmentation, 
-# labels, dev monitor and best-epoch floor (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`).
+# Moryossef 2026 external segmenter (the released architecture and weights) for the RQ2 cascade. It is not the in-system FSM
+# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input contract —
+# their 50 landmarks (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity after — where the
+# in-system head reads Uni-Sign features. The two arms share no input representation, which keeps cascade baseline independent
+# of the method (docs/membership_gate.md §4, shared components table). Its training recipe is S1's: pool, augmentation, labels,
+# optimizer schedule, dev monitor and best-epoch floor (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`). 
+# Declared differences: the model, the input contract, the initialization (released weights here, Uni-Sign encoder + random head 
+# in S1) and the chunk length (fixed (num_frames - 1) / fps s here, U(δ + K·stride, C) s in S1).
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
@@ -11,9 +13,10 @@ checkpoint:
     # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
     dir: checkpoints/moryossef/${corpus}
     save_best: true
-    monitor: val_phrase_tiou_f1  # complete-span F1@0.5 over fixed dev chunks, S1's monitor (train.helpers.evaluate_bio_chunks)
+    monitor: val_video_f1  # S1's monitor: RQ2 protocol on whole dev streams (train.helpers.evaluate_segmenter)
     mode: max
     restore_best: true
+    eval_every_epochs: 1
     from_pretrained: checkpoints/moryossef26.safetensors
 wandb:
     enabled: false
@@ -51,17 +54,16 @@ augmentation:        # TRAIN chunks only; same block as bio_pretrain.yaml (poses
     frame_dropout: 0.15
     body_part_dropout: 0.1
 
-learning_rate: 2.0e-4
+learning_rate: 1.0e-3
 weight_decay: 1.0e-4
 epochs: 100
-eval_every_epochs: 1
 early_stopping:
     enabled: true
     patience: 20
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 4
+    warmup_epochs: 0
 mixed_precision: auto
 max_grad_norm: 1.0
 

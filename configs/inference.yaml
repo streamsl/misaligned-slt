@@ -8,18 +8,19 @@ stride_s: 1.0
 # to set below this value. Every translation recipe (clean floor, arms) clamps its windows here.
 # A hysteresis commit needs δ of lead-in (the buffer starts at previous terminator − δ) + (K-1)·stride after the
 # terminator (plus up to 1 stride of quantisation), so a unit longer than about 40 - 0.5 - 2 = 37.5 s commits only
-# through the forced path. A pause before a unit also uses cap space, so a few units shorter than 37.5 s can be cut
-# open. The left-truncated tail of a force-committed unit is never translated: Mode-2b training gives the decoder no
-# translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
+# via the forced path. A pause before a unit also uses cap space, so some shorter units are cut open even with a
+# perfect segmenter (the share per corpus and cap is in docs/implementation_notes.md); segmenter merges cause most 
+# real cuts. The left-truncated tail of a force-committed unit is never translated: Mode-2b training gives the 
+# decoder no translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
 buffer_cap_s: 40.0
 boundary_stability:
     # delta_s (δ) plays 3 coupled roles:
     #   1. terminator-stability tolerance: the commit condition = the target span's terminator (first O-or-B —
     #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
     #      hysteresis_strides strides;
-    #   2. post-commit overlap: the buffer is cut at (terminator − δ), so an estimate late by ≤ δ still leaves
-    #      the next sentence's B in the buffer (the leftover tail is not re-emitted: buffer-start I does not open
-    #      a span, and candidate_spans skips any span terminating at or before the commit frontier χ);
+    #   2. post-commit overlap: the buffer is cut at (terminator − δ); the δ frames are left context only (they are
+    #      committed, so the decode tags them UNK and nothing in them is emitted again); after a real terminator the
+    #      next sentence opens at the commit frontier χ (known start);
     #   3. span-identity tolerance: each candidate span keeps its own hysteresis history (infer/commit_gate.CommitGate);
     #      a start that moves > δ is another span with its own history.
     delta_s: 0.5 # 12 frames at 24 fps, 13 at 25 fps, 15 at 30 fps
@@ -32,11 +33,11 @@ span_selection:
     # Λ_min: the shortest span the FSM may commit. A LABEL-domain floor: it answers "what is the shortest unit we are 
     # willing to emit", which is a property of the annotation, not of the head's boundary noise. 0.5s rejects brief 
     # flicker. Any genuine unit below this floor cannot be emitted exactly; report its count and the resulting recall 
-    # ceiling. A low duration percentile is not a minimum. It is NOT the re-emission guard: that is the commit-frontier 
-    # filter candidate_spans(skip_term_before=χ), which uses the commit log instead of a worst-case length bound.
+    # ceiling. A low duration percentile is not a minimum. It is NOT the re-emission guard: that is the committed prefix,
+    # which the decode tags UNK (infer/commit_gate.candidate_spans), not a worst-case length bound.
     min_span_s: 0.5
-translation: # the decode reads the whole buffer under the Ω soft crop, the conditioning stage 2 trains
+translation: # Decode reads support of Ω (hard crop of committed span) as a crop of buffer, the read stage 2 trains
     # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
     # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.
     # The block decode walks blocks until every row has emitted EOS, so an unreached slot costs nothing.
-    max_text_tokens: 320
+    max_text_tokens: 400

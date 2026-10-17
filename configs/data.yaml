@@ -1,7 +1,8 @@
 active_languages: [asf]
 
-# Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. pose.fps is a 
-# FALLBACK only. Real pose fps is resolved per video as total_pose_frames/video_duration from <root>/video_meta.csv. 
+# Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. Every video's 
+# pose fps is its total_pose_frames / duration_s from <root>/video_meta.csv, so videos of 1 corpus may differ in rate. 
+# A video without a duration_s stops the loader; an optional pose.fps sets a fallback rate for such videos instead. 
 # ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_yt25.py` writes their video_meta.csv (duration = 
 # frames / 24, rounded to 1 ms). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are 
 # extracted at the NATIVE rate varies per YouTube video. You can generate its labels once with:
@@ -11,7 +12,7 @@ languages:
     # `python prepare_yt25.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
     # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in shards) and <root>/video_meta.csv (duration 
     # from frame_count / 24 rounded to 1 ms, so per-video fps calibration recovers 24.0 within 0.001; 
-    # utils.seconds_to_frames absorbs that). pose.fps stays the fallback only.
+    # utils.seconds_to_frames absorbs that).
     # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
     # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
     # init on both axes. OpenASL uses the same architecture and strict-loads.
@@ -25,20 +26,17 @@ languages:
         # pretrained_slt: checkpoints/baseline_train/ase/model.pt
         root: data/youtube-sl-25/ase
         pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
             width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
     asf:
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
-        # pretrained_slt: checkpoints/baseline_train/asf/model.pt
+        # Re-rooted (README B2b) on the LOCAL clean-floor baseline, so the stage-2 arms and every later --method baseline
+        # eval share 1 init (§1.4 + controlled comparison). train-slt refuses a stage-2 arm while this points at any file
+        # without clean-floor meta (the released checkpoint, checkpoints/openasl_pose_only_slt.pth).
+        pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
         pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
             width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
     bfi:
@@ -51,7 +49,6 @@ languages:
         # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
         pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
             width: 1920  # fallback frame size for a video without video_meta.csv width/height.
             height: 1080
 

@@ -10,7 +10,7 @@ membership_gate:
     enabled: false # the clean floor is UNGATED (cf. ar.yaml, the GATED AR de-risk of §9.3)
 # EVAL loads the clean translator named by --checkpoint or data.yaml `pretrained_slt` (utils.resolve_pretrained):
 # the released Uni-Sign file before README B2b re-root, this language's trained clean floor after it. It reads
-# no `checkpoint.dir` (eval._build_eval_model), and a trained file must be this language's clean floor under 
+# no `checkpoint.dir` (evaluation.systems._build_eval_model), and a trained file must be this language's clean floor under 
 # the fixed constants (checked there).
 wandb:
     enabled: false

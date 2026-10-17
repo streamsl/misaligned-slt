@@ -1,4 +1,4 @@
-"""Segmentation training data for both arms: whole-input random chunks, BIO only (dev monitor: train.helpers.evaluate_bio_chunks).
+"""Segmentation training data for both arms: whole-input random chunks, BIO only (dev monitor: train.helpers.evaluate_segmenter).
 
 Each draw tiles the selected videos with chunk lengths U(L_min, C), independent of caption boundaries. For S1, C is the
 buffer cap and L_min = δ + K·stride sets a short training context (it is not a minimum legal streaming-buffer length);

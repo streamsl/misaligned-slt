@@ -25,8 +25,13 @@ scheduler:
 max_grad_norm: 1.0
 batch_size: 16
 grad_accum_steps: 1     # Effective batch = batch_size * grad_accum_steps
+early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
 lambda_bio: 0.0         # Uni-Sign SLT loss is a SINGLE label-smoothed CE — no BIO auxiliary. 0 means the model has no
                         # segmentation branch at all (no BIO head, no second pose encoder), not a zero-weighted one.
+lambda_trans: 1.0       # the single CE at full weight; dlm.yaml's joint-arm value is not inherited
 mode_ratios: {mode1: 1.0, mode2: 0.0, mode3: 0.0, mode4: 0.0}  # clean-span training view, NOT stage 2's designed mode mix
 jitter:
     context_s: 0.0
@@ -47,6 +52,7 @@ checkpoint:
                                      # this partial checkpoint override (lambda_bio: 0 also builds no segmentation branch)
     monitor: val_translation_bleu4   # selection by dev BLEU
     mode: max
+    eval_every_epochs: 1             # dev BLEU is cheap; dlm.yaml's stage-2 cadence and patience size the stage-2 monitor
 
 wandb:
     name: baseline_train_${language}

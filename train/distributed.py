@@ -35,6 +35,38 @@ def is_main() -> bool: # Rank 0 owns every SIDE EFFECT: checkpoint writes, wandb
 def local_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", 0))
 
+def cleanup() -> None:
+    if is_distributed(): dist.destroy_process_group()
+
+def barrier() -> None:
+    if is_distributed(): dist.barrier()
+
+def per_rank_batch_size(global_batch: int) -> int:
+    """Split a config's GLOBAL batch across ranks. Refuses a non-divisible split rather than silently changing
+    the effective batch (which would make a multi-GPU run a different experiment from its single-GPU config)."""
+    w = world_size()
+    if w == 1: return int(global_batch)
+    if int(global_batch) % w: raise SystemExit(
+        f"batch {global_batch} is a GLOBAL batch and must be divisible by the world size {w} (configs/*.yaml batch_size "
+        f"or checkpoint.dev_batch_size). Use a value divisible by {w}, or launch with a different --nproc-per-node."
+    )
+    return int(global_batch) // w
+
+def broadcast_state(module: torch.nn.Module) -> None:
+    """Copy rank 0's parameters and buffers to every rank once, as DDP does when it wraps a model. `average_gradients` keeps
+    the ranks equal only if they START equal, and some inits can differ per rank: a random draw (the DLM [MASK] row) whenever
+    the ranks' generators differ, or a fit on each rank's own GPU (the one-stream stitch, train/slt.py)."""
+    if not is_distributed(): return
+    for tensor in [*module.parameters(), *module.buffers()]: dist.broadcast(tensor.data, src=0)
+
+def merge_dicts(local: dict) -> dict:
+    # Union of every rank's dict (disjoint keys, picklable values), returned on every rank.
+    if not is_distributed(): return local
+    gathered: list[dict] = [None] * world_size()  # type: ignore[list-item]
+    dist.all_gather_object(gathered, local)
+    return {k: v for part in gathered for k, v in part.items()}
+
+
 def init_distributed() -> torch.device | None:
     """Join the torchrun process group if launched under one; return this rank's device (else None).
 
@@ -50,23 +82,6 @@ def init_distributed() -> torch.device | None:
     if torch.cuda.is_available(): torch.cuda.set_device(device)
     print(f"[dist] rank {rank()}/{world_size()} on {device} ({backend})", flush=True)
     return device
-
-def cleanup() -> None:
-    if is_distributed(): dist.destroy_process_group()
-
-def barrier() -> None:
-    if is_distributed(): dist.barrier()
-
-def per_rank_batch_size(global_batch: int) -> int:
-    """Split a config's GLOBAL batch across ranks. Refuses a non-divisible split rather than silently changing
-    the effective batch (which would make a multi-GPU run a different experiment from its single-GPU config)."""
-    w = world_size()
-    if w == 1: return int(global_batch)
-    if int(global_batch) % w: raise SystemExit(
-        f"batch_size {global_batch} is the GLOBAL batch and must divide the world size {w} "
-        f"(configs/*.yaml batch_size). Use a batch_size divisible by {w}, or launch with a different --nproc-per-node."
-    )
-    return int(global_batch) // w
 
 
 def average_gradients(params) -> None:

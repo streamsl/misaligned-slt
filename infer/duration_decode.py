@@ -1,8 +1,8 @@
 """Shared semi-Markov BIO scores and exact Viterbi decoding.
 
-A path scores the head's O/B/I log-probabilities + a duration prior fitted to the TRAIN unit durations; 
-there is no tuned per-span bonus or B-evidence weight. The legal-only S1 monitor uses the same state grammar 
-without duration factors. Caption membership is computed from these scores in models.membership_gate.
+A path scores the head's O/B/I log-probabilities + a duration prior fitted to the TRAIN unit durations; there is no tuned per-span 
+bonus or B-evidence weight. The online plain decoder control (--online --segmenter-decode plain) and the dev-chunk diagnostics use 
+the same state grammar without duration factors. Caption membership is computed from these scores in models.membership_gate.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass

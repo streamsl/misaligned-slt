@@ -6,9 +6,11 @@ checkpoint:
     dir: checkpoints/bio_s1/${corpus}
     from_pretrained: checkpoints/openasl_pose_only_slt.pth  # Released Uni-Sign pose weights initialize S1 pose encoder
     save_best: true
-    monitor: val_phrase_tiou_f1 # complete-span F1@0.5 over the fixed dev chunks
+    monitor: val_video_f1  # RQ2 protocol on whole dev streams
     mode: max
     restore_best: true
+    eval_every_epochs: 1
+    dev_batch_size: 32
 wandb:
     name: bio_s1_${corpus}
 
@@ -28,10 +30,10 @@ pretrain_geometry:
 epochs: 100
 batch_size: 32
 grad_accum_steps: 1    # Effective batch = batch_size * grad_accum_steps
-learning_rate: 2.0e-4  # The BIO head (random init)
-# S1's pose encoder starts from the released Uni-Sign weights, so it trains at a smaller rate than the fresh head:
-# 0.5 x learning_rate (discriminative fine-tuning). Only S1 has this key: stage 2 trains every module at one rate.
-backbone_lr: 1.0e-4
+learning_rate: 1.0e-3  # The BIO head (random init)
+# S1's pose encoder starts from the released Uni-Sign weights and trains at backbone_lr, the tuned head rate 
+# (a smaller encoder rate learned too slowly). Only S1 has this key: stage 2 trains every module at 1 rate.
+backbone_lr: 1.0e-3
 weight_decay: 1.0e-4
 early_stopping:
     enabled: true
@@ -39,11 +41,12 @@ early_stopping:
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 4
+    warmup_epochs: 0
 # Pose augmentation, TRAIN chunks only (dev chunks are never augmented; data/chunks.py). A full dict: dlm.yaml sets
 # `augmentation: null`, and a child dict replaces a parent null whole (utils.load_yaml), so no key is inherited.
-# The Moryossef 2026 release recipe, identical in moryossef26.yaml so 2 segmentation arms differ only by model 
-# and input contract. BIO labels are rebuilt from the kept timestamps.
+# A project adaptation of the Moryossef 2026 release's density resampling (the release draws 25-50 fps on 50 fps poses, 
+# with a 5 % tempo stretch); same in moryossef26.yaml, so 2 segmentation arms differ only by model and input contract. 
+# BIO labels are rebuilt from the kept timestamps.
 augmentation:
     fps: { min_fps: 15.0, max_fps: 30.0 }  # density resampling to U(min_fps, max_fps)
     frame_dropout: 0.15                    # remove U(0, rate) of the interior frames

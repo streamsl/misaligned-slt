@@ -1,14 +1,13 @@
-"""Segmentation training data for both arms: whole-input random chunks, BIO only (dev monitor: train.helpers.evaluate_bio_chunks).
+"""Segmentation training data for both arms: whole-input random chunks, BIO only (dev monitor: train.helpers.evaluate_segmenter).
 
-Each draw tiles the selected videos with chunk lengths U(L_min, C), independent of caption boundaries. For S1, C is the
-buffer cap and L_min = δ + K·stride sets a short training context (it is not a minimum legal streaming-buffer length);
-chunk lengths vary so that normalization sees both short and long windows. The Moryossef arm uses the same `ChunkDataset`
-with L_min = C = its fixed chunk and its release input contract (`release`). The arms differ by model and input contract,
-and by the unit of the chunk: S1's is SECONDS (its head is banded in seconds and its Uni-Sign box depends on the window, 
-like a stream buffer of at most C), the release's is FRAMES (1 1024-frame RoPE pass): under fps augmentation the release 
-arm loads the native span that resamples to its fixed frame count, as the release's `load_and_augment` does. The fixed 
-epoch budget can omit or repeat chunks from a draw (see ChunkDataset), so neither complete frame coverage nor exactly 1 
-expected visit per frame is guaranteed.
+Each draw tiles selected videos with chunk lengths U(L_min, C), independent of caption boundaries. For S1, C is the buffer cap 
+and L_min = δ + K·stride sets a short training context (it is not a minimum legal streaming-buffer length). The chunk lengths 
+vary so that normalization sees both short and long windows. Moryossef arm uses same `ChunkDataset` with L_min = C = its fixed 
+chunk and its release input contract (`release`). The arms differ by model and input contract, and by the unit of the chunk: 
+S1's is SECONDS (its head is banded in seconds and its Uni-Sign box depends on the window, like a stream buffer of at most C), 
+the release's is FRAMES (1 1024-frame RoPE pass): under fps augmentation the release arm loads the native span that resamples 
+to its fixed frame count, as the release's `load_and_augment` does. Fixed epoch budget can omit or repeat chunks from a draw 
+(see ChunkDataset), so neither complete frame coverage nor exactly 1 expected visit per frame is guaranteed.
 """
 from __future__ import annotations
 import numpy as np

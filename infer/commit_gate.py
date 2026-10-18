@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
+import itertools
 
 import torch
 from data.windowing import BIO
@@ -12,7 +13,7 @@ def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
     Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; most adjacent captions 
     chain with no gap have no visual pause), so 1st signing frame after a gap counts as a start. Buffer-start signing 
     without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before 
-    the buffer, don't translate"), which also makes the overlap cut safe — its ≤2δ leftover arrives as buffer-start `I`.
+    the buffer, don't translate"). FSM's committed overlap never reaches this rule: it's a prefix that the decode tags UNK.
     """
     if tag == BIO["B"]: return True
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
@@ -37,23 +38,18 @@ def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, in
     return spans
 
 
-def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0, skip_term_before: int = 0):
-    """Complete spans ≥ `min_span_frames` (Λ_min) terminating after `skip_term_before`, in order. The first is the target of
-    the FSM and of the membership gate's Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each
-    stride (`CommitGate.vote`).
+def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0):
+    """Complete spans ≥ `min_span_frames` (Λ_min), in order. The first is the target of the FSM and of the membership gate's
+    Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each stride (`CommitGate.vote`).
 
-    `skip_term_before` is the commit frontier χ in frames (= frames committed = index of 1st uncommitted frame). A span 
-    terminating at or before χ is already emitted — an overlap-cut leftover or a stale re-detection — so skip it. The bound 
-    is `term <= χ`, not `<`: the cut geometry (`last_commit_t = event.end_s - δ/fps`) makes equality the common case. This 
-    commit-log check is the whole no-re-emission guarantee, so Λ_min and δ need no coupling ("Λ_min > 2δ" rule is infeasible 
-    on short-sentence corpora: on asf 2δ > p10 sentence length). Spans STRADDLING χ stay selectable: δ-overlap stops a late 
-    terminator estimate eating the successor's onset, and their ≤δ committed prefix is attention-floored by Ω's χ term.
+    No re-emission: the frames before the commit frontier χ (the δ overlap the cut keeps) are a prefix that the decode tags 
+    UNK (`DurationDecoder`, commit mask), so a span can open only at or after χ and never ends at or before it. Λ_min and 
+    δ need no coupling ("Λ_min > 2δ" is infeasible on short-sentence corpora: on asf 2δ > p10 sentence length).
 
     Λ_min is a LABEL-domain floor chosen to reject brief flicker. A genuine unit shorter than the floor cannot be
     emitted exactly; report that exclusion when comparing localization scores.
     """
     for start, term in bio_complete_spans(bio_tags):
-        if term <= int(skip_term_before): continue  # term == χ: all content frames (< term) are committed
         if term - start >= int(min_span_frames): yield (start, term)
 
 
@@ -82,6 +78,7 @@ class BoundaryHistory:
     hysteresis_strides: int
     delta_enc_frames: int
     values: deque[tuple[int, int] | None] = field(default_factory=deque)
+    serial: int = -1  # gate's identity for this span; the stability trace records it (StreamingSLTRunner(record_trace=True))
 
     def push(self, span: tuple[int, int] | None) -> None:
         self.values.append(span)
@@ -110,6 +107,7 @@ class CommitGate:
     def __init__(self, delta_enc_frames: int, hysteresis_strides: int = 3):
         self.delta_enc_frames, self.hysteresis_strides = int(delta_enc_frames), int(hysteresis_strides)
         self.histories: list[BoundaryHistory] = []
+        self._serials = itertools.count()   # never reused, so a span seen after its history is gone gets a new identity
 
     def _match(self, span: tuple[int, int], pool: list[BoundaryHistory]) -> BoundaryHistory | None:
         best, best_gap = None, None
@@ -126,12 +124,17 @@ class CommitGate:
         for span in spans:
             history = self._match(span, pool)
             if history is None:
-                history = BoundaryHistory(self.hysteresis_strides, self.delta_enc_frames)
+                history = BoundaryHistory(self.hysteresis_strides, self.delta_enc_frames, serial=next(self._serials))
                 self.histories.append(history)
             else: pool.remove(history)
             history.push(span)
         for history in pool: history.push(None)
         self.histories = [h for h in self.histories if h.last_seen() is not None]  # unseen for K strides: gone
+
+    def identity(self, span: tuple[int, int]) -> int | None:
+        # The serial of the history `stable` and `retire` match for this span; None when the gate holds none for it.
+        history = self._match(span, self.histories)
+        return None if history is None else history.serial
 
     def stable(self, span: tuple[int, int]) -> bool:
         # Reads votes only: a pass that adds none (cap, EOF drain, post-commit re-check) commits only stability already earned.

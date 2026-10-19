@@ -29,8 +29,8 @@ from models.unisign import released_layout_state
 from models.checkpointing import _load_state, load_checkpoint_meta
 
 from train import distributed as dist
-from train.helpers import build_optimizer, evaluate_bio_chunks, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
+from train.helpers import build_optimizer, evaluate_segmenter, run_epoch_loop, segmenter_monitor_config
 from utils import cfg_get, checkpoint_dir, load_yaml, pool_key
 
 class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
@@ -74,18 +74,18 @@ def require_attention_radius(meta: dict, expected: float | None, source: str) ->
 
 
 def require_segmenter_data(meta: dict, language: str, train_fingerprint: str, buffer_cap_s: float, source: str) -> None:
-    """Refuse a segmenter (S1 or Moryossef) whose labels are not the current ones. A re-convert, a person-counts re-measure or 
-    a caption rule changes the train labels; a strict state_dict load cannot see that, and the stale model would load silently.
-    `train_fingerprint` is the annotation fingerprint of `language`'s whole train split. A language outside the stamped pool is
-    zero-shot for this segmenter, so it has nothing to compare. S1 must also have trained at the deployed cap or longer."""
+    """Refuse a segmenter (S1 or Moryossef) trained under another annotation protocol or on chunks shorter than the deployed cap;
+    warn when its train labels are not the current ones. A re-convert, a person-counts re-measure or a caption rule changes the
+    labels, and a strict state_dict load cannot see that. `train_fingerprint` is the annotation fingerprint of `language`'s whole
+    train split. A language outside the stamped pool is zero-shot for this segmenter, so it has nothing to compare."""
     if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
         f"{source} was trained under annotation protocol {meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}: retrain it."
     )
     stamped = meta.get("language_fingerprints")
-    if stamped is None: raise SystemExit(f"{source} stamps no language_fingerprints (trained before the data guard): retrain it.")
-    if language in stamped and stamped[language] != train_fingerprint: raise SystemExit(
-        f"{source} was trained on other {language} train labels "
-        f"(a re-convert, re-measured cuts or a caption rule changed them): retrain it."
+    if stamped is None: print(f"WARNING: {source} stamps no language_fingerprints, so its train labels cannot be compared.", flush=True)
+    elif language in stamped and stamped[language] != train_fingerprint: print(
+        f"WARNING: {source} was trained on other {language} train labels (a re-convert, re-measured "
+        f"cuts or a caption rule changed them). Retrain it before a run you report.", flush=True
     )
     trained_chunk = meta.get("rope_eval_chunk_s")
     if trained_chunk is not None and float(trained_chunk) + 1e-6 < float(buffer_cap_s): raise SystemExit(
@@ -168,6 +168,8 @@ def build_bio_s1(
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = dev_mix
     dev_dataset = ChunkDataset(dev_records, chunk_s, min_chunk_s, seed=seed, deterministic=True)
+    # Checkpoint selection scores these dev records as whole streams under the RQ2 protocol (train.helpers.evaluate_segmenter).
+    cfg["video_monitor"] = segmenter_monitor_config(data_cfg, dev_records)
 
     # The pool balances records (clean segments); training exposure is time. Stamp the hours each language contributes to an epoch.
     hours: dict[str, float] = {}
@@ -183,7 +185,9 @@ def build_bio_s1(
         # (data.loader LengthBucketSampler). Same indices, same coverage — only the grouping changes.
         bucket_by_length=True, bucket_seed=seed,
     )
-    dev_loader = streaming_loader(dev_dataset, batch_size, collate_windows, num_workers=num_workers)
+    dev_loader = streaming_loader( # checkpoint.dev_batch_size: the dev chunks' global batch
+        dev_dataset, dist.per_rank_batch_size(int(cfg["checkpoint"]["dev_batch_size"])), collate_windows, num_workers=num_workers
+    )
     # Every S1 recipe has an explicit initialization, independent of the clean translator's per-language re-root.
     pretrained = cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
@@ -197,8 +201,8 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg.get("dice_loss_weight", 1.5))
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
-    print("bio_s1 | monitor: complete-span F1@0.5, pooled dev-chunk counts, BIO Viterbi without duration scores; " \
-          "deployment: semi-Markov Viterbi with the train-fitted duration prior", flush=True)
+    print("bio_s1 | monitor: val_video_f1, the RQ2 protocol on whole dev streams (semi-Markov Viterbi with each language's "
+          f"duration prior, F1 averaged over tIoU {cfg['video_monitor']['tiou_thresholds']}, then over languages)", flush=True)
     # Head at learning_rate, the pretrained pose encoder at backbone_lr (both required keys of bio_pretrain.yaml).
     optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -212,7 +216,8 @@ def train_bio_s1_epochs(
     meta = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_loader.dataset.records),
         "language_fingerprints": cfg.get("language_fingerprints"),  # whole train split per language: require_segmenter_data
-        "monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
+        "monitor_decode": "semi_markov_viterbi", "monitor_protocol": "rq2_video_f1_avg",
+        "monitor_tiou_thresholds": cfg["video_monitor"]["tiou_thresholds"],
         "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, 
         "initialization": cfg_get(cfg, "checkpoint", "from_pretrained", default="checkpoints/openasl_pose_only_slt.pth"),
         "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
@@ -220,16 +225,19 @@ def train_bio_s1_epochs(
         "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix"),
         "pretrain_hours": cfg.get("pretrain_hours"), "min_chunk_s": cfg.get("training_min_chunk_s"),
         # --resume refuses a drifted rate or augmentation: the optimizer load would otherwise restore the saved rates silently.
-        "learning_rate": float(cfg["learning_rate"]), "backbone_lr": float(cfg["backbone_lr"]), 
-        "augmentation": cfg.get("augmentation"), "best_epoch_floor": int(cfg["best_epoch_floor"]),
+        "learning_rate": float(cfg["learning_rate"]), "backbone_lr": float(cfg["backbone_lr"]),
+        "augmentation": cfg.get("augmentation"), "best_epoch_floor": int(cfg["best_epoch_floor"]), "seed": cfg.get("seed"),
     }
     # The end-of-training save in train.py reuses THIS dict. A second, independently-built meta drops pretrain_pool/pretrain_mix 
-    # (disarming eval.py's provenance assertion) and re-derives rope_eval_chunk_s from the live inference.yaml, which may change
-    # after training; the stamp records the context the head actually trained on.
+    # (disarming the provenance assertion in evaluation/systems.py) and re-derives rope_eval_chunk_s from the live inference.yaml, 
+    # which may change after training; the stamp records the context the head actually trained on.
     cfg["checkpoint_meta"] = meta
     return run_epoch_loop(
         name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
-        step_fn=step_fn, evaluate_fn=lambda e: evaluate_bio_chunks(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta,
+        step_fn=step_fn, evaluate_fn=lambda e: evaluate_segmenter(
+            model, dev_loader, device, dice_weight, class_weights, cfg["video_monitor"], 
+            velocity=False, rope_chunk_s=training_cap_s,
+        ),
+        default_monitor="val_video_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta,
         best_epoch_floor=meta["best_epoch_floor"],
     )

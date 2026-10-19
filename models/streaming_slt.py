@@ -1,20 +1,72 @@
-"""Stage-2 composition: a segmentation branch (own pose encoder + BIO head), the translator front end, the Ω soft 
-crop between them, an AR or DLM decoder, and the stage-2 training loss (`MisalignedSLTModel.forward_loss`)."""
+"""Stage-2 composition: a segmentation branch (own pose encoder + BIO head), the translator front end, the Ω crop of the
+selected span between them, an AR or DLM decoder, and the stage-2 training loss (`MisalignedSLTModel.forward_loss`)."""
 from __future__ import annotations
 from dataclasses import dataclass
-from contextlib import contextmanager
 from pathlib import Path
-import copy
+import copy, math
 
 import torch
 import torch.nn as nn
+from data.windowing import BIO
+
 from models.bio_head import RoPEBIOHead
 from models.front_end import SLTFrontEnd
-from models.membership_gate import MembershipGate
+from models.membership_gate import MembershipGate, membership_bias, omega_cross_bias, span_membership
 
 from train.helpers import eval_mode
 from train.losses import bio_nll_dice_loss
 from infer.duration_decode import DurationDecoder
+from utils import UNIT_SEPARATOR
+
+# Stamped by train-slt and required by eval: an arm trained under another routing, crop or read must not load under this Ω.
+TEXT_ROUTING = "gt_anchored_span_crop"
+
+
+def support_crop(front_end, poses, timestamps_s, bio_tap, frame_mask, omega_bias, eps):
+    """The read of every gated decode and text loss: the translator reads Ω's support as a crop. Returns (tap, mask, Ω).
+
+    Support = frames with v > ε, v = (exp(Ω) - ε)/(1 - ε), read from pose columns of Ω, detached. Committed frames and padding are hidden, 
+    so they're never in it. [a, b] = 1st and last support frame of the row. Translator pose encoder encodes poses of a..b again as 1 crop, 
+    with 0 padding at both crop edges as on a clean-translator crop. Poses are window's, already normalized, so body box stays window's. 
+    The tap of row becomes [crop features of a..b, its own features of b+1..T-1]. Columns before a leave the tap, the mask and Ω (prompt 
+    columns stay), so the support starts right after the prompt, as a crop does. Frames after b keep their features and their Ω: they stay 
+    hidden near ε, and in training an end-side straight-through term on them keeps its gradient. Each row is left-aligned and padded on 
+    the right (mask 0, Ω hidden), so the memory is as long as longest row. No Ω (an ungated read) or no support: input is unchanged."""
+    if omega_bias is None: return bio_tap, frame_mask, omega_bias
+    prompt, t = front_end.prompt_length(), int(bio_tap.shape[1])
+    pose_omega = omega_bias[:, 0, 0, prompt:]
+    v = (pose_omega.detach().float().exp() - eps) / (1.0 - eps)
+    support = (v > eps) & frame_mask.bool()
+    if not bool(support.any()): return bio_tap, frame_mask, omega_bias
+
+    device = bio_tap.device
+    frames = torch.arange(t, device=device)
+    # min/max(1).values, not amin/amax: on MPS (torch 2.13) an int64 amin/amax over a row starts from 0, so it returned a = 0 and no cut.
+    a = torch.where(support, frames, t).min(1).values.masked_fill(~support.any(1), 0)
+    b = torch.where(support, frames, -1).max(1).values   # -1 on a row without support: an empty crop, so that row keeps its input
+    length = b - a + 1
+    cols = torch.arange(t - int(a.cpu().min()), device=device)
+    src = a[:, None] + cols                        # the window frame that each new column reads
+    mask = (src < t) & frame_mask.gather(1, src.clamp(max=t - 1))
+    src, rows, n = src.clamp(max=t - 1), torch.arange(len(bio_tap), device=device)[:, None], int(length.cpu().max())
+    in_crop = cols < length[:, None]
+
+    # The crop batch repeats each crop's last frame as its padding, as the collator does (data.batch.repeat_last_frame).
+    crop_src = torch.minimum(src[:, :n], torch.maximum(a, b)[:, None])
+    # The crop pass normalizes with BatchNorm's running statistics in training too, so training reads 
+    # the crop features that every inference read gets. The window pass still updates the statistics.
+    modules = front_end.modules() if isinstance(front_end, torch.nn.Module) else ()
+    norms = [m for m in modules if isinstance(m, torch.nn.modules.batchnorm._BatchNorm) and m.training]
+    for m in norms: m.eval()
+    try: crop = front_end.extract_bio_tap(
+        poses[rows, crop_src], in_crop[:, :n], None if timestamps_s is None else timestamps_s[rows, crop_src]
+    )[0]
+    finally:
+        for m in norms: m.train()
+    crop = torch.cat((crop, crop.new_zeros(crop.shape[0], len(cols) - n, *crop.shape[2:])), 1)
+    tap = torch.where(in_crop.view(*in_crop.shape, *[1] * (crop.dim() - 2)), crop, bio_tap[rows, src])
+    pose_omega = pose_omega[rows, src].masked_fill(~mask, math.log(eps))
+    return tap, mask, torch.cat((omega_bias[:, 0, 0, :prompt], pose_omega), 1)[:, None, None]
 
 
 @dataclass
@@ -32,27 +84,38 @@ class MisalignedSLTModel(nn.Module):
     """Stage-2 model: pluggable pose/text front end (`models.front_end.SLTFrontEnd`) + swappable AR or DLM decoder.
 
     Two pose streams read the same frames. Each encoder is pretrained alone and then loaded together, as in TwoStream-SLT
-    (arXiv 2211.01367 §4); there the 2 streams share 1 task and read different inputs, here they read 1 input for 2 tasks:
-    - segmentation: `bio_pose_encoder` (S1's weights) -> `bio_head` (RoPEBIOHead) -> phrase B/I/O logits. It reads 
-      per-frame features directly, so the buffer's variable length never hits the seq2seq encoder's positions.
-    - translation: `front_end.pose_encoder` (the clean translator's weights) -> task prompt + LM encoder -> decoder.
-      Ω (first-span membership from the BIO logits) biases the LM encoder's self-attention keys and the decoder's
-      cross-attention, so at a hard membership the translator reads the cropped span: up to the ε leak when the span
-      starts right after the prompt, and with a prompt<->span relative-position offset otherwise. Ω is the only
-      coupling: no feature path carries whole-window context past the crop.
+    (arXiv 2211.01367 §4). There the 2 streams share 1 task and read different inputs, here they read 1 input for 2 tasks:
+    - segmentation: `bio_pose_encoder` (S1's weights) -> `bio_head` (RoPEBIOHead) -> phrase B/I/O logits. It reads per-frame features 
+      directly, so the buffer's variable length never hits the seq2seq encoder's positions.
+    - translation: `front_end.pose_encoder` (the clean translator's weights) -> task prompt + LM encoder -> decoder. Ω (hard crop of 1st 
+      span the BIO logits select) biases the LM encoder's self-attention keys and the decoder's cross-attention. Every gated read encodes 
+      Ω's support again as a crop and removes columns before it (`support_crop`), so at a hard membership the translator reads cropped 
+      span up to the ε leak. Ω is the only path from segmentation into the translator: no feature path carries whole-window context past 
+      the crop. Other couplings run other way: `bio_adapter` (translator features into the BIO head, stop-gradient) and, on pause rows, 
+      the end-side text term (`_end_survival`).
     
-    At step 0 the branches hold S1's and the clean translator's weights; the gate-off AR arm decodes as the clean
-    translator token for token (the DLM adds its [MASK] row and block decoder on top).
+    At step 0 the branches hold S1's and the clean translator's weights. The gate-off AR arm decodes as the clean translator token for 
+    token (the DLM adds its [MASK] row and block decoder on top).
 
-    `decoder="dlm"` → block-diffusion decoder (OPUT training / block decode with SPD), `"ar"` → AR seq2seq. Nothing else
-    differs — front end, BIO head, sampler, FSM, commit gate identical — which is what makes AR-vs-DLM a clean test.
+    `shared_pose_encoder` (one-stream arm): no `bio_pose_encoder`; ONE pose encoder, the clean translator's, which the BIO head and the 
+    translator both read and both losses train. train/slt.py folds a least-squares map from its tokens to S1's encoder tokens into the 
+    head (`fold_s1_stitch`), so step 0 is S1's head behind that map and exactly the clean translator.
+
+    `decoder="dlm"` → block-diffusion decoder (OPUT training / block decode with SPD), `"ar"` → AR seq2seq. Nothing else differs — 
+    front end, BIO head, sampler, FSM, commit gate identical — which is what makes AR-vs-DLM a clean test.
     """
     def __init__(
         self, front_end: SLTFrontEnd, decoder: str = "dlm", block_size: int = 8, bio_hidden_dim: int = 384, bio_depth: int = 4, 
         bio_nhead: int = 8, bio_dropout: float = 0.1, bio_conv_stem_layers: int = 2, bio_attention_radius_s: float | None = None, 
-        pretrained_path: str | None = None, segmentation_branch: bool = True,
+        pretrained_path: str | None = None, segmentation_branch: bool = True, bio_adapter: bool = False,
+        shared_pose_encoder: bool = False,
     ):
         super().__init__()
+        # Like bio_adapter, the switch means nothing without a segmentation branch (the clean floor inherits dlm.yaml's value).
+        shared_pose_encoder = bool(shared_pose_encoder) and segmentation_branch
+        if shared_pose_encoder and bio_adapter: raise ValueError(
+            "shared_pose_encoder needs bio_adapter: false: with 1 pose encoder the adapter would add the head's own features to themselves."
+        )
         # Caller passes UniSignMT5FrontEnd (models/unisign.py).
         self.front_end = front_end
         self.tokenizer = self.front_end.tokenizer
@@ -74,39 +137,45 @@ class MisalignedSLTModel(nn.Module):
                   f"{rep['pose_unexpected']}/{rep['mt5_unexpected']})", flush=True)
         # Segmentation branch: its OWN pose encoder (same architecture, separate weights), so stage 2 can start from S1's encoder+head 
         # AND clean translator's encoder at once. Copied here from the warm start; train/slt.py overwrites it with S1's weights.
-        self.bio_pose_encoder = copy.deepcopy(self.front_end.pose_encoder) if segmentation_branch else None
+        self.shared_pose_encoder = shared_pose_encoder
+        self.bio_pose_encoder = copy.deepcopy(self.front_end.pose_encoder) if segmentation_branch and not shared_pose_encoder else None
+        # Translator -> segmentation features (dlm.yaml bio_adapter): W LN(sg(v)) into the head's hidden space, added after the head's 
+        # input norm (RoPEBIOHead residual), so it weighs against the normalized input whatever S1's token size; zero-initialized, so 
+        # the head reads S1's features at step 0.
+        self.bio_adapter = None
+        if bio_adapter and segmentation_branch:
+            dim = self.front_end.bio_tap_dim
+            self.bio_adapter = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, int(bio_hidden_dim)))
+            nn.init.zeros_(self.bio_adapter[1].weight); nn.init.zeros_(self.bio_adapter[1].bias)
         if decoder == "dlm": self.dlm_decoder = self.front_end.make_dlm_decoder(block_size)
         elif decoder != "ar": raise ValueError(f"Unsupported decoder type: {decoder}")
 
-    def segment(self, poses, frame_mask, timestamps_s=None):
-        """Segmentation branch on the same frames the translator reads: its own pose encoder, then the BIO head.
-        Returns the head output (logits for the duration decoder and the gate)."""
-        if self.bio_pose_encoder is None: raise RuntimeError("the clean-floor model has no segmentation branch")
+    def segment(self, poses, frame_mask, timestamps_s=None, translator_tap=None):
+        """Segmentation branch on the same frames the translator reads: its own pose encoder, then BIO head. With `bio_adapter`, the head 
+        also reads translator's per-frame features (`translator_tap`, the caller's `extract_bio_tap` output when it has one), stop-gradient. 
+        With `shared_pose_encoder`, the head reads those features themselves, WITH gradient (the one encoder is the translator's and both 
+        losses train it). Returns the head output."""
+        if self.bio_head is None: raise RuntimeError("the clean-floor model has no segmentation branch")
         if frame_mask is None: frame_mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=poses.device)
-        return self.bio_head(self.bio_pose_encoder(poses, frame_mask), timestamps_s=timestamps_s, frame_mask=frame_mask)
+        if self.shared_pose_encoder:   # one encoder (the translator's): BIO and text both train it
+            features = translator_tap if translator_tap is not None else self.front_end.extract_bio_tap(poses, frame_mask)[0]
+            return self.bio_head(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
+        features, residual = self.bio_pose_encoder(poses, frame_mask), None
+        if self.bio_adapter is not None:
+            if translator_tap is None: translator_tap = self.front_end.extract_bio_tap(poses, frame_mask)[0]
+            residual = self.bio_adapter(translator_tap.detach())
+        return self.bio_head(features, timestamps_s=timestamps_s, frame_mask=frame_mask, residual=residual)
 
     def encode_memory(self, bio_tap, bio_mask, omega_bias=None):
         # Translator memory from its own pose features; Ω (when gated) biases LM encoder's keys and decoder's cross-attention.
         return self.front_end.encode_memory(bio_tap, bio_mask, omega_bias=omega_bias)
 
-    def eval_encode_memory_fn(self, poses, frame_mask, timestamps_s, omega_bias=None):
-        def encode(): # DMax's eval-mode rollout: same poses and Ω, with pose features and memory built as inference builds them
-            with eval_mode(self):  # (dropout off, BatchNorm on its running statistics).
+    def eval_encode_memory_fn(self, poses, frame_mask, timestamps_s, omega_bias, eps):
+        def encode(): # DMax's eval-mode rollout: same poses and Ω, with pose features, support crop and memory built as inference
+            with eval_mode(self):  # builds them (dropout off, BatchNorm on its running statistics).
                 bio_tap, bio_mask, _ = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
-                return self.encode_memory(bio_tap, bio_mask, omega_bias=omega_bias)
+                return self.encode_memory(*support_crop(self.front_end, poses, timestamps_s, bio_tap, bio_mask, omega_bias, eps))
         return encode
-
-    @contextmanager
-    def translator_frozen(self, frozen: bool = True):
-        """Within the block, forwards record no gradient for the translation branch (pose encoder, LM, DLM decoder): a text loss
-        built inside reaches only Ω and the segmentation branch. Flags are restored on exit; the graph keeps the exclusion."""
-        params = [p for n, p in self.named_parameters() if p.requires_grad and not n.startswith(("bio_pose_encoder.", "bio_head."))]
-        if frozen:
-            for p in params: p.requires_grad_(False)
-        try: yield
-        finally:
-            if frozen:
-                for p in params: p.requires_grad_(True)
 
     @torch.no_grad()
     def generate_from_bio_tap(
@@ -139,39 +208,54 @@ class MisalignedSLTModel(nn.Module):
         return generated, confidence
 
     @torch.no_grad()
-    def generate_from_poses(
+    def gated_read(
         self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
-        gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int = 0, commit_mask: torch.Tensor | None = None, 
-        gate_stream_start: bool = False, gate_anchor: torch.Tensor | None = None, **decode_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Poses → (bio_logits, tokens, confidence, gate_skip). Owns the BIO tap + membership gate; decode knobs 
-        (max_text_tokens / tau_dec / spd_* / num_beams) pass via to `generate_from_bio_tap`, declared once there. 
+        gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int | list[int] = 0,
+        commit_mask: torch.Tensor | None = None, gate_stream_start: bool = False, gate_anchor: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Poses → (bio_logits, bio_tap, mask, omega_bias, gate_skip): translator's read of a window as every decode reads it, 
+        BIO tap, membership gate and support crop (generate_from_poses, and attention readout infer.unit_split.own_span_attention).
         `gate_skip` (B, bool) marks windows the deployed FSM would never decode; all-False when gate is off."""
         bio_tap, mask, timestamps = self.front_end.extract_bio_tap(poses, frame_mask, timestamps_s)
-        if self.bio_pose_encoder is None and not gate_enabled:
+        if self.bio_head is None and not gate_enabled:
             # Clean floor: no segmentation branch and, gate off, no reader — zeros fill the contract slot.
             bio_logits = bio_tap.new_zeros(*bio_tap.shape[:2], 4)
         else:
-            bio_output = self.segment(poses, mask, timestamps)
+            bio_output = self.segment(poses, mask, timestamps, translator_tap=bio_tap)
             bio_logits = bio_output.logits
-        # Inference gate, χ from the FSM commit log (single-window RQ1: none). Same Ω the decoder saw in
-        # training (§1.3/§2.8); the AR arm injects it via HF cross-attn hooks (front_end.ar_generate).
+        # Inference gate, χ from the FSM commit log (single-window RQ1: none). Same Ω and the same support-crop 
+        # read the decoder saw in training. AR arm injects Ω via HF cross-attn hooks (front_end.ar_generate).
         omega_bias = None
         gate_skip = torch.zeros(poses.shape[0], dtype=torch.bool)
         if gate_enabled:
             omega_bias, gate_stats = self.membership_gate(
                 bio_logits, mask, decoder=DurationDecoder(self.duration_model),
                 memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]), commit_mask=commit_mask, eps=gate_eps,
-                min_span_frames=gate_min_span_frames, stream_start=gate_stream_start, anchor_override=gate_anchor, timestamps_s=timestamps,
+                min_span_frames=gate_min_span_frames, stream_start=gate_stream_start, 
+                anchor_override=gate_anchor, timestamps_s=timestamps,
             )
             gate_skip = gate_stats["skip"]
             if gate_anchor is not None: gate_skip[(gate_anchor[:, 0] >= 0).cpu()] = False   # a known span is always decodable
+        bio_tap, mask, omega_bias = support_crop(self.front_end, poses, timestamps, bio_tap, mask, omega_bias, gate_eps)
+        return bio_logits, bio_tap, mask, omega_bias, gate_skip
+
+    @torch.no_grad()
+    def generate_from_poses(
+        self, poses: torch.Tensor, frame_mask: torch.Tensor, timestamps_s: torch.Tensor | None = None, *,
+        gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int | list[int] = 0, commit_mask: torch.Tensor = None, 
+        gate_stream_start: bool = False, gate_anchor: torch.Tensor | None = None, **decode_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Poses → (bio_logits, tokens, confidence, gate_skip). The read (BIO tap, membership gate, support crop) is gated_read. 
+        # Decode knobs (max_text_tokens / tau_dec / spd_* / num_beams) pass via to `generate_from_bio_tap`, declared once there.
+        bio_logits, bio_tap, mask, omega_bias, gate_skip = self.gated_read(
+            poses, frame_mask, timestamps_s, gate_enabled=gate_enabled, gate_eps=gate_eps, gate_min_span_frames=gate_min_span_frames,
+            commit_mask=commit_mask, gate_stream_start=gate_stream_start, gate_anchor=gate_anchor,
+        )
         tokens, confidence = self.generate_from_bio_tap(bio_tap, mask, omega_bias=omega_bias, **decode_kwargs)
         # DLM already strips its synthetic BOS in generate_from_bio_tap; the AR arm returns it raw. 
         # Strip here so eval's confidence mean covers only produced tokens, both arms.
         if self.decoder_type == "ar": tokens, confidence = tokens[:, 1:], confidence[:, 1:]
         return bio_logits, tokens, confidence, gate_skip
-
 
     @staticmethod
     def _candidate_frames(cands: list[dict], ts: torch.Tensor, n: int) -> list[dict]:
@@ -185,59 +269,143 @@ class MisalignedSLTModel(nn.Module):
             out.append({**c, "b_idx": min(b, n), "t_idx": min(e, n)})
         return out
 
-
-    def gt_target_spans(self, batch: dict, timestamps, bio_mask) -> list | None:
-        """Per-row frame span (B, terminator) of the sentence the collated text supervises, from the window's candidate list; None for 
-        rows without a text target. Used to identify whether the training target is complete, and for localization diagnostics."""
-        cands, firsts = batch.get("candidate_sentences"), batch.get("translation_targets")
-        if cands is None or firsts is None or timestamps is None: return None
+    @staticmethod
+    def gt_target_spans(batch: dict, timestamps, bio_mask) -> list | None:
+        """Per-row frame span (B frame, terminator frame) of the GT unit(s) the collated text supervises, from the window-relative
+        target times the sampler stores (`target_spans_s`), with the label convention of `_candidate_frames`; None for rows without
+        a text target. A multi-unit target ("A <sep> B") spans its first unit's B frame to its last unit's terminator."""
+        spans_s = batch.get("target_spans_s")
+        if spans_s is None or timestamps is None: return None
         out = []
-        for b in range(len(cands)):
-            first = firsts[b]
-            first_text = (first["text"] if isinstance(first, dict) else getattr(first, "text", None)) if first is not None else None
-            span = None
-            if first_text:
-                n = int(bio_mask[b].long().sum())
-                for c in self._candidate_frames(cands[b], timestamps[b], n):
-                    if c["text"] == first_text and c["t_idx"] > c["b_idx"]: span = (int(c["b_idx"]), int(min(c["t_idx"], n - 1))); break
-            out.append(span)
+        for b, span in enumerate(spans_s):
+            if span is None: out.append(None); continue
+            n = int(bio_mask[b].long().sum())
+            c = MisalignedSLTModel._candidate_frames([{"start_s": span[0], "end_s": span[1]}], timestamps[b], n)[0]
+            out.append((int(c["b_idx"]), int(min(c["t_idx"], n - 1))) if c["t_idx"] > c["b_idx"] else None)
         return out
+
+    def _text_crop(self, batch, bio_logits, bio_mask, timestamps, rows, min_span_frames, delta_frames, eps, logs, text_grad=()):
+        """Ω (B, 1, 1, M) for supervised `rows`, a hard crop as at inference: the predicted 1st span where it holds GT target within δ, 
+        else GT target span with its edges moved in training within same tolerance (at most δ frames of the target missing and at most 
+        δ frames outside it, in total; none in eval mode). The selection reads detached logits. Rows in `text_grad` add a zero-valued 
+        term that carries gradient of where selected span ends (`_end_survival`): there the text loss trains segmentation branch."""
+        b = len(bio_logits)
+        floors = torch.as_tensor(min_span_frames, dtype=torch.long).clamp(min=1).expand(b).tolist()
+        deltas = torch.as_tensor(delta_frames, dtype=torch.long).expand(b).tolist()
+        with torch.no_grad():
+            selected = self.membership_gate.select(
+                bio_logits.detach(), bio_mask, commit_mask=batch.get("commit_mask"), min_span_frames=floors,
+                timestamps_s=timestamps, decoder=DurationDecoder(self.duration_model),
+            )
+            p_start, p_term, p_closed = (x.cpu().tolist() for x in selected["anchors"])
+            gt = self.gt_target_spans(batch, timestamps, bio_mask)
+            lost = [i for i in rows if gt is None or gt[i] is None]
+            if lost: raise ValueError(f"supervised rows {lost} carry no locatable target span (target_spans_s)")
+
+            lengths = selected["lengths"].tolist()
+            committed = (batch["commit_mask"].long().sum(1).tolist() if batch.get("commit_mask") is not None else [0] * b)
+            starts, terms = list(p_start), list(p_term)
+            accepted = 0
+
+            for i in rows:
+                g, d = gt[i], deltas[i]
+                if p_closed[i]:
+                    overlap = min(p_term[i], g[1]) - max(p_start[i], g[0])
+                    outside = (p_term[i] - p_start[i]) - overlap
+                    if overlap >= max(floors[i], g[1] - g[0] - d, 1) and outside <= d: accepted += 1; continue
+
+                a, e = g
+                if self.training and d > 0:
+                    # Uniform over the edge moves that the acceptance test above would accept: at most d frames of the target
+                    # missing and at most d frames outside it, in total (so no fallback crop trains text it cannot see).
+                    while True:
+                        sa, se = (int(x) for x in torch.randint(-d, d + 1, (2,)))
+                        if max(sa, 0) + max(-se, 0) <= d and max(-sa, 0) + max(se, 0) <= d: break
+                    a, e = a + sa, e + se
+                a = min(max(a, int(committed[i])), lengths[i] - 1); e = min(max(e, a + floors[i]), lengths[i] - 1)
+                starts[i], terms[i] = a, e
+
+            has_term = torch.tensor([True if i in rows else bool(p_closed[i]) for i in range(b)], device=bio_logits.device)
+            membership = span_membership(
+                torch.tensor(starts, device=bio_logits.device), torch.tensor(terms, device=bio_logits.device), has_term,
+                selected["lengths"], bio_logits.shape[1],
+            )
+        logs["text_accepted_rate"] = bio_logits.new_tensor(accepted / len(rows))
+        if text_grad: membership = membership + self._end_survival(bio_logits, bio_mask, timestamps, list(text_grad), starts, floors)
+        omega = membership_bias(membership, bio_mask, batch.get("commit_mask"), eps)
+        return omega_cross_bias(omega, memory_len=self.front_end.prompt_length() + int(bio_logits.shape[1]), dtype=bio_logits.dtype)
+
+
+    def _end_survival(self, bio_logits, bio_mask, timestamps, rows, starts, floors):
+        """(B, T) term, 0 in value, whose gradient is that of v(t) = P(the span that starts at the selected start s holds frame t) = 
+        P(its terminator >= t), t >= s, on `rows` (a straight-through estimator: the forward stays the crop). v holds terminator frame
+        because the crop does. Every row reads a hard crop (the model's own span or the jittered GT span), so the term is the text loss
+        linearized at that crop and pulls the span's end toward the caption's end. v is 1st closed span's membership with frames before
+        s committed and s a known start, so text loss moves only where that span ends: not its start, and no earlier span."""
+        device = bio_logits.device
+        idx = torch.tensor(rows, device=device)
+        s = torch.tensor([starts[i] for i in rows], device=device)
+        frames = torch.arange(bio_logits.shape[1], device=device)[None]
+        valid = bio_mask[idx].bool()
+        commit = (frames < s[:, None]) & valid   # holds the window's own committed prefix too: the selected start is never before it
+        
+        # Frame s is a known start; ruling out O there makes 1st span start AT s (B, or I as a certified start). The posterior
+        # conditions on 1st ELIGIBLE span, so the span at s must also reach Λ_min: no O or B on s+1..s+Λ_min-1, else a later span
+        # becomes 1st eligible one and the text would move ITS start.
+        pinned = bio_logits[idx].clone()
+        pinned[torch.arange(len(rows), device=device), s, BIO['O']] = -1e4
+        floor = torch.tensor([floors[i] for i in rows], device=device)
+        short = (frames > s[:, None]) & (frames < (s + floor)[:, None])
+        for tag in ('O', 'B'): pinned[..., BIO[tag]] = pinned[..., BIO[tag]].masked_fill(short, -1e4)
+        post = self.membership_gate.posterior(
+            pinned, valid.long().sum(1), [floors[i] for i in rows], commit, torch.ones(len(rows), dtype=torch.bool, device=device),
+            decoder=DurationDecoder(self.duration_model), timestamps_s=None if timestamps is None else timestamps[idx],
+        )
+        p = post.closed_probability
+        v = (post.closed / p.clamp(min=1e-6)[:, None]).clamp(0.0, 1.0) * ((frames >= s[:, None]) & (p[:, None] > 1e-6))
+        # post.closed is P(s <= t < term); P(term >= t) is its value one frame earlier for t > s, and 1 at s.
+        v = torch.where(frames > s[:, None], torch.cat((v[:, :1], v[:, :-1]), 1), v) * valid
+        return v.new_zeros(bio_logits.shape[:2]).index_add(0, idx, v - v.detach())   # the posterior's dtype (float32 under AMP too)
 
 
     def forward_loss(
         self, batch: dict, *, lambda_trans: float = 1.0, lambda_bio: float = 1.0,
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
         oput_t_low: float = 0.3, oput_t_high: float = 0.8, oput_label_smoothing: float,
-        gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int,
-        gate_delta_frames: int, gate_detach_omega: bool = False,
+        gate_enabled: bool = False, gate_eps: float = 1e-4, gate_min_span_frames: int | list[int],
+        gate_delta_frames: int | list[int], gate_detach_omega: bool = False,
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch: ``L = lambda_bio * L_BIO + lambda_trans * L_translation``.
 
-        The text supervision follows the state the deployed model is in, read from its OWN prediction (the gate's Viterbi first eligible 
-        span and closed/open readout, as `MembershipGate.forward` computes at inference). GT decides only which text exists (premise P1: 
-        a truncated visual input never receives a partial text label):
-        - BIO (all rows): class-weighted CE plus binary signing Dice; padding/UNK ignored.
-        - Complete GT target (window's 1st complete eligible unit, Mode 1/3). If the predicted 1st span COVERS the unit (it misses at
-          most δ frames of the unit in total, start and end together, and holds at least Λ_min frames of it; it may run past the unit),
-          the full-text loss (OPUT for DLM, CE for AR) trains the translator and, via Ω, the segmentation branch. If it does not cover
-          it, the translator would read a crop that lacks part of the unit, so the same loss runs as a CRITIC: translation parameters
-          receive no gradient from this loss; only Ω and segmentation branch receive its gradient. Coverage is a boundary-tolerance
-          test, not proof that all semantic evidence receives high membership.
+        - BIO (all rows): class-weighted CE plus binary signing Dice on the GT labels; padding/UNK ignored.
+        - Text (Mode 1/3 rows with a complete GT target: 1 unit "A", or a run of complete units that follow each other with gaps of 
+          at most δ, "A <sep> B"): EVERY supervised row trains the translator on its GT text. The crop it reads (Ω, a hard crop from
+          `models.membership_gate.span_membership`) is a sample of the segmentation the text belongs to: model's own 1st span when it
+          holds GT target within δ (it misses at most δ frames of it in total, holds >= Λ_min frames of it, and holds at most δ frames 
+          outside it), otherwise GT target span with its edges moved within that same tolerance (no move in eval mode). The label never 
+          depends on the prediction, so the translator's data and labels are stationary, and it trains on segmenter's own spans wherever 
+          those are a valid input for the label. The crop's value never carries a gradient. The translator reads Ω's support as a crop 
+          (`support_crop`), as every gated decode does. On rows whose target is 1 unit followed by a pause (more than δ to the record's 
+          next unit, `target_pause_after`), text loss also trains segmentation branch via where selected span ends (`_end_survival`): 
+          there the text's best extent is caption unit, so text cannot reward a merge. Joined target ("A <sep> B") would reward merging 
+          A and B, and an abutting successor has no pose evidence, so those rows give no gradient. `gate_detach_omega` turns it off.
         - Other rows (truncated, headless, interior, gap): BIO only. A truncated window never receives text (P1).
-        
+
         Gate off (clean floor): every complete target trains the translator on the whole window.
-        `gate_detach_omega` (ablation): Ω carries no text gradient, so the segmentation branch learns from BIO only.
         """
         # Translator features and the segmentation branch read the same frames through separate pose encoders.
         bio_tap, bio_mask, timestamps = self.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
         bio_out = None
-        if self.bio_pose_encoder is not None and (float(lambda_bio) != 0.0 or gate_enabled):
-            bio_out = self.segment(batch["poses"], bio_mask, timestamps)
+        if self.bio_head is not None and (float(lambda_bio) != 0.0 or gate_enabled):
+            bio_out = self.segment(batch["poses"], bio_mask, timestamps, translator_tap=bio_tap)
         bio_loss = bio_nll_dice_loss(
             bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights
         ) if bio_out is not None and float(lambda_bio) != 0.0 else bio_tap.new_zeros(())
         translation_loss = bio_tap.sum() * 0.0
-        logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
+        # The clean floor (lambda_bio 0) has no segmentation branch, so it logs no BIO loss (a column of zeros).
+        logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()} if float(lambda_bio) != 0.0 else {}
+        # Does path (b) carry weight? The adapter's term against the head's normalized input (0 at step 0).
+        if bio_out is not None and bio_out.residual_share is not None: logs["adapter_share"] = bio_out.residual_share
 
         # REALIZED mode mix (materialize() relabels windows jitter reshapes, so the drawn ratios are not what trains).
         realized = batch.get("mode_names")
@@ -247,101 +415,53 @@ class MisalignedSLTModel(nn.Module):
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
 
-        # The model's own state, exactly as inference reads it (docs/membership_gate.md): Ω from the predicted readout, plus the predicted 
-        # 1st span. Λ_min and δ are frame counts on the batch's native pose grid (stage 2 has no fps augmentation): the caller converts
-        # the seconds of inference.yaml with the batch's fps (train/slt.py _gate_frames), as the FSM does with its stream's fps.
-        omega_bias, pred = None, None
-        if bio_out is not None and gate_enabled:
-            omega_bias, gate_stats = self.membership_gate(
-                bio_out.logits, bio_mask, memory_len=self.front_end.prompt_length() + int(bio_tap.shape[1]),
-                commit_mask=batch.get("commit_mask"), eps=gate_eps, min_span_frames=max(1, gate_min_span_frames), 
-                timestamps_s=timestamps, decoder=DurationDecoder(self.duration_model),
-            )
-            if gate_detach_omega: omega_bias = omega_bias.detach()
-            starts, terms, closed = (x.detach().cpu() for x in gate_stats["anchors"])
-            pred = [(int(a), int(t)) if bool(c) else None for a, t, c in zip(starts, terms, closed)]
-            logs["gate_closed_probability"] = gate_stats["closed_probability"]
-            logs["gate_open_probability"] = gate_stats["open_probability"]
-            logs["gate_uncertain_rows"] = bio_tap.new_tensor(float(gate_stats["uncertain_rows"]))
-
         if target_tokens is not None and supervised is not None and supervised.any():
             idx = supervised.to(device=bio_tap.device).nonzero(as_tuple=False).flatten()
             mode_names = batch.get("mode_names")
             idx_list = idx.detach().cpu().tolist()
             if isinstance(mode_names, list):
                 invalid = sorted({mode_names[int(i)] for i in idx_list} - {"mode1", "mode3"})
-                if invalid: 
-                    raise ValueError(f"Translation supervision is allowed only for complete-conditioning Mode 1/3 windows; got {invalid}")
+                if invalid: raise ValueError(
+                    f"Translation supervision is allowed only for complete-conditioning Mode 1/3 windows; got {invalid}"
+                )
+            targets = batch.get("translation_targets") or []
+            logs["text_pair_rate"] = bio_tap.new_tensor(sum(
+                UNIT_SEPARATOR in (t["text"] if isinstance(t, dict) else getattr(t, "text", "")) for t in (targets[i] for i in idx_list)
+            ) / len(idx_list))
+            omega_bias = None
 
-            covered, critic = idx_list, []
-            if pred is not None:
-                gt = self.gt_target_spans(batch, timestamps, bio_mask)
-                lost = [i for i in idx_list if gt is None or gt[i] is None]
-                if lost: 
-                    raise ValueError(f"supervised rows {lost} carry no locatable target span (candidate_sentences/translation_targets)")
-
-                def covers(i):
-                    # The crop may miss at most δ frames of the unit in TOTAL (caption-boundary noise), and must hold at least Λ_min
-                    # frames of it. A tolerance of δ at EACH end let a 36-frame unit be covered by its middle 12 frames, so the
-                    # translator learned the full text from a third of the signs. Running past the unit is allowed (a merger).
-                    p, g = pred[i], gt[i]
-                    if p is None: return False
-                    overlap = min(p[1], g[1]) - max(p[0], g[0])
-                    return overlap >= max(int(gate_min_span_frames), g[1] - g[0] - int(gate_delta_frames), 1)
-                
-                covered = [i for i in idx_list if covers(i)]
-                # A critic row trains only Ω. With Ω detached, or on a row whose Ω fell back to the whole window 
-                # (no decoded span, or P < 1e-6: Ω = 0 with no gradient), nothing can learn from it, so it is not run.
-                uncertain = gate_stats["uncertain"]
-                critic = [] if gate_detach_omega else [i for i in idx_list if not covers(i) and not bool(uncertain[i])]
-                logs["text_covered_rate"] = bio_tap.new_tensor(len(covered) / len(idx_list))
-
+            if bio_out is not None and gate_enabled:
+                pause_after = batch.get("target_pause_after")
+                text_grad = [] if gate_detach_omega or pause_after is None or not torch.is_grad_enabled() \
+                               else [i for i in idx_list if pause_after[i]]
+                logs["text_grad_rate"] = bio_tap.new_tensor(len(text_grad) / len(idx_list))
+                omega_bias = self._text_crop(
+                    batch, bio_out.logits, bio_mask, timestamps, idx_list, gate_min_span_frames, 
+                    gate_delta_frames, gate_eps, logs, text_grad
+                )
             labels = target_tokens["labels"].to(bio_tap.device)
-            # Supervised tokens per group, as each loss counts them (AR: labels != -100; DLM: the OPUT canvas mask).
-            n_tok = [0.0 if not grp else float((labels[grp] != -100).sum()) if self.decoder_type == "ar" else
-                     float(self.dlm_decoder._prepare_x0(labels[grp])[1].sum()) for grp in (covered, critic)]
-            n_all = max(1.0, sum(n_tok))
-            group_losses, row_stats = [], {}
-
-            for n_g, group, as_critic in ((n_tok[0], covered, False), (n_tok[1], critic, True)):
-                if not group: continue
-                g = torch.tensor(group, dtype=torch.long, device=bio_tap.device)
-                om = None if omega_bias is None else omega_bias[g]
-                # Each group is its own per-token mean (below), so through Ω a group's tokens would weigh 1/n_g each. Scaling only
-                # the Ω gradient by n_g/N gives every supervised token the same 1/N pull on the segmentation branch; the forward
-                # value and the translator's gradients do not change.
-                if om is not None and om.requires_grad: om = om.detach() + (n_g / n_all) * (om - om.detach())
-                with self.translator_frozen(as_critic):
-                    # A critic row's translator input is a constant; only Ω carries its gradient.
-                    tap = bio_tap[g].detach() if as_critic else bio_tap[g]
-                    enc_hidden, enc_mask = self.encode_memory(tap, bio_mask[g], omega_bias=om)
-                    if self.decoder_type == "ar":
-                        loss_g, row_sum, row_valid = self.front_end.ar_loss(
-                            enc_hidden, enc_mask, labels[g], label_smoothing=oput_label_smoothing, omega_bias=om, row_stats=True,
-                        )
-                    else:
-                        out = self.dlm_decoder.oput_forward(
-                            enc_hidden=enc_hidden, enc_mask=enc_mask, labels=labels[g], t_low=oput_t_low, t_high=oput_t_high,
-                            label_smoothing=oput_label_smoothing, rollout_encode_fn=self.eval_encode_memory_fn(
-                                batch["poses"][g], bio_mask[g], None if timestamps is None else timestamps[g], om,
-                            ),
-                            omega_bias=om,
-                        )
-                        loss_g, row_sum, row_valid = out["translation_loss"], out.get("row_loss_sum"), out.get("row_valid_count")
-
-                # Each group is its own per-token mean: the translator's step must not shrink with the share of critic rows,
-                # which would tie its effective learning rate to the segmentation quality.
-                group_losses.append(loss_g)
-                logs["text_critic_loss" if as_critic else "text_covered_loss"] = loss_g.detach()   # per-token CE of each group
-                if row_sum is not None and row_valid is not None:
-                    for k, i in enumerate(group): row_stats[i] = (row_sum[k], row_valid[k])
-
-            if group_losses: translation_loss = torch.stack(group_losses).sum()
-            if isinstance(mode_names, list) and row_stats:
+            om = None if omega_bias is None else omega_bias[idx]
+            poses, ts = batch["poses"][idx], None if timestamps is None else timestamps[idx]
+            # The crop pass is on gradient path: the text trains the translator's pose encoder through it 
+            # (BatchNorm on its running statistics, as every inference read; support_crop).
+            tap, mask, read = support_crop(self.front_end, poses, ts, bio_tap[idx], bio_mask[idx], om, gate_eps)
+            enc_hidden, enc_mask = self.encode_memory(tap, mask, omega_bias=read)
+            if self.decoder_type == "ar":
+                translation_loss, row_sum, row_valid = self.front_end.ar_loss(
+                    enc_hidden, enc_mask, labels[idx], label_smoothing=oput_label_smoothing, omega_bias=read, row_stats=True,
+                )
+            else:
+                out = self.dlm_decoder.oput_forward(
+                    enc_hidden=enc_hidden, enc_mask=enc_mask, t_low=oput_t_low, t_high=oput_t_high, 
+                    labels=labels[idx], label_smoothing=oput_label_smoothing, omega_bias=read,
+                    rollout_encode_fn=self.eval_encode_memory_fn(poses, bio_mask[idx], ts, om, gate_eps),
+                    
+                )
+                translation_loss, row_sum, row_valid = out["translation_loss"], out.get("row_loss_sum"), out.get("row_valid_count")
+            if isinstance(mode_names, list) and row_sum is not None and row_valid is not None:
                 for mode in ("mode1", "mode3"):
-                    rows = [row_stats[i] for i in idx_list if mode_names[int(i)] == mode and i in row_stats]
-                    if rows: logs[f"oput_{mode}"] = torch.stack([r[0] for r in rows]).sum() / \
-                                                    torch.stack([r[1] for r in rows]).sum().clamp(min=1)
+                    rows = [k for k, i in enumerate(idx_list) if mode_names[int(i)] == mode]
+                    if rows: logs[f"oput_{mode}"] = row_sum[rows].sum() / row_valid[rows].sum().clamp(min=1)
 
         # `lambda_bio=0` = translation-only: the faithful Uni-Sign SLT recipe (1 label-smoothed CE) for the clean-floor arm.
         total = float(lambda_bio) * bio_loss + float(lambda_trans) * translation_loss

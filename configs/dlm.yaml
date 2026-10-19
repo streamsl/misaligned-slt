@@ -9,16 +9,22 @@ checkpoint:
     # on whole-input chunks (data/chunks.py); the translator keeps its own warm-start encoder (models/streaming_slt.py).
     # Multilingual SEGMENTATION pretraining (configs/bio_pretrain.yaml pretrain_languages) writes 1 language-agnostic checkpoint
     # under checkpoints/bio_s1/multi_<pool>/. Point here for monolingual S1 recipe: checkpoints/bio_s1/${language}/model.pt
-    # `auto` resolves through utils.checkpoint_dir against configs/bio_pretrain.yaml, so a pooled S1 is found by its pool key and
-    # this file never carries a stale copy of the pool name. An explicit path still wins.
+    # `auto` resolves through utils.checkpoint_dir against configs/bio_pretrain.yaml, so a pooled S1 is found by its pool key 
+    # and this file never carries a stale copy of the pool name. An explicit path still wins.
     bio_head_init: auto
     # Translator warm start: data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained), which must be re-rooted to
     # this language's clean translator. train-slt refuses a file without clean-floor meta (the released file), and refuses a 
-    # local file of another language, cap or annotation set.
+    # local file of another language or cap; a file of another annotation set only warns.
     save_best: true # write on every new best dev value (not just end of training)
-    monitor: val_joint_score # Dev-window F1 times translation BLEU: a joint selection surrogate, not DVC.
+    monitor: val_offline_score  # F1 avg x DVC BLEU-4 avg (RQ2's protocol) of the --offline row
     mode: max
     restore_best: true
+    eval_every_epochs: 1        # early_stopping.patience counts evaluations, so set them together
+    # Only for monitor val_online_score: the streaming FSM reads whole dev source videos in a seeded random order up to this
+    # many pose hours (0 = off), which caps the cost of 1 evaluation. The offline monitor does not read it. The clean floor
+    # has no segmentation branch, so it runs no monitor of this kind.
+    online_dev_hours: 4.0
+    dev_batch_size: 16
 decoder: dlm
 wandb:
     enabled: false
@@ -28,8 +34,8 @@ wandb:
 lambda_bio: 1.0
 lambda_trans: 1.0
 oput:
-    # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
-    # [0,1] wastes steps on near-trivial (t->0) and near-degenerate (t->1) masking.
+    # Mask ratio t ~ U(0.3, 0.8): the clipped schedule that BD3-LM Table 8 (arXiv 2503.09573) finds best at block 16. 
+    # DMax's own OPUT recipe uses a fixed 0.75. [0,1] wastes steps on near-trivial (t->0) and near-degenerate (t->1) masking.
     t_low: 0.3
     t_high: 0.8
     # The on-policy rollout is argmax (the greedy token SPD commits at temperature 0), computed under model.eval() + no_grad
@@ -37,17 +43,20 @@ oput:
     # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss).
     # Without it the DLM is the only arm with an unsmoothed CE.
     label_smoothing: 0.2
-membership_gate: # Exact first-complete-span membership from legal BIO paths. Live logits carry caption gradients.
+membership_gate: # Ω = a hard crop of the selected first span (its terminator frame included), as the cascade crops it.
     enabled: true
     eps: 1.0e-4 # finite floor for the log-membership bias
-    # On from step 0 (§1.4): train-slt refuses a segmentation branch without a trained S1 at checkpoint.bio_head_init,
-    # so the gate never couples to an untrained head (garbage conditioning, §1.2).
-    detach_omega: false # true = ablation "text doesn't train segmentation", so segmentation branch learns from BIO only.
+    # On from step 0 (§1.4): train-slt refuses a segmentation branch without a trained S1 at checkpoint.bio_head_init, so the 
+    # gate never reads an untrained head (garbage conditioning, §1.2). Each supervised row reads its predicted span when that
+    # span holds the GT target within δ, else the δ-jittered GT span (models/streaming_slt.py). Crop's value carries no gradient.
+    # Text trains the segmentation branch only on rows whose target is ONE unit followed by a pause (> δ): via where the selected
+    # span ends (a straight-through estimator), where the text's best extent is the caption unit, so text never rewards a merge.
+    detach_omega: false   # true = the ablation "text never trains segmentation" 
 # Fixed coverage mix, shared by all datasets. A DESIGN choice, not a measured distribution: it gives each window state mass.
 mode_ratios:     # Edges and Mode-2 cut depths come from the designed `jitter:` block below
     mode1: 0.45  # mode1+mode3 = 0.65 complete-sentence targets
     mode2: 0.30  # mode2 trains the head on the truncated buffers the FSM meets at most strides (BIO only, no text, P1).
-    mode3: 0.20  # mode-3 window spans the anchor and its successor
+    mode3: 0.20  # mode-3 window spans the anchor's back-to-back run (gaps <= delta), else the anchor and its successor
     mode4: 0.05
 # Within Mode 2, each over-segmentation event yields one right-trunc + one left-trunc window, so right~=left dominate;
 # both-truncated is rare and "falls out of the sampler naturally". Uniform 1/3 would over-represent the interior case, 
@@ -84,6 +93,15 @@ bio_conv_stem_layers: 2
 # This bounds direct neural look-ahead for fixed normalization and eval-mode features. Buffer normalization and the global
 # Viterbi path can still change; stability is checked, not guaranteed.
 bio_attention_radius_s: 0.375
+# Translator -> segmentation features: the BIO head reads RMSNorm(input_proj(u)) + W LN(sg(v)) (the term joins after the head's
+# input norm, so W acts at that scale whatever S1's token size), with u the segmentation pose encoder's output, v the translator's 
+# per-frame ST-GCN features (bounded temporal look-ahead) and W zero-initialized, so step 0 is S1 + the clean floor. Stop-gradient 
+# keeps BIO gradients out of the translator.
+bio_adapter: true  # false = two streams share nothing but Omega
+# One-stream arm (true): ONE pose encoder, clean translator's, read by BIO head and the translator and trained by both losses. 
+# Pooled S1's head reads it via a least-squares map to S1's encoder tokens, fitted on train windows when train-slt starts and 
+# folded into bio_head.input_proj (S1's encoder is only that target).
+shared_pose_encoder: false
 jitter:
     # Designed window edges for stage 2 (S1 trains on whole-input chunks, data/chunks.py). Each edge offset is drawn from
     # Uniform(-context_s, +context_s) around the anchor's boundaries, and Mode-2 cut depths uniformly from cut_range.
@@ -96,32 +114,27 @@ mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on
 batch_size: 16
 grad_accum_steps: 1 # Effective batch = batch_size * grad_accum_steps
 num_workers: 4
-# Stage 2 fine-tunes 2 CONVERGED models (S1 and the clean translator, which already fits train to its smoothing floor),
-# so one small rate trains every module in one optimizer group, both pose encoders included (nothing is frozen). 1e-5 is a
-# judgment call that matches TwoStream-SLT's translator rate (arXiv 2211.01367 §4, App. B.2: 1e-5 for its MLP + translator,
-# 1e-3 for its visual heads, so it does not back 1e-5 for the pose encoders or the BIO head). No measurement on this model
-# supports it: watch dev BIO loss and translation CE over epochs 0-3.
-learning_rate: 1.0e-5
+# Stage 2 fine-tunes 2 CONVERGED models (S1 and the clean translator), so 1 rate trains every module in 1 optimizer group,
+# both pose encoders included (nothing is frozen).
+learning_rate: 1.0e-4
 weight_decay: 1.0e-4
 epochs: 50
-eval_every_epochs: 1
-early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
-    enabled: true # enabled: false to train the full `epochs`.
-    patience: 20
+early_stopping:    # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
+    enabled: true  # enabled: false to train the full `epochs`.
+    patience: 20   # evaluations: 20 x checkpoint.eval_every_epochs 1 = 20 epochs without a new best
     min_delta: 0.0
 scheduler:
     type: cosine
     warmup_epochs: 0
 max_grad_norm: 1.0
-# Text canvas ceiling, sized to the data like buffer_cap_s. A caption unit can hold several sentences, so target length
-# follows the unit distribution: longest unit that fits streaming buffer needs 281 mT5 tokens on ase, 177 on asf and 143
-# on bfi. The pool sets it, so one value covers every target. Block alignment is required (BD3LM attends bidirectionally
-# within a block, and `data.batch` refuses a canvas that would cap mid-block): 320 = 2^6 x 5 divides by every block size
-# worth running (4, 8, 16, 32, 64), so block-size dial below moves without a 2nd canvas. `train.slt.assert_targets_fit`
-# refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash
-# mid-epoch; when a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes
+# Text canvas ceiling, sized to the data like buffer_cap_s. A target joins back-to-back units of a window, so its length
+# follows joined runs. The longest joinable run of every corpus sets it, so 1 value covers every target. Block alignment 
+# is required (BD3LM attends bidirectionally within a block, and `data.batch` refuses a canvas that would cap mid-block): 
+# 400 = 25 x 16 divides by block sizes 4/8/16. Block of 32/64 needs a canvas of 416/448. `train.slt.assert_targets_fit` 
+# refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash 
+# mid-epoch. When a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes 
 # each batch's canvas to its longest target (block-aligned), so the ceiling costs no compute.
-max_text_tokens: 320
+max_text_tokens: 400
 # Block size: BD3LM's interpolation dial between autoregression (block 1: 1 slot/block — AR order, with at most 1 soft-state 
 # revision pass/slot) and full diffusion (block = canvas). It bounds DLM arm's parallelism and is a TRAINING parameter — the 
 # block-causal mask, OPUT corruption and canvas alignment all read it — so it is stamped in the checkpoint and eval refuses 

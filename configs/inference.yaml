@@ -3,15 +3,16 @@
 # The duration prior of the semi-Markov decoder is NOT here: it is fitted on the target language's TRAIN unit
 # durations wherever it is needed (infer.duration_decode.DurationModel.fit), with no dev-tuned weight.
 stride_s: 1.0
-# Latency/capacity bound: a buffer this long is force-committed (flagged PARTIAL). 40 s covers the train p99 unit
-# duration in current corpora and equals S1 maximum training context (bio_pretrain.yaml), which train-bio refuses 
-# to set below this value. Every translation recipe (clean floor, arms) clamps its windows here.
-# A hysteresis commit needs δ of lead-in (the buffer starts at previous terminator − δ) + (K-1)·stride after the
-# terminator (plus up to 1 stride of quantisation), so a unit longer than about 40 - 0.5 - 2 = 37.5 s commits only
-# via the forced path. A pause before a unit also uses cap space, so some shorter units are cut open even with a
-# perfect segmenter (the share per corpus and cap is in docs/implementation_notes.md); segmenter merges cause most 
-# real cuts. The left-truncated tail of a force-committed unit is never translated: Mode-2b training gives the 
-# decoder no translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
+# Latency/capacity bound: at this buffer length a complete span is force-committed (flagged PARTIAL). 40 s covers the 
+# train p99 unit duration in current corpora and equals S1 maximum training context (bio_pretrain.yaml), which train-bio 
+# refuses to set below this value. Every translation recipe (clean floor, arms) clamps its windows here.
+# A hysteresis commit needs δ of lead-in (buffer starts at previous terminator − δ, or δ before a span that the cap kept) 
+# + (K-1)·stride after terminator (plus up to 1 stride of quantization), so unit longer than about 40 - 0.5 - 2 = 37.5 s 
+# commits only via forced path. An open span gets no event (P1 at inference): the cap keeps one that starts more than δ 
+# after the buffer start (the next buffer starts δ before it), so a pause or a leftover before a unit does not use its 
+# cap space, and drops any other, which runs about 40 - 0.5 = 39.5 s or longer with no decoded boundary (segmenter merges 
+# cause most of these). The rest of a dropped span starts the next buffer as an I-run, which never opens: Mode-2b training 
+# gives the decoder no translation supervision on headless fragments.
 buffer_cap_s: 40.0
 boundary_stability:
     # delta_s (δ) plays 3 coupled roles:

@@ -15,27 +15,20 @@ from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
 from infer.duration_decode import DurationDecoder
-from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
+from infer.commit_gate import bio_complete_spans
+from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics
 
 
 def bio_tags_to_segments(tags, timestamps_s) -> list[Segment]:
-    """BIO argmax tags → time-domain phrase Segments (shared span-decode rule).
-
-    Spans = contiguous signing runs (Moryossef's `likeliest_probs_to_segments` never needs a predicted `B`), split
-    at interior `B`s to keep adjacent sentences separate. End = onset of the next frame, extrapolated one step past
-    sequence end for open spans.
-    """
+    """Decoded BIO tags of 1 whole stream → time-domain phrase Segments, by the span rule of FSM: a span opens on `B` or 
+    on O → I (a predicted `B` isn't needed after pause) and ends at its terminator, the next O, B or UNK; End = terminator 
+    frame's onset. Every offline span path reads it (--offline row and stage-2 offline monitor, the segmenter span files 
+    of --segments cascades, --segmenter-eval and segmenters' val_video_f1). P1 at inference, as in FSM: a run that starts 
+    with I on 1st frame (its start is the stream edge) or runs to last frame (its end is the stream edge) is no span."""
     if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
     times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
     if not times: return []
-
-    step = (times[-1] - times[-2]) if len(times) > 1 else 0.04  # assume 25fps when a single frame
-    segments: list[Segment] = []
-    for seg in signing_runs_with_b_splits(tags):
-        end_idx = int(seg["end"]) + 1
-        end_t = times[end_idx] if end_idx < len(times) else times[-1] + step
-        segments.append(Segment(times[int(seg["start"])], end_t))
-    return segments
+    return [Segment(times[start], times[term]) for start, term in bio_complete_spans(tags)]
 
 
 def _phrase_logits(
@@ -76,7 +69,8 @@ def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
     rope_chunk_s: float | None = None, duration=None
 ) -> dict[str, list[Segment]]:
-    # 1 decode/stream: spans keyed by record id on the stream's own clock (eval.to_source maps them to the source video).
+    # 1 decode/stream: spans keyed by record id on the stream's own clock 
+    # (evaluation.predictions.to_source maps them to the source video).
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -129,9 +123,9 @@ def evaluate_moryossef_whole_video(
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
     `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
 
-    The current window monitor pools complete-span counts at 1 threshold. Whole-video scoring uses different context, 
-    units and aggregation. Compare checkpoints under both protocols before attributing a gap to training; a protocol 
-    difference does not rule out a model or implementation failure.
+    The segmenters' checkpoint monitor (`val_video_f1`, evaluation.segmenter_eval.segmenter_dev_scores) decodes the 
+    same whole-video pass with the duration prior and scores it with the RQ2 rows of `--segmenter-eval`. The dev-chunk 
+    numbers it also logs use other context, units and aggregation and are diagnostics only.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []

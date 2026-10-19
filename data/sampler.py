@@ -1,4 +1,4 @@
-"""Misalignment-aware window sampler over 4 real-timeline window modes, and its window-edge jitter."""
+# Misalignment-aware window sampler over 4 real-timeline window modes, and its window-edge jitter.
 from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 
@@ -6,7 +6,7 @@ import numpy as np
 from data.loader import VideoRecord
 from utils import lambda_min_s, seconds_to_frames
 from data.windowing import (TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
-                            count_complete_spans, make_bio_labels)
+                            count_complete_spans, join_runs, joined_target, make_bio_labels)
 from poses import load_pose_window, normalize_keypoints_unisign
 
 
@@ -53,8 +53,8 @@ class WindowSampler:
     - **Mode 1** — anchor fully inside (head/tail from the uniform context band).
     - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge),
       `left` (no B for the anchor), `both` (interior, rare).
-    - **Mode 3** — ≥2 complete sentences (the spec spans the anchor and its successor); target = earliest complete span 
-      (first-complete-span rule, identical at train and inference).
+    - **Mode 3** — ≥2 complete sentences (the anchor's back-to-back run, else the anchor and its successor); target = the earliest complete span 
+       (first-complete-span rule, identical at train and inference), joined with the complete units that follow it within δ.
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
 
     Truncation happens only here, by *window shaping* — never by relabelling text (premise P1). 
@@ -77,10 +77,6 @@ class WindowSampler:
         # δ of the FSM's post-commit cut (inference.yaml boundary_stability.delta_s): after committing a unit, the buffer restarts at its 
         # terminator − δ. `materialize` gives a window the same left edge after a quarantined unit (see there).
         self.delta_s = float(delta_s)
-
-        # A batch has 1 frame floor (train/slt.py _gate_frames): refuse a pool whose rates give different counts here, not mid-epoch.
-        rates = [float(r.pose.fps) for r in records]
-        seconds_to_frames(self.min_span_s, rates); seconds_to_frames(self.delta_s, rates)
         self.rng = np.random.default_rng(seed)
         # Base for index-seeded per-window draws (spec_for): every draw of a window comes from draw_seed + index, 
         # so an index maps to ONE window in the main process and in any DataLoader worker.
@@ -190,12 +186,17 @@ class WindowSampler:
 
 
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
-        """Span the anchor and its successor, so 2 sentences are fully inside; degrade to Mode 1 if the pair yields no 2 complete spans. 
-        materialize() later picks the translation target. Edges carry the designed jitter like every other mode — an exact [anchor B, 
-        successor end] window would train a boundary distribution (B at frame 0) the buffer never produces."""
+        """Span the anchor's whole back-to-back run: the anchor and reliable units after it with gaps of at most δ (on the record's frame grid), no 
+        unit between and the whole run inside the buffer with its terminator frame (data.windowing.join_runs, the rule of the joined target). With 
+        no unit within δ after the anchor, span the anchor and its successor. So every unit of a run can be complete, and materialize() joins the 
+        complete ones into 1 target "A <sep> B <sep> ...". Degrade to Mode 1 if the window yields no 2 complete spans. Edges carry designed jitter 
+        like every other mode — an exact [anchor B, run end] window will train a boundary distribution (B at frame 0) the buffer never produces."""
         anchor = rec.sentences[anchor_idx]
-        end_anchor = rec.sentences[min(anchor_idx + 1, len(rec.sentences) - 1)]
         eps = 1.0 / rec.pose.fps
+        gap_s = seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
+        reliable_after = [u for u in rec.sentences[anchor_idx:] if getattr(u, "reliable", True)]
+        run = join_runs(reliable_after, rec.sentences, gap_s, max_span_s=self.buffer_cap_s - eps)[0]
+        end_anchor = run[-1] if len(run) > 1 else rec.sentences[min(anchor_idx + 1, len(rec.sentences) - 1)]
         min_span_s = seconds_to_frames(self.min_span_s, rec.pose.fps) / rec.pose.fps   # Λ_min on the record's frame grid
 
         for _ in range(20):
@@ -277,7 +278,7 @@ class WindowSampler:
         keep = timestamps >= spec.start_s - 1e-3
         if keep.any() and not keep.all(): poses, timestamps = poses[keep], timestamps[keep]
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
-        target = None
+        target, pause_after = None, False
 
         # Eligibility uses the actual sampled frame grid, also used by the gate's GT frame conversion.
         relative_times = (timestamps - spec.start_s).astype(np.float32)
@@ -291,7 +292,14 @@ class WindowSampler:
         candidates = tuple(span for span, frames in complete if frames >= seconds_to_frames(self.min_span_s, rec.pose.fps))
         if candidates:
             spec = replace(spec, mode="mode3" if len(candidates) >= 2 else "mode1", subcase=None)
-            target = candidates[0]
+            # The target: 1st complete unit, joined with the complete units that follow it with gaps of at most δ ("A <sep> B").
+            gap_s = seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
+            run = join_runs(candidates, rec.sentences, gap_s)[0]
+            target = joined_target(run)
+            # 1 unit with a pause after it (the next unit of the record, of any kind, starts more than δ later): the text's best
+            # extent is then the caption unit itself, so only these rows let text train the segmentation branch.
+            after = min((u.start_s for u in rec.sentences if u is not run[-1] and u.start_s >= run[-1].end_s), default=None)
+            pause_after = len(run) == 1 and (after is None or after - run[-1].end_s > gap_s)
         elif anchor_span is not None:
             represented = any(span is anchor_span for span, _ in complete)
             if represented: # A complete but too-short unit stays BIO-supervised; it is not a truncation target.
@@ -324,8 +332,7 @@ class WindowSampler:
         # straddling the window's left edge. In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's 
         # leftover tail is content FSM already emitted — the gate floors it unconditionally (no cross-seam duplication). The ANCHOR itself 
         # straddling the edge (Mode 2b) is MISSED-HEAD case, NOT a commit: FSM's commit log would show nothing there (χ=0 at inference), 
-        # so training mirrors it with χ=0 and leaves those frames to Ω (the posterior membership) — which is what lets translation vote to 
-        # relocate a start. Inference-parity of χ is invariant; the anchor test enforces it.
+        # so training mirrors it with χ=0. Inference-parity of χ is invariant; the anchor test enforces it.
         commit_mask = np.zeros((poses.shape[0],), dtype=bool)
         for span in rec.sentences:
             straddles = span.start_s < spec.start_s < span.end_s
@@ -334,7 +341,7 @@ class WindowSampler:
             if straddles and is_predecessor: commit_mask |= timestamps < span.end_s
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, translation_target=target, 
-            fps=float(rec.pose.fps), commit_mask=commit_mask, candidate_sentences=candidates
+            fps=float(rec.pose.fps), commit_mask=commit_mask, candidate_sentences=candidates, target_pause_after=pause_after,
         )
 
     @staticmethod
@@ -343,6 +350,12 @@ class WindowSampler:
             "spec": asdict(sample.spec), "poses": sample.poses, "timestamps_s": sample.timestamps_s,
             "bio_labels": sample.bio_labels, "commit_mask": sample.commit_mask, "fps": sample.fps,
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
+            # Window-relative seconds of the GT unit(s) the text target covers: the crop the translator trains on (models.streaming_slt).
+            "target_span_s": None if sample.translation_target is None else [
+                float(sample.translation_target.start_s - sample.spec.start_s), 
+                float(sample.translation_target.end_s - sample.spec.start_s)
+            ],
+            "target_pause_after": bool(sample.target_pause_after),
             "candidate_sentences": [
                 {"start_s": float(sp.start_s - sample.spec.start_s), "end_s": float(sp.end_s - sample.spec.start_s), "text": sp.text} 
                 for sp in sample.candidate_sentences

@@ -1,9 +1,11 @@
 """Window primitives: BIO labels from GT boundaries, plus the complete-span count of the sampler's Mode-3 draws.
 UNK is the padding/ignore class — padding is never labelled O."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
+
 import numpy as np
+from utils import UNIT_SEPARATOR
 
 BIO = {"UNK": 0, "O": 1, "B": 2, "I": 3}
 # Names the labelling rule; `annotation_fingerprint` adds the content hash. Both travel with every checkpoint and
@@ -54,7 +56,30 @@ class WindowSample:
     # Every complete, reliable, >= Lambda_min sentence inside the window (time order): the multi-sentence target pool 
     # of a Mode-1/3 window; empty for the other modes (P1: no text for a sentence the window does not show whole).
     candidate_sentences: tuple[SentenceSpan, ...] = ()
+    # The text target is ONE unit and the record's next unit starts more than δ after it (or there is none): the only rows on which
+    # the text loss may train the segmentation branch, because there the text's best extent is the caption unit (models.streaming_slt).
+    target_pause_after: bool = False
 
+
+def joined_target(run) -> SentenceSpan:
+    # 1 unit is its own target; a run is one span from its first onset to its last end, its texts joined by UNIT_SEPARATOR.
+    if len(run) == 1: return run[0]
+    return replace(run[0], end_s=run[-1].end_s, text=f" {UNIT_SEPARATOR} ".join(u.text for u in run))
+
+def join_runs(units, sentences, gap_s: float, max_span_s: float | None = None) -> list[tuple[SentenceSpan, ...]]:
+    """Group time-ordered complete units into runs that one text target may cover: each next unit starts at most `gap_s` (δ on
+    the record's frame grid) after the previous one ends, no other unit of `sentences` (reliable or not) lies between them, and
+    the whole run spans at most `max_span_s` (when given). Most caption boundaries inside a run show no pause in the poses, so
+    only the text can place them; a run never crosses a longer gap, which a pause marks and which may hold uncaptioned signing."""
+    runs: list[list[SentenceSpan]] = []
+    for unit in units:
+        if runs:
+            prev, first = runs[-1][-1], runs[-1][0]
+            between = any(u is not prev and u is not unit and u.start_s < unit.start_s and u.end_s > prev.end_s for u in sentences)
+            fits = max_span_s is None or unit.end_s - first.start_s <= max_span_s
+            if unit.start_s - prev.end_s <= gap_s and not between and fits: runs[-1].append(unit); continue
+        runs.append([unit])
+    return [tuple(r) for r in runs]
 
 def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, trusted_gap_s: float) -> list[tuple[float, float]]:
     # Uncaptioned stretches (incl. video head/tail) LONGER than trusted_gap_s.

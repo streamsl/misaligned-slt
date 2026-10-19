@@ -5,23 +5,23 @@ import torch
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 LAMBDA_MIN_S = 0.5  # label-domain floor that rejects flicker; genuine shorter units can't be emitted.
+# Joins the texts of caption units that follow each other with gaps of at most δ into 1 text target ("A <sep> B"). An unused 
+# mT5 sentinel: the tokenizer keeps it as 1 piece, and decoding keeps it in the text, where `split_unit_events` cuts at it.
+UNIT_SEPARATOR = "<extra_id_0>"
 
+# A time within this many frames of a frame time is that frame: it absorbs the float noise of a seconds round trip
+# (a frame time saved as seconds, a per-video fps from a duration rounded to 1 ms).
+FRAME_SLACK = 0.01
 
-def seconds_to_frames(seconds: float, fps) -> int:
-    """`seconds` as a frame count at `fps`, at least 1: the one conversion of every time constant (Λ_min, δ, the run rules).
+# Artifact folders under outputs/, one per kind: RQ1 sweeps, RQ2 offline and online rows (each events file with its scores 
+# and its --resplit re-cuts), segmenter files (dev/test evaluation and span files), segmenter-error analyses, the display 
+# replays of --stability (policy scores and provisional texts), the open-span decodes of --shadow-open-spans (with their 
+# --separator-replay results) and report.py's reports and debug views.
+OUTPUT_KINDS = ("rq1", "rq2_offline", "rq2_online", "segmenter", "analysis", "stability", "shadow", "report")
 
-    Every constant is in seconds. `fps` may be a list, 1 rate/row of a batch: rows must then give 2 count, because a batch 
-    has 1 frame floor. The 0.01-frame slack absorbs loader's per-video fps (frames / a duration_s rounded to 1 ms, within 
-    0.002 frame of 24 fps on SignVerse), so 0.5s at that rate stays 12 frames.
-    """
-    rates = fps if isinstance(fps, (list, tuple)) else [fps]
-    counts = {max(1, math.ceil(float(seconds) * float(rate) - 0.01)) for rate in rates}
-    if len(counts) != 1: raise ValueError(
-        f"{seconds}s is {sorted(counts)} frames across the rows of 1 batch (fps {sorted({float(r) for r in rates})}); "
-        f"a batch has 1 frame floor, so its rows must share a frame rate"
-    )
-    return counts.pop()
-
+def seconds_to_frames(seconds: float, fps: float) -> int:
+    # `seconds` as a frame count at `fps`, at least 1: the one conversion of every time constant (Λ_min, δ, the run rules).
+    return max(1, math.ceil(float(seconds) * float(fps) - FRAME_SLACK))
 
 def lambda_min_s(inference_cfg: dict) -> float:
     # Lambda_min: the shortest span the FSM may commit. A LABEL-domain floor, so it does not move with a noise measurement.
@@ -48,7 +48,6 @@ def pool_key(cfg: dict) -> str | None: # Accessors for the consolidated `checkpo
     langs = (cfg or {}).get("pretrain_languages") or None
     return f"multi_{'-'.join(sorted(str(x) for x in langs))}" if langs else None
 
-
 def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
     # Resolved `checkpoint.dir`. Shipped segmentation configs template it with `${corpus}` (load_yaml), so it is
     # already pool-correct here; the last-segment substitution below is the safety net for a `${language}`-templated
@@ -60,6 +59,13 @@ def checkpoint_dir(cfg: dict, default: str | None = None) -> str | None:
     langs = {str(x) for x in (cfg.get("pretrain_languages") or [])}
     if parts and (parts[-1] in langs or parts[-1] == str(cfg.get("language", ""))): parts[-1] = key
     return "/".join(parts)   # an explicit, non-language-templated dir is the caller's choice — never rewritten
+
+def output_dir(kind: str) -> Path:
+    # The only resolver of artifact paths: outputs/<kind>/, created on first use (a fresh clone or VM has no outputs/).
+    if kind not in OUTPUT_KINDS: raise ValueError(f"unknown output kind {kind!r}; known: {', '.join(OUTPUT_KINDS)}")
+    path = Path("outputs") / kind
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 def target_language(data_cfg: dict, language: str, default: str = "en_XX") -> str:
     # Declared TEXT language of a dataset language's captions (`data.yaml languages.<lang>.target_lang`).
@@ -79,7 +85,6 @@ def resolve_pretrained(model_cfg: dict, data_cfg: dict, language: str, default: 
     if explicit: return explicit
     lang_ckpt = ((data_cfg.get("languages", {}) or {}).get(language, {}) or {}).get("pretrained_slt")
     return lang_ckpt or default
-
 
 def resolve_placeholders(cfg: dict) -> dict:
     # Substitute `${key}` in string values from the config's own TOP-LEVEL scalar keys.

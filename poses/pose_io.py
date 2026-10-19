@@ -6,6 +6,7 @@ from pathlib import Path
 import os, re, csv, json
 import numpy as np
 from .preprocessing import normalize_keypoints_unisign
+from utils import FRAME_SLACK
 
 SEGMENT_RE = re.compile(r"_segment_(\d+)$")
 META_FILENAME = "video_meta.csv"
@@ -127,8 +128,8 @@ def save_video_meta(path: str | Path, meta: dict[str, dict]) -> None:
             ])
 
 
-def build_pose_index( # Index pose .npy files; fps and frame size are resolved PER VIDEO when `video_meta` covers them
-    pose_root: str | Path, fps: float, width: int | None = None, height: int | None = None,
+def build_pose_index( # Index pose .npy files; fps (frames / duration_s) and frame size are resolved PER VIDEO from `video_meta`
+    pose_root: str | Path, fps: float | None = None, width: int | None = None, height: int | None = None,
     video_meta: dict[str, dict] | None = None,
 ) -> dict[str, PoseIndex]:
     pose_root = Path(pose_root)
@@ -146,7 +147,11 @@ def build_pose_index( # Index pose .npy files; fps and frame size are resolved P
         counts = tuple(int(np.load(path, mmap_mode="r").shape[0]) for path in ordered)
         meta = (video_meta or {}).get(video_id) or {}
         duration = meta.get("duration_s")
-        video_fps = sum(counts) / float(duration) if duration and float(duration) > 0 else float(fps)
+        video_fps = sum(counts) / float(duration) if duration and float(duration) > 0 else fps  # `fps`: optional fallback rate
+        if video_fps is None: raise SystemExit(
+            f"[pose_io] {video_id}: no duration_s in video_meta.csv, so its frame rate is unknown. Run "
+            f"`python prepare_yt25.py --stage meta --languages <lang>` (yt-dlp metadata, no video download)."
+        )
         sized = bool(meta.get("width") and meta.get("height"))   # both or neither: a mixed pair is no aspect
         index[video_id] = PoseIndex(
             video_id=video_id, paths=ordered, frame_counts=counts, fps=float(video_fps),
@@ -188,8 +193,10 @@ def load_pose_window(
     # DWPose to Uni-Sign 69-kp representation (poses.normalize_keypoints_unisign).
     start_s = max(0.0, float(start_s))
     end_s = min(float(end_s), pose_index.duration_s)
-    start_frame = int(np.floor(start_s * pose_index.fps))
-    end_frame = int(np.ceil(end_s * pose_index.fps))
+    # [start_s, end_s) in frames; a bound within FRAME_SLACK of a frame time is that frame,
+    # so a saved event time maps back to its frame.
+    start_frame = int(np.floor(start_s * pose_index.fps + FRAME_SLACK))
+    end_frame = int(np.ceil(end_s * pose_index.fps - FRAME_SLACK))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
     if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses)
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)

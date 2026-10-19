@@ -8,12 +8,14 @@ from data.windowing import BIO
 
 
 def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
-    """A span OPENS on a predicted `B`, or O→I mid-buffer.
+    """A span OPENS on a predicted `B`, or O→I mid-buffer: the rule of every emitted span (the FSM, and every offline span
+    path through moryossef26.infer.bio_tags_to_segments).
 
-    Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; most adjacent captions 
-    chain with no gap have no visual pause), so 1st signing frame after a gap counts as a start. Buffer-start signing 
-    without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before 
-    the buffer, don't translate"). FSM's committed overlap never reaches this rule: it's a prefix that the decode tags UNK.
+    `B` rarely wins argmax (1 B/sentence; most adjacent captions chain with no gap have no visual pause), so 1st signing frame 
+    after gap counts as a start. Buffer-start signing without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated 
+    sentence `I`-without-`B` ("started before the buffer, don't translate"), and its start is a buffer or stream edge, not a 
+    decision of the head (P1 at inference). FSM's committed overlap never reaches this rule: it's a prefix that the decode tags
+    UNK. `metrics.signing_runs_with_b_splits` (Moryossef-protocol diagnostics only) opens such a run.
     """
     if tag == BIO["B"]: return True
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
@@ -54,13 +56,14 @@ def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0
 
 
 def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation, or a buffer-cap 
-    forced commit); None if the buffer ends outside a span.
+    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation); None if the buffer ends
+    outside a span. Such a span is never emitted (spec §7.1): the cap keeps it for the next buffer when it starts more 
+    than δ after the buffer start and drops it otherwise, and the stream end drops it.
 
-    Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate needs on
-    the forced/open path (docs/membership_gate.md §2.8): Ω anchored here gives γ≡γ_s with no right cliff (Ω≈0 for the
-    all-I interior), while frame 0 would sweep the opening B and floor the span the gate should open. A buffer-start
-    I-run (left-truncated leftover) never opens → None."""
+    Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate reads on
+    an open-span decode (the stability trace, the shadow decodes; docs/membership_gate.md §2.5): Ω anchored here gives
+    γ≡γ_s with no right cliff (Ω≈0 for the all-I interior), while frame 0 would sweep the opening B and floor the span
+    the gate should open. A buffer-start I-run (left-truncated leftover) never opens → None."""
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     start: int | None = None
     prev: int | None = None

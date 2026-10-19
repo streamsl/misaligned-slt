@@ -1,0 +1,292 @@
+"""RQ2 online rows (eval.py --rq 2 --online) and the stage-2 online monitor.
+
+Streaming FSM (infer/stream.py) runs over each stream, with the joint arm or an online segmenter cascade, and writes events, the
+display replay of --stability (outputs/stability/) and the open-span decodes of --shadow-open-spans (outputs/shadow/). The online
+monitor (train/slt.py, checkpoint.monitor val_online_score) runs the same FSM over whole dev videos and scores it as RQ2.
+"""
+from __future__ import annotations
+from contextlib import nullcontext
+from tqdm import tqdm
+import argparse, json, time
+import numpy as np
+
+import torch
+from poses import load_pose_window
+from data.loader import annotation_fingerprint, ANNOTATION_PROTOCOL, load_language_records
+from data.windowing import BIO, make_bio_labels
+from infer.duration_decode import DurationModel
+from infer.stability import build_policies, group_tracks, TAU_GRID
+from infer.stream import MoryossefRunnerAdapter, S1RunnerAdapter
+from train import distributed as dist
+
+from metrics import moryossef_segment_metrics
+from evaluation.predictions import _prediction_events, PredictionEvent, to_source
+from evaluation.systems import (
+    _build_eval_model, _build_streaming_runner, _load_segmenter, _method_config_path, model_annotation, rq2_translator_token
+)
+from evaluation.scoring import accumulate_policy, dev_monitor_scores, merged_policy, score_policy
+from utils import load_yaml, output_dir, pick_device, UNIT_SEPARATOR
+
+
+def _online_segmenter_arch(args): # No explicit segmenter keeps the joint arm; clean translator defaults to external segmenter.
+    return getattr(args, "segmenter_arch", None) or ("moryossef" if getattr(args, "method", None) == "baseline" else None)
+
+
+def _track_units(tracks, events, sentences, cover: float = 0.5) -> dict[int, tuple[float, float, int]]:
+    """{track index: (start_s, end_s, reference words)} for the stability LAAL, on stream's clock. A committed track's span 
+    runs from its start to the end of the event it emitted. It holds a reliable gold unit when it covers at least `cover` of it
+    (evaluation.scoring.held_unit_latency's rule), and each unit goes to the first committing track that holds it. A track that
+    holds several units (a merge) is scored as one long unit over them."""
+    ends = {(round(e.start_s, 4), round(e.commit_time_s, 4)): e.end_s for e in events}
+    spans = []
+    for index, tr in enumerate(tracks):
+        h = tr.hyps[-1]
+        end = ends.get((round(float(h.span_start_s), 4), round(float(h.commit_time_s), 4))) if tr.committed else None
+        if end is not None: spans.append((float(h.commit_time_s), index, float(h.span_start_s), float(end)))
+
+    held: dict[int, list] = {}
+    for g in (u for u in sentences if u.reliable):
+        need = cover * max(g.end_s - g.start_s, 1e-6)
+        first = min((s for s in spans if min(s[3], g.end_s) - max(s[2], g.start_s) >= need), default=None)
+        if first is not None: held.setdefault(first[1], []).append(g)
+    return {i: (min(g.start_s for g in gs), max(g.end_s for g in gs), sum(len(g.text.split()) for g in gs)) for i, gs in held.items()}
+
+
+@torch.no_grad()
+def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
+    """Drive the sawtooth FSM end-to-end over each stream (a clean segment, from t = 0) → committed events on the source timeline.
+
+    This is the *usable inference engine* for RQ2: Our own BIO head + commit gate, recompute-each-stride, no cross-stride decoder state. 
+    AR/DLM use their joint head. Online Moryossef/S1 cascades use the clean translator on each proposed raw crop.
+    """
+    segmenter_arch = _online_segmenter_arch(args)
+    no_translate = bool(getattr(args, "no_translate", False))
+    if segmenter_arch is not None and not no_translate and args.method != "baseline":
+        raise SystemExit("Online segmenter cascades use --method baseline; use --no-translate for segmentation only.")
+    plain = getattr(args, "segmenter_decode", None) == "plain"
+    if plain and segmenter_arch is None: raise ValueError(
+        "--segmenter-decode plain is a segmenter control: the joint arm's head trained under its duration "
+        "model and its gate reads the same scores, so an arm row cannot drop them. Use it with --segmenter-arch."
+    )
+    data_cfg = load_yaml(args.data_config)
+    inference_cfg = load_yaml(args.inference_config)
+    cascade_model = None
+    run_online.last_model_annotation = None   # Translator's labels (model_annotation); none when nothing translates
+
+    if segmenter_arch is not None:
+        method_cfg = {} if no_translate else load_yaml(_method_config_path(args), language=args.language)
+        segmenter_args = argparse.Namespace(**{**vars(args), "segmenter_arch": segmenter_arch})
+
+        if not no_translate: segmenter_args.checkpoint = None  # --checkpoint names the clean translator
+        model, device, velocity, _, segmenter_checkpoint = _load_segmenter(segmenter_args)
+        model.eval().to(device)
+        run_online.last_checkpoint = segmenter_checkpoint
+        tokenizer = None
+
+        if not no_translate:
+            if int(getattr(args, "num_beams", None) or method_cfg.get("validation", {}).get("num_beams", 1)) != 1:
+                raise ValueError("The online rows (the cascade and the arms) use greedy decoding (num_beams=1).")
+            method_cfg = {**method_cfg, "membership_gate": {"enabled": False}}
+            cascade_model, tokenizer = _build_eval_model(
+                "baseline", args.checkpoint, args.language, data_cfg, method_cfg, inference_cfg, device
+            )
+            run_online.last_translation_checkpoint = getattr(cascade_model, "checkpoint_path", None)
+            run_online.last_model_annotation = model_annotation(cascade_model, data_cfg, args.language)
+
+        model = (S1RunnerAdapter(model) if segmenter_arch == "s1" else MoryossefRunnerAdapter(model, velocity)).eval().to(device)
+        # One decoder for both segmenters: the language's train-fitted duration prior, no per-segmenter tuning.
+        model.duration_model = None if plain else DurationModel.for_language(data_cfg, args.language)
+        if plain: print("[online] plain decode: legal BIO paths only, no duration scores (a decoder control).", flush=True)
+    else:
+        method_cfg = load_yaml(_method_config_path(args), language=args.language)
+        if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
+        device = pick_device(args.device)
+        model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, inference_cfg, device)
+        run_online.last_arm_checkpoint = getattr(model, "checkpoint_path", None)
+        run_online.last_model_annotation = model_annotation(model, data_cfg, args.language)
+
+    run_online.last_duration_model = model.duration_model.to_dict() if model.duration_model is not None else None
+    run_online.last_segmentation_decode = "semi_markov_viterbi" if model.duration_model is not None else "legal_viterbi"
+    run_online.last_velocity = bool(velocity) if segmenter_arch == "moryossef" else False
+    if no_translate: print("[online] Segmentation only: no decode, events carry no text.", flush=True)
+    runner = _build_streaming_runner(
+        model, inference_cfg, method_cfg, translate=not no_translate, cascade_model=cascade_model,
+        record_trace=bool(getattr(args, "stability", False)), record_shadow=bool(getattr(args, "shadow_open_spans", False)),
+    )
+    records, _ = load_language_records(data_cfg, args.language, split=args.split)
+    shadow_rows: dict[str, list[dict]] = {}   # separator-commit replay: open-span decodes per SOURCE video, in source time
+    # --stability: every recorded decode as text, one entry per sentence track, per SOURCE video in source time: the provisional
+    # text a live display would have had on each stride (the policies above choose what of it to show). Strings, not tensors.
+    provisional_rows: dict[str, list[dict]] = {}
+    # Scored per video and accumulated as (sum, count), not held as Track objects: a Track carries one cloned token
+    # tensor per stride, so keeping the whole split pinned every hypothesis of every video (ase is 11,939 of them).
+    # Every field score_policy returns is an unweighted mean over same track set, so a count-weighted merge is exact.
+    stability_totals: dict[str, dict[str, float]] = {}
+    stability_policies = build_policies()
+    # The separator is no displayed word (scored as a space, as in RQ1/RQ2); its id comes from tokenizing it 
+    # (convert_tokens_to_ids gives UNK). Words start at a "▁" piece, so LAAL counts words as the references do.
+    separator_id = tokenizer(UNIT_SEPARATOR, add_special_tokens=False).input_ids[-1] if callable(tokenizer) else None
+    word_start = (lambda toks: [str(p).startswith("▁") for p in tokenizer.convert_ids_to_tokens(toks)]) \
+                                                       if hasattr(tokenizer, "convert_ids_to_tokens") else None
+
+    predicted: dict[str, list[PredictionEvent]] = {}
+    fsm_bio_rows: list[dict[str, float]] = []
+    stride_seconds: list[tuple[float, float]] = []
+    for record in tqdm(records, desc="Processing records"):
+        poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
+        if poses.shape[0] == 0:
+            predicted[record.video_id] = []
+            continue
+
+        if runner.trace is not None: runner.trace.clear()
+        if runner.shadow is not None: runner.shadow.clear()
+        # The released contract is isotropic and our poses are stored per-axis, so external adapter needs THIS video's width/height 
+        # (moryossef26.dataset.pose_aspect: video_meta.csv width/height, else data.yaml); a per-video constant, unlike release_stats.
+        adapter = getattr(runner, "model", None)
+        if hasattr(adapter, "aspect"):
+            from moryossef26.dataset import pose_aspect
+            adapter.aspect = pose_aspect(record.pose)
+
+        events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps))
+        stride_seconds += runner.stride_seconds
+        if runner.trace:
+            tracks = group_tracks(runner.trace)   # the commit gate's own span identity, recorded per hypothesis
+            units = _track_units(tracks, events, record.sentences)
+            for name, policy in stability_policies.items(): accumulate_policy(stability_totals, name, score_policy(
+                tracks, policy, separator_id=separator_id, units=units, word_start=word_start))
+            off = float(record.pose.offset_s)
+            provisional_rows.setdefault(record.pose.video_id, []).extend({"committed": tr.committed, "hypotheses": [{
+                "time_s": float(h.commit_time_s) + off, "span_start_s": float(h.span_start_s) + off,
+                "kind": "committed" if h.committed else "open" if h.open_span else "closed",
+                "text": tokenizer.decode(h.token_ids.tolist(), skip_special_tokens=True).strip() if tokenizer is not None else "",
+            } for h in tr.hyps]} for tr in tracks)
+
+        predicted[record.video_id] = _prediction_events(record.video_id, events, None if no_translate else tokenizer)
+        if runner.shadow:
+            off = float(record.pose.offset_s)
+            shadow_rows.setdefault(record.pose.video_id, []).extend({
+                "emission_time_s": h.emission_time_s + off, "span_start_s": h.span_start_s + off, 
+                "buffer_end_s": h.buffer_end_s + off, "text": tokenizer.decode(h.token_ids.tolist(), skip_special_tokens=True).strip()
+            } for h in runner.shadow)
+
+        # BIO P/R/F1 on the runner's stitched legal tags (including committed frontier, 
+        # as FSM read them; not raw argmax) vs GT captions: latest estimate per frame.
+        if runner._bio_timeline is not None:
+            gold = make_bio_labels(
+                timestamps, record.sentences, 0.0, float(record.pose.duration_s), 
+                video_duration_s=record.pose.duration_s, untrusted=record.untrusted_s,
+            )
+            tags = runner._bio_timeline.clone()
+            # Ignore-region: where gold is UNK (quarantine / untrusted gap) the pred is neither right nor wrong —
+            # mask it too, or every phantom "segment" there deflates precision for a region that has no GT.
+            gold_t = torch.as_tensor(np.asarray(gold)).long()
+            # A stream with no gold signing (all UNK, or O/UNK only) gets no row (moryossef26.infer.evaluate_moryossef_whole_video):
+            # its F1 is undefined, and a 0 or 1 there would move the mean. Its events still go to the RQ2 scorer.
+            if not ((gold_t == BIO["B"]) | (gold_t == BIO["I"])).any(): continue
+            tags[gold_t == BIO["UNK"]] = BIO["UNK"]
+            logits_1hot = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=4).float().unsqueeze(0) * 10.0
+            fsm_bio_rows.append(moryossef_segment_metrics(
+                logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio"
+            ))
+
+    # Real time: wall time per stride against the buffer length, on this device (ReSCUE App. G reports the mean, the p95 and 
+    # the longest-buffer step). Live use needs each stride done within stride_s, the long buffers near the cap included.
+    buffer_s, wall_s  = np.array([b for b, _ in stride_seconds]), np.array([w for _, w in stride_seconds])
+    long_s = wall_s[buffer_s >= 30.0]
+    stride_s = float(inference_cfg.get("stride_s", 1.0))
+    run_online.last_compute = {
+        "device": str(device), "strides": int(wall_s.size), "p50_s": float(np.median(wall_s)) if wall_s.size else None,
+        "p95_s": float(np.percentile(wall_s, 95)) if wall_s.size else None, "max_s": float(wall_s.max()) if wall_s.size else None,
+        "p95_s_buffer_ge_30s": float(np.percentile(long_s, 95)) if long_s.size else None,
+        "share_within_stride": float((wall_s <= stride_s).mean()) if wall_s.size else None,
+        # The stride times above exclude the decodes that only --stability needs (StreamingSLTRunner.trace_only_s), 
+        # so a traced row still stamps the deployed cost; the trace's own cost is reported apart.
+        "record_trace": runner.trace is not None, "trace_only_decodes": int(runner.gate_stats.get("trace_only_decoded", 0)),
+        "record_shadow": runner.shadow is not None, "shadow_decodes": int(runner.gate_stats.get("shadow_decoded", 0)),
+        "trace_only_decode_s": float(getattr(runner, "trace_only_s", 0.0)), "shadow_decode_s": float(runner.shadow_s),
+        # The FSM's counters over every stream, saved so a reader can report them: committed, forced_commit (complete spans committed
+        # before K votes), open_span_kept (open spans that the cap kept for the next buffer) and open_span_dropped (open spans that the
+        # cap or the stream end dropped: no event, spec §7.1; open_span_dropped_at_cap the cap's share). They count passes, not
+        # units: a unit that the cap keeps twice, or keeps and then drops, counts in each.
+        "gate_stats": dict(runner.gate_stats),
+    }
+    print(f"[online] compute: {run_online.last_compute}", flush=True)
+    # Why-did-it-(not)-commit: low streaming recall with near-perfect frame BIO = the boundary-stability gate suppressed emission.
+    s = runner.gate_stats
+    seen = s.get("spans_seen", 0)
+    if seen: print(
+        f"[online] gate: spans_seen={seen} boundary_ok={s.get('boundary_ok',0)} gated_decoded={s.get('gated_decoded',0)} "
+        f"committed={s.get('committed',0)} forced={s.get('forced_commit',0)} open_span_kept={s.get('open_span_kept',0)} "
+        f"open_span_dropped={s.get('open_span_dropped',0)} (at_cap={s.get('open_span_dropped_at_cap',0)}) "
+        f"trace_only_decoded={s.get('trace_only_decoded',0)}", flush=True
+    )
+    if stability_totals:
+        # Stable-prefix comparison on the SAME decodes the FSM already produced: how much earlier could text appear,
+        # and what does freezing it early cost? commit_only is the deployed behaviour (latency ceiling, 0 error).
+        rows = {name: merged_policy(totals) for name, totals in stability_totals.items()}
+        print(f"[stability] {max(r['n_tracks'] for r in rows.values())} tracks | tau grid {TAU_GRID}", flush=True)
+        # ANCHORS DIFFER, deliberately. RQ2 `emission_latency` = commit_time - GOLD SENTENCE END: when the SCORED translation is complete, 
+        # under commit_only, the only policy the FSM actually runs. `latency_s` here is first_reveal - COMMIT: how much earlier a policy 
+        # would put text on screen. Latency to 1st text = emission_latency + latency_s (negative). Keep them separate — quoting a prefix's 
+        # latency against the full sentence's BLEU would describe 2 different objects.
+        print("latency_s is relative to the COMMIT (negative = earlier); add RQ2 emission_latency for gold-anchored number.", flush=True)
+        print(f"{'policy':<30}{'latency_s':>11}{'revealed':>10}{'frozen_err':>12}{'rewrite_rate':>14}{'NE':>8}{'LAAL_s':>9}", flush=True)
+        for name, r in rows.items(): print(
+            f"{name:<30}{r['first_token_latency_s']:>11.3f}{r['revealed_fraction']:>10.3f}{r['frozen_prefix_error']:>12.3f}"
+            f"{r['contradicted_track_rate']:>14.3f}{r['normalized_erasure']:>8.3f}{r['laal_s']:>9.3f}", flush=True
+        )
+        r = rows["commit_only"]
+        print(f"[stability] LAAL on {r['n_laal_tracks']} of {r['n_tracks']} committed sentences (those holding >= half of a gold unit); "
+              f"boundary flips per sentence {r['boundary_flip_rate']:.3f}", flush=True)
+        out = output_dir("stability") / f"stability_{segmenter_arch or \
+                                        rq2_translator_token(args, run_online.last_arm_checkpoint)}_{args.language}_{args.split}.json"
+        out.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # The texts themselves, beside the scores: per sentence track, each recorded decode with its stride time and kind (open: the
+        # unit before its end appeared; closed: the span waiting for its votes; committed: the emitted text). Never read by scoring.
+        texts = out.with_name(out.name.replace("stability_", "provisional_", 1))
+        texts.write_text(json.dumps({"provenance": {
+            "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), 
+            "language": args.language, "split": args.split, "hysteresis_strides": runner.hysteresis_strides,
+            "unit_separator": UNIT_SEPARATOR, "delta_s": runner.delta_s, "stride_s": runner.stride_s,
+        }, "tracks": provisional_rows}, indent=1) + "\n", encoding="utf-8")
+        print(f"[stability] {sum(len(t['hypotheses']) 
+                                 for v in provisional_rows.values() for t in v)} recorded decodes -> {texts}", flush=True)
+
+    if runner.shadow is not None:
+        # Input of `eval.py --separator-replay` (error analysis): never read by scoring; the events above are those of a run without it.
+        out = output_dir("shadow") / f"shadow_{segmenter_arch or \
+                                     rq2_translator_token(args, run_online.last_arm_checkpoint)}_{args.language}_{args.split}.json"
+        out.write_text(json.dumps({"provenance": {
+            "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records), 
+            "language": args.language, "split": args.split, "hysteresis_strides": runner.hysteresis_strides,
+            "unit_separator": UNIT_SEPARATOR, "delta_s": runner.delta_s, "stride_s": runner.stride_s,
+        }, "hypotheses": shadow_rows}, indent=1) + "\n", encoding="utf-8")
+        print(f"[online] shadow: {sum(map(len, shadow_rows.values()))} open-span decodes -> {out}", flush=True)
+
+    if fsm_bio_rows:
+        fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
+        print("[online] FSM BIO (stitched decoded FSM tags vs GT): " + 
+              " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
+    return to_source(predicted, records)
+
+
+@torch.no_grad()
+def online_dev_scores(model, records, inference_cfg: dict, method_cfg: dict, thresholds, char_level: bool) -> dict[str, float]:
+    """Checkpoint selection on the deployed path (train/slt.py evaluate_slt, checkpoint.monitor val_online_score): streaming FSM 
+    over `records` (whole source videos), scored as RQ2 (threshold averages). Each rank streams every world_size-th record and the 
+    events are merged, so every rank returns the same scores. `online_score` = F1 avg x DVC BLEU-4 avg."""
+    started = time.perf_counter()
+    runner = _build_streaming_runner(model, inference_cfg, method_cfg)
+
+    # Full precision, as `eval.py --rq 2 --online` runs: the training loop calls its monitor under CUDA autocast 
+    # (see segmenter_dev_scores), and bf16/fp16 logits can move duration-Viterbi boundaries and greedy tokens.
+    local = {}
+    with torch.autocast(device_type="cuda", enabled=False) if torch.cuda.is_available() else nullcontext():
+        for record in records[dist.rank()::dist.world_size()]:
+            poses, _ = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
+            events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps)) if poses.shape[0] else []
+            local[record.video_id] = _prediction_events(record.video_id, events, model.tokenizer)
+
+    scores = dev_monitor_scores(to_source(dist.merge_dicts(local), records), records, thresholds, char_level, "online")
+    if dist.is_main(): print(f"slt | online monitor: {len(records)} streams in {time.perf_counter() - started:.0f}s", flush=True)
+    return scores

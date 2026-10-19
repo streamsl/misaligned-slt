@@ -1,36 +1,28 @@
-# First-span membership as a soft crop: one Ω biases the translator encoder self-attention keys and the decoder cross-attention.
+# The selected first span as a hard crop (span_membership): 1 Ω biases the 
+# translator encoder self-attention keys and the decoder cross-attention.
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
-
 import math, warnings
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from infer.duration_decode import DurationDecoder
 from infer.commit_gate import candidate_spans, open_span_start
 
-_MIN_SPAN_PROBABILITY = 1e-6  # Below this P, a row has no span to condition on.
 
+def membership_bias(membership, frame_mask, commit_mask=None, eps=1e-4):
+    """Ω = log(eps + (1-eps)·clamp(m, 0, 1)) on valid, uncommitted frames; log(eps) on committed and padded frames.
 
-def membership_bias(membership, frame_mask, commit_mask=None, eps=1e-4, probability=None):
-    """Ω = log(eps + (1-eps)·clamp(m/P, 0, 1)) on valid, uncommitted frames; log(eps) on committed and padded frames.
-
-    P (B,) is the probability that the row's selected span exists, so m/P is membership given that span. The division removes the 
-    channel where the caption loss pays the gate to declare a span. There is no rescale by window length: a point mass gives Ω = 0 
-    on the span and log(eps) elsewhere, a crop on a window of any length (the translator then matches a hard crop up to eps leak 
-    when the span starts right after the prompt; see models/unisign.encode_memory). A row with P < 1e-6 has no span to condition on: 
-    it reads the whole window (m = 1), as an ungated model does. `_condition` sets P = 0 on a row whose decode has no span and no 
-    open start, so that row takes  same fallback. `probability=None` means P = 1 (a point mass or a membership already conditioned 
-    on its span). m and P stay live tensors, so the gradient reaches the posterior through both.
+    `membership` is the visibility of each frame given the selected span (`span_membership`, or a supplied interval).
+    There is no rescale by window length: a point mass gives Ω = 0 on the span and log(eps) elsewhere, a crop on a 
+    window of any length (every gated read encodes the support again as a crop right after the prompt, 
+    models.streaming_slt.support_crop, so the translator then matches a hard crop up to the eps leak).
     """
     if not 0 < eps < 1: raise ValueError("eps must lie between 0 and 1")
     valid = frame_mask.bool()
     if commit_mask is not None: valid = valid & ~commit_mask.bool()
-    if probability is not None:
-        uncertain = (probability < _MIN_SPAN_PROBABILITY)[:, None]
-        # Divide by 1 on an uncertain row: the unused quotient m/0 would put NaN into the gradient.
-        ratio = membership / torch.where(uncertain, torch.ones_like(probability[:, None]), probability[:, None])
-        membership = torch.where(uncertain, torch.ones_like(ratio), ratio)
     omega = torch.log(eps + (1.-eps)*membership.clamp(0., 1.))
     return omega.masked_fill(~valid, math.log(eps))
 
@@ -117,10 +109,22 @@ def omega_cross_bias(omega: torch.Tensor, memory_len: int, dtype: torch.dtype) -
 
 @dataclass
 class SpanPosterior:
-    closed: torch.Tensor
-    open: torch.Tensor
+    closed: torch.Tensor          # P(t in the first closed span)
+    open: torch.Tensor            # P(t in the open first span); the open span runs to the window end, so this is its start CDF
     closed_probability: torch.Tensor
     open_probability: torch.Tensor
+    closed_start: torch.Tensor    # P(the first closed span starts at t)
+
+
+def span_membership(starts, terms, has_term, lengths, t: int) -> torch.Tensor:
+    """Visibility (B, T) of SELECTED span [s, e]: 1 on it (e = its terminator frame, which the crop holds, as cascade crop does)
+    and 0 off it. An open span (no terminator) is visible to window end. Row with s < 0 (no span) is visible everywhere. Every
+    gated read encodes this support again as 1 crop (models.streaming_slt.support_crop), so translator reads cascade's crop."""
+    frames = torch.arange(int(t), device=starts.device)[None]
+    s, e, n = starts[:, None], terms[:, None], lengths[:, None]
+    inside = (frames >= s) & torch.where(has_term.bool()[:, None], frames <= e, frames < n)
+    return torch.where(s < 0, torch.ones_like(inside), inside).float()
+
 
 def _lse(x, dim=-1): # Unreachable states have 0 gradient, including an all-impossible log-sum.
     reachable = torch.isfinite(x).any(dim=dim, keepdim=True)
@@ -128,7 +132,7 @@ def _lse(x, dim=-1): # Unreachable states have 0 gradient, including an all-impo
     return torch.where(reachable.squeeze(dim), value, torch.full_like(value, -torch.inf))
 
 
-class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and the Ω soft crop.
+class MembershipGate(nn.Module): # First-eligible-span probabilities and the Ω crop of the selected span.
     @staticmethod
     @lru_cache(maxsize=2)
     def _recurrence_steps(device_type):
@@ -187,24 +191,26 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and t
         return beta, close, opened, MembershipGate._members(active, close, opened, valid)
 
     def posterior(self, logits, lengths, min_span_frames=1, commit_mask=None, known_start=False, *, decoder=None, timestamps_s=None):
-        floor = int(min_span_frames)  # Λ_min in frames, 1 value for every row
-        if floor < 1: raise ValueError("min_span_frames must be positive")
+        # Λ_min in frames: 1 int for every row, or 1 per row (each row's own frame rate).
+        floors = torch.as_tensor(min_span_frames, dtype=torch.long).expand(len(logits))
+        if len(floors) and int(floors.min()) < 1: raise ValueError("min_span_frames must be positive")
         scores = (decoder or DurationDecoder()).path_scores(
-            logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s, min_age_states=floor if len(logits) else 1
+            logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s, 
+            min_age_states=int(floors.max()) if len(logits) else 1
         )
         e, factors, n = scores.emissions, scores.factors, scores.lengths
         b, padded_t, _ = e.shape
         t = int(n.max()) if b else 0
         if not t:
             empty = e[..., 0] * 0.; p = empty.sum(1)
-            return SpanPosterior(empty, empty, p, p)
+            return SpanPosterior(empty, empty, p, p, empty)
         # Later padding and unreachable ages cannot affect a valid path; restore the original frame axes at the end.
         e, factors = e[:, :t], factors[..., :t]
 
         # Separate storage prevents compiler guards on changing residual-column offsets.
         end, stay, residual_end, residual_stay = (x.contiguous() for x in factors.unbind(1))
         ages = end.shape[1]
-        eligible = (torch.arange(1, ages + 1, device=e.device) >= floor).repeat(b, 1)  # (B, ages)
+        eligible = torch.arange(1, ages + 1, device=e.device)[None] >= floors.to(e.device)[:, None]  # (B, ages)
         initial = scores.initial[:, :ages + 2]
         scale = _lse(initial); full = initial - scale[:, None]
         pref = full
@@ -239,15 +245,20 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and t
 
         closed, opened, starts = torch.stack(members_by_time[::-1], 1).unbind(-1)
         p_open = opened.gather(1, (n - 1).clamp(min=0)[:, None]).squeeze(1)
-        return SpanPosterior(scores.restore(F.pad(closed, (0, padded_t - t))),
-                             scores.restore(F.pad(opened, (0, padded_t - t))), starts.sum(1), p_open)
+        return SpanPosterior(
+            scores.restore(F.pad(closed, (0, padded_t - t))), scores.restore(F.pad(opened, (0, padded_t - t))),
+            starts.sum(1), p_open, scores.restore(F.pad(starts, (0, padded_t - t)))
+        )
 
     def forward(
         self, bio_logits, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, min_span_frames=1,
         seam_is_terminator=True, stream_start=False, anchor_override=None, timestamps_s=None, decoder=None,
     ):
-        if anchor_override is not None and bool((anchor_override[:, 0] >= 0).all()):
+        # Ω for deployed path: predicted 1st span as a hard crop (`span_membership`), or a supplied interval on every row 
+        # (`anchor_override`, (start, terminator) frames). Λ_min (`min_span_frames`) is a frame count..
+        if anchor_override is not None:
             # A supplied interval replaces membership completely; there is no inferred posterior to compute or report.
+            if not bool((anchor_override[:, 0] >= 0).all()): raise ValueError("a supplied interval needs a start on every row")
             if commit_mask is not None:
                 if commit_mask.shape != frame_mask.shape: raise ValueError("Commit mask must match the frame axes")
                 committed = commit_mask.bool() & frame_mask.bool()
@@ -259,59 +270,51 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and t
                 "skip": torch.zeros(len(bio_logits), dtype=torch.bool), "uncertain_rows": 0,
                 "uncertain": torch.zeros(len(bio_logits), dtype=torch.bool),
             }
-        return self._condition( # Inference uses predicted state or an explicitly supplied proposal; no supervision is accepted.
-            bio_logits, frame_mask, memory_len, commit_mask=commit_mask, eps=eps, min_span_frames=min_span_frames,
-            seam_is_terminator=seam_is_terminator, stream_start=stream_start, anchor_override=anchor_override,
-            timestamps_s=timestamps_s, decoder=decoder,
+        selected = self.select(
+            bio_logits, frame_mask, commit_mask=commit_mask, min_span_frames=min_span_frames, seam_is_terminator=seam_is_terminator,
+            stream_start=stream_start, timestamps_s=timestamps_s, decoder=decoder,
         )
+        starts, terms, has_term = selected["anchors"]
+        membership = span_membership(starts, terms, has_term, selected["lengths"], bio_logits.shape[1])
+        omega = membership_bias(membership, frame_mask, commit_mask, eps)
+        bias = omega_cross_bias(omega, memory_len=int(memory_len), dtype=bio_logits.dtype)
+        return bias, {
+            "skip": starts.cpu() < 0,
+            "uncertain_rows": int((starts < 0).sum()),
+            "uncertain": (starts < 0).detach().cpu(),   # per row: no span and no open start, Ω falls back to the whole window
+            "anchors": (starts, terms, has_term),
+        }
 
     @staticmethod
     def _provided_membership(anchors, length):
+        # [start, terminator]: the terminator frame stays visible, as in the training crop and the cascade crop. 
+        # A terminator of -1 means the span runs to the window end.
         positions = torch.arange(length, device=anchors.device)[None]
-        start, end = anchors[:, :1], anchors[:, 1:2]
-        return ((positions >= start) & ((end < 0) | (positions < end))).float()
+        start, term = anchors[:, :1], anchors[:, 1:2]
+        return ((positions >= start) & ((term < 0) | (positions <= term))).float()
 
-    def _condition(
-        self, bio_logits, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, min_span_frames=1,
-        seam_is_terminator=True, stream_start=False, anchor_override=None, timestamps_s=None, decoder=None,
-    ):
+    def select(
+        self, bio_logits, frame_mask, *, commit_mask=None, min_span_frames=1, seam_is_terminator=True, 
+        stream_start=False, timestamps_s=None, decoder=None,
+    ) -> dict:
+        # The first-span readout as inference makes it: Viterbi tags -> the first candidate span (start, terminator), or the 
+        # open start when no span is complete; a row with no span and no open start has start -1 and reads the whole window.
         lengths = frame_mask.long().sum(1)
         known_start = torch.full_like(lengths, bool(stream_start), dtype=torch.bool)
         if commit_mask is not None and seam_is_terminator: known_start = known_start | commit_mask.any(dim=1)
         decoder = decoder or DurationDecoder()
         tags = decoder.decode(bio_logits, lengths, commit_mask, known_start, timestamps_s=timestamps_s)
-        floor = max(1, int(min_span_frames))
-        spans = [next(candidate_spans(tags[b, :int(n)], floor), None) for b, n in enumerate(lengths)]
+        floors = torch.as_tensor(min_span_frames, dtype=torch.long).clamp(min=1).expand(len(lengths))
+        spans = [next(candidate_spans(tags[b, :int(n)], int(floors[b])), None) for b, n in enumerate(lengths)]
         starts, terms, has_term = [], [], []
+
         for b, n in enumerate(lengths):
             span = spans[b]
             open_start = open_span_start(tags[b, :int(n)])
             starts.append(span[0] if span else (open_start if open_start is not None else -1))
             terms.append(span[1] if span else -1); has_term.append(span is not None)
 
-        posterior = self.posterior(bio_logits, lengths, floor, commit_mask, known_start, decoder=decoder, timestamps_s=timestamps_s)
-        open_rows = ~torch.tensor(has_term, device=bio_logits.device)
-        membership = torch.where(open_rows[:, None], posterior.open, posterior.closed)
-        probability = torch.where(open_rows, posterior.open_probability, posterior.closed_probability)
-        # No decoded span and no open start: the translator reads the whole window (P = 0 fallback).
-        probability = torch.where(torch.tensor(starts, device=probability.device) < 0, torch.zeros_like(probability), probability)
-
-        if anchor_override is not None: # Given-span evaluation conditions on supplied boundaries: a point-mass interval posterior.
-            fixed = self._provided_membership(anchor_override, bio_logits.shape[1])
-            given = anchor_override[:, 0] >= 0
-            membership = torch.where(given[:, None], fixed, membership)
-            probability = torch.where(given, torch.ones_like(probability), probability)
-
-        omega = membership_bias(membership, frame_mask, commit_mask, eps, probability)
-        bias = omega_cross_bias(omega, memory_len=int(memory_len), dtype=bio_logits.dtype)
-        return bias, {
-            "skip": torch.tensor(starts) < 0,
-            "closed_probability": posterior.closed_probability.detach().mean(),
-            "open_probability": posterior.open_probability.detach().mean(),
-            "uncertain_rows": int((probability < _MIN_SPAN_PROBABILITY).sum()),
-            "uncertain": (probability < _MIN_SPAN_PROBABILITY).detach().cpu(),   # per row: Ω fell back to the whole window
-            "anchors": (
-                torch.tensor(starts, device=bio_logits.device), torch.tensor(terms, device=bio_logits.device),
-                torch.tensor(has_term, device=bio_logits.device)
-            )
-        }
+        device = bio_logits.device
+        return {"lengths": lengths, "anchors": (
+            torch.tensor(starts, device=device), torch.tensor(terms, device=device), torch.tensor(has_term, device=device)
+        )}

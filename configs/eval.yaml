@@ -1,8 +1,7 @@
+# Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration (delta_s = grid * duration), 
+# so every sentence sits at same proportional severity. Absolute seconds would mix regimes (0.3s wrecks a 1s sentence, barely touches a 10s one). 
+# Set severity_mode: absolute to use *_grid_s instead. Negative tail = right-truncation stress test.
 rq1:
-    # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
-    # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
-    # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative
-    # tail = right-truncation stress test.
     severity_mode: relative
     severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3] # fractions of sentence duration
     smoke_grid_rel: [-0.2, 0.0, 0.2]
@@ -13,4 +12,18 @@ rq1:
     # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction + 
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
 rq2:
-    tiou_thresholds: [0.5, 0.7, 0.9]
+    tiou_thresholds: [0.5, 0.7, 0.9]  # sentence-level tIoU F1: the secondary localization score, for comparison with earlier work
+    # The main localization score, the edge chunk score (evaluation.scoring.edge_chunk_scores): a caption may hold any run of consecutive
+    # reliable units inside 1 chunk, and it matches that run only when both its edges are within tau of the run's edges.
+    chunk_gap_s: 0.5  # a chunk = units of 1 stream with caption gaps of at most this; = δ, kept here so that a δ change leaves the score as it is
+    edge_taus_s: [0.5, 1.0, 2.0]  # F1 is averaged over these: the chunk gap, the stride, about a third of a median sentence
+split_rule:              # Paired video bootstrap that judges every unit-split candidate against the word share
+    bootstrap_resamples: 2000
+    bootstrap_seed: 0
+likelihood_cut:          # eval.py --resplit likelihood: SegFree-style re-cut of split spans, just a candidate rule
+    refine_step_s: 0.08  # after the δ-grid DP, each cut moves in steps of this many seconds within ±δ (2 frames at 24 fps)
+    frame_budget: 6000   # padded pose frames per encoder batch (memory only; no effect on any score)
+    token_budget: 1500   # label tokens per decoder call (memory only)
+attention_cut:           # eval.py --resplit attention: Whisper-style cross-attention re-cut of split spans, just a candidate rule
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # decoder layers (1-based) read, heads averaged.
+    median_half_width_s: 0.125  # Median filter along frames spans 2 x seconds_to_frames(this) + 1 frames (7 at 24 fps. Whisper's 7 frames are 20ms each)

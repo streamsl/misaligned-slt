@@ -6,9 +6,8 @@ on full videos. Whole-video segmenter evaluation also reports its spans through 
 Frame diagnostics and span diagnostics answer different questions; training monitors are not final results.
 
 FRAME-DOMAIN: bio_frame_metrics and moryossef_segment_metrics, with a shared span parser for predictions and gold.
-
-TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by eval.py 
-(RQ2 tIoU brackets), report.py and reporting/ (outcome and protocol tables).
+TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; 
+used by evaluation/ (RQ2 tIoU brackets), report.py and reporting/ (outcome and protocol tables).
 
 TEXT: compute_text_metrics (BLEU-4/ROUGE-L/METEOR/BLEURT).
 """
@@ -86,12 +85,15 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
 
 
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """PREDICTION/inference decode: signing runs split at interior `B` (== moryossef26.infer.bio_tags_to_segments).
+    """Signing runs split at interior `B`: the run rule of `moryossef_segment_metrics` (the Moryossef-protocol frame and run scores that
+    --segmenter-eval and the online `fsm_bio` rows print beside the RQ2 rows) and of the `report.py` debug view, applied to the tags and the
+    labels alike. It is not the rule of an emitted span, nor of `val_phrase_*` (CompleteSpanMetrics): those use
+    infer.commit_gate.bio_complete_spans, which opens no headless run and emits no run without a terminator (P1 at inference, spec §7.1).
 
-    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap): 
-    a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments` 
-    doesn't require one either. Interior `B`s split back-to-back sentences. `I` with nothing open opens (sentence start 
-    after a gap; headless left-truncated fragment). `O` and `UNK` close. Returns [{start, end}] frame segments.
+    Requiring a predicted `B` to OPEN is fatal (`B` is ~1% of frames, and most adjacent captions chain with no gap):
+    a signing-detecting model that never argmaxes `B` yields zero segments — Moryossef's `likeliest_probs_to_segments`
+    doesn't require one either. Interior `B`s split back-to-back sentences. `I` with nothing open opens (sentence start
+    after a gap; headless left-truncated fragment). `O` and `UNK` close; a run open at the end is kept. Returns [{start, end}] frame segments.
     """
     if isinstance(tags, torch.Tensor): tags = tags.detach().cpu().tolist()
     segments: list[dict] = []
@@ -168,7 +170,7 @@ def moryossef_segment_metrics(
     `{prefix}_frame_f1`: macro F1 over O/B/I frame classes.
     `{prefix}_tiou_f1`/`_seg_precision`/`_seg_recall`: `segmentation_prf` (the RQ2 metric) on frame-unit segments.
     Clipped fragments can score well on short windows. Training monitors use CompleteSpanMetrics instead.
-    Both sides decode with the inference rule (signing_runs_with_b_splits).
+    Both sides decode with the Moryossef-protocol run rule (signing_runs_with_b_splits), not the emitted-span rule.
     Binary signing-frame overlap belongs to bio_frame_metrics; it does not test sentence boundaries.
     """
     # 1 decode on BOTH sides: make_bio_labels tags a left-truncated span as a HEADLESS I-run, so a B-required gold decode

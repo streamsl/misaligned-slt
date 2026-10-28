@@ -1,19 +1,23 @@
-# Faithful Moryossef 2026 external segmenter for the RQ2 cascade. It is not the in-system FSM head (that is train-bio / 
-# bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input contract — their 50 landmarks 
-# (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity after — where the in-system head 
-# reads Uni-Sign features. The two arms share no input representation, which keeps cascade baseline independent of the 
-# method (docs/membership_gate.md §4, shared components table). Everything else is S1's: pool, chunk tiling, augmentation, 
-# labels, dev monitor and best-epoch floor (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`).
+# Moryossef 2026 external segmenter (the released architecture and weights) for the cascade rows. It is not the in-system FSM
+# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads RELEASED model's own input contract —
+# their 50 landmarks (8 body + 2 hands, no face), their shoulder-and-standardise normalisation, velocity after — where the
+# in-system head reads Uni-Sign features. 2 arms share no input representation, which keeps cascade baseline independent. 
+# Its training recipe is S1's: pool, augmentation, labels, optimizer schedule, dev monitor and best-epoch floor 
+# (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`). 
+# Declared differences: the model, the input contract, the initialization (released weights here, Uni-Sign encoder + 
+# random head in S1), the chunk length (fixed (num_frames - 1) / fps s here, U(δ + K·stride, C) s in S1) and input types
+# (pretrain.inputs: [chunks] here, the release's chunk-only training; S1 lists its own types in bio_pretrain.yaml).
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
-    # ${corpus} = pool key (multi_<pool>) when pretrain_languages is set, else the language — same
+    # ${corpus} = pool key (multi_<pool>) when pretrain.languages is set, else the language — same
     # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
     dir: checkpoints/moryossef/${corpus}
     save_best: true
-    monitor: val_phrase_tiou_f1  # complete-span F1@0.5 over fixed dev chunks, S1's monitor (train.helpers.evaluate_bio_chunks)
+    monitor: val_video_f1  # S1's monitor: the edge chunk F1 on whole dev streams (train.helpers.evaluate_segmenter)
     mode: max
     restore_best: true
+    eval_every_epochs: 1
     from_pretrained: checkpoints/moryossef26.safetensors
 wandb:
     enabled: false
@@ -37,8 +41,9 @@ attn_dropout: 0.1
 # this corpus cannot supply, and on YouTube-SL-25, the unweighted CNN never predicts B. `balanced` (corpus-measured,
 # same rule S1 uses) keeps baseline matched to the method instead of comparing against a collapsed head; `null` is 
 # the faithful unweighted variant.
-dice_loss_weight: 1.5
-bio_class_weights: balanced
+bio:
+  dice_loss_weight: 1.5
+  class_weights: balanced
 
 # Chunk training: each epoch tiles every record from a random phase with chunks of (num_frames - 1) / fps s, 
 # fps the highest record rate, so a chunk loads at most num_frames frames (data/chunks.py; S1 tiles the same 
@@ -46,29 +51,33 @@ bio_class_weights: balanced
 num_frames: 1024 # chunk length in frames; also the RoPE window for overlap-stitched whole-video inference
 batch_size: 32
 grad_accum_steps: 1  # Effective batch = batch_size * grad_accum_steps, at batch_size activation memory
-augmentation:        # TRAIN chunks only; same block as bio_pretrain.yaml (poses/augmentation.py has the recipe).
-    fps: { min_fps: 15.0, max_fps: 30.0 }
+augmentation:        # TRAIN chunks only. A copy of dlm.yaml's block.
+    fps: { min_factor: 0.625, max_factor: 1.25 }
     frame_dropout: 0.15
     body_part_dropout: 0.1
 
-learning_rate: 2.0e-4
+learning_rate: 1.0e-3
 weight_decay: 1.0e-4
 epochs: 100
-eval_every_epochs: 1
 early_stopping:
     enabled: true
     patience: 20
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 4
+    warmup_epochs: 0
 mixed_precision: auto
 max_grad_norm: 1.0
 
-# Matched to configs/bio_pretrain.yaml: the baseline segmenter trains on the SAME language pool as S1, so the RQ2
-# cascade rows compare methods rather than the amount of segmentation data each arm saw. Set both to null together
-# for the monolingual recipe.
-pretrain_languages: [ase, asf, bfi]
-# Same pool rule as bio_pretrain.yaml: τ sets each language's share in records (clean segments), τ=1 proportional,
-# τ=0 uniform; the best-epoch floor (one full rotation) is computed and printed at run time.
-pretrain_temperature: 0.0
+# Matched to configs/bio_pretrain.yaml: baseline segmenter trains on SAME language pool as S1, so the cascade rows compare 
+# methods rather than the amount of segmentation data each arm saw. Set both to null together for the monolingual recipe.
+pretrain:
+    languages: [ase, asf, bfi, bobsl_auto]
+    # Same pool rule as bio_pretrain.yaml: the dev corpora that choose the checkpoint, and τ and the weights over each corpus's
+    # hours (share ∝ weight · hours^τ, τ=0 equal); the best-epoch floor (one full rotation) is computed and printed at run time.
+    dev_languages: [ase, asf, bfi]
+    weights: {bfi: 0.5, bobsl_auto: 0.5}
+    temperature: 0.0
+    # The train set's input types, as bio_pretrain.yaml pretrain.inputs: plain chunks only, the release's chunk-only training
+    # (data/chunks.py ChunkDataset refuses windows and restart chunks under the release's input contract). --resume refuses a change.
+    inputs: [chunks]

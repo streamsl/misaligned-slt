@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from data.windowing import BIO, make_bio_labels
+from train import distributed as dist
 
 
 def masked_cross_entropy(
@@ -55,16 +56,16 @@ def bio_label_counts(records) -> list[int]:
 
 
 def resolve_bio_class_weights(cfg: dict, records) -> None:
-    """Replace a `bio_class_weights: balanced` config entry with the concrete 4-list measured on `records`.
+    """Replace a `bio.class_weights: balanced` config entry with the concrete 4-list measured on `records`.
 
     Resolved once at setup, in place, so every consumer sees the same numbers and the run's saved config records
     the exact weights used — a corpus-derived weight vector is not reproducible from the string alone.
     """
-    if str(cfg.get("bio_class_weights") or "").lower() != "balanced": return
+    if str(cfg["bio"]["class_weights"] or "").lower() != "balanced": return
     counts = bio_label_counts(records)
-    cfg["bio_class_weights"] = balanced_bio_class_weights(counts)
+    cfg["bio"]["class_weights"] = balanced_bio_class_weights(counts)
     print(f"[bio] balanced class weights from {len(records)} train videos: UNK/O/B/I counts {counts} -> "
-          f"{[round(w, 4) for w in cfg['bio_class_weights']]}", flush=True)
+          f"{[round(w, 4) for w in cfg['bio']['class_weights']]}", flush=True)
 
 
 def balanced_bio_class_weights(label_counts) -> list[float]:
@@ -93,7 +94,7 @@ def bio_class_weight_tensor(class_weights: dict | list | None) -> torch.Tensor |
     "balanced" into that list at setup. UNK forced to 0 (ignored). None when no weights given → unweighted CE, Moryossef's default recipe."""
     if not class_weights: return None
     if isinstance(class_weights, str): 
-        raise ValueError(f"bio_class_weights {class_weights!r} is unresolved; run resolve_bio_class_weights first")
+        raise ValueError(f"bio.class_weights {class_weights!r} is unresolved; run resolve_bio_class_weights first")
     if isinstance(class_weights, dict):
         w = [0.0, float(class_weights.get("O", 1.0)), float(class_weights.get("B", 1.0)), float(class_weights.get("I", 1.0))]
     else:
@@ -113,7 +114,11 @@ def bio_nll_dice_loss(
     *sign* head gave dense `B` supervision. Without that head (YouTube-SL-25 has no sign spans), `B` is ~1 frame per caption unit (under
     1% of frames) and unweighted CE + binary Dice (no B-vs-I signal) collapses to all-`I`. None ⇒ unweighted CE; Dice term on the phrase 
     head is our adaptation (their Dice sits on the sign head).
+
+    Under torchrun, in a training step, it is the loss of the global batch on every rank (`train.distributed.gather_rows`): CE over
+    all valid frames and 1 Dice over all of them, as 1 process computes it.
     """
+    logits, targets = dist.gather_rows(logits, targets, fill=ignore_index)
     valid = targets != ignore_index
     if not valid.any(): return logits.sum() * 0.0
     ce = masked_cross_entropy(logits, targets.clamp_min(0), valid, class_weights=class_weights)

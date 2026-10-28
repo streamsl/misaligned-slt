@@ -1,13 +1,14 @@
-"""Misalignment-aware window sampler over 4 real-timeline window modes, and its window-edge jitter."""
+# Misalignment-aware window sampler over 4 real-timeline window modes, and its window-edge jitter.
 from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 
 import numpy as np
+from data.chunks import INPUT_TYPES, committed_prefix, edge_mask, restart_chunk, restart_points, shortest_chunk_s
 from data.loader import VideoRecord
+from data.windowing import (BIO, TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
+                            count_complete_spans, join_runs, joined_target, make_bio_labels)
+from poses import apply_fps_aug, apply_frame_dropout, apply_hand_dropout, load_pose_window, normalize_keypoints_unisign
 from utils import lambda_min_s, seconds_to_frames
-from data.windowing import (TRUSTED_GAP_S, WindowSample, WindowSpec, classify_anchor_visibility,
-                            count_complete_spans, make_bio_labels)
-from poses import load_pose_window, normalize_keypoints_unisign
 
 
 @dataclass
@@ -53,34 +54,50 @@ class WindowSampler:
     - **Mode 1** — anchor fully inside (head/tail from the uniform context band).
     - **Mode 2** — anchor truncated: `right` (no terminator — the anchor's I-run reaches the window edge),
       `left` (no B for the anchor), `both` (interior, rare).
-    - **Mode 3** — ≥2 complete sentences (the spec spans the anchor and its successor); target = earliest complete span 
-      (first-complete-span rule, identical at train and inference).
+    - **Mode 3** — ≥2 complete sentences (the anchor's back-to-back run, else the anchor and its successor); target = the earliest complete span 
+       (first-complete-span rule, identical at train and inference), joined with the complete units that follow it within δ.
     - **Mode 4** — pure inter-sentence gap; BIO-only, trains the head to stay quiet.
 
-    Truncation happens only here, by *window shaping* — never by relabelling text (premise P1). 
+    Truncation happens only here, by *window shaping* — never by relabelling text (premise P1).
     BIO labels come from GT boundaries; padding is masked, never `O`.
+
+    A stage-2 train set turns each index into one of its `inputs` (dlm.yaml train_inputs; S1's 3 input types) instead (`spec_for`):
+    this window, a restart chunk or a chunk at the same anchor, with the same first-complete-span text rule on its own frames.
     """
 
     def __init__(
         self, records: list[VideoRecord], jitter: JitterSampler, mode_ratios: dict[str, float], buffer_cap_s: float,
-        mode2_subcase_weights: dict[str, float], min_span_s: float, delta_s: float, seed: int = 42
+        mode2_subcase_weights: dict[str, float], min_span_s: float, delta_s: float, seed: int = 42, augmentation: dict | None = None,
+        edge_reach: dict | None = None, min_chunk_s: float | None = None, inputs=("windows",),
     ):
         self.records = records
+        # The shared pose augmentation (dlm.yaml `augmentation`, poses/augmentation.py) of every row that `sample` draws; None for
+        # dev windows (data.loader.StreamingWindowDataset) and for S1's window inputs, which use only `window_spec`.
+        self.augmentation = augmentation
+        # The input types each index draws (dlm.yaml train_inputs; data.chunks INPUT_TYPES), 1 that fits its anchor in equal shares,
+        # with S1's chunk length law U(min_chunk_s, buffer_cap_s) (data.chunks.shortest_chunk_s); windows only for dev sets and S1's
+        # window inputs. `edge_reach` (train.bio_pretrain.edge_reach, read from an arm's modules): how far a window edge reaches into
+        # the head's outputs; None without a head (the clean floor, dev sets), which masks no window edge.
+        self.inputs, self.edge_reach, self.min_chunk_s = tuple(inputs), edge_reach, min_chunk_s
+        if not self.inputs or len(set(self.inputs)) != len(self.inputs) or not set(self.inputs) <= set(INPUT_TYPES): raise ValueError(
+            f"train_inputs must list each of {list(INPUT_TYPES)} at most once, got {list(inputs)}"
+        )
+        if self.inputs == ("restart_chunks",): raise ValueError(
+            "train_inputs [restart_chunks] alone cannot place a row at an anchor with no reliable unit just before it; add chunks or windows"
+        )
+        if set(self.inputs) & {"chunks", "restart_chunks"} and min_chunk_s is None: raise ValueError("chunk types need min_chunk_s (the length law)")
+        self._restart_points: dict[int, list[float]] = {}   # per record (id), labelled once
         self.jitter = jitter
         self.mode_ratios = normalized_mode_ratios(mode_ratios)
         self.buffer_cap_s = float(buffer_cap_s)
         # Λ_min mirror of the commit gate's span_selection.min_span_s: the training target/complete-span rules must skip sub-Λ_min sentences 
         # exactly like the deployed candidate_spans, or a window whose earliest complete span is sub-Λ_min supervises a sentence the gate 
-        # never anchors (wrong-sentence Ω). Stage-2 windows stay on the record's native pose grid (no fps augmentation), so each rule below 
-        # uses the frame count of the record's fps (utils.seconds_to_frames), the count the gate and the FSM apply to that stream.
+        # never anchors (wrong-sentence Ω). `materialize` counts it in frames of the window's own grid (WindowSample.fps), the count the gate 
+        # applies to that row (train/slt.py _gate_frames); the spec rules below use the record's fps (utils.seconds_to_frames), as FSM does.
         self.min_span_s = float(min_span_s)
         # δ of the FSM's post-commit cut (inference.yaml boundary_stability.delta_s): after committing a unit, the buffer restarts at its 
         # terminator − δ. `materialize` gives a window the same left edge after a quarantined unit (see there).
         self.delta_s = float(delta_s)
-
-        # A batch has 1 frame floor (train/slt.py _gate_frames): refuse a pool whose rates give different counts here, not mid-epoch.
-        rates = [float(r.pose.fps) for r in records]
-        seconds_to_frames(self.min_span_s, rates); seconds_to_frames(self.delta_s, rates)
         self.rng = np.random.default_rng(seed)
         # Base for index-seeded per-window draws (spec_for): every draw of a window comes from draw_seed + index, 
         # so an index maps to ONE window in the main process and in any DataLoader worker.
@@ -99,12 +116,16 @@ class WindowSampler:
 
 
     @classmethod
-    def from_slt_config(cls, records: list[VideoRecord], slt_cfg: dict, inference_cfg: dict) -> "WindowSampler":
-        return cls( # Stage 2 only (S1 trains on whole-input chunks, data/chunks.py): windows use the deployed cap and floor.
-            records=records, jitter=JitterSampler.from_config(slt_cfg["jitter"]), 
-            mode_ratios=slt_cfg["mode_ratios"], buffer_cap_s=float(inference_cfg["buffer_cap_s"]), 
+    def from_slt_config(
+        cls, records: list[VideoRecord], slt_cfg: dict, inference_cfg: dict, augmentation: dict | None = None,
+        edge_reach: dict | None = None, inputs=("windows",),
+    ) -> "WindowSampler":
+        return cls( # Stage 2, and S1's window inputs (data/chunks.py, BIO only): windows use the deployed cap and floor.
+            records=records, jitter=JitterSampler.from_config(slt_cfg["jitter"]),
+            mode_ratios=slt_cfg["mode_ratios"], buffer_cap_s=float(inference_cfg["buffer_cap_s"]),
             min_span_s=lambda_min_s(inference_cfg), delta_s=float(inference_cfg["boundary_stability"]["delta_s"]),
-            mode2_subcase_weights=slt_cfg["mode2_subcase_weights"], seed=int(slt_cfg.get("seed", 42)),
+            mode2_subcase_weights=slt_cfg["mode2_subcase_weights"], seed=int(slt_cfg.get("seed", 42)), augmentation=augmentation,
+            edge_reach=edge_reach, inputs=inputs, min_chunk_s=shortest_chunk_s(inference_cfg) if set(inputs) - {"windows"} else None,
         )
 
     def _choose_mode(self) -> str:
@@ -190,12 +211,17 @@ class WindowSampler:
 
 
     def _mode3_spec(self, rec: VideoRecord, anchor_idx: int) -> WindowSpec: # Multi-complete window
-        """Span the anchor and its successor, so 2 sentences are fully inside; degrade to Mode 1 if the pair yields no 2 complete spans. 
-        materialize() later picks the translation target. Edges carry the designed jitter like every other mode — an exact [anchor B, 
-        successor end] window would train a boundary distribution (B at frame 0) the buffer never produces."""
+        """Span the anchor's whole back-to-back run: the anchor and reliable units after it with gaps of at most δ (on the record's frame grid), 
+        no unit between and the whole run inside the buffer with its terminator frame (data.windowing.join_runs, rule of joined target). With no 
+        unit within δ after the anchor, span the anchor and its successor. So every unit of a run can be complete, and materialize() joins the 
+        complete ones into 1 target "A<sep>B<sep>...". Degrade to Mode 1 if window yields no 2 complete spans. Edges carry designed jitter like 
+        every other mode — an exact [anchor B, run end] window will train a boundary distribution (B at frame 0) the buffer never produces."""
         anchor = rec.sentences[anchor_idx]
-        end_anchor = rec.sentences[min(anchor_idx + 1, len(rec.sentences) - 1)]
         eps = 1.0 / rec.pose.fps
+        gap_s = seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
+        reliable_after = [u for u in rec.sentences[anchor_idx:] if getattr(u, "reliable", True)]
+        run = join_runs(reliable_after, rec.sentences, gap_s, max_span_s=self.buffer_cap_s - eps)[0]
+        end_anchor = run[-1] if len(run) > 1 else rec.sentences[min(anchor_idx + 1, len(rec.sentences) - 1)]
         min_span_s = seconds_to_frames(self.min_span_s, rec.pose.fps) / rec.pose.fps   # Λ_min on the record's frame grid
 
         for _ in range(20):
@@ -210,7 +236,8 @@ class WindowSampler:
 
 
     def _mode4_spec(self, rec: VideoRecord) -> WindowSpec: # All-gap window
-        # The whole of one inter-sentence gap (≥0.5s of no signing); falls back to a Mode-2 window if the video has no usable gap.
+        # The whole of one inter-sentence gap longer than δ on the record's frame grid (a gap of at most that lies inside 1 joined run, 
+        # data.windowing join_runs, as materialize joins); falls back to a Mode-2 window if the video has no usable gap.
         gaps: list[tuple[float, float]] = []
         prev = 0.0
         for span in rec.sentences:
@@ -220,7 +247,8 @@ class WindowSampler:
         if prev < rec.pose.duration_s: gaps.append((prev, rec.pose.duration_s))
         # Trusted gaps only: long uncaptioned stretches (> TRUSTED_GAP_S, mostly intros/outros) may contain uncaptioned signing — 
         # an "all-gap" window there could be all-signing, the exact opposite of what Mode 4 trains (stay quiet on non-signing input).
-        gaps = [(s, e) for s, e in gaps if 0.5 <= e - s <= TRUSTED_GAP_S and not any(a < e and s < b for a, b in rec.untrusted_s or ())]
+        gap_s = seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
+        gaps = [(s, e) for s, e in gaps if gap_s < e - s <= TRUSTED_GAP_S and not any(a < e and s < b for a, b in rec.untrusted_s or ())]
         if not gaps:
             # Reliable spans only: this is the one path that bypasses `self.anchors`, which hold only reliable spans (a quarantined
             # unit is never an anchor). `self.anchors` guarantees at least one reliable span in any record that reaches the sampler.
@@ -239,19 +267,48 @@ class WindowSampler:
         That is what lets a length-bucketing batch sampler predict a window's frame count from a ~0.02 ms call instead of materialising it (see 
         data.loader.LengthBucketSampler), and it also makes an epoch's content reproducible across a resume and any worker layout.
         """
-        self.rng = np.random.default_rng(self.draw_seed + int(index))
         rec, anchor_idx = self._choose_anchor(index)
+        window_rng = np.random.default_rng(self.draw_seed + int(index))
+        if self.inputs == ("windows",): return rec, self.window_spec(rec, anchor_idx, window_rng)
+        # A train row: 1 of the listed input types that fit the anchor, in equal shares. The type and its placement draw from an rng
+        # of their own, so a window keeps the draws of a windows-only set. A restart chunk needs a restart point before the anchor.
+        rng, anchor, tau = np.random.default_rng((self.draw_seed, int(index), 1)), rec.sentences[anchor_idx], self._restart(rec, anchor_idx)
+        kinds = [k for k in self.inputs if k != "restart_chunks" or tau is not None]
+        kind = kinds[int(rng.integers(len(kinds)))]
+        if kind == "windows": return rec, self.window_spec(rec, anchor_idx, window_rng)
+        length = float(rng.uniform(self.min_chunk_s, self.buffer_cap_s))   # S1's chunk length law
+        if kind == "restart_chunks": start_s, end_s = restart_chunk(rec, tau, self.delta_s, length)
+        else:   # a chunk: the anchor's onset at a uniform position inside it, clipped by the record ends as S1's tiles are
+            start_s = anchor.start_s - float(rng.uniform(0.0, length))
+            start_s, end_s = self._clip_window(rec, start_s, start_s + length)
+        # materialize relabels the mode from the content; a restart chunk that ends before its anchor starts holds no unit (a gap).
+        return rec, WindowSpec(rec.video_id, start_s, end_s, "mode4", anchor_idx, input=kind)
+
+    def _restart(self, rec: VideoRecord, anchor_idx: int) -> float | None:
+        """The gold terminator of the unit just before the anchor where it is a restart point of the record (data.chunks.restart_points:
+        the unit is reliable and its span ends in O or B), the FSM's buffer start after it commits that unit; else None. That terminator
+        lies after the unit's onset and at or before the anchor's B frame; no other unit starts in between, so no other point lies there."""
+        if id(rec) not in self._restart_points: self._restart_points[id(rec)] = restart_points(rec)
+        anchor = rec.sentences[anchor_idx]
+        before = [u.start_s for u in rec.sentences if u.start_s < anchor.start_s]
+        if not before: return None
+        hi = anchor.start_s + 1.0 / float(rec.pose.fps)   # the anchor's B frame lies less than 1 frame after its onset
+        return max((p for p in self._restart_points[id(rec)] if max(before) < p < hi), default=None)
+
+    def window_spec(self, rec: VideoRecord, anchor_idx: int, rng: np.random.Generator) -> WindowSpec:
+        # The window law for one anchor: a mode from mode_ratios, then that mode's edges, every draw from `rng`.
+        # S1's window inputs (data.chunks.ChunkDataset) draw it for an anchor of their own record.
+        self.rng = rng
         mode = self._choose_mode()
         if mode in ("mode1", "mode3") and rec.sentences[anchor_idx].duration_s + 1.0 / rec.pose.fps > self.buffer_cap_s:
             # No complete view of this unit exists at this capacity: every jittered mode-1/3 draw would be clamped by
             # _clip_window and fall back to the zero-jitter clean clip, pinning B at the window edge. Draw a truncation.
             mode = "mode2"
-        if mode == "mode1": spec = self._mode1_spec(rec, anchor_idx)
-        elif mode == "mode2": spec = self._mode2_spec(rec, anchor_idx)
-        elif mode == "mode3": spec = self._mode3_spec(rec, anchor_idx)
-        elif mode == "mode4": spec = self._mode4_spec(rec)
-        else: raise ValueError(f"Unknown mode {mode}")
-        return rec, spec
+        if mode == "mode1": return self._mode1_spec(rec, anchor_idx)
+        if mode == "mode2": return self._mode2_spec(rec, anchor_idx)
+        if mode == "mode3": return self._mode3_spec(rec, anchor_idx)
+        if mode == "mode4": return self._mode4_spec(rec)
+        raise ValueError(f"Unknown mode {mode}")
 
     def spec_frames(self, index: int) -> int:
         # Frame count the window will have, for length BUCKETING — an ordering key, not a contract. It mirrors 
@@ -264,77 +321,131 @@ class WindowSampler:
 
     def sample(self, index: int) -> WindowSample:
         rec, spec = self.spec_for(index)   # index-seeded: the window a bucketing pre-pass predicted
-        return self.materialize(rec, spec)
+        return self.materialize(rec, spec, aug_seed=(self.draw_seed, int(index)))   # its own rng, apart from the spec draws
 
 
-    def materialize(self, rec: VideoRecord, spec: WindowSpec) -> WindowSample:
-        """Realize a `WindowSpec` into tensors: load+normalize pose window, build per-frame BIO labels from GT boundaries, 
-        pick translation target (Mode 1/3 first-complete-span). The window stays on the native pose grid, as at inference."""
+    def materialize(self, rec: VideoRecord, spec: WindowSpec, aug_seed=None, shifted: bool = False) -> WindowSample:
+        """Realize a `WindowSpec` into tensors: load+normalize pose window, build per-frame BIO labels from GT boundaries, pick translation
+        target (Mode 1/3 first-complete-span). With `aug_seed` and a sampler `augmentation` (train rows), the shared augmentation runs
+        first and every rule below reads the kept frames; otherwise the window stays on the native grid. Every input type takes the same
+        rules; a restart chunk adds its committed prefix, and an arm's window hides its edge frames from the BIO loss.
+        `shifted`: the post-commit shift below moved the start (its own recursive call)."""
         poses, timestamps = load_pose_window(rec.pose, spec.start_s, spec.end_s, normalize=False)
-        # The loader floors the start frame, so it can return 1 frame BEFORE spec.start_s. Drop it: labels, completeness test and commit frontier 
-        # below all measure window from spec.start_s, and a pre-start frame can show an onset that labels call a cut (an illegal O->I). 1 ms absorbs 
-        # float32 time noise. The drop comes before Uni-Sign normalization (below post-commit shift), so dropped frame can't set window's body box.
+        # The loader floors the start frame, so it can return 1 frame BEFORE spec.start_s. Drop it: labels, completeness test and commit 
+        # frontier below all measure window from spec.start_s, and a pre-start frame can show an onset that labels call a cut (an illegal O->I). 
+        # 1 ms absorbs float32 time noise. The drop comes before Uni-Sign normalization, so dropped frame can't set window's body box.
         keep = timestamps >= spec.start_s - 1e-3
         if keep.any() and not keep.all(): poses, timestamps = poses[keep], timestamps[keep]
+        # The shared augmentation in S1's order (data/chunks.py ChunkDataset): hand dropout on the raw poses, Uni-Sign normalization with 1 body
+        # box over the native window (as the deployed buffer is normalized), then fps resampling and frame dropout. Both keep the first and the 
+        # last frame, so the window keeps its extent. 1 rng per seed, so the post-commit shift below draws the same augmentation again.
+        aug, n, raw = self.augmentation if aug_seed is not None else None, len(timestamps), poses.shape[1:] == (133, 3)
+        rng = np.random.default_rng(aug_seed) if aug else None
+        if aug: target_fps = float(rec.pose.fps) * float(rng.uniform(float(aug["fps"]["min_factor"]), float(aug["fps"]["max_factor"])))
+        if aug and raw: poses = apply_hand_dropout(poses, float(aug["body_part_dropout"]), rng)
+        if raw: poses = normalize_keypoints_unisign(poses).astype(np.float32, copy=False)
+        if aug and n > 1:
+            poses, timestamps = apply_fps_aug(poses, timestamps, float(rec.pose.fps), target_fps)
+            poses, timestamps = apply_frame_dropout(poses, timestamps, float(aug["frame_dropout"]), rng)
+        # The row's grid rate, on which Λ_min and δ become frame counts here and in the gate (train/slt.py _gate_frames): the record's 
+        # fps on the native grid, else the realized rate of the kept frames (frame dropout makes the grid sparser than target_fps).
+        fps = float(rec.pose.fps)
+        if 1 < len(timestamps) < n: fps = (len(timestamps) - 1) / float(timestamps[-1] - timestamps[0])
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
-        target = None
+        target, pause_after, run = None, False, ()
+        # A restart chunk after the commit of the unit before its anchor: its frames through that unit's terminator frame are UNK
+        # (data.chunks.committed_prefix; S1's rule, so no label sits at a fixed distance from this caption-placed edge), and the frames
+        # before the terminator frame are committed, as the FSM's χ after that commit (infer/stream.py: frames < the event's end_frame);
+        # none if the shift below moved past it.
+        tau = self._restart(rec, spec.anchor_index) if spec.input == "restart_chunks" else None
+        prefix = committed_prefix(timestamps, tau) if tau is not None and tau >= spec.start_s else 0
+        committed = max(prefix - 1, 0)
+        # The frame where a unit's span begins: its B frame (labels' comparisons), or the 1st frame after the committed frames (the
+        # terminator frame, which the gate decodes as a known start, so an abutting successor opens on it, as in the FSM). A unit that
+        # ends inside the committed frames (the committed one) is no span.
+        onset = lambda t_s: max(int(np.count_nonzero(timestamps < t_s)), committed)
 
-        # Eligibility uses the actual sampled frame grid, also used by the gate's GT frame conversion.
-        relative_times = (timestamps - spec.start_s).astype(np.float32)
+        # Eligibility uses the actual sampled frame grid, with the comparisons of the labels (make_bio_labels: B = 1st frame at or after
+        # the onset, terminator = 1st frame at or after the end), so a frame exactly on a unit edge counts here as the gate counts it.
         complete = []
         for span in sorted(rec.sentences, key=lambda x: (x.start_s, x.end_s)):
             if not span.reliable or span.start_s < spec.start_s: continue
-            begin, end = np.searchsorted(relative_times, np.asarray([span.start_s - spec.start_s, span.end_s - spec.start_s], dtype=np.float32))
-            if begin < end < len(relative_times): complete.append((span, int(end - begin)))
+            begin, end = onset(span.start_s), int(np.count_nonzero(timestamps < span.end_s))
+            if begin < end < len(timestamps): complete.append((span, end - begin))
             
-        # Λ_min in frames of the record's grid, the same count the gate and the FSM apply.
-        candidates = tuple(span for span, frames in complete if frames >= seconds_to_frames(self.min_span_s, rec.pose.fps))
+        # Λ_min in frames of the window's grid, the same count the gate applies to this row, so the target is the gate's 1st span on 
+        # window's labels. On an augmented grid a unit near Λ_min can pass or fail by a frame, so its eligibility (and with it the
+        # joined text and the pause flag) can depend on the draw. The joins, the pause flag and the shift then compare GT times only.
+        candidates = tuple(span for span, frames in complete if frames >= seconds_to_frames(self.min_span_s, fps))
         if candidates:
             spec = replace(spec, mode="mode3" if len(candidates) >= 2 else "mode1", subcase=None)
-            target = candidates[0]
-        elif anchor_span is not None:
+            # The target: 1st complete unit, joined with the complete units that follow it with gaps of at most δ ("A <sep> B").
+            gap_s = seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
+            run = join_runs(candidates, rec.sentences, gap_s)[0]
+            target = joined_target(run)
+            # A pause after the target's last unit (the next unit of the record, of any kind, starts more than δ later): the text's best
+            # extent then ends where that unit ends, so only these rows let text train the segmentation branch, and only where the span
+            # from the last unit's onset ends (models.streaming_slt _end_survival): never a boundary inside a joined run.
+            after = min((u.start_s for u in rec.sentences if u is not run[-1] and u.start_s >= run[-1].end_s), default=None)
+            pause_after = after is None or after - run[-1].end_s > gap_s
+        # The anchor's realized mode; a restart chunk that ends before its anchor starts keeps its gap mode.
+        elif anchor_span is not None and (spec.input != "restart_chunks" or anchor_span.start_s < spec.end_s):
             represented = any(span is anchor_span for span, _ in complete)
             if represented: # A complete but too-short unit stays BIO-supervised; it is not a truncation target.
                 spec = replace(spec, mode="mode3" if len(complete) >= 2 else "mode1", subcase=None)
             else:
                 has_start = anchor_span.start_s >= spec.start_s and anchor_span.start_s < spec.end_s
-                end_idx = int(np.searchsorted(relative_times, np.float32(anchor_span.end_s - spec.start_s)))
-                has_end = anchor_span.end_s > spec.start_s and end_idx < len(relative_times)
+                has_end = anchor_span.end_s > spec.start_s and np.count_nonzero(timestamps < anchor_span.end_s) < len(timestamps)
                 if has_start and not has_end: subcase = "right"
                 elif not has_start and has_end: subcase = "left"
                 else: subcase = "both"
                 spec = replace(spec, mode="mode2", subcase=subcase)
 
-        # POST-COMMIT SHIFT. FSM can't know a unit is quarantined: when 1 (U) ends inside the window before the text target starts (1st candidate, 
+        # POST-COMMIT SHIFT. FSM can't know a unit is quarantined: when 1 (U) ends inside window before the text target starts (1st candidate, 
         # or open anchor of a right-truncated window), FSM commits U first and restarts its buffer at U's terminator − δ. Window does the same, 
         # and never moves left: U becomes the straddling committed predecessor that the commit mask below marks, and the target keeps its text. 
         # Materializing again drops the frames before the new start and relabels from it (P1/P2).
         text_start = target.start_s if target is not None else anchor_span.start_s if spec.subcase == "right" else None
         if text_start is not None:
-            ends = [span.end_s for span in rec.sentences if not span.reliable and spec.start_s < span.end_s <= text_start]
+            # A chunk's edge (a buffer at a stream start or after a cap) that cuts the unit leaves a headless I-run, which the FSM never
+            # commits, so only a unit that starts inside a chunk moves its edge.
+            ends = [span.end_s for span in rec.sentences if not span.reliable and spec.start_s < span.end_s <= text_start
+                    and (spec.input != "chunks" or span.start_s >= spec.start_s)]
             cut = max(ends, default=-np.inf) - seconds_to_frames(self.delta_s, rec.pose.fps) / rec.pose.fps
-            if cut > spec.start_s: return self.materialize(rec, replace(spec, start_s=cut))
-        if poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses).astype(np.float32, copy=False)
+            if cut > spec.start_s: return self.materialize(rec, replace(spec, start_s=cut), aug_seed, shifted=True)
         labels = make_bio_labels(
             timestamps, rec.sentences, spec.start_s, spec.end_s,
             video_duration_s=rec.pose.duration_s, untrusted=rec.untrusted_s,  # long uncaptioned stretches -> UNK (see make_bio_labels)
         )
+        labels[:prefix] = BIO["UNK"]   # through the terminator frame, as in S1's restart chunks (data/chunks.py)
 
         # χ from sampler bookkeeping (docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of a PREDECESSOR sentence 
         # straddling the window's left edge. In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's 
         # leftover tail is content FSM already emitted — the gate floors it unconditionally (no cross-seam duplication). The ANCHOR itself 
         # straddling the edge (Mode 2b) is MISSED-HEAD case, NOT a commit: FSM's commit log would show nothing there (χ=0 at inference), 
-        # so training mirrors it with χ=0 and leaves those frames to Ω (the posterior membership) — which is what lets translation vote to 
-        # relocate a start. Inference-parity of χ is invariant; the anchor test enforces it.
+        # so training mirrors it with χ=0. Inference-parity of χ is invariant; the anchor test enforces it.
+        # A chunk's left edge is no commit (the FSM's buffer at a stream start or after a cap has none), unless the shift put it there.
         commit_mask = np.zeros((poses.shape[0],), dtype=bool)
-        for span in rec.sentences:
+        for span in rec.sentences if spec.input != "chunks" or shifted else ():
             straddles = span.start_s < spec.start_s < span.end_s
             is_predecessor = anchor_span is None or span.start_s < anchor_span.start_s
             # Commit state is a time frontier, including any earlier context loaded by frame rounding.
             if straddles and is_predecessor: commit_mask |= timestamps < span.end_s
+        commit_mask[:committed] = True
+        # Target's B frame (after the committed frames) and terminator frame, and its last unit's B frame, found with the comparisons
+        # of labels, kept as their own window-relative times: the model finds those frames again by time
+        # (models.streaming_slt gt_target_spans, _text_crop), with no rounding tie.
+        rel, target_span, last_start = timestamps - spec.start_s, None, None
+        if target is not None:
+            target_span = (float(rel[onset(target.start_s)]), float(rel[int(np.count_nonzero(timestamps < target.end_s))]))
+            last_start = float(rel[onset(run[-1].start_s)])
+        # An arm's window: every frame whose head output reads a window edge (data.chunks.edge_mask, the arm's reach) is UNK, as in S1's
+        # window inputs. Only the BIO loss reads the labels; the target, its frames and the commit mask above are fixed already.
+        if spec.input == "windows" and self.edge_reach is not None: labels[edge_mask(rel, self.edge_reach)] = BIO["UNK"]
         return WindowSample(
-            spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, translation_target=target, 
-            fps=float(rec.pose.fps), commit_mask=commit_mask, candidate_sentences=candidates
+            spec=spec, poses=poses, timestamps_s=rel, bio_labels=labels, translation_target=target, fps=fps,
+            commit_mask=commit_mask, candidate_sentences=candidates, target_pause_after=pause_after, target_span_s=target_span,
+            target_last_start_s=last_start,
         )
 
     @staticmethod
@@ -343,6 +454,11 @@ class WindowSampler:
             "spec": asdict(sample.spec), "poses": sample.poses, "timestamps_s": sample.timestamps_s,
             "bio_labels": sample.bio_labels, "commit_mask": sample.commit_mask, "fps": sample.fps,
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
+            # Window-relative times of the B frame and the terminator frame of the GT unit(s) the text target covers: 
+            # the crop the translator trains on (models.streaming_slt).
+            "target_span_s": None if sample.target_span_s is None else list(sample.target_span_s),
+            "target_last_start_s": sample.target_last_start_s,
+            "target_pause_after": bool(sample.target_pause_after),
             "candidate_sentences": [
                 {"start_s": float(sp.start_s - sample.spec.start_s), "end_s": float(sp.end_s - sample.spec.start_s), "text": sp.text} 
                 for sp in sample.candidate_sentences

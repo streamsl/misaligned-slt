@@ -1,10 +1,10 @@
 from __future__ import annotations
 from collections import Counter
 from pathlib import Path
-import argparse
-import json
+import argparse, json, random
 
 import torch
+import numpy as np
 from data.windowing import BIO
 from data.batch import collate_windows
 from data.loader import load_language_records
@@ -65,6 +65,11 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; without them this is a no-op and the run is a single process.
     dist_device = dist.init_distributed()
+    seed = int(load_yaml({
+        "train-bio": args.bio_config, "train-moryossef": args.moryossef_config
+    }.get(args.stage, args.slt_config)).get("seed", 42))
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+
     if args.stage == "smoke-data": result = smoke_data(args)
     elif args.stage == "train-bio":
         from train.bio_pretrain import build_bio_s1, train_bio_s1_epochs
@@ -80,7 +85,7 @@ if __name__ == "__main__":
         ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-moryossef":
-        # Faithful Moryossef external segmenter for the RQ2 cascade: its own landmarks and UNet, independent of the FSM head. 
+        # Faithful Moryossef external segmenter for the cascade rows: its own landmarks and UNet, independent of the FSM head. 
         # Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
         from moryossef26.trainer import build_moryossef, build_moryossef_loaders, train_moryossef_epochs
         train_loader, dev_loader, cfg = build_moryossef_loaders(args.data_config, args.moryossef_config, language=args.language)
@@ -106,8 +111,9 @@ if __name__ == "__main__":
         device = dist_device or pick_device(args.device)
         optimizer = build_optimizer(slt_cfg, components.model.parameters())   # one group: every stage-2 module at learning_rate
         log_rows = train_slt_epochs(
-            components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
-            dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,
+            components.model, components.train_loader, optimizer, device=device, epochs=epochs, 
+            slt_cfg=slt_cfg, inference_cfg=components.inference_cfg, dev_loader=components.dev_loader, 
+            resume=args.resume, checkpoint_meta=components.checkpoint_meta, monitor_records=components.monitor_records, 
         )
         path = save_model_checkpoint(
             components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"), meta=components.checkpoint_meta,

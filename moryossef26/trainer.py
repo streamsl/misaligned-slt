@@ -1,24 +1,27 @@
-"""Faithful Moryossef 2026 external segmenter for the RQ2 cascade.
+"""Faithful Moryossef 2026 external segmenter for the cascade rows.
 
 Their 50 landmarks (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: their own input contract, not the
 in-system head's Uni-Sign features. Standalone on whole-video chunks, never the FSM head's bio_head_init. Everything else 
-is S1's (train/bio_pretrain.py): pool and rotation, chunk tiling, augmentation, labels, dev monitor and best-epoch floor.
+is S1's (train/bio_pretrain.py): pool and rotation, chunk tiling, augmentation, labels, dev monitor and best-epoch floor. It draws
+plain chunks only (the release trains on chunks), not S1's windows or restart chunks; ChunkDataset refuses them with `release`.
 """
 from __future__ import annotations
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from data.chunks import ChunkDataset
 from data.loader import (ANNOTATION_PROTOCOL, PooledEpochRecords, annotation_fingerprint, resolve_pretrain_records,
                          segmenter_language_fingerprints, streaming_loader)
+from data.windowing import BIO
 from moryossef26.dataset import collate_moryossef_chunks, fit_release_stats
 from moryossef26.model import MoryossefSegmenter, load_moryossef_pretrained
 
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
-from train.helpers import build_optimizer, evaluate_bio_chunks, run_epoch_loop
-from utils import load_yaml, checkpoint_dir, pool_key
+from train.helpers import build_optimizer, evaluate_segmenter, run_epoch_loop, segmenter_monitor_config
+from utils import cfg_get, load_yaml, checkpoint_dir, pool_key
 
 
 def build_moryossef_loaders(
@@ -50,22 +53,29 @@ def build_moryossef_loaders(
     # Same rotation contract and best-epoch floor as S1 (train/bio_pretrain.py): a pooled run re-draws its balanced 
     # sub-sample each epoch, and no epoch before the rotation's first full cycle can become the best checkpoint.
     pool = PooledEpochRecords(cfg, data_cfg, language) if pretrain_mix else None
-    # Provenance stamp, same keys S1 writes: without it a pooled baseline checkpoint is indistinguishable
-    # from a monolingual one at load time and eval.py's pool assertion can never fire for this arm.
+    # Provenance stamp, same keys S1 writes: without it a pooled baseline checkpoint is indistinguishable from a 
+    # monolingual one at load time and the pool assertion in evaluation/systems.py can never fire for this arm.
     cfg["checkpoint_meta"] = {
         "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(train_records),
-        "language_fingerprints": segmenter_language_fingerprints(cfg, data_cfg, language, train_records),  # require_segmenter_data
-        "language": cfg.get("language"), "bio_class_weights": cfg.get("bio_class_weights"),
+        "language_fingerprints": segmenter_language_fingerprints(cfg, data_cfg, language, train_records),
+        "language": cfg.get("language"), "bio_class_weights": cfg["bio"]["class_weights"],
         "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "release_stats": release_stats,
+        "pretrain_weights": cfg_get(cfg, "pretrain", "weights"), "pretrain_dev_languages": cfg_get(cfg, "pretrain", "dev_languages"),
+        "pretrain_inputs": list(cfg["pretrain"]["inputs"]),   # as S1 stamps its list, so --resume refuses a change
         "initialization": (cfg.get("checkpoint", {}) or {}).get("from_pretrained"),
         "learning_rate": float(cfg["learning_rate"]),  # --resume refuses a drifted rate the optimizer load would restore
         "augmentation": cfg.get("augmentation"),       # and a changed augmentation, as S1 does
-        "best_epoch_floor": pool.cycle_epochs() if pool else 0,
+        "best_epoch_floor": pool.cycle_epochs() if pool else 0, "seed": seed,
     }
-    # Dev is balanced by the same rule as train (see train/bio_pretrain.py for the argument) and never rotates.
+    # Dev holds every record of each pooled language (see train/bio_pretrain.py) and never rotates.
     # Stamped for the same reason S1 stamps it: the two arms' monitors are only comparable next to their dev sets.
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = cfg["checkpoint_meta"]["pretrain_dev_mix"] = dev_mix
+    # S1's checkpoint selection: these dev records as whole streams under the scoring of the rows (train.helpers.evaluate_segmenter).
+    cfg["video_monitor"] = segmenter_monitor_config(data_cfg, dev_records)
+    cfg["checkpoint_meta"].update(
+        monitor_decode="semi_markov_viterbi", monitor_protocol="edge_chunk_f1_avg_complete_spans", monitor_edge=cfg["video_monitor"]["edge"],
+    )
     # One fixed chunk length, C = L_min = (num_frames - 1) / fps: a floored-and-ceiled window loads at most num_frames frames,
     # so a training chunk is one RoPE pass. fps is the highest record rate, so no record's chunk holds more than num_frames; 
     # a pool that mixes rates gives its slower records shorter chunks. The release contract (50 landmarks, fitted table, 
@@ -73,14 +83,14 @@ def build_moryossef_loaders(
     chunk_s = (int(cfg.get("num_frames", 1024)) - 1) / max(float(rec.pose.fps) for rec in (*train_records, *dev_records))
     release = {"stats": release_stats, "velocity": bool(cfg.get("velocity", True))}
     train_ds = ChunkDataset(
-        train_records, chunk_s, chunk_s, augmentation=cfg["augmentation"], seed=seed, records_for_epoch=pool, release=release
+        train_records, chunk_s, chunk_s, augmentation=cfg["augmentation"], seed=seed, records_for_epoch=pool, inputs=cfg["pretrain"]["inputs"],
+        release=release,
     )
     dev_ds = ChunkDataset(dev_records, chunk_s, chunk_s, seed=seed, deterministic=True, release=release)
     print(f"segmenter | {len(train_ds)} train chunks/epoch, {len(dev_ds)} dev chunks ({train_ds.chunk_s:g} s)", flush=True)
     num_workers = int(cfg.get("num_workers", 0))
-    bs = dist.per_rank_batch_size(int(cfg.get("batch_size", 8)))
-    train_loader = streaming_loader(
-        train_ds, bs, collate_moryossef_chunks, num_workers=num_workers,
+    train_loader = streaming_loader(   # batch_size: the global batch (data.loader.streaming_loader)
+        train_ds, int(cfg.get("batch_size", 8)), collate_moryossef_chunks, num_workers=num_workers,
         bucket_by_length=True, bucket_seed=seed,
     )
     # Batch 1: the release model attends to zero padding (no key mask), and whole-video and online inference never pad, 
@@ -90,8 +100,8 @@ def build_moryossef_loaders(
 
 
 def build_moryossef(moryossef_config: str, pretrained: bool = True, seed: int | None = None) -> MoryossefSegmenter:
-    # `pretrained=False` + an explicit `seed` is random-init control (eval --segmenter-init random): same architecture and same input 
-    # contract with nothing transferred, which is the range a released-weights score has to be read against.
+    # `pretrained=False` + an explicit `seed` is random-init control (eval --segmenter-init random): same architecture and 
+    # same input contract with nothing transferred, which is the range a released-weights score has to be read against.
     cfg = load_yaml(moryossef_config)
     if seed is not None: torch.manual_seed(int(seed))
     pose_dim = 6 if bool(cfg.get("velocity", True)) else 3  # +velocity doubles the per-keypoint channel dim
@@ -112,22 +122,39 @@ def build_moryossef(moryossef_config: str, pretrained: bool = True, seed: int | 
     return model
 
 
+def global_batch_padding(batch: dict) -> dict:
+    """Under torchrun, in a training step: this rank's chunks padded to the longest chunk of the GLOBAL batch, as 1 process pads
+    the global batch (collate_moryossef_chunks: zero poses and timestamps, UNK labels). The release attends to its padding and
+    counts it in BatchNorm (moryossef26.model), so a part padded only to its own longest chunk trains another model; frame
+    dropout makes chunk lengths differ in almost every batch. Else the batch unchanged."""
+    grow = dist.max_shape(batch["bio_labels"])[1] - batch["bio_labels"].shape[1]
+    if not grow: return batch
+    pad = lambda x, value=0: F.pad(x, (0, 0) * (x.dim() - 2) + (0, grow), value=value)
+    return {**batch, "poses": pad(batch["poses"]), "timestamps_s": pad(batch["timestamps_s"]),
+            "bio_labels": pad(batch["bio_labels"], BIO["UNK"]), "frame_mask": pad(batch["frame_mask"], False)}
+
+
 def train_moryossef_epochs(model, train_loader, dev_loader, device, epochs, cfg, resume: bool = False) -> int:
-    dice_weight = float(cfg.get("dice_loss_weight", 1.5))
-    class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
+    dice_weight = float(cfg["bio"]["dice_loss_weight"])
+    class_weights = bio_class_weight_tensor(cfg["bio"]["class_weights"])
     if class_weights is not None: class_weights = class_weights.to(device)
     optimizer = build_optimizer(cfg, model.parameters())  # end-to-end: UNet + RoPE + head all train
+    model.release_stats = cfg["checkpoint_meta"]["release_stats"]
 
     def step_fn(batch, _epoch):
+        batch = global_batch_padding(batch)
         logits = model(batch["poses"], timestamps_s=batch["timestamps_s"])["phrase"]
         loss = bio_nll_dice_loss(logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=class_weights)
         return loss, {"bio_loss": float(loss.detach())}
 
     return run_epoch_loop(
         name="moryossef", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, 
-        step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_bio_chunks(model, dev_loader, device, dice_weight, class_weights),
-        default_monitor="val_phrase_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
-        # Same wiring as S1 (train/bio_pretrain.py): without it the SAVE-ON-BEST model.pt and latest.pt carry no meta, 
-        # so eval.py's pool-provenance assertion could never fire for this arm and --resume could not detect config drift. 
+        step_fn=step_fn, evaluate_fn=lambda epoch: evaluate_segmenter(
+            model, dev_loader, device, dice_weight, class_weights, cfg["video_monitor"],
+            velocity=bool(cfg.get("velocity", True)), rope_chunk_s=None,  # the UNet chunks internally at num_frames
+        ),
+        default_monitor="val_video_f1", default_mode="max", dev_loader=dev_loader, resume=resume,
+        # Same wiring as S1 (train/bio_pretrain.py): without it the SAVE-ON-BEST model.pt and latest.pt carry no meta, so the 
+        # pool-provenance assert in evaluation/systems.py can never fire for this arm and --resume can't detect config drift.
         checkpoint_meta=cfg["checkpoint_meta"], best_epoch_floor=cfg["checkpoint_meta"]["best_epoch_floor"],
     )

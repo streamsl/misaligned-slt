@@ -1,25 +1,39 @@
-# Streaming FSM constants, all in seconds. Code converts each to frames with the stream's own fps 
-# (utils.seconds_to_frames), so a corpus at another frame rate keeps the same times.
+# Streaming FSM constants, all in seconds. Code converts each to frames with the stream's own fps (utils.seconds_to_frames), 
+# so a corpus at another frame rate keeps the same times. Settings that follow from these are computed where they are used, 
+# not set here: the cap cut's window (infer.commit_gate.cap_cut_window), S1's longest training chunk (= buffer_cap_s), the 
+# BIO head's attention band (models.bio_head.band_radius_s) and the decode canvas (the method config's max_text_tokens).
 # The duration prior of the semi-Markov decoder is NOT here: it is fitted on the target language's TRAIN unit
 # durations wherever it is needed (infer.duration_decode.DurationModel.fit), with no dev-tuned weight.
 stride_s: 1.0
-# Latency/capacity bound: a buffer this long is force-committed (flagged PARTIAL). 40 s covers the train p99 unit
-# duration in current corpora and equals S1 maximum training context (bio_pretrain.yaml), which train-bio refuses 
-# to set below this value. Every translation recipe (clean floor, arms) clamps its windows here.
-# A hysteresis commit needs δ of lead-in (the buffer starts at previous terminator − δ) + (K-1)·stride after the
-# terminator (plus up to 1 stride of quantisation), so a unit longer than about 40 - 0.5 - 2 = 37.5 s commits only
-# through the forced path. A pause before a unit also uses cap space, so a few units shorter than 37.5 s can be cut
-# open. The left-truncated tail of a force-committed unit is never translated: Mode-2b training gives the decoder no
-# translation supervision on headless fragments, and the unit's head was already emitted PARTIAL.
+# Latency/capacity bound: at this buffer length a complete span is force-committed (flagged PARTIAL). 40s covers the train 
+# p99 unit duration in current corpora and is S1's longest training chunk (train-bio reads it here, and the checkpoint
+# stamps it). Every translation recipe (clean floor, arms) clamps its windows here.
+# A hysteresis commit needs δ of lead-in (buffer starts at previous terminator − δ, or δ before a span that the cap kept) 
+# + (K-1)·stride after terminator (plus up to 1 stride of quantization), so unit longer than about 40 - 0.5 - 2 = 37.5s 
+# commits only via forced path. An open span gets no whole event (P1 at inference): the cap keeps one that starts more 
+# than δ after the buffer start (the next buffer starts δ before it), so a pause or a leftover before a unit doesn't use 
+# its cap space. Any other open span with a decoded start runs about 40 - 0.5 = 39.5s or longer with no decoded boundary 
+# (segmenter merges cause most of these): the cap cuts it (the cap cut below). The cap drops a gap or a leftover. The rest 
+# of a cut or dropped span starts the next buffer as an I-run, which never opens: Mode-2b training gives the decoder no 
+# translation supervision on headless fragments.
 buffer_cap_s: 40.0
+# The cap cut: the one declared exception to P1 at inference. P1 stays a training rule with no exception. It fires at a 
+# cap pass that would drop an open span with a decoded start: the span starts within δ of the buffer start, or the cap 
+# kept it already (keep once). The cut c is the frame with lowest head P(I) over buffer time [cap / 2, cap - (K-1)·stride] 
+# (infer/commit_gate.cap_cut_window and cap_cut_frame; 20 to 38s here). The closed part [start, c] commits once as 1 event, 
+# flagged cap_cut (not PARTIAL), if it holds Λ_min. The next buffer starts δ before c with the frames before c committed, and
+# c certifies no start, so the rest opens only on a start the head decodes at or after c; a leftover (no decoded start) is not
+# cut, and the stream end still drops an open span. Window ends (K-1)·stride before buffer end, where the head's banded
+# attention still lacks look-ahead. The offline rows have no buffer cap: every complete span stays whole there.
 boundary_stability:
-    # delta_s (δ) plays 3 coupled roles:
+    # delta_s (δ) plays 3 coupled roles, and the loader reads it as a label rule (data.loader._clamp_overlaps: 2 cues that overlap
+    # by more than δ have no boundary known to δ, so both units are quarantined; a change of δ changes the labels of every corpus):
     #   1. terminator-stability tolerance: the commit condition = the target span's terminator (first O-or-B —
     #      back-to-back sentences terminate on the next B, not on a closing O) moved ≤ δ over the last
     #      hysteresis_strides strides;
-    #   2. post-commit overlap: the buffer is cut at (terminator − δ), so an estimate late by ≤ δ still leaves
-    #      the next sentence's B in the buffer (the leftover tail is not re-emitted: buffer-start I does not open
-    #      a span, and candidate_spans skips any span terminating at or before the commit frontier χ);
+    #   2. post-commit overlap: the buffer is cut at (terminator − δ); the δ frames are left context only (they are
+    #      committed, so the decode tags them UNK and nothing in them is emitted again); after a real terminator the
+    #      next sentence opens at the commit frontier χ (known start);
     #   3. span-identity tolerance: each candidate span keeps its own hysteresis history (infer/commit_gate.CommitGate);
     #      a start that moves > δ is another span with its own history.
     delta_s: 0.5 # 12 frames at 24 fps, 13 at 25 fps, 15 at 30 fps
@@ -32,11 +46,7 @@ span_selection:
     # Λ_min: the shortest span the FSM may commit. A LABEL-domain floor: it answers "what is the shortest unit we are 
     # willing to emit", which is a property of the annotation, not of the head's boundary noise. 0.5s rejects brief 
     # flicker. Any genuine unit below this floor cannot be emitted exactly; report its count and the resulting recall 
-    # ceiling. A low duration percentile is not a minimum. It is NOT the re-emission guard: that is the commit-frontier 
-    # filter candidate_spans(skip_term_before=χ), which uses the commit log instead of a worst-case length bound.
+    # ceiling. A low duration percentile is not a minimum. It is NOT the re-emission guard: that is committed prefix,
+    # which the decode tags UNK (infer/commit_gate.candidate_spans), not a worst-case length bound. Its one source:
+    # the loader's clean-segment floor, the sampler, the gate and the FSM all read it here (utils.lambda_min_s).
     min_span_s: 0.5
-translation: # the decode reads the whole buffer under the Ω soft crop, the conditioning stage 2 trains
-    # Decode canvas. Keep at or above the training ceiling (configs/dlm.yaml max_text_tokens): a caption unit can hold
-    # several sentences, so a shorter decode canvas would truncate exactly the long units the arm was trained to emit.
-    # The block decode walks blocks until every row has emitted EOS, so an unreached slot costs nothing.
-    max_text_tokens: 320

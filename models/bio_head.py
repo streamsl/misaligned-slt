@@ -1,17 +1,49 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from poses import normalize_keypoints_unisign
+from utils import FRAME_SLACK
 
+BAND_SLACK_S = 1e-4  # absorbs f32 rounding of k/fps timestamps, so a key exactly r away stays inside. Far below any frame period
+
+def band_frames(radius_s: float, fps: float) -> int:
+    # The band in whole frames at `fps`, as `attention_mask` reads it: the farthest key is at most radius_s + BAND_SLACK_S away.
+    return math.floor((float(radius_s) + BAND_SLACK_S) * float(fps))
+
+def band_radius_s(reach_frames: int, depth: int, horizon_s: float, fps: float) -> float:
+    """The head's attention band, derived: the widest whole-frame band at `fps` for which a frame's logits read at most `horizon_s` 
+    ahead, i.e. reach_frames + depth x band <= horizon_s x fps frames, with `reach_frames` the temporal convs' reach and `depth` the 
+    banded layers (train.bio_pretrain.edge_reach). At any faster rate the band holds at most radius x rate frames and the convs reach 
+    less time, so the reach fits there too. A stream on which the reach would pass the horizon is refused (`require_band_reach`), for 
+    example a 16 fps stream under the 24 fps band (not every slower rate: 15 and 20 fps fit)."""
+    band = math.floor((float(horizon_s) * float(fps) - int(reach_frames) + FRAME_SLACK) / int(depth))
+    if band < 1: raise SystemExit(
+        f"At {float(fps):g} fps the temporal convs alone reach {int(reach_frames)} frames, so no attention band fits the "
+        f"{float(horizon_s):g} s look-ahead of a K-stride commit: raise stride_s or hysteresis_strides, or train on faster poses."
+    )
+    return band / float(fps)
+
+def require_band_reach(reach: dict, fps: float, horizon_s: float) -> None:
+    """Refuse a stream on which a frame's logits read more than `horizon_s` ahead (spec §1.4 rule 16): `reach` is the head's
+    train.bio_pretrain.edge_reach (conv frames, band radius, depth). The band was derived at the slowest train rate, so a slower
+    stream, or a smaller stride or K than the head trained under, can break it. The FSM checks every stream it starts."""
+    frames = int(reach["frames"]) + int(reach["depth"]) * band_frames(reach["radius_s"], fps)
+    if frames > float(horizon_s) * float(fps) + FRAME_SLACK: raise SystemExit(
+        f"At {float(fps):g} fps the BIO head reads {frames / float(fps):.3f} s ahead (band {float(reach['radius_s']):g} s), "
+        f"more than the {float(horizon_s):g} s before a K-stride commit: retrain S1 on a pool that holds this frame rate."
+    )
 
 @dataclass
 class BIOHeadOutput:
     logits: torch.Tensor
-
+    # With a residual: the mean per-frame ||residual|| / ||normalized input|| on valid frames (detached), 
+    # i.e. how much the added features weigh against the head's own input. None without a residual.
+    residual_share: torch.Tensor | None = None
 
 class RoPETransformerEncoderLayer(nn.Module):
     """Pre-norm transformer encoder layer with Rotary Position Embedding (RoPE).
@@ -21,7 +53,7 @@ class RoPETransformerEncoderLayer(nn.Module):
     """
     REFERENCE_FPS = 50.0
 
-    def __init__(self, hidden_dim: int = 384, nhead: int = 8, dim_feedforward: int = 768, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, nhead: int, dim_feedforward: int, dropout: float):
         super().__init__()
         if hidden_dim % nhead != 0: raise ValueError(f"hidden_dim={hidden_dim} must be divisible by nhead={nhead}")
         self.nhead = int(nhead)
@@ -70,8 +102,8 @@ class RoPETransformerEncoderLayer(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = q * cos + self._rotate_half(q) * sin
         k = k * cos + self._rotate_half(k) * sin
-        # Residual (attention-output) dropout, not SDPA's dropout_p: the fused MPS SDPA kernel raises
-        # NotImplementedError on in-kernel dropout; negligible difference at p=0.1.
+        # Residual (attention-output) dropout, not SDPA's dropout_p: the fused MPS SDPA kernel raises NotImplementedError 
+        # on in-kernel dropout. The difference is negligible at the dropout rates of dlm.yaml bio.dropout.
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x + self.attn_drop(self.out_proj(attn.transpose(1, 2).reshape(batch, frames, hidden_dim)))
         return x + self.ffn(self.norm2(x.float()).to(x.dtype))
@@ -87,7 +119,7 @@ def attention_mask(
     our variable windows would leave ghost keys at train and none at inference, the exact mismatch his rule targets.
 
     Band (`attention_radius_s` r): query i attends key j only if |t_i - t_j| <= r seconds, so a frame's output reads a bounded
-    stretch of time and doesn't change when the buffer grows beyond it (dlm.yaml bio_attention_radius_s). The diagonal always stays
+    stretch of time and doesn't change when the buffer grows beyond it (S1 derives r: `band_radius_s`). The diagonal always stays
     open, so no row is empty (no NaN), padded rows included. r=None is the full-attention key-padding mask, shape (B,1,1,T).
     """
     km = None if key_mask is None else key_mask.to(dtype=torch.bool)
@@ -97,8 +129,7 @@ def attention_mask(
         return km[:, None, None, :]
     if timestamps_s is None: raise ValueError("attention_radius_s needs timestamps_s: the band is a time window, not a frame count")
     ts = timestamps_s if timestamps_s.dim() == 2 else timestamps_s.unsqueeze(0)
-    # 1e-4 s absorbs float32 rounding of k/fps timestamps, so a key exactly r away stays inside; far below any frame period.
-    allowed = (ts[:, :, None] - ts[:, None, :]).abs() <= float(attention_radius_s) + 1e-4       # (B, T, T)
+    allowed = (ts[:, :, None] - ts[:, None, :]).abs() <= float(attention_radius_s) + BAND_SLACK_S       # (B, T, T)
     if km is not None: allowed = allowed & km.to(device=allowed.device)[:, None, :]
     allowed = allowed | torch.eye(ts.shape[-1], dtype=torch.bool, device=allowed.device)
     return allowed[:, None]
@@ -195,13 +226,13 @@ class TemporalConvStem(nn.Module):
     Moryossef's ablations credit UNet skip convolutions for boundary precision (Moryossef 2026 release, dist/2026/EXPERIMENTS.md, 
     findings 8/23: "CNN naturally detects B"; "UNet skip connections are critical for sign boundary precision"). This head reads 
     pose tokens directly with no UNet, so without a stem it is a transformer/BiLSTM tagger — weak on B, which feeds commit gate's 
-    terminator δ_enc stability and RQ2 tIoU. 2 conv layers, not the full UNet, to keep the head small.
+    terminator δ_enc stability and the edge scores. 2 conv layers, not the full UNet, to keep the head small.
 
     Stride 1 + odd kernel + 'same' padding keeps length, so per-frame BIO labels stay aligned. Per-position RMSNorm
     (channels only) is length- and batch-independent: no train/inference mismatch over the growing streaming buffer
     (unlike BatchNorm running stats or a time-pooling GroupNorm).
     """
-    def __init__(self, hidden_dim: int, num_layers: int = 2, kernel_size: int = 5, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, num_layers: int, kernel_size: int, dropout: float):
         super().__init__()
         if kernel_size % 2 != 1: raise ValueError(f"conv stem kernel must be odd to preserve length; got {kernel_size}")
         self.convs = nn.ModuleList([
@@ -235,9 +266,8 @@ class RoPEBIOHead(nn.Module):
     `attention_radius_s` bands every RoPE layer to +-r seconds (see `attention_mask`); None = full attention.
     """
     def __init__(
-        self, input_dim: int, hidden_dim: int = 384, depth: int = 4, nhead: int = 8, 
-        ff_mult: int = 2, dropout: float = 0.1, num_classes: int = 4,
-        conv_stem_layers: int = 2, conv_stem_kernel: int = 5, attention_radius_s: float | None = None,
+        self, input_dim: int, *, hidden_dim: int, depth: int, nhead: int, dropout: float, conv_stem_layers: int,  # dlm.yaml bio:
+        ff_mult: int = 2, num_classes: int = 4, conv_stem_kernel: int = 5, attention_radius_s: float | None = None,
     ):
         super().__init__()
         self.attention_radius_s = None if attention_radius_s is None else float(attention_radius_s)
@@ -251,17 +281,28 @@ class RoPEBIOHead(nn.Module):
         self.phrase_bio_head = ClassifierHead(hidden_dim, num_classes)
 
     def encode(
-        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None, residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         proj = self.input_proj(features)
         x = self.input_norm(proj.float()).to(proj.dtype)  # fp32 RMSNorm (see layer note)
+        # A residual (stage 2's bio_adapter) joins AFTER the norm, so its weight acts at 
+        # the scale of the normalized input, whatever the size of the encoder's tokens.
+        if residual is not None:
+            valid = frame_mask.bool() if frame_mask is not None else torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+            ratio = residual.detach().float().norm(dim=-1) / x.detach().float().norm(dim=-1).clamp(min=1e-6)
+            self.last_residual_share = ratio[valid].mean() if bool(valid.any()) else ratio.new_zeros(())
+            x = x + residual.to(x.dtype)
         # Mask-aware conv stem (see TemporalConvStem), then one banded RoPE pass: whole-video callers window 
         # the input to the trained context first (`chunk_normalized_logits`), so the head never chunks.
         x = self.conv_stem(x, key_mask=frame_mask)
         return chunked_rope_encode(self.layers, x, timestamps_s, None, key_mask=frame_mask, attention_radius_s=self.attention_radius_s)
 
     def forward(
-        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, frame_mask: torch.Tensor | None = None
+        self, features: torch.Tensor, timestamps_s: torch.Tensor | None = None, 
+        frame_mask: torch.Tensor | None = None, residual: torch.Tensor | None = None,
     ) -> BIOHeadOutput:
-        hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
-        return BIOHeadOutput(logits=self.phrase_bio_head(hidden))
+        hidden = self.encode(features, timestamps_s=timestamps_s, frame_mask=frame_mask, residual=residual)
+        return BIOHeadOutput(
+            logits=self.phrase_bio_head(hidden), residual_share=self.last_residual_share if residual is not None else None
+        )

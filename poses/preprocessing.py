@@ -35,14 +35,13 @@ def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.n
     [-1,1], so a part's size encodes its real scale relative to the body (a phonological cue). Low-confidence
     points (conf <= thr) are zeroed. `thr=0.3` is Uni-Sign's hardcoded value — keep it to match their weights.
 
-    Args:
-        keypoints: (frames, 133, 3) x, y, confidence — COCO-WholeBody, coords NORMALIZED per-axis to [0,1]
-            (x/W, y/H), the exact domain the released Uni-Sign checkpoints were trained on. crop_scale below uses 
-            a SINGLE shared scale for both axes, so it is invariant to UNIFORM scaling but aspect-ratio DEPENDENT 
-            — feeding pixels (x·W, y·H, W≠H) would distort the skeleton. SignVerse feeds this same [0,1] domain 
-            and reproduces the paper BLEU; SignVerse (prepare_yt25.py) keeps its stored [0,1] unchanged.
-    Returns:
-        (frames, 69, 3) in part order [body 9 | left 21 | right 21 | face_all 18].
+    keypoints: (frames, 133, 3) x, y, confidence — COCO-WholeBody, coords as poses.load_pose_frames returns them:
+        the stored per-axis [0,1] (x/W, y/H) with x mapped to a 16:9 frame (pose_io.REFERENCE_ASPECT), the domain 
+        of the released Uni-Sign checkpoints on 16:9 video. crop_scale below uses a SINGLE shared scale for both 
+        axes, so it is invariant to UNIFORM scaling but aspect-ratio DEPENDENT: without that map a 4:3 or portrait 
+        video gives a distorted skeleton. A 16:9 video reaches this function as stored.
+
+    Returns: (frames, 69, 3) in part order [body 9 | left 21 | right 21 | face_all 18].
     """
     if keypoints.shape[1:] != (133, 3):
         raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')

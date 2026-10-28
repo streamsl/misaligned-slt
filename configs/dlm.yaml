@@ -6,19 +6,27 @@ language_model:
 checkpoint:
     dir: checkpoints/dlm/${language} # best model.pt + best.json saved here
     # S1 init (train.py --stage train-bio) of the SEGMENTATION branch: S1's pose encoder and BIO head, pre-trained together
-    # on whole-input chunks (data/chunks.py); the translator keeps its own warm-start encoder (models/streaming_slt.py).
-    # Multilingual SEGMENTATION pretraining (configs/bio_pretrain.yaml pretrain_languages) writes 1 language-agnostic checkpoint
+    # on input types of bio_pretrain.yaml pretrain.inputs (data/chunks.py); the translator keeps its own warm-start encoder
+    # (models/streaming_slt.py).
+    # Multilingual SEGMENTATION pretraining (configs/bio_pretrain.yaml pretrain.languages) writes 1 language-agnostic checkpoint
     # under checkpoints/bio_s1/multi_<pool>/. Point here for monolingual S1 recipe: checkpoints/bio_s1/${language}/model.pt
-    # `auto` resolves through utils.checkpoint_dir against configs/bio_pretrain.yaml, so a pooled S1 is found by its pool key and
-    # this file never carries a stale copy of the pool name. An explicit path still wins.
+    # `auto` resolves through utils.checkpoint_dir against configs/bio_pretrain.yaml, so a pooled S1 is found by its pool key 
+    # and this file never carries a stale copy of the pool name. An explicit path still wins.
     bio_head_init: auto
-    # Translator warm start: data.yaml `languages[lang].pretrained_slt` (utils.resolve_pretrained), which must be re-rooted to
-    # this language's clean translator. train-slt refuses a file without clean-floor meta (the released file), and refuses a 
-    # local file of another language, cap or annotation set.
+    # Translator warm start: data.yaml `languages[lang].pretrained_slt.<decoder>` (utils.resolve_pretrained; dlm here, ar for
+    # ar.yaml), which must be re-rooted to this language's clean floor of the same decoder. train-slt refuses a file without
+    # clean-floor meta (the released file), and refuses a local file of other language, decoder, block_size (dlm), augmentation
+    # or cap. A file of another annotation set only warns. A DLM arm also loads its DLM floor's canvas ([MASK] row, tables).
     save_best: true # write on every new best dev value (not just end of training)
-    monitor: val_joint_score # Dev-window F1 times translation BLEU: a joint selection surrogate, not DVC.
+    monitor: val_offline_score  # edge chunk F1 avg x edge chunk DVC BLEU-4 avg (the main scores) of the --offline row
     mode: max
     restore_best: true
+    eval_every_epochs: 1        # early_stopping.patience counts evaluations, so set them together
+    # Only for monitor val_online_score: the streaming FSM reads whole dev source videos in a seeded random order up to this
+    # many pose hours (0 = off), which caps the cost of 1 evaluation. The offline monitor does not read it. The clean floor
+    # has no segmentation branch, so it runs no monitor of this kind.
+    online_dev_hours: 4.0
+    dev_batch_size: 16
 decoder: dlm
 wandb:
     enabled: false
@@ -28,8 +36,8 @@ wandb:
 lambda_bio: 1.0
 lambda_trans: 1.0
 oput:
-    # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
-    # [0,1] wastes steps on near-trivial (t->0) and near-degenerate (t->1) masking.
+    # Mask ratio t ~ U(0.3, 0.8): the clipped schedule that BD3-LM Table 8 (arXiv 2503.09573) finds best at block 16. 
+    # DMax's own OPUT recipe uses a fixed 0.75. [0,1] wastes steps on near-trivial (t->0) and near-degenerate (t->1) masking.
     t_low: 0.3
     t_high: 0.8
     # The on-policy rollout is argmax (the greedy token SPD commits at temperature 0), computed under model.eval() + no_grad
@@ -37,17 +45,32 @@ oput:
     # Optimization PARITY with the AR arm, which trains with Uni-Sign's label smoothing 0.2 (models/unisign.py ar_loss).
     # Without it the DLM is the only arm with an unsmoothed CE.
     label_smoothing: 0.2
-membership_gate: # Exact first-complete-span membership from legal BIO paths. Live logits carry caption gradients.
+membership_gate: # Ω = a hard crop of the selected first span (its terminator frame included), as the cascade crops it.
     enabled: true
     eps: 1.0e-4 # finite floor for the log-membership bias
-    # On from step 0 (§1.4): train-slt refuses a segmentation branch without a trained S1 at checkpoint.bio_head_init,
-    # so the gate never couples to an untrained head (garbage conditioning, §1.2).
-    detach_omega: false # true = ablation "text doesn't train segmentation", so segmentation branch learns from BIO only.
-# Fixed coverage mix, shared by all datasets. A DESIGN choice, not a measured distribution: it gives each window state mass.
+    # On from step 0: train-slt refuses a segmentation branch without a trained S1 at checkpoint.bio_head_init, so the gate 
+    # never reads an untrained head (garbage conditioning). Each supervised row reads its predicted span when that span holds 
+    # the GT target within δ, else the δ-jittered GT span (models/streaming_slt.py). Crop's value carries no gradient. Text 
+    # trains segmentation branch only on rows whose target (1 unit or a joined run) is followed by a pause (> δ): via where the span
+    # from the target's last unit ends (a straight-through estimator), never at or before that unit's B frame, so text never rewards
+    # a merge.
+    detach_omega: false   # true = the ablation "text never trains segmentation" 
+# Stage-2 train rows (data/sampler.py WindowSampler.spec_for): each index draws one listed type that fits its anchor, in equal shares
+# from an rng of the index, so 1 and N GPUs draw the same rows. A restart chunk needs a reliable unit just before the anchor; at the
+# other anchors the index draws among the other listed types, so that type is a little rarer. Every row takes its text by the
+# first-complete-span rule on its own frames. Dev sets read windows only.
+#   windows         a designed window (mode_ratios, mode2_subcase_weights and jitter below). With a BIO head, every frame whose
+#                   receptive field reaches a window edge is UNK for the BIO loss; the text target, its crop and the commit mask stay.
+#   restart_chunks  starts δ before the gold terminator of the unit just before the anchor, length U(δ + K·stride, buffer cap): the
+#                   FSM's buffer after it commits that unit. The frames before the terminator frame are committed; through it, UNK.
+#   chunks          the same length law, with the anchor's onset at a uniform place; its left edge commits nothing.
+# Any non-empty subset; restart_chunks alone is refused (not every anchor has one). The clean floor reads [windows] (baseline_train.yaml).
+train_inputs: [chunks, windows, restart_chunks]
+# Fixed coverage mix, shared by all datasets (and by S1's window inputs, bio_pretrain.yaml pretrain.inputs). 
 mode_ratios:     # Edges and Mode-2 cut depths come from the designed `jitter:` block below
     mode1: 0.45  # mode1+mode3 = 0.65 complete-sentence targets
     mode2: 0.30  # mode2 trains the head on the truncated buffers the FSM meets at most strides (BIO only, no text, P1).
-    mode3: 0.20  # mode-3 window spans the anchor and its successor
+    mode3: 0.20  # mode-3 window spans the anchor's back-to-back run (gaps <= delta), else the anchor and its successor
     mode4: 0.05
 # Within Mode 2, each over-segmentation event yields one right-trunc + one left-trunc window, so right~=left dominate;
 # both-truncated is rare and "falls out of the sampler naturally". Uniform 1/3 would over-represent the interior case, 
@@ -56,72 +79,87 @@ mode2_subcase_weights:
     right: 0.45
     left: 0.45
     both: 0.10
-# No pose augmentation in stage 2 (and, by inheritance, the clean floor): both translators and the segmentation branch see
-# each record's native frame grid and unrotated poses, as at inference, so Λ_min and δ (seconds) become the frame counts of
-# the record's fps, as in the FSM. S1 sets its own block (bio_pretrain.yaml); it must be a full dict, because a child dict 
-# replaces this null whole (utils.load_yaml).
-augmentation: null
-# BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries O/I imbalance but gives
-# NO B-vs-I signal; B is ~1 frame/unit (under 1% of frames), so unweighted CE lets the class collapse. Inverse frequency
-# is far too hot on B and over-segments; `balanced` uses inverse-sqrt compromise, MEASURED on the corpus being trained
-# (train.losses.resolve_bio_class_weights) instead of pinning 1 dataset's constants — B's share is set by that corpus's
-# sentence rate, so no fixed vector ports. The resolved 4-list is saved with the run; an explicit {O,B,I} dict overrides it.
-bio_class_weights: balanced
-dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
-# In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
-# SLT training and S1 BOTH read these keys and MUST build the identical shape, or checkpoint.bio_head_init fails to
-# strict-load. Keep them here as the single source of truth; do not override in bio_pretrain.yaml.
-#   conv_stem_layers: the standalone Moryossef segmenter keeps the full UNet; this UNet-less head reads pose-token features
-#   directly, so a small Conv1d stem restores local boundary inductive bias (Moryossef 2026 release, dist/2026/EXPERIMENTS.md,
-#   findings 8/23) the commit gate's δ_enc stability and RQ2 tIoU depend on.
-bio_hidden_dim: 384
-bio_depth: 4
-bio_nhead: 8
-bio_dropout: 0.1
-bio_conv_stem_layers: 2
-# Banded attention: each RoPE layer attends only to frames within +-r seconds (models/bio_head.attention_mask). Receptive
-# field R <= 4 x 0.375 + (6 ST-GCN + 4 stem frames)/24 = 1.92 s at 24 fps (less at higher rate), within 2s between 3 strides.
-# This bounds direct neural look-ahead for fixed normalization and eval-mode features. Buffer normalization and the global
-# Viterbi path can still change; stability is checked, not guaranteed.
-bio_attention_radius_s: 0.375
+# Pose augmentation of every TRAIN input of every trained pose model: S1 and the clean floors and arms inherit this block
+# (bio_pretrain.yaml, baseline_*.yaml, ar.yaml); moryossef26.yaml, which extends nothing, holds a copy (a test checks that
+# they are equal). Dev inputs, eval and the FSM read each record's native grid. A project adaptation of the Moryossef 2026
+# release's density resampling (the release draws 25-50 fps on 50 fps poses, with a 5 % tempo stretch). The target rate is
+# a share of each record's own rate, so the recipe means the same on a corpus at any fps: 15-30 fps on 24 fps poses (only
+# targets more than 5 % below the native rate resample, poses.augmentation.apply_fps_aug). Labels, targets and the frame
+# counts of Λ_min and δ come from the kept frames (data/sampler.py materialize, data/chunks.py).
+augmentation:
+    fps: { min_factor: 0.625, max_factor: 1.25 }  # density resampling to U(min_factor, max_factor) x the record's own fps
+    frame_dropout: 0.15                           # remove U(0, rate) of the interior frames
+    body_part_dropout: 0.1                        # drop each hand with this probability
+    # speed_aug forbidden and no spatial transform
+# The BIO head and its loss: one block, read by stage 2, S1 (bio_pretrain.yaml extends this file) and eval.
+bio:
+  # BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries O/I imbalance but gives
+  # NO B-vs-I signal; B is ~1 frame/unit (under 1% of frames), so unweighted CE lets the class collapse. Inverse frequency
+  # is far too hot on B and over-segments; `balanced` uses inverse-sqrt compromise, MEASURED on the corpus being trained
+  # (train.losses.resolve_bio_class_weights) instead of pinning 1 dataset's constants — B's share is set by that corpus's
+  # sentence rate, so no fixed vector ports. The resolved 4-list is saved with the run; an explicit {O,B,I} dict overrides it.
+  class_weights: balanced
+  dice_loss_weight: 1.5 # weight on the Dice term in the in-model BIO head's NLL+Dice loss (S1 inherits this)
+  # In-model BIO head architecture. S1 (train.py --stage train-bio, bio_pretrain.yaml `extends` THIS file) and
+  # SLT training and S1 BOTH read these keys and MUST build the identical shape, or checkpoint.bio_head_init fails to
+  # strict-load. Keep them here as the single source of truth; do not override in bio_pretrain.yaml.
+  #   conv_stem_layers: the standalone Moryossef segmenter keeps the full UNet; this UNet-less head reads pose-token features
+  #   directly, so a small Conv1d stem restores local boundary inductive bias (Moryossef 2026 release, dist/2026/EXPERIMENTS.md,
+  #   findings 8/23) the commit gate's δ_enc stability and the edge scores depend on.
+  hidden_dim: 384
+  depth: 4
+  nhead: 8
+  dropout: 0.1
+  conv_stem_layers: 2
+  # Banded attention: each RoPE layer attends only to frames within +-r seconds (models/bio_head.attention_mask). r is not set
+  # here: train-bio derives it (models/bio_head.band_radius_s) as the widest whole-frame band whose receptive field, 10 frames
+  # of ST-GCN and stem kernels + depth bands, stays within (K-1)·stride = 2s before a commit at the slowest train frame rate: 
+  # 9/24 = 0.375 s at 24 fps (R = 1.92 s; 1/3 s at 15 fps, 0.40 s at 25 or 30 fps, 0.44 s at 50 fps). S1 stamps it, stage 2 and 
+  # eval read the stamp, and the FSM refuses a stream on which R passes that horizon. This bounds direct neural look-ahead for 
+  # fixed normalization and eval-mode features. Buffer normalization and the global Viterbi path can still change.
+  # Translator -> segmentation features: BIO head reads RMSNorm(input_proj(u)) + W LN(sg(v)) (the term joins after the head's
+  # input norm, so W acts at that scale whatever S1's token size), with u the segmentation pose encoder's output, v the 
+  # translator's per-frame ST-GCN features (bounded temporal look-ahead) and W zero-initialized, so step 0 is S1 + the 
+  # clean floor. Stop-gradient keeps BIO gradients out of the translator.
+  adapter: true  # false = two streams share nothing but Omega
+# One-stream arm (true): ONE pose encoder, clean translator's, read by BIO head and the translator and trained by both losses. 
+# Pooled S1's head reads it via a least-squares map to S1's encoder tokens, fitted on train windows when train-slt starts and 
+# folded into bio_head.input_proj (S1's encoder is only that target).
+shared_pose_encoder: false
 jitter:
-    # Designed window edges for stage 2 (S1 trains on whole-input chunks, data/chunks.py). Each edge offset is drawn from
-    # Uniform(-context_s, +context_s) around the anchor's boundaries, and Mode-2 cut depths uniformly from cut_range.
-    # Streaming buffers end at the clock and offline chunks at arbitrary frames, so an edge-at-boundary cue is false at
-    # deployment. The flat band reduces edge concentration; finite support and mode constraints still give edge cues.
-    # context_s = (K+1)·stride = 4 s adds context beyond the three-observation stability test; it is a design choice.
-    context_s: 4.0
+    # Designed window edges for stage 2, and for S1's window inputs when bio_pretrain.yaml pretrain.inputs lists windows (S1 
+    # stamps this block with mode_ratios and mode2_subcase_weights as pretrain_window_law, so an S1 --resume refuses a change). 
+    # Each edge offset is drawn from Uniform(-context_s, +context_s) around anchor's boundaries, and Mode-2 cut depths uniformly 
+    # from cut_range. Streaming buffers end at the clock and offline chunks at arbitrary frames, so an edge-at-boundary cue is 
+    # false at deployment. The flat band reduces edge concentration. Finite support and mode constraints still give edge cues.
+    context_s: 4.0          # = (K+1)·stride
     cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off edges so mode2 stays distinct from mode1/4
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
 grad_accum_steps: 1 # Effective batch = batch_size * grad_accum_steps
 num_workers: 4
-# Stage 2 fine-tunes 2 CONVERGED models (S1 and the clean translator, which already fits train to its smoothing floor),
-# so one small rate trains every module in one optimizer group, both pose encoders included (nothing is frozen). 1e-5 is a
-# judgment call that matches TwoStream-SLT's translator rate (arXiv 2211.01367 §4, App. B.2: 1e-5 for its MLP + translator,
-# 1e-3 for its visual heads, so it does not back 1e-5 for the pose encoders or the BIO head). No measurement on this model
-# supports it: watch dev BIO loss and translation CE over epochs 0-3.
-learning_rate: 1.0e-5
+# Stage 2 fine-tunes 2 CONVERGED models (S1 and the clean translator), so 1 rate trains every module in 1 optimizer group,
+# both pose encoders included (nothing is frozen).
+learning_rate: 1.0e-4
 weight_decay: 1.0e-4
 epochs: 50
-eval_every_epochs: 1
-early_stopping: # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
-    enabled: true # enabled: false to train the full `epochs`.
-    patience: 20
+early_stopping:    # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
+    enabled: false # enabled: false to train the full `epochs`. Stage 2 trains them all, so latest.pt holds the last epoch
+                   # (end of cosine) and model.pt the dev-selected best. S1, Moryossef and clean floor set their own block.
+    patience: 20   # evaluations: 20 x checkpoint.eval_every_epochs 1 = 20 epochs without a new best
     min_delta: 0.0
 scheduler:
     type: cosine
     warmup_epochs: 0
 max_grad_norm: 1.0
-# Text canvas ceiling, sized to the data like buffer_cap_s. A caption unit can hold several sentences, so target length
-# follows the unit distribution: longest unit that fits streaming buffer needs 281 mT5 tokens on ase, 177 on asf and 143
-# on bfi. The pool sets it, so one value covers every target. Block alignment is required (BD3LM attends bidirectionally
-# within a block, and `data.batch` refuses a canvas that would cap mid-block): 320 = 2^6 x 5 divides by every block size
-# worth running (4, 8, 16, 32, 64), so block-size dial below moves without a 2nd canvas. `train.slt.assert_targets_fit`
-# refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash
-# mid-epoch; when a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes
+# Text canvas ceiling, sized to the data like buffer_cap_s. A target joins back-to-back units of a window, so its length
+# follows joined runs. The longest joinable run of every corpus sets it, so 1 value covers every target. Block alignment 
+# is required (BD3LM attends bidirectionally within a block, and `data.batch` refuses a canvas that would cap mid-block): 
+# 448 = 28 x 16 divides by block sizes 4/8/16/32/64. `train.slt.assert_targets_fit`
+# refuses to start below the measured need — the collator never truncates complete target, so the alternative is a crash 
+# mid-epoch. When a new language or protocol moves the maximum, that guard reports the value to put here. Collator sizes 
 # each batch's canvas to its longest target (block-aligned), so the ceiling costs no compute.
-max_text_tokens: 320
+max_text_tokens: 448
 # Block size: BD3LM's interpolation dial between autoregression (block 1: 1 slot/block — AR order, with at most 1 soft-state 
 # revision pass/slot) and full diffusion (block = canvas). It bounds DLM arm's parallelism and is a TRAINING parameter — the 
 # block-causal mask, OPUT corruption and canvas alignment all read it — so it is stamped in the checkpoint and eval refuses 
@@ -129,8 +167,8 @@ max_text_tokens: 320
 # cost grows with the block; whether NUMBER of passes falls with it doesn't follow, because a block ends only when all of its 
 # slots have committed and settled — that is a property of the trained model's confidence, not of the block. 16 keeps blocks 
 # inside the range BD3LM reports (4-16) while quadrupling the slots a single forward can commit; DMax runs block 32 at every 
-# published point. No pass-count or latency number belongs here: measure it on dev at the RQ1 clean point with eval.yaml
-# rq1.batch_size 1 and read `mean_decoder_passes` beside `text_metrics` (AR arm's count in that field is its generate() length: 
+# published point. No pass-count or latency number belongs here: measure it on dev at the (0,0) point of the boundary sweep with
+# eval.yaml boundary_sweep.batch_size 1 and read `mean_decoder_passes` beside `text_metrics` (AR arm's count in that field is its generate() length: 
 # N cached steps + the confidence pass).
 block_size: 16
 spd: # Block decode (infer/decode.py, DMax decode_uniform) — design spec §7.2.
@@ -144,7 +182,7 @@ spd: # Block decode (infer/decode.py, DMax decode_uniform) — design spec §7.2
     # settle test at 0.9 does fire and how often is a property of the trained model. DMax's published points are 0.65 on code, 0.5 
     # on math, 0.3 on LLaDA2-mini (dInfer/evaluations/eval_llada_dmax_{code,math}.sh, eval_llada_mini.sh, all at block_length 32, 
     # all via decode_uniform) and 0.0 in chat.py. 0.5 is their math point and is reachable here. It is a fixed mechanism constant,
-    # not dev-tuned; RQ1 reports its cost as `mean_decoder_passes` (AR arm's count in same field is its generate() length).
+    # not dev-tuned; the boundary sweep reports its cost as `mean_decoder_passes` (AR arm's count in same field is its generate() length).
     tau_dec: 0.5       # dev decoding and inference both read this value (eval from the method config it loads)
     top_k: 1           # DMax SPD top-k token/mask embedding mixture.
     renormalize: true  # DMax Eq. 10 norm restoration.

@@ -6,10 +6,11 @@ writes 1 caption per video and video_meta.csv (duration = npz frames / the corpu
 like the repo's own extractions: train.py / analyze.py / eval.py run unchanged with --language asf|bfi.
 
     python prepare_yt25.py --stage plan [--size]            # shard/video counts (+ HEAD size estimate); no download
-    python prepare_yt25.py --stage all --languages asf bfi  # download + convert + subs gap-fill (resumable)
+    python prepare_yt25.py --stage all --languages asf bfi  # download + convert + subs gap-fill (resumable) + copy check
     python prepare_yt25.py --stage subs --languages asf     # gap-fill captions from the subtitles tar only
     python prepare_yt25.py --stage convert --delete-tars    # convert already-downloaded shards, free disk
     python prepare_yt25.py --stage meta --languages asf [--format SEL]  # yt-dlp video_meta rows for pose ids without one
+    python prepare_yt25.py --stage dedup --languages asf    # train copies of dev/test videos → video_meta.csv copy_of (stage_dedup)
 
 ON-DISK LAYOUT (root = data/youtube-sl-25):
     <root>/SignVerse-2M-metadata_split.csv        # splits (shipped)
@@ -41,33 +42,40 @@ DWPose keypoints in the 128-point OpenPose layout (18 body + 68 face + 2×21 han
   - per-frame:    <vid>/npz/00000001.npz ... (1-based file index = frame index; no fps header — the corpus is extracted at a unified 
     24 fps per the dataset card)
 
-Output (T, 133, 3) float32 keeps coords NORMALIZED [0,1] — the contract of poses.preprocessing.normalize_keypoints_unisign used by 
-the released Uni-Sign weights. Do NOT scale to pixels: released weights were trained on x/W,y/H, and crop_scale uses ONE shared 
-scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent).
+Output (T, 133, 3) float32 keeps coords NORMALIZED [0,1] (x/W, y/H). Do NOT scale to pixels: crop_scale uses ONE shared 
+scale=max(bbox_w,bbox_h) for both axes (aspect-ratio dependent), so the reader (poses.pose_io.load_pose_frames) maps x to the 
+geometry of a 16:9 frame from video_meta.csv width/height, the domain of the released Uni-Sign weights on 16:9 video.
 
 The converter reads the flat `person_<k>_*_keypoints (18,2)` + `_scores` schema. Slot 0 is the detector's top-scored person, chosen again 
 in every frame, so slot order does not certify body size, signing activity, or a persistent identity. Detector boxes and signer identities 
 are not present in this schema. `_primary_slots` keeps slot 0 except where it flickers to another real body for < 0.5s, or where slot 0
-holds no real body and another slot does. Other slots supply candidate hand crops and the masked-run measurement.
+holds no real body and another slot does. `_signer_slots` then moves the kept body to the person who signs now (hand motion relative to
+its own shoulders, a raised hand, 1 s without a break) and back. Other slots supply candidate hand crops.
 
 Verified quirks handled here (real bytes, shards 000006 + 000270):
   - body_scores always hold upstream DWPose index code 18*i+j (joint visible, detector conf > 0.3) or -1, never a confidence → 1.0 in-frame / 
     0.0 otherwise. So no per-body confidence exists to rank persons.
   - num_persons == 0 → no keypoint arrays → zero frames (velocity masking + conf gating treat all-zero joints as absent).
-  - multiple persons → body/face from the `_primary_slots` slot. The retained body changes identity only where the detector's own switch lasts 
-    >= 0.5s (turn-taking, a cut, a sustained wrong pick) or where retained body is lost (< 8 visible joints, or it moves > 0.05 frame heights 
-    in 1 frame), and it can differ from the captioned signer. `masked_runs` marks the frame runs where a second real body is present and moves, 
-    and `empty_runs` the runs with no real body; the loader cuts both out of every stream (data.loader.split_clean_segments). `handless_runs` 
-    marks the runs where the kept body shows no hand; the loader quarantines a unit mostly inside them and cuts no frame.
+  - multiple persons → body/face from the `_kept_slots` slot (`_primary_slots`, then the signer switch `_signer_slots`). The retained body
+    changes identity where another person signs for 1 s while it does not, and where it is absent from a frame (< 8 visible joints, no
+    torso point, or a move > 0.10 frame heights from its last centre) and the `_primary_slots` slot holds another body (turn-taking, a cut,
+    a sustained detector pick); it can still differ from the captioned signer. `empty_runs` marks the frame runs with no real body; the
+    loader cuts them out of every stream (data.loader.split_clean_segments). `handless_runs` marks the runs where the kept body shows no hand, `switch_runs` the runs where the
+    kept body is the switch's body and not the `_primary_slots` body, and `default_signing_runs` the runs where the `_primary_slots` body
+    signs. The loader quarantines a unit mostly inside handless_runs (data.yaml poses.handless_unit_share), and a unit with enough of its
+    frames in switch_runs and enough in default_signing_runs (poses.switch_unit_share, poses.switch_doubt_share); it cuts no frame for them.
   - off-frame sentinel coords → score 0 beyond a tolerance.
 """
 from __future__ import annotations
-import argparse, bisect, io, csv, json, shutil, sys, tarfile, urllib.request, zipfile
+import argparse, io, csv, json, multiprocessing, shutil, sys, tarfile, urllib.request, zipfile
 import numpy as np
 
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from data.loader import best_subtitle
-from poses.pose_io import (META_FILENAME, base_video_id, build_pose_index, drop_from_page_cache, 
+from data.loader import (best_subtitle, case_lexicon_entry, corpus_config, dataset_config, load_language_records, train_copies,
+                         video_meta_path)
+from poses.pose_io import (META_FILENAME, OFFSCREEN_TOLERANCE, base_video_id, build_pose_index, drop_from_page_cache, 
                            load_pose_frames, load_video_meta, save_video_meta)
 from utils import load_yaml, seconds_to_frames
 
@@ -75,6 +83,7 @@ HF_BASE = "https://huggingface.co/datasets/SignerX/SignVerse-2M/resolve/main"
 PROGRESS_JSON = "runtime_state/archive_upload_progress.json"
 SUBTITLES_TAR = "signverse_subtitles_with_english.tar"
 DEFAULT_SPLIT_CSV = "data/youtube-sl-25/SignVerse-2M-metadata_split.csv"
+DATASET = "youtube-sl-25"   # data.yaml datasets.<DATASET>: its subtitle rules choose the caption of a shard (`--stage convert`)
 DEFAULT_CACHE = "data/youtube-sl-25/signverse_shards"
 DEFAULT_ROOT = "data/youtube-sl-25"
 
@@ -100,10 +109,8 @@ COCO_LEFT_SLICE = slice(91, 112)    # 21 left-hand points
 COCO_RIGHT_SLICE = slice(112, 133)  # 21 right-hand points
 
 SIGNVERSE_DEFAULT_FPS = 24.0        # dataset card: "unified DWPose keypoint sequences ... at 24 FPS"
-_COORD_TOLERANCE = 0.25             # normalized coords beyond [-tol, 1+tol] are off-screen sentinels → score 0
+_COORD_TOLERANCE = OFFSCREEN_TOLERANCE   # normalized coords beyond [-tol, 1+tol] are off-screen sentinels → score 0 (the reader's rule too)
 _PARTS = (("body", 18), ("face", 68), ("left_hand", 21), ("right_hand", 21))  # (payload key stem, expected joint count)
-_EXTRA_PARTS = (("body", 18), ("left_hand", 21), ("right_hand", 21))
-_OP_SHOULDERS, _OP_ARMS = (2, 5), (3, 6, 4, 7)   # OpenPose-18: R/L shoulder, then R/L elbow and R/L wrist
 _OP_WRIST = {"left_hand": 7, "right_hand": 4}    # OpenPose-18 wrists, the joint a hand crop must attach to
 _HAND_GATE = 0.08                                # normalized-image distance: a crop further than this is nobody's
 _OP_UPPER_TORSO = [0, 1, 2, 5]                   # OpenPose-18 nose, neck, R/L shoulder: the tracked body centre
@@ -111,12 +118,23 @@ _REAL_BODY_JOINTS = 8                            # visible body joints for a slo
 _SLOT_JUMP, _SLOT_NEAR = 0.10, 0.05              # frame heights: slot-0 jump / other-slot match to the last chosen centre
 # Run rules in seconds; each function converts them with the video's fps (utils.seconds_to_frames: 12/24/48 frames at 24 fps).
 _SLOT_HOLD_MAX_S = 0.5                           # a longer hold is the detector's real choice
-_MASK_RUN_S = 0.5                                # runs closer than this merge; shorter masked runs drop
+_EMPTY_GAP_S = 0.5                               # empty runs closer than this merge
 _EMPTY_RUN_S = 1.0                               # shorter empty runs drop
-_MOTION_BLOCK_S = 2.0                            # a masked run is scored and cut per window this long, at half-window steps
-_HAND_CONF = 0.3                                 # a hand keypoint counts when its confidence is above Uni-Sign's validity threshold 
+_HAND_CONF = 0.3                                 # a hand keypoint counts when its confidence is above Uni-Sign's validity threshold
 _HAND_MIN_POINTS = 10                            # of a hand's 21 keypoints: half a hand is a visible hand
-_HANDLESS_RUN_S = _MASK_RUN_S                    # a shorter no-hand stretch is a sign transition, an occlusion or motion blur, not an absent signer
+_HANDLESS_RUN_S = 0.5                            # a shorter no-hand stretch is a sign transition, an occlusion or motion blur, not an absent signer
+# _signer_slots: the kept body follows who signs now, per person (`_people`). The relative signing speed and the raised offset are
+# data.yaml poses.switch_signing_speed / poses.switch_raised_offset.
+_PERSON_GAP_S = 1.0                              # a person unseen for longer is a new person
+_PERSON_MIN_S = 2.0                              # a person seen for less in the whole video is no signer: brief detections are noise
+_PERSON_SIZE_SHARE = 0.5                         # of the widest person in the frame (median shoulder widths): a small figure's noise reads as signing
+_HAND_SPEED_S = (0.25, 1.0)                      # the hand speed is averaged over these windows, in turn
+_HAND_SPEED_MAX = 8.0                            # shoulder widths per second: a faster step is a detector jump; each frame is clipped here before the means
+_RAISED_S, _RAISED_SHARE = 1.0, 0.5              # a person signs only with a hand raised in at least this share of the last 1 s
+_SWITCH_HOLD_S = 1.0                             # a challenger must sign this long without a break to take the kept body; those frames become its own
+# The run columns of the signer switch (`_signer_slots`). Only convert writes them, together with the pose file, so a row has them only
+# when the current converter wrote the video's pose file; switch_runs is the mark that the stages read (`stage_convert`, `stage_person_counts`).
+_SWITCH_RUNS = ("switch_runs", "default_signing_runs")
 
 def _part_arrays(payload: dict, part: str, count: int, who: str = "person_000") -> tuple[np.ndarray, np.ndarray] | None:
     kp = payload.get(f"{who}_{part}_keypoints")
@@ -173,93 +191,8 @@ def assert_normalized_coords(payloads, video_id: str = "") -> None:
         f"shard format (and re-normalize to x/W,y/H) before converting."
     )
 
-def _person_keypoints(payload, who: str) -> np.ndarray:
-    # Fixed landmark positions: a missing left hand must not move the right hand into its columns.
-    parts = []
-    for part, count in _EXTRA_PARTS:
-        got = _part_arrays(payload, part, count, who=who)
-        xy = np.full((count, 2), np.nan, dtype=np.float64)
-        if got is not None:
-            kp, score = got
-            valid = (score > 0) & np.isfinite(score) & np.isfinite(kp).all(axis=-1)
-            xy[valid] = kp[valid]
-        parts.append(xy)
-    return np.concatenate(parts, axis=0)
-
 def num_persons(payload) -> int:
     return int(payload.get("num_persons", 0) or 0) if isinstance(payload, dict) else 0
-
-
-def _shoulders(xy: np.ndarray) -> tuple[np.ndarray, float] | None:
-    # (shoulder midpoint, shoulder width) of a `_person_keypoints` array, when both shoulders are visible.
-    right, left = xy[_OP_SHOULDERS[0]], xy[_OP_SHOULDERS[1]]
-    if not (np.isfinite(right).all() and np.isfinite(left).all()): return None
-    width = float(np.linalg.norm(right - left))
-    return ((right + left) / 2.0, width) if width > 1e-6 else None
-
-def _extra_arms(payload, kept: int) -> tuple[bool, float | None, list[tuple[np.ndarray, np.ndarray]]]:
-    # What `_arm_motion` reads from 1 frame: whether a real body other than the kept slot shows an arm, the KEPT body's shoulder width
-    # (the scale of every arm), and per such body with both shoulders visible, (shoulder midpoint in frame heights, elbows and wrists
-    # minus its shoulder midpoint). A body with no visible elbow or wrist (a head-and-shoulders photo, an inset cut at the chest) can't
-    # sign in this frame, so it is not an extra body here: otherwise its arms are unmeasurable and the whole run is cut.
-    kept_shoulders = _shoulders(_person_keypoints(payload, f"person_{kept:03d}"))
-    width, height = float(payload.get("frame_width", 0) or 0), float(payload.get("frame_height", 0) or 0)
-    aspect = width / height if width > 0 and height > 0 else 16 / 9   # as `_body_centres`
-    extra, arms = False, []
-    for slot in range(num_persons(payload)):
-        if slot == kept or _real_body(payload, slot) is None: continue
-        xy = _person_keypoints(payload, f"person_{slot:03d}")
-        if not np.isfinite(xy[list(_OP_ARMS)]).any(): continue
-        extra = True
-        if (shoulders := _shoulders(xy)) is not None: arms.append((shoulders[0] * (aspect, 1.0), xy[list(_OP_ARMS)] - shoulders[0]))
-    return extra, (kept_shoulders[1] if kept_shoulders else None), arms
-
-
-def _person_tracks(rows) -> list[list[np.ndarray]]:
-    # The other bodies of `_extra_arms` rows linked into people: each body joins the nearest person whose last shoulder midpoint is within
-    # _SLOT_JUMP, else starts a new one. Slots are detector ranks that the detector re-orders every frame, so pooling arms by slot made 2
-    # still people who swap ranks look like 1 moving person.
-    people: list[tuple[np.ndarray, list]] = []
-    for _, _, arms in rows:
-        free = list(range(len(people)))
-        for centre, xy in arms:
-            near = min(((float(np.linalg.norm(centre - people[k][0])), k) for k in free), default=(np.inf, -1))
-            if near[0] <= _SLOT_JUMP: k = near[1]; free.remove(k); people[k] = (centre, people[k][1])
-            else: people.append((centre, [])); k = len(people) - 1
-            people[k][1].append(xy)
-    return [joints for _, joints in people]
-
-
-def _arm_motion(per_frame) -> float | None:
-    """Largest ARM travel of the other real bodies over the `_extra_arms` of a set of frames, in the KEPT body's shoulder widths.
-
-    Each frame is scaled by the kept body's shoulder width in that frame, floored at half its median over the frames (a frame without 
-    it takes the median), so a camera zoom cancels. The scale is the signer's, not the other body's own: a partial or false detection 
-    (a profile, a body cut at the frame edge, an object) has shoulders near 0 wide, and its own scale turned jitter into tens of widths.
-    A joint needs 10 observations. None means that other bodies show arms but can't be measured (too few arm observations, no shoulders 
-    on other body, or no kept shoulders in any frame). Zero covers no other body with a visible arm, or measured arms with no variation. 
-    Each other body is followed as a person across the frames (`_person_tracks`), not as a detector slot.
-    """
-    rows = list(per_frame)
-    has_extra = any(extra for extra, _, _ in rows)
-    known = [width for _, width, _ in rows if width is not None]
-    if not known: return None if has_extra else 0.0
-    median = float(np.median(known))
-    scaled = [
-        (extra, width, [(centre, xy / max(median if width is None else width, 0.5 * median)) for centre, xy in arms]) 
-        for extra, width, arms in rows
-    ]
-    scores = []
-    for joints in _person_tracks(scaled):
-        arms = np.stack(joints)
-        seen = np.isfinite(arms).all(axis=-1)
-        keep = seen.sum(axis=0) >= 10
-        if not keep.any(): continue
-        # Select the joints BEFORE the standard deviation. A joint with under 2 observations has no deviation, 
-        # and numpy warns once per such slice; dropping them first asks only for values that are used.
-        sd = np.nanstd(np.where(seen[..., None], arms, np.nan)[:, keep], axis=0)
-        scores.append(float(np.nanmax(sd)))
-    return max(scores) if scores else (None if has_extra else 0.0)
 
 
 def _real_body(payload, slot: int) -> tuple[np.ndarray, np.ndarray] | None:
@@ -271,69 +204,169 @@ def _real_bodies(payload) -> int:
     return sum(_real_body(payload, slot) is not None for slot in range(num_persons(payload)))
 
 
-def masked_runs(frames, slots: np.ndarray, min_motion: float, fps: float) -> list[list[int]]:
-    """Half-open .npy frame runs [a, b) where a real body other than the kept one is present AND moves.
-
-    `frames` gives (0-based frame, payload) in frame order; an absent frame has no body. `slots[t]` is the slot the .npy keeps in 
-    frame t (`_primary_slots`), so signer's own motion never counts, whichever slot holds it. Frame qualifies with >=2 real bodies. 
-    Runs separated by less than _MASK_RUN_S merge, and runs shorter than _MASK_RUN_S are dropped. Each run is scored in windows of 
-    _MOTION_BLOCK_S at half-window steps (frame counts at the video's `fps`), the last one ending at the run end (a run shorter than 
-    1 window is 1 window), so a still picture beside the signer neither hides a short mover nor gets cut with it, and a mover off the 
-    window grid is still covered. A window whose own frames are too few to measure (`_arm_motion` None) takes the motion of whole run, 
-    so a picture the detector finds only now and then is not cut. A window is cut when its motion is None (whole run is unmeasurable) 
-    or above `min_motion` (data.yaml poses.min_extra_person_motion); overlapping and adjacent cut windows merge. A still 2nd body 
-    (picture), or one that never shows an elbow or wrist, is therefore no run.
-    """
-    mask_run, block = seconds_to_frames(_MASK_RUN_S, fps), seconds_to_frames(_MOTION_BLOCK_S, fps)
-    runs: list[list[int]] = []
-    run: list = []   # [a, b, (frame, _extra_arms) rows since a]: the arm rows, not the payloads, bound memory on a long run
-
-    def close() -> None:
-        a, b, rows = run
-        if b - a < mask_run: return
-        rows = [row for row in rows if row[0] < b]
-        times, arms = [t for t, _ in rows], [row[1] for row in rows]
-        whole = _arm_motion(arms)
-        for lo in [*range(a, b - block, block // 2), max(a, b - block)]:
-            hi = min(lo + block, b)
-            motion = _arm_motion(arms[bisect.bisect_left(times, lo):bisect.bisect_left(times, hi)])
-            if motion is None: motion = whole
-            if motion is None or motion > min_motion:
-                if runs and runs[-1][1] >= lo: runs[-1][1] = max(runs[-1][1], hi)
-                else: runs.append([lo, hi])
-
-    for t, payload in frames:
-        if run and t - run[1] >= mask_run: close(); run = []  # no later frame can merge into this run
-        qualifies = _real_bodies(payload) >= 2
-        if run or qualifies:
-            if not run: run = [t, t + 1, []]
-            run[2].append((t, _extra_arms(payload, int(slots[t]))))
-            if qualifies: run[1] = t + 1
-    if run: close()
-    return runs
-
-
 def empty_runs(frames, n_frames: int, fps: float) -> list[list[int]]:
     """Half-open .npy frame runs [a, b) with no real body (no slot with _REAL_BODY_JOINTS visible joints).
 
     `frames` gives (0-based frame, payload) for frames < `n_frames`; a frame it omits has no body. Runs separated by less than 
-    _MASK_RUN_S merge, and runs shorter than _EMPTY_RUN_S are dropped (frame counts at the video's `fps`).
+    _EMPTY_GAP_S merge, and runs shorter than _EMPTY_RUN_S are dropped (frame counts at the video's `fps`).
     """
-    mask_run, empty_run = seconds_to_frames(_MASK_RUN_S, fps), seconds_to_frames(_EMPTY_RUN_S, fps)
+    gap, empty_run = seconds_to_frames(_EMPTY_GAP_S, fps), seconds_to_frames(_EMPTY_RUN_S, fps)
     empty = np.ones(n_frames, dtype=np.int8)
     for t, payload in frames: empty[t] = _real_bodies(payload) == 0
     edges = np.flatnonzero(np.diff(np.concatenate([[0], empty, [0]])))
     runs: list[list[int]] = []
     for a, b in zip(edges[::2].tolist(), edges[1::2].tolist()):
-        if runs and a - runs[-1][1] < mask_run: runs[-1][1] = b
+        if runs and a - runs[-1][1] < gap: runs[-1][1] = b
         else: runs.append([a, b])
     return [run for run in runs if run[1] - run[0] >= empty_run]
+
+
+def _moving_mean(x: np.ndarray, width: int) -> np.ndarray:
+    # Centred float32 moving mean over the finite values of `x` (np.convolve "same" alignment); nan where at most half the window is finite.
+    kernel, ok, lo = np.full(width, 1 / width, dtype=np.float32), np.isfinite(x), (width - 1) // 2
+    num = np.convolve(np.where(ok, x, 0).astype(np.float32), kernel)[lo:lo + len(x)]
+    den = np.convolve(ok.astype(np.float32), kernel)[lo:lo + len(x)]
+    return np.where(den > 0.5, num / np.maximum(den, 1e-9), np.nan).astype(np.float32)
+
+
+def _people(rows, n_frames: int, fps: float) -> tuple[list[list[np.ndarray | None]], dict]:
+    """Every real body of `rows` linked into a person, with the hand points that the signer switch reads.
+
+    `rows` gives (0-based frame, payload, frame width, frame height) in frame order (`_frame_rows`, or `_per_frame_rows`). Every real body
+    is linked into a person by its upper-torso centre (`_body_centres`): the nearest pairs first, each within _SLOT_JUMP of a person unseen
+    for at most _PERSON_GAP_S, else a new person. A body's hands are the crops its own wrists claim (`_primary_hands`). Each hand's reference
+    point is its centre (the mean of its keypoints above _HAND_CONF when _HAND_MIN_POINTS of them are), else the wrist; every point is in
+    frame heights (x scaled by the aspect ratio). Returns the `_body_centres` of every frame ([] for a frame not in `rows`) and a table:
+    per linked body in frame order, its `frame`, `person`, `slot`, (2, 2) hand `point`s, their `kind` (1 centre, 0 wrist, nan none) and
+    its shoulder `middle` (nan without both shoulders); per person, its rows in frame order (`own`), its median shoulder width (`size`, 0
+    when unknown) and whether it is seen for _PERSON_MIN_S in the video (`long_enough`); per frame, the size of the `widest` person.
+    """
+    gap = seconds_to_frames(_PERSON_GAP_S, fps)
+    centres: list[list[np.ndarray | None]] = [[] for _ in range(n_frames)]
+    linked = []   # per linked body: (frame, person, slot, shoulder width, (2, 2) hand points, (2,) point kind, (2,) shoulder midpoint)
+    last: dict[int, tuple[np.ndarray, int]] = {}   # person -> (last centre, last frame)
+    people = 0
+    for t, payload, width, height in rows:
+        aspect = (width / height if width > 0 and height > 0 else 16 / 9, 1.0)   # as `_body_centres`
+        centres[t] = _body_centres(payload, width, height)
+        bodies = [(slot, centre) for slot, centre in enumerate(centres[t]) if centre is not None]
+        last = {k: v for k, v in last.items() if t - v[1] - 1 <= gap}   # frames unseen in between
+        pairs = sorted((float(np.linalg.norm(c - lc)), i, k) for i, (_, c) in enumerate(bodies) for k, (lc, _) in last.items())
+        person, taken = [-1] * len(bodies), set()
+        for d, i, k in pairs:
+            if d <= _SLOT_JUMP and person[i] < 0 and k not in taken: person[i] = k; taken.add(k)
+        for i, (slot, centre) in enumerate(bodies):
+            if person[i] < 0: person[i], people = people, people + 1
+            last[person[i]] = (centre, t)
+            body = _real_body(payload, slot)
+            kp, sc = (body[0] * aspect).astype(np.float32), body[1]
+            hands, points, kind = _primary_hands(payload, body), np.full((2, 2), np.nan, dtype=np.float32), np.full(2, np.nan)
+            for side, (part, wrist) in enumerate(_OP_WRIST.items()):
+                confident = hands[part][1] > _HAND_CONF if part in hands else np.zeros(0, dtype=bool)
+                if confident.sum() >= _HAND_MIN_POINTS: points[side], kind[side] = (hands[part][0][confident] * aspect).mean(axis=0), 1
+                elif sc[wrist] > 0: points[side], kind[side] = kp[wrist], 0
+            both = sc[2] > 0 and sc[5] > 0
+            middle = (kp[2] + kp[5]) / 2 if both else np.full(2, np.nan, dtype=np.float32)
+            linked.append((t, person[i], slot, np.linalg.norm(kp[2] - kp[5]) if both else np.nan, points, kind, middle))
+
+    frame, who, slot = (np.array([r[k] for r in linked], dtype=np.int64) for k in range(3))
+    shoulder = np.array([r[3] for r in linked], dtype=np.float32)
+    point, kind, middle = (np.array([r[k] for r in linked]).reshape(len(linked), *shape) for k, shape in ((4, (2, 2)), (5, (2,)), (6, (2,))))
+    order = np.argsort(who, kind="stable")   # each person's rows, in frame order
+    own = np.split(order, np.searchsorted(who[order], np.arange(1, people))) if people else []
+    size = np.array([np.nanmedian(shoulder[r]) if np.isfinite(shoulder[r]).any() else 0 for r in own], dtype=np.float32)
+    widest = np.zeros(n_frames, dtype=np.float32); np.maximum.at(widest, frame, size[who])
+    long_enough = np.array([len(r) for r in own], dtype=np.int64) >= seconds_to_frames(_PERSON_MIN_S, fps)
+    return centres, {"frame": frame, "person": who, "slot": slot, "point": point, "kind": kind, "middle": middle,
+                     "own": own, "size": size, "long_enough": long_enough, "widest": widest}
+
+
+def _hand_activity(points: np.ndarray, kinds: np.ndarray, at: np.ndarray, size: float, n_frames: int, fps: float) -> tuple[int, np.ndarray]:
+    # The hand activity of 1 person seen in frames `at` (in order) with hand `points` (rows, 2, 2) of `kinds` (rows, 2), over the frames
+    # [lo, lo + len(activity)) around them: per frame the faster hand's step from the previous frame, counted only when both frames use
+    # the same kind of point (a hand whose confidence flickers, so that its point changes kind, does not move), in `size` (the person's
+    # median shoulder width) per second, clipped at _HAND_SPEED_MAX, then averaged over each _HAND_SPEED_S window in turn, in float32.
+    # nan where unknown: no shoulder width, or a window with too few steps.
+    smooth = [seconds_to_frames(s, fps) for s in _HAND_SPEED_S]
+    lo, hi = max(0, int(at[0]) - sum(smooth)), min(n_frames, int(at[-1]) + 1 + sum(smooth))
+    pos, ref = np.full((hi - lo, 2, 2), np.nan, dtype=np.float32), np.full((hi - lo, 2), np.nan)
+    pos[at - lo], ref[at - lo] = points, kinds
+    step = np.linalg.norm(np.diff(pos, axis=0), axis=-1)   # nan where a hand is absent in either frame
+    step[ref[1:] != ref[:-1]] = np.nan                     # the centre in one frame and the wrist in the other: no step
+    speed = np.minimum(step * fps / size, _HAND_SPEED_MAX) if size > 0 else np.full_like(step, np.nan)
+    act = np.full(hi - lo, np.nan, dtype=np.float32); act[1:] = np.fmax(speed[:, 0], speed[:, 1])
+    for window in smooth: act = _moving_mean(act, window)
+    return lo, act
+
+
+def _flag_runs(flag: np.ndarray) -> list[list[int]]:
+    # The half-open runs [a, b) of the True frames of `flag`, as they are: no merge and no length floor.
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], flag.astype(np.int8), [0]])))
+    return [[a, b] for a, b in zip(edges[::2].tolist(), edges[1::2].tolist())]
+
+
+def _signer_slots(people: dict, default: np.ndarray, n_frames: int, fps: float, signing: float,
+                  raised: float) -> tuple[np.ndarray, dict[str, list[list[int]]]]:
+    """The slot the .npy keeps per frame: the person who signs now, on top of the `_primary_slots` choice `default`; and the switch runs.
+
+    `people` is `_people`'s table. A person's activity is `_hand_activity` of its hand points minus its shoulder midpoint in the same
+    frame (relative to its own body, so a body that walks or a camera that moves adds no speed): the faster hand's same-kind step in the
+    person's own median shoulder width per second, clipped at _HAND_SPEED_MAX, then each _HAND_SPEED_S mean, in float32; a person with
+    no shoulder width, or a window with too few steps, has unknown activity (nan), which never signs. A person SIGNS in a frame when its
+    activity is at least `signing` (data.yaml poses.switch_signing_speed) and a hand was raised in at least _RAISED_SHARE of the last
+    _RAISED_S (causal; a frame where the person is absent has no raised hand); a hand is raised when its point is less than `raised`
+    (poses.switch_raised_offset) own median shoulder widths below the shoulder midpoint. A candidate is a person seen for _PERSON_MIN_S
+    in the video with at least _PERSON_SIZE_SHARE of the size of the widest person in the frame. The choice starts on the default body,
+    and it returns to the default body whenever the current one is absent. In a frame where the current body does not sign, the most
+    active signing candidate other than it (the lowest person on a tie) is the challenger; one challenger that holds for _SWITCH_HOLD_S
+    without a break becomes the current body from the first frame of its hold. Nothing else switches, so a body that stops signing loses
+    the choice to one that signs, whichever came first. The switch runs (`_SWITCH_RUNS`) are half-open .npy frame runs [a, b), with no
+    merge: `switch_runs`, where the kept slot is not the default slot (the kept body is the switch's body, not the default body), and
+    `default_signing_runs`, where the default body signs, kept or not. The loader quarantines a caption unit by its shares of both
+    (poses.switch_unit_share, poses.switch_doubt_share).
+    """
+    frame, who, slot = people["frame"], people["person"], people["slot"]
+    size, widest, window = people["size"], people["widest"], seconds_to_frames(_RAISED_S, fps)
+    act, signs = np.full(len(frame), np.nan, dtype=np.float32), np.zeros(len(frame), dtype=bool)   # per linked body
+    for k, rows in enumerate(people["own"]):
+        at = frame[rows]
+        rel = people["point"][rows] - people["middle"][rows][:, None, :]   # nan without both shoulders
+        lo, a = _hand_activity(rel, people["kind"][rows], at, size[k], n_frames, fps)
+        up = np.zeros(len(a), dtype=np.int64)
+        with np.errstate(invalid="ignore"):   # nan compares False: no point, or no shoulder width, is no raised hand
+            up[at - lo] = (rel[..., 1] / size[k] < raised).any(axis=1) if size[k] > 0 else 0
+            t = np.arange(lo, lo + len(a))   # the frames before lo precede the person: no raised hand there
+            count = np.concatenate([[0], np.cumsum(up)])
+            share_up = count[t - lo + 1] - count[np.maximum(t - window + 1, lo) - lo] >= _RAISED_SHARE * np.minimum(window, t + 1)
+            act[rows], signs[rows] = a[at - lo], ((a >= signing) & share_up)[at - lo]
+    ok = (people["long_enough"][who] & (size[who] >= _PERSON_SIZE_SHARE * widest[frame])).tolist()
+    is_default = slot == default[frame]
+    old = np.full(n_frames, -1, dtype=np.int64); old[frame[is_default]] = who[is_default]
+    new, hold, signs_l, act_l, who_l = old.copy(), seconds_to_frames(_SWITCH_HOLD_S, fps), signs.tolist(), act.tolist(), who.tolist()
+    starts = np.searchsorted(frame, np.arange(n_frames + 1)).tolist()   # the rows of frame t are starts[t]:starts[t + 1]
+    current, challenger, held = -1, -1, 0
+    for t in range(n_frames):
+        here = {who_l[r]: r for r in range(starts[t], starts[t + 1])}
+        if current not in here: current = int(old[t])   # the current body is absent: back to the default body
+        best = -1
+        if current < 0 or not signs_l[here[current]]:
+            candidates = [(act_l[r], -k) for k, r in here.items() if ok[r] and signs_l[r] and k != current]
+            if candidates: best = -max(candidates)[1]
+        challenger, held = (best, held + 1) if best >= 0 and best == challenger else (best, 1 if best >= 0 else 0)
+        if held >= hold:
+            current, challenger, held = challenger, -1, 0
+            new[t - hold + 1:t + 1] = current
+        new[t] = current
+    pick = who == new[frame]
+    slots = default.copy(); slots[frame[pick]] = slot[pick]
+    default_signs = np.zeros(n_frames, dtype=bool); default_signs[frame[is_default & signs]] = True
+    return slots, {"switch_runs": _flag_runs(slots != default), "default_signing_runs": _flag_runs(default_signs)}
 
 
 def handless_runs(poses: np.ndarray, fps: float) -> list[list[int]]:
     """Half-open .npy frame runs [a, b) of at least _HANDLESS_RUN_S (in frames at the video's `fps`) in which the kept body shows no hand.
 
-    `poses` is the converted (T, 133, 3) array, so the hands are the ones `_primary_slots` kept. A hand is present in a frame when at least 
+    `poses` is the converted (T, 133, 3) array, so the hands are the ones `_kept_slots` kept. A hand is present in a frame when at least 
     _HAND_MIN_POINTS of its 21 keypoints have confidence above _HAND_CONF; a frame with no body has no hand. Runs never merge across a frame 
     with a hand. Loader quarantines a caption unit that lies mostly inside these runs (data.yaml poses.handless_unit_share) and cuts no frame.
     """
@@ -480,7 +513,7 @@ def payload_to_coco133(payload: dict, who: str = "person_000") -> np.ndarray:
     return out
 
 
-def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int, int]:
+def _load_consolidated(npz_path: Path, rules: dict) -> tuple[np.ndarray, float, int, int, int, np.ndarray, dict[str, list[list[int]]]]:
     z = np.load(npz_path, allow_pickle=True)
     # UNIFORM 24 fps corpus (dataset card; verified). Pin to SIGNVERSE_DEFAULT_FPS so convert_video and _backfill_meta (which sees only the 
     # .npy) agree by construction; warn on a disagreeing header rather than using a rate the crash-recovery path can't reproduce.
@@ -505,61 +538,55 @@ def _load_consolidated(npz_path: Path) -> tuple[np.ndarray, float, int, int, int
     poses = np.zeros((n_frames, 133, 3), dtype=np.float32)
     frame_w = frame_h = detected = 0
     rows = _frame_rows(z, payloads)
-    slots = _kept_slots(rows, n_frames, fps)
+    slots, switch = _kept_slots(rows, n_frames, fps, rules)
     for t, payload, w, h in rows:
         detected += num_persons(payload) >= 1
         poses[t] = payload_to_coco133(payload, who=f"person_{slots[t]:03d}") # normalized coords — no W/H scaling
-        if w > 0 and h > 0: frame_w, frame_h = int(w), int(h) # recorded in video_meta (feeds Moryossef aspect correction only)
-    return poses, fps, frame_w, frame_h, detected, slots
+        if w > 0 and h > 0: frame_w, frame_h = int(w), int(h) # recorded in video_meta (the reader's x map to a 16:9 frame reads it)
+    return poses, fps, frame_w, frame_h, detected, slots, switch
 
 
-def _load_per_frame(npz_dir: Path) -> tuple[np.ndarray, float, int, int, int]:
-    frames: dict[int, Path] = {}
-    for path in npz_dir.glob("*.npz"):
-        if path.name == "poses.npz": continue
-        try: frames[int(path.stem)] = path  # 00000001.npz → frame 1 (1-based)
-        except ValueError: continue
-    if not frames: return np.zeros((0, 133, 3), dtype=np.float32), SIGNVERSE_DEFAULT_FPS, 0, 0, 0, np.zeros(0, dtype=np.int64)
+def _per_frame_rows(npz_dir: Path):
+    # (0-based .npy frame, payload, frame width, frame height) of a per-frame-layout video (00000001.npz → frame 0), 1 file at a time in
+    # numeric frame order; the size is the payload's own. Plain numeric arrays only — no allow_pickle (untrusted HF bytes).
+    for path in sorted((p for p in npz_dir.glob("*.npz") if p.stem.isdigit() and int(p.stem) >= 1), key=lambda p: int(p.stem)):
+        with np.load(path) as z: payload = {k: z[k] for k in z.files}
+        size = (float(np.asarray(payload.get(key, 0)).item() or 0) for key in ("frame_width", "frame_height"))
+        yield int(path.stem) - 1, payload, *size
 
-    n_frames = max(frames)
+
+def _load_per_frame(npz_dir: Path, rules: dict) -> tuple[np.ndarray, float, int, int, int, np.ndarray, dict[str, list[list[int]]]]:
+    numbers = [int(p.stem) for p in npz_dir.glob("*.npz") if p.stem.isdigit() and int(p.stem) >= 1]
+    if not numbers:
+        return np.zeros((0, 133, 3), dtype=np.float32), SIGNVERSE_DEFAULT_FPS, 0, 0, 0, np.zeros(0, dtype=np.int64), {k: [] for k in _SWITCH_RUNS}
+    n_frames = max(numbers)
+    slots, switch = _kept_slots(_per_frame_rows(npz_dir), n_frames, SIGNVERSE_DEFAULT_FPS, rules)   # pass 1: the slot choice
     poses = np.zeros((n_frames, 133, 3), dtype=np.float32)
     frame_w = frame_h = detected = 0
-    frames = sorted((f, p) for f, p in frames.items() if f >= 1)   # guard poses[-1]
-    centres: list[list] = [[] for _ in range(n_frames)]
-
-    for frame_no, path in frames:  # pass 1 reads body arrays only: the slot choice needs no face or hands
-        with np.load(path) as z:   # plain numeric arrays only — no allow_pickle (untrusted HF bytes)
-            body = {k: z[k] for k in z.files if "_body_" in k or not k.startswith("person_")}
-        w = float(np.asarray(body.get("frame_width", 0)).item() or 0)
-        h = float(np.asarray(body.get("frame_height", 0)).item() or 0)
-        centres[frame_no - 1] = _body_centres(body, w, h)
-        if w > 0 and h > 0: frame_w, frame_h = int(w), int(h)  # recorded in video_meta (feeds Moryossef aspect correction only)
-
-    slots = _primary_slots(centres, SIGNVERSE_DEFAULT_FPS)
     checked = False
-    for frame_no, path in frames:
-        with np.load(path) as z: payload = {k: z[k] for k in z.files}
+    for t, payload, w, h in _per_frame_rows(npz_dir):
         if not checked:  # pixel-space guard, first POPULATED frame
             assert_normalized_coords([payload], video_id=npz_dir.parent.name)
             checked = bool(_confident_coord_sample(payload).size)
         detected += num_persons(payload) >= 1
-        poses[frame_no - 1] = payload_to_coco133(payload, who=f"person_{slots[frame_no - 1]:03d}")  # normalized coords
-    return poses, SIGNVERSE_DEFAULT_FPS, frame_w, frame_h, detected, slots
+        poses[t] = payload_to_coco133(payload, who=f"person_{slots[t]:03d}")  # normalized coords
+        if w > 0 and h > 0: frame_w, frame_h = int(w), int(h)  # recorded in video_meta (the reader's x map to a 16:9 frame reads it)
+    return poses, SIGNVERSE_DEFAULT_FPS, frame_w, frame_h, detected, slots, switch
 
 
-def load_signverse_video(npz_dir: str | Path) -> tuple[np.ndarray, float, int, int, int, np.ndarray]:
-    # 1 video's npz dir (either scheme) → ((T,133,3) NORMALIZED-[0,1] poses, fps, width, height, frames 
-    # with >= 1 detected person, (T,) kept slot per frame).
+def load_signverse_video(npz_dir: str | Path, rules: dict) -> tuple[np.ndarray, float, int, int, int, np.ndarray, dict[str, list[list[int]]]]:
+    # 1 video's npz dir (either scheme) → ((T,133,3) NORMALIZED-[0,1] poses, fps, width, height, frames with >= 1 detected person,
+    # (T,) kept slot per frame, the switch runs by column). `rules` is the data.yaml poses block (the switch reads its 2 thresholds).
     npz_dir = Path(npz_dir)
     consolidated = npz_dir / "poses.npz"
-    if consolidated.exists(): return _load_consolidated(consolidated)
-    return _load_per_frame(npz_dir)
+    if consolidated.exists(): return _load_consolidated(consolidated, rules)
+    return _load_per_frame(npz_dir, rules)
 
-def convert_video(npz_dir: str | Path, out_npy: str | Path, min_motion: float) -> dict:
-    # Convert 1 video → `<out_npy>` ((T,133,3) float32) + summary stats for reporting. 
-    # `min_motion` is the masked-run motion threshold (data.yaml poses.min_extra_person_motion).
-    poses, fps, width, height, detected, slots = load_signverse_video(npz_dir)
-    masked, empty = _person_measures(Path(npz_dir), min_motion, poses.shape[0], slots, fps)
+def convert_video(npz_dir: str | Path, out_npy: str | Path, rules: dict) -> dict:
+    # Convert 1 video → `<out_npy>` ((T,133,3) float32) + summary stats for reporting. `rules` is the data.yaml poses block (the
+    # thresholds of the signer switch: switch_signing_speed, switch_raised_offset).
+    poses, fps, width, height, detected, _, switch = load_signverse_video(npz_dir, rules)
+    empty = _source_empty_runs(Path(npz_dir), poses.shape[0], fps)
     out_npy = Path(out_npy)
     out_npy.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_npy, poses)
@@ -567,8 +594,8 @@ def convert_video(npz_dir: str | Path, out_npy: str | Path, min_motion: float) -
     # unusable joints is still counted; missing sparse frames count as undetected.
     return {
         "frames": int(poses.shape[0]), "fps": float(fps), "duration_s": float(poses.shape[0] / fps) if fps > 0 else 0.0, 
-        "empty_frames": int(poses.shape[0] - detected), "masked_runs": masked, "empty_runs": empty, 
-        "handless_runs": handless_runs(poses, fps), "width": int(width), "height": int(height),
+        "empty_frames": int(poses.shape[0] - detected), "empty_runs": empty,
+        "handless_runs": handless_runs(poses, fps), **switch, "width": int(width), "height": int(height),
     }
 
 def _frame_rows(z, payloads) -> list[tuple[int, dict, float, float]]:
@@ -587,34 +614,28 @@ def _frame_rows(z, payloads) -> list[tuple[int, dict, float, float]]:
         rows.append((int(f) - 1, p, w, h))
     return sorted(rows, key=lambda r: r[0])
 
-def _kept_slots(rows, n_frames: int, fps: float) -> np.ndarray:
-    # The slot `_primary_slots` keeps per frame, from `_frame_rows` rows: the same choice in --stage convert and --stage person-counts.
-    centres: list[list] = [[] for _ in range(n_frames)]
-    for t, payload, w, h in rows: centres[t] = _body_centres(payload, w, h)
-    return _primary_slots(centres, fps)
+def _kept_slots(rows, n_frames: int, fps: float, rules: dict) -> tuple[np.ndarray, dict[str, list[list[int]]]]:
+    # The slot the .npy keeps per frame (`_primary_slots`, then the signer switch `_signer_slots`) and the switch runs by column, from
+    # `_frame_rows` rows (or `_per_frame_rows`), in both archive layouts. `rules` is the data.yaml poses block.
+    centres, people = _people(rows, n_frames, fps)
+    return _signer_slots(people, _primary_slots(centres, fps), n_frames, fps,
+                         float(rules["switch_signing_speed"]), float(rules["switch_raised_offset"]))
 
-def _person_measures(
-    npz_dir: Path, min_motion: float, n_frames: int, slots: np.ndarray, fps: float
-) -> tuple[list[list[int]], list[list[int]]]:
-    # The masked and the empty runs, from the source payloads: the .npy keeps one body per frame (`slots`, from the loader).
+def _source_empty_runs(npz_dir: Path, n_frames: int, fps: float) -> list[list[int]]:
+    # The empty runs, from the source payloads: the .npy keeps one body per frame, so it cannot show that no real body is in a frame.
     consolidated = npz_dir / "poses.npz"
     if consolidated.exists():
-        with np.load(consolidated, allow_pickle=True) as z: 
-            rows = [(t, p) for t, p, _, _ in _frame_rows(z, z["frame_payloads"] if "frame_payloads" in z.files else [])]
-        frames = lambda: rows
-    else:
-        def frames():   # read twice, 1 file at a time, in frame order (numeric, as `_load_per_frame`)
-            for path in sorted((p for p in npz_dir.glob("*.npz") if p.stem.isdigit() and int(p.stem) >= 1), key=lambda p: int(p.stem)):
-                with np.load(path) as z: yield int(path.stem) - 1, {k: z[k] for k in z.files}
-    return masked_runs(frames(), slots, min_motion, fps), empty_runs(frames(), n_frames, fps)
+        with np.load(consolidated, allow_pickle=True) as z: rows = _frame_rows(z, z["frame_payloads"] if "frame_payloads" in z.files else [])
+    else: rows = _per_frame_rows(npz_dir)   # 1 file at a time
+    return empty_runs(((t, p) for t, p, _, _ in rows), n_frames, fps)
 
 
-def sidecar_stats_from_npz(z, min_motion: float) -> dict:
-    """The video_meta columns only the SHARD carries: detection count, masked and empty runs, pixel frame size.
+def sidecar_stats_from_npz(z) -> dict:
+    """The video_meta columns only the SHARD carries that person-counts writes: detection count, empty runs, pixel frame size.
 
-    Reads person counts, frame size and body keypoints. `.npy` keeps only the primary pose, so these measurements use the source archive. 
-    No pose file is written. The runs use same code as `convert_video` (`_frame_rows`, `masked_runs` at same `min_motion`, `empty_runs`), 
-    at the same pinned SIGNVERSE_DEFAULT_FPS as `_load_consolidated`.
+    Reads person counts, frame size and body keypoints. `.npy` keeps only the primary pose, so these measurements use the source
+    archive. No pose file is written. The runs use the same code as `convert_video` (`_frame_rows`, `empty_runs`), at the same pinned
+    SIGNVERSE_DEFAULT_FPS as `_load_consolidated`.
     """
     files = set(z.files)
     payloads = z["frame_payloads"] if "frame_payloads" in files else []
@@ -636,11 +657,8 @@ def sidecar_stats_from_npz(z, min_motion: float) -> dict:
             w = float(np.asarray(payload.get("frame_width", 0)).item() or 0)
             h = float(np.asarray(payload.get("frame_height", 0)).item() or 0)
             if w > 0 and h > 0: width, height = int(w), int(h)
-    rows = _frame_rows(z, payloads)
-    pairs = [(t, p) for t, p, _, _ in rows]
-    return {"frames": frames, "detected": sum(1 for c in counts if c >= 1), "width": width, "height": height, 
-            "masked_runs": masked_runs(pairs, _kept_slots(rows, frames, SIGNVERSE_DEFAULT_FPS), min_motion, SIGNVERSE_DEFAULT_FPS),
-            "empty_runs": empty_runs(pairs, frames, SIGNVERSE_DEFAULT_FPS)}
+    return {"frames": frames, "detected": sum(1 for c in counts if c >= 1), "width": width, "height": height,
+            "empty_runs": empty_runs(((t, p) for t, p, _, _ in _frame_rows(z, payloads)), frames, SIGNVERSE_DEFAULT_FPS)}
 
 
 def _lang_targets(data_cfg: dict, languages) -> dict[str, str]:  # en_XX->en, de_DE->de, zh_CN->zh
@@ -784,12 +802,16 @@ def stage_verify(args, plan: dict) -> None:
 
 
 def _convert_one(
-    tar: tarfile.TarFile, vid: str, lang_root: Path, tmp_dir: Path, tcode: str, subtitle_cfg: dict, min_motion: float
+    tar: tarfile.TarFile, vid: str, lang_root: Path, tmp_dir: Path, tcode: str, subtitle_cfg: dict, rules: dict
 ) -> dict | None:
     members = [m for m in tar.getmembers() if m.name.startswith(f"{vid}/")]
     if not any(m.name.startswith(f"{vid}/npz/") for m in members): return None
-    tar.extractall(tmp_dir, members=members, filter="data")
-    stats = convert_video(tmp_dir / vid / "npz", lang_root / "poses" / f"{vid}.npy", min_motion)
+    if hasattr(tarfile, "data_filter"): tar.extractall(tmp_dir, members=members, filter="data")
+    else:   # Python before 3.9.17 (the GPU machine's 3.9) has no extraction filter: refuse what filter="data" refuses in a shard
+        unsafe = [m.name for m in members if not (m.isfile() or m.isdir()) or m.name.startswith("/") or ".." in Path(m.name).parts]
+        if unsafe: raise SystemExit(f"{tar.name}: unsafe archive members {unsafe[:3]}; extract this shard with Python 3.9.17 or later")
+        tar.extractall(tmp_dir, members=members)
+    stats = convert_video(tmp_dir / vid / "npz", lang_root / "poses" / f"{vid}.npy", rules)
 
     # Harvest the SINGLE best shard-bundled caption → the canonical `<vid>.<tcode>.vtt` that `--stage subs` also writes, so both paths agree 
     # on exactly 1 caption/video. lang_prefix=tcode restricts `best_subtitle` (the loader's rule) to TARGET-language tracks: a non-en target 
@@ -805,6 +827,34 @@ def _convert_one(
     return stats
 
 
+def _convert_shard(tar_path: Path, jobs: list[tuple[str, Path, str]], tmp_dir: Path, subtitle_cfg: dict, rules: dict) -> list[tuple[str, dict | str | None]]:
+    # The (video id, language root, caption code) `jobs` of 1 shard converted in order: per video `_convert_one`'s stats, None when its
+    # npz is absent from the shard, or the error text of an unreadable npz. Module level, so that `--stage convert --workers N` can run it
+    # in a worker process: it writes only the videos' own pose and caption files, and extracts under its own `tmp_dir`.
+    # A truncated shard raises deep inside tarfile with no clue which file is bad. Name it and say what to do: the archive is unusable,
+    # so the only fix is to delete and re-download it. getmembers(), not open(): a truncated tar opens fine (its 1st header is intact)
+    # and only fails when the index is walked to the end.
+    if not jobs: return []   # every video of the shard is converted already: the tar is not read
+    try:
+        with tarfile.open(tar_path) as _probe: _probe.getmembers()
+    except tarfile.ReadError as e: raise SystemExit(
+        f"convert | {tar_path} is corrupt or truncated ({e}). This is a partial download, not a data problem. "
+        f"Delete it and re-run the download stage:\n    rm {tar_path}"
+    ) from e
+    out: list[tuple[str, dict | str | None]] = []
+    tmp_dir.mkdir(parents=True, exist_ok=True)   # exist_ok: workers create the parent at the same time
+    with tarfile.open(tar_path) as tar:
+        for vid, lang_root, tcode in jobs:
+            # A per-video npz can be corrupt inside a structurally valid tar (CRC failure on the inner zip member). That is 1 unusable
+            # video, not a bad run: record it and continue, so a multi-hour conversion is not lost to a single upstream byte error.
+            try: out.append((vid, _convert_one(tar, vid, lang_root, tmp_dir, tcode, subtitle_cfg, rules)))
+            except (zipfile.BadZipFile, EOFError, ValueError) as e:
+                shutil.rmtree(tmp_dir / vid, ignore_errors=True)
+                out.append((vid, f"{type(e).__name__}: {e}"))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out
+
+
 def _backfill_meta(vid: str, lang_root: Path, meta: dict[str, dict]) -> None:
     # A run that crashed before save leaves a .npy with no meta row. Recompute duration from the .npy frame count
     # at the corpus's fixed 24 fps (cheap: mmap header only) so video_meta stays complete across resumes.
@@ -814,14 +864,66 @@ def _backfill_meta(vid: str, lang_root: Path, meta: dict[str, dict]) -> None:
     frames = int(np.load(npy, mmap_mode="r").shape[0])
     # caption_source "none", not blank: a blank is not in human_only_exclude_sources, so a crash-recovered row
     # would silently pass as a human caption on the test split. "none" is what `--stage subs` gap-fills.
-    meta[vid] = {"video_id": vid, "duration_s": f"{frames / SIGNVERSE_DEFAULT_FPS:.3f}", "width": "", "height": "", "caption_source": "none"}
+    meta[vid] = {"video_id": vid, "duration_s": f"{frames / SIGNVERSE_DEFAULT_FPS:.3f}", "width": "", "height": "", "caption_source": "none",
+                 "unreliable_spans": []}   # no such annotation (convert)
+
+
+def _refuse_stale_sidecars(root: Path, plan: dict, cache: Path | None = None) -> None:
+    # A video_meta.csv whose header lacks the switch columns (`_SWITCH_RUNS`) comes from a converter without the signer switch, so every
+    # pose file of its language holds the old body. Person-counts, subs and convert without --overwrite stop on such a file with the
+    # command that converts it again. Convert --overwrite (`cache` given) converts every pose file again: it stops only while a pose file
+    # of that language sits in a shard that is not in the cache, because that file would stay old. A file with the columns can still hold
+    # old pose files (a stopped --overwrite run): each such row has no switch_runs value, so convert converts it again and the loader
+    # warns for it.
+    for lang in sorted({info["language"] for info in plan["videos"].values()}):
+        path = root / lang / META_FILENAME
+        if not path.exists(): continue
+        with path.open("r", encoding="utf-8", newline="") as f: header = next(csv.reader(f), [])
+        if not (missing := "/".join(key for key in _SWITCH_RUNS if key not in header)): continue
+        if cache is None: raise SystemExit(
+            f"prepare | {path} has no {missing} column: a converter without the signer switch wrote it, so its pose files hold the old "
+            f"body. Convert them again before this stage: `python prepare_yt25.py --stage all --overwrite --languages {lang}` (it needs "
+            f"every shard tar of the language)."
+        )
+        old = sorted(shard for shard, vids in plan["shards"].items() if not (cache / shard).exists() and any(
+            plan["videos"].get(v, {}).get("language") == lang and (root / lang / "poses" / f"{v}.npy").exists() for v in vids))
+        if old: raise SystemExit(
+            f"convert | {path} has no {missing} column (a converter without the signer switch), and {len(old)} shard(s) that hold "
+            f"its pose files are not in {cache}: those pose files would keep the old body under the new header. Download them first "
+            f"(`--stage download`, which `--stage all` runs): {', '.join(old[:5])}{' ...' if len(old) > 5 else ''}"
+        )
+
+
+@contextmanager
+def _shard_map(workers: int):
+    # `map` over shards, in this process (workers 1) or in `workers` worker processes; both yield the results in input order. spawn, not
+    # fork: a forked child of a process that holds threads (numpy, torch) can hang. On an error (a bad shard's SystemExit, a Ctrl-C) the
+    # shards not yet started are cancelled, so the stop waits only for the shards in progress, not for the rest of the corpus.
+    if workers <= 1:
+        yield map
+        return
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+        try: yield pool.map
+        except BaseException:
+            pool.shutdown(cancel_futures=True)
+            raise
 
 
 def stage_convert(args, plan: dict) -> None:
+    """Convert every wanted video of the cached shards (`_convert_shard`) and write its video_meta.csv row.
+
+    With `--workers N`, N worker processes each convert 1 shard at a time (each video's pose and caption files are its own); this process
+    alone writes video_meta.csv after each shard, in plan order, and prints the log, so N changes only the speed and the memory (per
+    worker it grows with the video's frames and people; README gives the measured sizes), never a file or the log. A video is wanted when the current converter did not write its pose file: it
+    has no `.npy`, or its row has no switch_runs, which only this stage writes, together with the pose file (a converter without the
+    signer switch, a stopped `--overwrite` run, or a stop before the row was saved). `--overwrite` wants every video of a cached shard, and
+    it first clears their switch columns, so a stopped `--overwrite` run continues without `--overwrite`.
+    """
     cache, root = Path(args.cache), Path(args.root)
+    _refuse_stale_sidecars(root, plan, cache if args.overwrite else None)
     data_cfg = load_yaml(args.data_config)
-    subtitle_cfg = data_cfg.get("subtitles", {}) or {}
-    min_motion = float(data_cfg["poses"]["min_extra_person_motion"])  # the masked-run motion threshold
+    subtitle_cfg = dataset_config(data_cfg, DATASET)["subtitles"]   # also for a SignVerse language that data.yaml does not name
+    rules = data_cfg["poses"]   # the thresholds of the signer switch (switch_signing_speed, switch_raised_offset)
     targets = _lang_targets(data_cfg, {v["language"] for v in plan["videos"].values()})
     per_lang_meta: dict[str, dict[str, dict]] = {}
     report = {"converted": 0, "skipped_existing": 0, "empty_heavy": [],
@@ -831,6 +933,12 @@ def stage_convert(args, plan: dict) -> None:
         if lang not in per_lang_meta: per_lang_meta[lang] = load_video_meta(root / lang / META_FILENAME)
         return per_lang_meta[lang]
 
+    def _converted(vid: str) -> bool:   # the current converter wrote its pose file (see above)
+        lang = plan["videos"][vid]["language"]
+        return (root / lang / "poses" / f"{vid}.npy").exists() and (_meta_for(lang).get(vid) or {}).get("switch_runs") is not None
+
+    stale_absent = 0   # pose files that the current converter did not write, in shards not in the cache
+    jobs: list[tuple[str, list[str]]] = []   # (shard, wanted videos): a video sits in 1 shard
     for shard in sorted(plan["shards"]):
         tar_path = cache / shard
         if not tar_path.exists():
@@ -843,77 +951,71 @@ def stage_convert(args, plan: dict) -> None:
                 if (root / lang / "poses" / f"{vid}.npy").exists():
                     _backfill_meta(vid, root / lang, _meta_for(lang)); touched.add(lang)
                     report["skipped_existing"] += 1
+                    stale_absent += not _converted(vid)
                 else: report["not_downloaded"] += 1
             for lang in touched: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
             continue
 
         in_shard = plan["shards"][shard]
-        wanted = [v for v in in_shard if args.overwrite or not (root / plan["videos"][v]["language"] / "poses" / f"{v}.npy").exists()]
-        # Even for fully-converted shards: backfill meta rows a prior crash lost, then honor --delete-tars ("re-run convert --delete-tars 
-        # to free disk" flow must delete these too). A backfilled row carries the duration only: frame size and person counts live in the 
-        # shard, not the `.npy`, so `--stage person-counts` fills those and it needs shard tars (handless_runs it fills from the `.npy`).
-        touched_langs = set()
-        for vid in in_shard:
-            if vid not in wanted:
-                lang = plan["videos"][vid]["language"]
-                _backfill_meta(vid, root / lang, _meta_for(lang))
-                touched_langs.add(lang)
+        # A video that a prior stop left with a pose file but no row (or a row without switch_runs) is converted again. A fully
+        # converted shard is a job with no video, so --delete-tars still deletes it ("re-run convert --delete-tars to free disk").
+        wanted = [v for v in in_shard if args.overwrite or not _converted(v)]
         report["skipped_existing"] += len(in_shard) - len(wanted)
+        jobs.append((shard, wanted))
 
-        if wanted:
-            print(f"convert | {shard}: {len(wanted)} video(s)", flush=True)
-            tmp_dir = cache / "_extract"
-            # A truncated shard raises deep inside tarfile with no clue which file is bad. Name it and say what to do: the archive is 
-            # unusable, so the only fix is to delete and re-download it. getmembers(), not open(): a truncated tar opens fine (its 1st 
-            # header is intact) and only fails when the index is walked to the end.
-            try:
-                with tarfile.open(tar_path) as _probe: _probe.getmembers()
-            except tarfile.ReadError as e: raise SystemExit(
-                f"convert | {tar_path} is corrupt or truncated ({e}). This is a partial download, not a data problem. "
-                f"Delete it and re-run the download stage:\n    rm {tar_path}"
-            ) from e
-            with tarfile.open(tar_path) as tar:
-                shard_corrupt: list[str] = []
-                for vid in wanted:
-                    lang = plan["videos"][vid]["language"]
-                    lang_root = root / lang
-                    # A per-video npz can be corrupt inside a structurally valid tar (CRC failure on the inner zip member). That is 1 
-                    # unusable video, not a bad run: record it and continue, so a multi-hour conversion is not lost to a single upstream 
-                    # byte error. A shard where MANY videos fail is a bad download instead, and is escalated below.
-                    try: stats = _convert_one(tar, vid, lang_root, tmp_dir, targets.get(lang, "en"), subtitle_cfg, min_motion)
-                    except (zipfile.BadZipFile, EOFError, ValueError) as e:
-                        shutil.rmtree(tmp_dir / vid, ignore_errors=True)
-                        shard_corrupt.append(vid)
-                        report["npz_corrupt"].append(vid)
-                        print(f"convert |   {vid}: unreadable npz in {shard} ({type(e).__name__}: {e}) — skipped", flush=True)
-                        continue
-                    if stats is None: # Upstream inconsistency, nothing to retry — record it so the final tally reconciles.
-                        report["npz_missing"].append(vid)
-                        print(f"convert |   {vid}: npz absent from {shard} (upstream index/packaging gap) — skipped", flush=True)
-                        continue
-                    frames = max(1, int(stats["frames"]))
-                    _meta_for(lang)[vid] = {
-                        "video_id": vid, "duration_s": f"{stats['duration_s']:.3f}",
-                        "width": str(stats["width"] or ""), "height": str(stats["height"] or ""), 
-                        "caption_source": stats["caption_source"], "undetected_ratio": stats["empty_frames"] / frames,
-                        "masked_runs": stats["masked_runs"], "empty_runs": stats["empty_runs"], "handless_runs": stats["handless_runs"],
-                    }
-                    touched_langs.add(lang)
-                    report["converted"] += 1
-                    if stats["caption_source"] == "none": report["no_caption"] += 1
-                    if stats["frames"] and stats["empty_frames"] / stats["frames"] > 0.5:
-                        report["empty_heavy"].append((vid, round(stats["empty_frames"] / stats["frames"], 2)))
+    if args.overwrite:   # every wanted video loses its switch columns until it is converted again, so a stopped run continues without --overwrite
+        cleared = set()
+        for _, wanted in jobs:
+            for vid in wanted:
+                lang = plan["videos"][vid]["language"]
+                if (row := _meta_for(lang).get(vid)) is not None: row.update(dict.fromkeys(_SWITCH_RUNS)); cleared.add(lang)
+        for lang in cleared: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
 
-                # Widespread failure in ONE shard is a corrupt download, not upstream data: same remedy as a
-                # corrupt tar index, so fail with the same instruction rather than silently dropping the shard.
-                if len(shard_corrupt) >= max(3, len(wanted) // 2): raise SystemExit(
-                    f"convert | {len(shard_corrupt)}/{len(wanted)} videos in {tar_path} have unreadable npz data. That is a "
-                    f"corrupt download, not an upstream gap. Delete it and re-run the download stage:\n    rm {tar_path}"
-                )
+    for lang in sorted({plan["videos"][v]["language"] for _, wanted in jobs for v in wanted}): _blank_copy_of(root, lang, _meta_for(lang), data_cfg)
+    work = [(cache / shard, [(v, root / plan["videos"][v]["language"], targets.get(plan["videos"][v]["language"], "en")) for v in wanted],
+             cache / "_extract" / shard) for shard, wanted in jobs]
+    with _shard_map(args.workers) as convert:   # the shards' results in plan order
+        results = convert(_convert_shard, *zip(*work), [subtitle_cfg] * len(work), [rules] * len(work)) if work else []
+        for (shard, wanted), converted in zip(jobs, results):
+            if wanted: print(f"convert | {shard}: {len(wanted)} video(s)", flush=True)
+            shard_corrupt, touched_langs = [], set()
+            for vid, stats in converted:
+                lang = plan["videos"][vid]["language"]
+                if isinstance(stats, str):
+                    shard_corrupt.append(vid)
+                    report["npz_corrupt"].append(vid)
+                    print(f"convert |   {vid}: unreadable npz in {shard} ({stats}) — skipped", flush=True)
+                    continue
+                if stats is None: # Upstream inconsistency, nothing to retry — record it so the final tally reconciles.
+                    report["npz_missing"].append(vid)
+                    print(f"convert |   {vid}: npz absent from {shard} (upstream index/packaging gap) — skipped", flush=True)
+                    continue
+                frames = max(1, int(stats["frames"]))
+                _meta_for(lang)[vid] = {
+                    "video_id": vid, "duration_s": f"{stats['duration_s']:.3f}",
+                    "width": str(stats["width"] or ""), "height": str(stats["height"] or ""), 
+                    "caption_source": stats["caption_source"], "undetected_ratio": stats["empty_frames"] / frames,
+                    "empty_runs": stats["empty_runs"], "handless_runs": stats["handless_runs"],
+                    **{key: stats[key] for key in _SWITCH_RUNS},
+                    # YouTube-SL-25 has no annotation of cues whose signing does not match them: [] (checked, none), as How2Sign
+                    # and Auslan-Daily; only BOBSL's manual alignment has one (slp-pose writes it).
+                    "unreliable_spans": [],
+                }
+                touched_langs.add(lang)
+                report["converted"] += 1
+                if stats["caption_source"] == "none": report["no_caption"] += 1
+                if stats["frames"] and stats["empty_frames"] / stats["frames"] > 0.5:
+                    report["empty_heavy"].append((vid, round(stats["empty_frames"] / stats["frames"], 2)))
 
-        # Persist meta AFTER EACH SHARD: a crash then costs 1 shard, not the whole run.
-        for lang in touched_langs: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
-        if args.delete_tars: tar_path.unlink()
+            # Widespread failure in ONE shard is a corrupt download, not upstream data: same remedy as a
+            # corrupt tar index, so fail with the same instruction rather than silently dropping the shard.
+            if wanted and len(shard_corrupt) >= max(3, len(wanted) // 2): raise SystemExit(
+                f"convert | {len(shard_corrupt)}/{len(wanted)} videos in {cache / shard} have unreadable npz data. That is a "
+                f"corrupt download, not an upstream gap. Delete it and re-run the download stage:\n    rm {cache / shard}"
+            )
+            # Persist meta AFTER EACH SHARD: a crash then costs the shards in progress, not the whole run.
+            for lang in touched_langs: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
+            if args.delete_tars: (cache / shard).unlink()
 
     shutil.rmtree(cache / "_extract", ignore_errors=True)
     for lang, meta in per_lang_meta.items(): print(f"convert | {root / lang / META_FILENAME}: {len(meta)} rows", flush=True)
@@ -927,6 +1029,9 @@ def stage_convert(args, plan: dict) -> None:
           f"unreadable npz {len(report['npz_corrupt'])} + shard not downloaded {report['not_downloaded']}")
     if report["not_downloaded"]: print(f"convert | {report['not_downloaded']} video(s) are in shards not present in {cache} — "
                                        f"run `--stage download` (or `--stage all` without --limit) to fetch them.")
+    if stale_absent: print(f"convert | {stale_absent} video(s) keep a pose file that the current converter did not write (their row has no "
+                           f"switch_runs), and their shards are not in {cache}: the loader warns for them. "
+                           f"Run `--stage download` and convert again.")
     print(f"convert | {report['converted'] - report['no_caption']} video(s) captioned from their shard track (caption_source=shard); "
           f"{report['no_caption']} without a usable shard caption → `--stage subs` gap-fills from subtitles tar (else the loader drops them)")
     if report["empty_heavy"]: print(f"convert | {len(report['empty_heavy'])} converted video(s) have >50% frames with no detected body.")
@@ -937,29 +1042,54 @@ def stage_convert(args, plan: dict) -> None:
     )
 
 
-def stage_person_counts(args, plan: dict) -> None:
-    """Fill undetected_ratio, masked and empty runs and frame size in video_meta.csv from source archives, and handless_runs from pose files.
+def _shard_stats(tar_path: Path, wanted: set[str]) -> list[tuple[str, dict]]:
+    # (video id, `sidecar_stats_from_npz`) of every wanted video in 1 consolidated shard, in archive order. Module level, so that
+    # `--stage person-counts --workers N` can run it in a worker process.
+    out = []
+    with tarfile.open(tar_path, "r|") as tar:   # stream: 1 sequential pass, nothing seeks back
+        for member in tar:
+            vid = member.name.split("/")[0]
+            if vid not in wanted or not member.name.endswith("/npz/poses.npz"): continue
+            out.append((vid, sidecar_stats_from_npz(np.load(io.BytesIO(tar.extractfile(member).read()), allow_pickle=True))))
+    drop_from_page_cache(tar_path)
+    return out
 
-    Reads the counts and keypoints 1 video at a time. Pose files and caption_source are preserved. Complete rows are skipped, except under
-    `--stage person-counts --overwrite`, which measures every video again (after a change of the run rules). The loader cuts nothing for a 
-    run column left blank, and quarantines nothing for a blank handless_runs.
+
+def stage_person_counts(args, plan: dict) -> None:
+    """Fill undetected_ratio, empty runs and frame size in video_meta.csv from source archives, and handless_runs from pose files.
+
+    Reads the counts and keypoints 1 video at a time. With `--workers N`, N worker processes each measure 1 shard at a time; this
+    process alone updates the rows and saves video_meta.csv after each shard, in plan order, so N changes only the speed and the
+    memory (per worker it grows with the video's frames and people; README gives the measured sizes), never the file. Pose files and caption_source are preserved. Complete rows are skipped, except under
+    `--stage person-counts --overwrite`, which measures every video again (after a change of the run rules). A row with any of these
+    columns blank is measured, every shard column again. No shard column depends on the body that the pose file keeps, so a row
+    without switch_runs (a pose file that the current converter did not write) is measured too; a sidecar without the switch columns is
+    refused (`_refuse_stale_sidecars`). The loader cuts nothing for a blank empty_runs, and quarantines nothing for a blank handless_runs,
+    switch_runs or default_signing_runs. Under `--overwrite`, a row that no consolidated archive measures (a per-frame-layout video, or a
+    shard not in the cache) gets blank empty runs, so the loader warns rather than reads runs of older rules as current; its frame size,
+    undetected_ratio and switch columns stay, as no run rule changes them.
     """
     cache, root = Path(args.cache), Path(args.root)
-    min_motion = float(load_yaml(args.data_config)["poses"]["min_extra_person_motion"])  # as in `--stage convert`
+    _refuse_stale_sidecars(root, plan)
     remeasure = bool(args.overwrite) and args.stage == "person-counts"   # `--stage all` has just measured them in convert
     per_lang_meta: dict[str, dict[str, dict]] = {}
-    filled = skipped = 0
+    filled = skipped = unmeasured = 0
     missing_shards: list[str] = []
 
     def _meta_for(lang: str) -> dict:
         if lang not in per_lang_meta: per_lang_meta[lang] = load_video_meta(root / lang / META_FILENAME)
         return per_lang_meta[lang]
 
+    def _unmeasured(vids) -> int:   # under --overwrite, the rows no consolidated archive measured: their runs become unknown
+        if not remeasure: return 0
+        for vid in vids: _meta_for(plan["videos"][vid]["language"])[vid]["empty_runs"] = None
+        return len(vids)
+
     def _needs(vid: str) -> bool:
         lang = plan["videos"][vid]["language"]
         row = _meta_for(lang).get(vid)
         if row is None or not (root / lang / "poses" / f"{vid}.npy").exists(): return False
-        return remeasure or any(row.get(key) is None for key in ("undetected_ratio", "masked_runs", "empty_runs", "width", "height"))
+        return remeasure or any(row.get(key) is None for key in ("undetected_ratio", "empty_runs", "width", "height"))
 
     # handless_runs reads the kept body, which the .npy holds (`handless_runs`, as in `--stage convert`): no archive needed.
     handless_filled = 0
@@ -969,49 +1099,53 @@ def stage_person_counts(args, plan: dict) -> None:
             handless_filled += filled_here
     print(f"person-counts | handless_runs filled {handless_filled} from the pose files", flush=True)
 
+    jobs: list[tuple[str, set[str]]] = []   # a video sits in 1 shard, so measuring a shard changes no other shard's `_needs`
     for shard in sorted(plan["shards"]):
         wanted = {v for v in plan["shards"][shard] if _needs(v)}
         skipped += sum(1 for v in plan["shards"][shard] if v in plan["videos"] and not _needs(v)
                          and (root / plan["videos"][v]["language"] / "poses" / f"{v}.npy").exists())
         if not wanted: continue
-        tar_path = cache / shard
-        if not tar_path.exists():
+        if not (cache / shard).exists():
             missing_shards.append(shard)
+            unmeasured += _unmeasured(wanted)
             continue
+        jobs.append((shard, wanted))
 
-        with tarfile.open(tar_path, "r|") as tar:   # stream: 1 sequential pass, nothing seeks back
-            for member in tar:
-                vid = member.name.split("/")[0]
-                if vid not in wanted or not member.name.endswith("/npz/poses.npz"): continue
-                z = np.load(io.BytesIO(tar.extractfile(member).read()), allow_pickle=True)
-                stats = sidecar_stats_from_npz(z, min_motion)
+    with _shard_map(args.workers) as measure:   # the shards' results in plan order
+        for (shard, wanted), shard_stats in zip(jobs, measure(_shard_stats, [cache / s for s, _ in jobs], [w for _, w in jobs])):
+            filled_before = filled
+            for vid, stats in shard_stats:
                 frames = stats["frames"]
                 lang = plan["videos"][vid]["language"]
                 row = _meta_for(lang)[vid]
-                row.update({
-                    "undetected_ratio": 1.0 - stats["detected"] / frames if frames else 1.0,
-                    "masked_runs": stats["masked_runs"], "empty_runs": stats["empty_runs"],
-                })
-                # Only when the shard knows it: a blank stays blank rather than becoming a wrong 0, 
-                # because Moryossef segmenter's aspect correction reads these.
+                row.update({"undetected_ratio": 1.0 - stats["detected"] / frames if frames else 1.0, "empty_runs": stats["empty_runs"]})
+                # Only when the shard knows it: a blank stays blank rather than becoming a wrong 0,
+                # because the reader's x map to a 16:9 frame (poses.pose_io.load_pose_frames) reads these.
                 if stats["width"] and stats["height"]: row.update({"width": stats["width"], "height": stats["height"]})
                 filled += 1
                 wanted.discard(vid)
+            unmeasured += _unmeasured(wanted)
+            for lang in per_lang_meta: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
+            print(f"person-counts | {shard}: filled {filled - filled_before}, not in a consolidated archive {len(wanted)} "
+                  f"({'run columns set unknown' if remeasure else 'blank columns stay unknown'})", flush=True)
 
-        drop_from_page_cache(tar_path)
+    if unmeasured:   # the rows of shards not in the cache (a read shard saved its own above)
         for lang in per_lang_meta: save_video_meta(root / lang / META_FILENAME, per_lang_meta[lang])
-        print(f"person-counts | {shard}: filled {len(plan['shards'][shard]) - len(wanted)}, "
-              f"per-frame layout left unknown {len(wanted)}", flush=True)
-
     print(f"person-counts | filled {filled}, already known {skipped}, shards not in cache {len(missing_shards)}", flush=True)
-    # Name what is still blank. The loader's visual cuts read the run columns and the segmenter's aspect correction reads
+    if unmeasured: print(
+        f"person-counts | --overwrite: {unmeasured} row(s) that no consolidated archive measured (a per-frame-layout video, or a shard not "
+        f"in the cache) now have unknown empty_runs: the loader warns and cuts nothing for them. "
+        f"`--stage all --overwrite` measures a per-frame-layout video in convert.", flush=True
+    )
+    # Name what is still blank. The loader's visual cuts read the run columns and the pose reader's x map reads
     # the frame size. Report missing values so the user can distinguish unmeasured videos from measured absences.
     for lang, meta in sorted(per_lang_meta.items()):
         blank = lambda *keys: sum(1 for row in meta.values() if any(row.get(k) is None for k in keys))
         print(
             f"person-counts | {lang}: rows still unknown: undetected_ratio {blank('undetected_ratio')}/{len(meta)}, "
-            f"frame size {blank('width', 'height')}/{len(meta)}, masked_runs {blank('masked_runs')}/{len(meta)}, "
-            f"empty_runs {blank('empty_runs')}/{len(meta)}, handless_runs {blank('handless_runs')}/{len(meta)}", flush=True
+            f"frame size {blank('width', 'height')}/{len(meta)}, "
+            f"empty_runs {blank('empty_runs')}/{len(meta)}, handless_runs {blank('handless_runs')}/{len(meta)}, "
+            + ", ".join(f"{key} {blank(key)}/{len(meta)}" for key in _SWITCH_RUNS), flush=True
         )
     if missing_shards: print(
         f"person-counts | {len(missing_shards)} shard(s) absent from {cache}; their videos stay UNKNOWN and data/loader.py cuts nothing "
@@ -1025,6 +1159,7 @@ def stage_subs(args, plan: dict) -> None:
     A video already carrying `<vid>.<target>.vtt` in subs/ is left untouched — convert wrote that same canonical name from its shard track. 
     Only GAPS get one from the tar. Provenance (human | mt) → video_meta.csv `caption_source`."""
     root = Path(args.root)
+    _refuse_stale_sidecars(root, plan)   # it saves video_meta.csv
     data_cfg = load_yaml(args.data_config)
     lang_target = _lang_targets(data_cfg, {info["language"] for info in plan["videos"].values()})
 
@@ -1061,6 +1196,7 @@ def stage_subs(args, plan: dict) -> None:
         _download(f"{HF_BASE}/{SUBTITLES_TAR}", tar_path)
     else: print(f"subs | {len(gaps)} caption gap(s); using existing {tar_path}", flush=True)
 
+    for lang in sorted(set(gaps.values())): _blank_copy_of(root, lang, load_video_meta(root / lang / META_FILENAME), data_cfg)
     buf: dict[str, dict[str, bytes]] = {}  # vid -> {caption filename: bytes}, only for gap videos
     with tarfile.open(tar_path) as tar:
         for m in tar:  # stream: subtitles/<vid>/<file>
@@ -1105,6 +1241,51 @@ def stage_subs(args, plan: dict) -> None:
               f"caption-less (dropped by loader). Provenance → {root / lang / META_FILENAME} caption_source.", flush=True)
     if total_mt: print("subs | NLLB-machine-translated captions are noisy SLT targets — the loader scores the TEST split "
                        "against human references only (subtitles.human_only_splits + caption_source in video_meta.csv).")
+
+
+def _blank_copy_of(root: Path, lang: str, meta: dict[str, dict], data_cfg: dict) -> None:
+    # The copy check (`--stage dedup`) reads the captions of every split, so a stage that writes captions of `lang` first blanks copy_of
+    # for every video of `lang`: the train loader then refuses until `--stage dedup` runs again (`--stage all` runs it last). It also
+    # deletes the casing file that pools `lang` (its subtitles.case_lexicon, built from train captions by that stage's train load),
+    # so a dev or test load refuses until then too; only when these captions are the ones the file reads (`--root` holds the root that
+    # data.yaml names for `lang`), so a conversion into another folder leaves the shared file alone.
+    # A SignVerse language that data.yaml does not name is in no pool and has no configured root.
+    entry, configured = case_lexicon_entry(data_cfg, lang), (data_cfg["languages"].get(lang) or {}).get("root")
+    if entry and configured and (root / lang).resolve() == Path(configured).resolve(): entry[0].unlink(missing_ok=True)
+    if not meta: return   # no row (a new corpus): nothing to blank, and its folder may not exist yet
+    for row in meta.values(): row["copy_of"] = None
+    save_video_meta(root / lang / META_FILENAME, meta)
+
+
+def stage_dedup(args) -> None:
+    """The cross-split copy check (data.yaml subtitles.dedup), once per corpus: the only step that reads the captions of more than 1 split.
+
+    Per language, at its --data-config root (the root the loader reads): `data.loader.train_copies` compares the train records before the
+    check (made by the loader's own rules) with every dev and test caption, and this writes the result to the video_meta.csv column copy_of:
+    [held-out video, score] for a train copy of a dev/test video, which the train loader drops whole; [] for every other checked train
+    video; blank for every other video (dev and test, and a train video that a loader rule drops). So a split change after the check is
+    refused by the train loader: a video moved to train is blank, and one moved to dev or test keeps its value. Run it again after a
+    change of captions (convert and subs blank the column), the split CSV, the caption rules or subtitles.dedup; `--stage all` runs it
+    last. Its train load also builds the case lexicon again when the train captions changed (`data.loader.case_lexicon`), which the dev
+    and test loaders only read."""
+    data_cfg = load_yaml(args.data_config)
+    for lang in args.languages:
+        root, meta_path = Path(data_cfg["languages"][lang]["root"]), video_meta_path(data_cfg, lang)   # the corpus's own sidecar
+        subtitle_cfg = corpus_config(data_cfg, lang)["subtitles"]
+        train, splits = load_language_records(data_cfg, lang, split="train", before_dedup=True)   # builds the case lexicon too
+        if not subtitle_cfg["dedup"]["enabled"]:
+            print(f"dedup | {lang}: subtitles.dedup.enabled is false: the train loader reads no copy_of, nothing to write", flush=True)
+            continue
+        meta = load_video_meta(meta_path)
+        if unlisted := sorted(r.video_id for r in train if r.video_id not in meta): raise SystemExit(
+            f"dedup | {lang}: {len(unlisted)} train video(s) have no {meta_path.name} row to hold copy_of (e.g. {', '.join(unlisted[:3])}). "
+            f"Run `python prepare_yt25.py --stage meta --languages {lang}` first (for slp-pose poses: its metadata command)."
+        )
+        copy_of = train_copies(train, splits, root, subtitle_cfg)
+        for vid, row in meta.items(): row["copy_of"] = copy_of.get(vid)
+        save_video_meta(meta_path, meta)
+        print(f"dedup | {lang}: {sum(map(bool, copy_of.values()))} of {len(copy_of)} train videos are copies of a dev/test video (compared "
+              f"with {len(splits.get('dev', []))} dev and {len(splits.get('test', []))} test videos) → {meta_path} copy_of", flush=True)
 
 
 def fetch_youtube_meta(video_ids: list[str], ytdlp_format: str = YTDLP_FORMAT, workers: int = 4, chunk: int = 25) -> dict[str, dict]:
@@ -1157,7 +1338,8 @@ def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) ->
 
     Existing sidecar rows are kept; yt-dlp metadata is fetched only for pose ids still missing (no video download). A single constant fps 
     CANNOT replace this: own extractions vary in fps per video, and a wrong rate shifts every caption timestamp against the poses. A blank 
-    handless_runs is filled from pose files (`fill_handless_runs`); masked_runs and empty_runs need SignVerse archives, so they stay blank.
+    handless_runs is filled from pose files (`fill_handless_runs`); empty_runs, switch_runs and default_signing_runs need SignVerse
+    archives, so they stay blank.
     """
     lang_root = Path(lang_root)
     out_path = lang_root / META_FILENAME
@@ -1169,6 +1351,8 @@ def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) ->
         print(f"fetching {len(missing)} videos' metadata from YouTube (yt-dlp, no download)...")
         meta.update(fetch_youtube_meta(missing, ytdlp_format=ytdlp_format))
     if handless_filled := fill_handless_runs(lang_root, meta): print(f"handless_runs filled {handless_filled} from the pose files")
+    for row in meta.values():
+        if row.get("unreliable_spans") is None: row["unreliable_spans"] = []   # no such annotation (convert)
     save_video_meta(out_path, meta)
     still_missing = sorted(pose_ids - set(meta))
     print(f"{len(meta)} videos -> {out_path}; pose ids still missing: {len(still_missing)}"
@@ -1178,7 +1362,7 @@ def build_video_meta(lang_root: str | Path, ytdlp_format: str = YTDLP_FORMAT) ->
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SignVerse-2M → repo language layout (poses/ + subs/ + video_meta.csv)")
-    parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "person-counts", "subs", "meta", "all"])
+    parser.add_argument("--stage", default="all", choices=["plan", "download", "verify", "convert", "person-counts", "subs", "meta", "dedup", "all"])
     parser.add_argument("--languages", nargs="+", default=["ase", "asf", "bfi"])
     parser.add_argument("--split-csv", default=DEFAULT_SPLIT_CSV)
     parser.add_argument("--data-config", default="configs/data.yaml", help="reads languages[lang].target_lang for the caption language")
@@ -1194,10 +1378,16 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", action="store_true",
                         help="convert: re-convert videos whose .npy already exists; person-counts: measure every video's run columns again")
     parser.add_argument("--format", default=YTDLP_FORMAT, help="meta: yt-dlp format selector; use the one the videos were downloaded with")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="convert and person-counts: shards worked on at the same time, each in a worker process (1 = in this "
+                             "process); the written files and video_meta.csv are the same for every value")
     args = parser.parse_args()
 
     if args.stage == "meta":   # reads <root>/<lang>/poses only: no split CSV, no shard index
         for lang in args.languages: build_video_meta(Path(args.root) / lang, ytdlp_format=args.format)
+        sys.exit(0)
+    if args.stage == "dedup":   # reads the --data-config corpora (captions, train pose index) and writes their video_meta.csv copy_of: no shard index
+        stage_dedup(args)
         sys.exit(0)
     split_csv = Path(args.split_csv)
     if not split_csv.exists(): sys.exit(f"split CSV not found: {split_csv}")
@@ -1209,3 +1399,4 @@ if __name__ == "__main__":
     if args.stage in ("convert", "all"): stage_convert(args, plan)
     if args.stage in ("person-counts", "all"): stage_person_counts(args, plan)
     if args.stage in ("subs", "all"): stage_subs(args, plan)
+    if args.stage == "all": stage_dedup(args)

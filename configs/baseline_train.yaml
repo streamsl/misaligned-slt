@@ -1,17 +1,21 @@
-# Train the clean translator for YouTube-SL-25 languages without an in-domain released checkpoint.
+# Train the clean translator of a language (README B2a), also one with its own released translator (data.yaml released_slt).
 # Recipe = Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh), strict 
-# warm-start from the released checkpoint (checkpoint.from_pretrained below, NOT data.yaml pretrained_slt).
+# warm-start from a released checkpoint (data.yaml released_slt of the language, else checkpoint.from_pretrained below; 
+# NOT data.yaml pretrained_slt).
 #
 # "Pre-trimmed" TRAINING VIEW with 0 new data plumbing: mode1-only ratios + a 0 context band make every sampler 
 # window exactly the GT caption span + 1 terminator frame, deterministically (at context_s 0 mode1's jittered-retry 
 # acceptance never fires and clean-clip fallback always wins; anchors are index-driven, so 1 epoch = exact coverage 
 # of every train caption). NB these spans are CAPTION-cut, not studio-trimmed: onset noise and back-to-back bleed 
-# remain in the training windows. The RQ1 curve is self-anchored at (0,0).
-# Deliberate deviations from Uni-Sign: no 256-frame random subsampling (their memory heuristic; our encoder runs 
-# native-rate and deployment never subsamples — introducing it would create a rate mismatch OUR system never sees), 
-# and single-GPU batch sizing below.
+# remain in the training windows. The boundary sweep's curve is self-anchored at (0,0).
+# Deliberate deviations from Uni-Sign: no 256-frame random subsampling (their memory heuristic: the frame rate then 
+# follows the clip length, 6.4 fps for a 40 s clip, which deployment never produces), and single-GPU batch sizing below. 
+# The floor trains with the shared augmentation of dlm.yaml instead: a bounded density range whose top is the native rate, 
+# as every trained pose model (S1, the arms) does, so the arm that starts from this floor keeps its input distribution.
 #
-# After training: set data.yaml <lang>.pretrained_slt to checkpoints/baseline_train/<lang>/model.pt (README B2b). 
+# Decoder: baseline_eval.yaml `decoder` (ar: CE; dlm: OPUT, selected on the block decode). Each decoder has its own folder.
+# After training: set data.yaml <lang>.pretrained_slt.<decoder> to checkpoints/baseline_train_<decoder>/<lang>/model.pt 
+# (README B2b). 
 # NOT train-bio: pooled S1 is language-agnostic and deliberately warm-starts from RELEASED checkpoint, so re-rooting 
 # it on 1 language's fine-tune would privilege that language inside language-agnostic pretraining (train/bio_pretrain.py). 
 # Stage 2's segmentation branch loads S1's pose encoder; its translator loads THIS baseline's.
@@ -25,28 +29,36 @@ scheduler:
 max_grad_norm: 1.0
 batch_size: 16
 grad_accum_steps: 1     # Effective batch = batch_size * grad_accum_steps
+early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
 lambda_bio: 0.0         # Uni-Sign SLT loss is a SINGLE label-smoothed CE — no BIO auxiliary. 0 means the model has no
                         # segmentation branch at all (no BIO head, no second pose encoder), not a zero-weighted one.
+train_inputs: [windows] # caption windows only (no BIO head, so no edge mask); dlm.yaml lists the arms' types
+lambda_trans: 1.0       # Single text loss (AR CE or DLM OPUT) at full weight. dlm.yaml's joint-arm value is not inherited
 mode_ratios: {mode1: 1.0, mode2: 0.0, mode3: 0.0, mode4: 0.0}  # clean-span training view, NOT stage 2's designed mode mix
 jitter:
     context_s: 0.0
 # Captions LONGER than inference.yaml buffer_cap_s get right-truncated by the window clip and relabel to mode2 
 # (no translation target -> and with lambda_bio 0, NO loss at all: the sentence is silently unsupervised).
-# Deliberate: deployment can never decode >buffer_cap at once either (FSM force-commit), and Uni-Sign's
-# alternative — random 256-frame subsampling — would train at a frame rate the deployed system never produces.
+# Deliberate: deployment can never decode >buffer_cap at once either (FSM force-commit), and Uni-Sign's alternative — 
+# random 256-frame subsampling — would train at a frame rate set by the clip length, far below the native one.
 # CONSEQUENCE: Baseline must be (re)trained under SAME buffer_cap_s the arms train under — a stale smaller cap silently 
 # removes longest sentences (the heaviest BLEU mass) from THIS arm's supervision only, turning the controlled comparison 
 # into a training-data asymmetry. The cap (40s) covers the train p99 unit duration of every corpus (inference.yaml).
 
 checkpoint:
-    dir: checkpoints/baseline_train/${language}
-    # The clean floor ALWAYS starts from the released Uni-Sign weights, never from data.yaml pretrained_slt: after the
-    # README B2b re-root that key names this recipe's own previous output. train-slt refuses a trained warm start here.
+    dir: checkpoints/baseline_train_${decoder}/${language}  # 1 folder per decoder (baseline_eval.yaml decoder)
+    # The clean floor ALWAYS starts from released weights, never from data.yaml pretrained_slt: after the README B2b re-root
+    # that key names this recipe's own previous output. A language with its own released translator (data.yaml released_slt)
+    # starts both of its floors from that file instead of this one (utils.resolve_pretrained). train-slt refuses a trained warm start.
     from_pretrained: checkpoints/openasl_pose_only_slt.pth
     bio_head_init: null              # explicit: extends deep-merges, so dlm.yaml's S1 path would otherwise leak through
                                      # this partial checkpoint override (lambda_bio: 0 also builds no segmentation branch)
     monitor: val_translation_bleu4   # selection by dev BLEU
     mode: max
+    eval_every_epochs: 1             # dev BLEU is cheap; dlm.yaml's stage-2 cadence and patience size the stage-2 monitor
 
 wandb:
-    name: baseline_train_${language}
+    name: baseline_train_${decoder}_${language}

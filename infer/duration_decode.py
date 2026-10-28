@@ -1,8 +1,8 @@
 """Shared semi-Markov BIO scores and exact Viterbi decoding.
 
-A path scores the head's O/B/I log-probabilities + a duration prior fitted to the TRAIN unit durations; 
-there is no tuned per-span bonus or B-evidence weight. The legal-only S1 monitor uses the same state grammar 
-without duration factors. Caption membership is computed from these scores in models.membership_gate.
+A path scores the head's O/B/I log-probabilities + a duration prior fitted to the TRAIN unit durations; there is no tuned per-span 
+bonus or B-evidence weight. The online plain decoder control (--online --segmenter-decode plain) and the dev-chunk diagnostics use 
+the same state grammar without duration factors. Caption membership is computed from these scores in models.membership_gate.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
@@ -11,7 +11,7 @@ import math
 import numpy as np
 import torch
 from scipy.special import log_ndtr
-from data.loader import _cached_language_records, annotation_fingerprint
+from data.loader import cached_language_records, annotation_fingerprint
 from data.windowing import BIO
 
 
@@ -52,7 +52,7 @@ class DurationModel:
     def for_language(cls, data_cfg, language):
         # Target language's prior, fitted on its train split: what stage 2 trains with and every cascade decodes with. 
         # The split is parsed once per process (eval's segmenter data guard reads the same records).
-        return cls.fit(_cached_language_records(data_cfg, language, "train"))
+        return cls.fit(cached_language_records(data_cfg, language, "train"))
 
     @lru_cache(maxsize=128)
     def factors(self, fps: float):

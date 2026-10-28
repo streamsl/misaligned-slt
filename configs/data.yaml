@@ -1,128 +1,260 @@
 active_languages: [asf]
 
-# Each language entry defines a YouTube-SL-25 root, target language, warm start, and pose properties. pose.fps is a 
-# FALLBACK only. Real pose fps is resolved per video as total_pose_frames/video_duration from <root>/video_meta.csv. 
-# ase/asf/bfi use SignVerse-2M poses at UNIFORM 24 fps — `prepare_yt25.py` writes their video_meta.csv (duration = 
-# frames / 24, rounded to 1 ms). The per-video-fps note below is the SELF-EXTRACTION route: your own poses are 
-# extracted at the NATIVE rate varies per YouTube video. You can generate its labels once with:
-# `python prepare_yt25.py --stage meta --languages <lang> [--format SEL]` (yt-dlp metadata fetch, no video download).
+# The data, in 3 levels (data.loader.corpus_config). A corpus reads each of the blocks `splits` and `subtitles` as:
+#   1. the rules of every corpus (the `splits` and `subtitles` blocks at the end of this file),
+#   2. then its dataset (`datasets`): the source of its videos and captions, with what the corpora of 1 source share (split file,
+#      caption track, casing file),
+#   3. then its own entry (`languages`), for what differs between the corpora of 1 dataset (BOBSL's 2 label sources).
+# Each level replaces only the keys that it names. The `pose` block (the fallback frame size of a video that its sidecar does not size)
+# has only levels 2 and 3; the pose rules of every corpus are the `poses` block at the end. Every corpus reads its video rates, frame
+# sizes and run columns from its sidecar (<root>/video_meta.csv, or its `video_meta` entry), and the pose reader gives every video on
+# the poses.model_fps grid.
+
+datasets:
+    # YouTube-SL-25 through SignVerse-2M (HF SignerX/SignVerse-2M): DWPose at a uniform 24 fps. `python prepare_yt25.py --languages L`
+    # writes each language root: poses/<vid>.npy (the 133 COCO-WholeBody keypoints, x/W and y/H), subs/<vid>.en.vtt (the 1 caption of
+    # each video: the best shard track, chosen with the suffixes below, else the curated SignVerse English) and video_meta.csv (duration =
+    # frames / 24 rounded to 1 ms, frame size, run columns). Poses that you extract yourself at the native rate of each video get their
+    # sidecar from `python prepare_yt25.py --stage meta --languages L [--format SEL]` (yt-dlp metadata, no video download).
+    youtube-sl-25:
+        splits:
+            file: data/youtube-sl-25/SignVerse-2M-metadata_split.csv
+        subtitles:
+            preferred_suffixes: [.en-GB.vtt, .en-en-GB.vtt, .en-en.vtt, .en.vtt]
+            reject_suffixes: [.en-orig.vtt, .orig.vtt]
+            # The casing file (data.loader.case_lexicon): the words that lose the capital of a sentence start inside a unit, built from
+            # the TRAIN captions of every corpus that names the file. 1 file per caption source and target language, because a word's
+            # ordinary case depends on the source ("Bush" in US news, "bush" in British broadcast subtitles). A train load builds it
+            # again when these captions change; dev and test loads only read it, so copy it to a machine that lacks one of its corpora.
+            case_lexicon: data/youtube-sl-25/case_lexicon.en_XX.json
+        pose:
+            width: 1920   # fallback frame size for a video without video_meta.csv width/height
+            height: 1080
+    # The 3 public benchmarks come from slp-pose (github.com/streamsl/DWPose-untrimmed-slp): DWPose at the rate of each video. slp-pose
+    # writes their poses, captions (subs/<vid>.<track>.vtt), split files and sidecars; this repository only runs `--stage dedup` on them.
+    how2sign:
+        splits:
+            file: data/how2sign/splits.csv
+        subtitles:
+            preferred_suffixes: [.en.vtt]
+            case_lexicon: data/how2sign/case_lexicon.en_XX.json
+        pose:
+            width: 1280
+            height: 720
+    auslan_daily:
+        splits:
+            file: data/auslan-daily-abc/splits.csv
+        subtitles:
+            preferred_suffixes: [.en.vtt]
+            case_lexicon: data/auslan-daily-abc/case_lexicon.en_XX.json   # its captions carry no capitals: the list changes nothing
+        pose:
+            width: 1280
+            height: 720
+    # BOBSL holds 2 label sources on the same episodes, so its 2 corpora name their own split file, track and sidecar (`languages`).
+    bobsl:
+        subtitles:
+            case_lexicon: data/bobsl/case_lexicon.en_XX.json
+        pose:
+            width: 444
+            height: 444
+
+# The corpora. Each names its dataset, its root, its target language and its translators:
+# - `pretrained_slt`: the translation warm start of each decoder (utils.resolve_pretrained reads the entry of the config's `decoder`).
+#   After the pre-trimmed baseline (the clean floor) fine-tunes, re-root each entry on the LOCAL clean floor of that decoder (the
+#   commented values), so each stage-2 arm and every later `--method baseline` eval of that decoder share 1 init (§1.4 + controlled
+#   comparison). train-slt refuses a stage-2 arm while its entry points at a file without clean-floor meta (a released checkpoint) or at
+#   the floor of the other decoder. The released start for an English target is Uni-Sign's OpenASL release (openasl_pose_only_slt.pth):
+#   its mT5 is tuned to emit English (OpenASL is ASL->English SLT), its pose encoder saw sign skeletons, and it strict-loads.
+# - `released_slt`: a released translator trained on this corpus. Both clean floors of the corpus start from it (README B2a), in place
+#   of baseline_train.yaml checkpoint.from_pretrained.
+# - `lowercase_references: true`: every text of the corpus's rows is scored in lowercase, for every system alike (metrics.text_level).
+# - `video_meta`: the corpus's own sidecar, when 2 corpora share a root (default <root>/video_meta.csv).
 languages:
-    # asf/bfi poses come from SignVerse-2M (HF SignerX/SignVerse-2M; DWPose extracted at a UNIFIED 24 fps) via
-    # `python prepare_yt25.py --languages asf bfi` — it writes <root>/poses/*.npy (canonical normalized-[0,1] 
-    # 133-kpt), <root>/subs/*.vtt (per-video captions bundled in shards) and <root>/video_meta.csv (duration 
-    # from frame_count / 24 rounded to 1 ms, so per-video fps calibration recovers 24.0 within 0.001; 
-    # utils.seconds_to_frames absorbs that). pose.fps stays the fallback only.
-    # asf/bfi/ase all target ENGLISH → warm-start from Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its
-    # mT5 is tuned to emit English (OpenASL is ASL→English SLT) and its pose encoder saw sign skeletons — the right
-    # init on both axes. OpenASL uses the same architecture and strict-loads.
     ase:
+        dataset: youtube-sl-25
         name: ASL
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
-        # pretrained_slt: checkpoints/baseline_train/ase/model.pt
         root: data/youtube-sl-25/ase
-        pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
-            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
-            height: 1080
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/ase/model.pt
+            # dlm: checkpoints/baseline_train_dlm/ase/model.pt
     asf:
+        dataset: youtube-sl-25
         name: Auslan (SignVerse-2M poses)
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
-        # pretrained_slt: checkpoints/baseline_train/asf/model.pt
         root: data/youtube-sl-25/asf
-        pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
-            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
-            height: 1080
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/asf/model.pt
+            # dlm: checkpoints/baseline_train_dlm/asf/model.pt
     bfi:
+        dataset: youtube-sl-25
         name: BSL (SignVerse-2M poses)
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        # After the README B2 baseline fine-tune, re-root the language on the LOCAL clean-floor baseline so the
-        # stage-2 arms and every later --method baseline eval share 1 init (§1.4 + controlled comparison). train-slt 
-        # refuses a stage-2 arm while this points at any file without clean-floor meta (the released checkpoint).
-        # pretrained_slt: checkpoints/baseline_train/bfi/model.pt
         root: data/youtube-sl-25/bfi
-        pose:
-            fps: 24.0    # SignVerse unified extraction rate (dataset card; verified on real shard headers)
-            width: 1920  # fallback frame size for a video without video_meta.csv width/height.
-            height: 1080
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/bfi/model.pt
+            # dlm: checkpoints/baseline_train_dlm/bfi/model.pt
+    how2sign:
+        dataset: how2sign
+        name: ASL (How2Sign, slp-pose DWPose)
+        target_lang: en_XX
+        root: data/how2sign
+        released_slt: checkpoints/how2sign_pose_only_slt.pth
+        pretrained_slt:
+            ar: checkpoints/how2sign_pose_only_slt.pth
+            dlm: checkpoints/how2sign_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/how2sign/model.pt
+            # dlm: checkpoints/baseline_train_dlm/how2sign/model.pt
+    auslan_daily:
+        dataset: auslan_daily
+        name: Auslan (Auslan-Daily News V1 + V2, slp-pose DWPose)
+        target_lang: en_XX
+        root: data/auslan-daily-abc
+        lowercase_references: true
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/auslan_daily/model.pt
+            # dlm: checkpoints/baseline_train_dlm/auslan_daily/model.pt
+    # The automatic SAT alignment on the official split: S1 pretraining only (its test split is never read).
+    bobsl_auto:
+        dataset: bobsl
+        name: BSL (BOBSL, automatic alignment, official split)
+        target_lang: en_XX
+        root: data/bobsl
+        splits:
+            file: data/bobsl/splits_automatic.csv
+        subtitles:
+            preferred_suffixes: [.en.vtt]
+            reject_suffixes: [.en-manual.vtt]   # the other corpus's track: never read (data.loader.best_subtitle)
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+    # The manual alignment on the re-split by interpreter: the BOBSL target.
+    bobsl_manual:
+        dataset: bobsl
+        name: BSL (BOBSL, manual alignment, re-split by interpreter)
+        target_lang: en_XX
+        root: data/bobsl
+        video_meta: data/bobsl/video_meta_manual.csv
+        splits:
+            file: data/bobsl/splits_manual.csv
+        subtitles:
+            preferred_suffixes: [.en-manual.vtt]
+            reject_suffixes: [.en.vtt]          # the other corpus's track: never read (data.loader.best_subtitle)
+        pretrained_slt:
+            ar: checkpoints/openasl_pose_only_slt.pth
+            dlm: checkpoints/openasl_pose_only_slt.pth
+            # ar: checkpoints/baseline_train_ar/bobsl_manual/model.pt
+            # dlm: checkpoints/baseline_train_dlm/bobsl_manual/model.pt
 
+# ---- The rules of every corpus ----
+
+# The split of a corpus whose levels name no split file (`file`): a seeded random split of its pose videos; test is the remainder
+# (1 - train - dev), computed by data.loader.build_splits.
 splits:
-    signverse_csv: data/youtube-sl-25/SignVerse-2M-metadata_split.csv
     fallback_seed: 42
     fallback_train: 0.8
     fallback_dev: 0.1
-    # test split is the remainder (1 - train - dev), computed by build_splits.
 
 poses:
-    # Visual cuts, 1 rule for every split and language (data.loader.split_clean_segments): the loader cuts every stream 
-    # at video_meta.csv masked_runs (2+ real bodies and extra arms move) and empty_runs (no real body), and each clean 
-    # segment between them is a record. A multi-body run is scored in 2s windows at 1s steps (prepare_yt25._MOTION_BLOCK_S): 
-    # a window is cut when the arm variation of every real body other than the kept one, in KEPT body's shoulder widths,
-    # exceeds this threshold over it, or can't be measured over whole run (a window too sparse to measure takes whole run's
-    # value). A still picture of a person, or a body that never shows an elbow or wrist, is no run. Motion is in shoulder
-    # widths, not a fraction capped at 1. `prepare_yt25.py --stage convert` / `person-counts` apply it when they write
-    # masked_runs, so a change needs `prepare_yt25.py --stage person-counts --overwrite` (or `--stage all --overwrite`).
-    min_extra_person_motion: 0.7
-    # No-hand quarantine, 1 rule for every split and language (data.loader.quarantine_handless): a reliable caption unit 
-    # with at least this share of its frames inside video_meta.csv handless_runs (12+ frames where the kept body shows no 
+    # The frame rate that every model reads, 1 value for every corpus. The pose reader (poses.pose_io.load_pose_frames) gives every
+    # video on this grid: a video stored at another rate reads, at each frame time of the grid, its nearest stored frame (SignVerse
+    # made the YouTube-SL-25 poses the same way: ffmpeg fps=24 before DWPose), and a video stored on the grid reads byte-identical.
+    # The fps augmentation, Λ_min, the attention band and the FSM then all see this rate. A change needs every pose model trained again.
+    model_fps: 24.0
+    # Repeated frames (poses.pose_io.content_frames): a file stored at a higher rate than the rate of its video repeats frames (How2Sign's
+    # 24 fps video in 30 and 60 fps files, Auslan-Daily's 25 fps broadcasts in 29.97 fps files), and the grid read would show no motion on
+    # up to a third of its steps. Such a file shows its content rate as a line in the spectrum of its motion; the reader takes the line of
+    # one of these content rates when it is above pulldown_line_ratio times the noise floor, drops the repeats (in each window, the frames
+    # with the least motion), and each grid frame reads the content frame nearest in time. A repeat shows about no motion, so the dropped
+    # frames must move at most pulldown_repeat_motion times as much as the kept ones (in the median), else nothing is dropped. A file at
+    # the model rate (every SignVerse file) is never read for it.
+    pulldown_content_fps: [23.976, 24.0, 25.0]
+    pulldown_line_ratio: 8.0
+    pulldown_repeat_motion: 0.25
+    # No-hand quarantine, 1 rule for every split and language (data.loader.quarantine_units): a reliable caption unit
+    # with at least this share of its frames inside video_meta.csv handless_runs (12+ frames where the kept body shows no
     # hand, prepare_yt25.handless_runs) is quarantined; no frame is cut. Per-unit handless share is bimodal and 0.9 sits
     # in its empty band; `report.py data` units_quarantined_handless gives the count after cuts.
     handless_unit_share: 0.9
-    # Exclude when fewer than this share of grouped caption intervals fits inside the supplied pose timeline
-    # (1s end tolerance). This doesn't infer the cause, clip offset, or caption source. 0.0 disables it.
-    min_unit_coverage: 0.5
-    
+    # Signer switch, 1 rule for every split and language (prepare_yt25._signer_slots): converter keeps the person who signs
+    # now. A person's activity is its hand speed relative to its own shoulder midpoint (so a body that walks or a camera that
+    # moves adds no speed), in its own median shoulder widths per second, clipped per frame at prepare_yt25._HAND_SPEED_MAX,
+    # then the _HAND_SPEED_S means. A person signs when that activity is at least switch_signing_speed and in at least half of
+    # the last 1s a hand was raised: less than switch_raised_offset own shoulder widths below the shoulder midpoint. When the
+    # kept body does not sign, most active signing person (seen for _PERSON_MIN_S, at least _PERSON_SIZE_SHARE of the widest
+    # person's shoulder width) takes it after 1s without a break, from the 1st frame of that second. Fitted on train only, on
+    # frames inside reliable units of single-person asf and bfi train videos: switch_signing_speed is the 5th percentile of
+    # the kept body's relative activity, rounded to 0.1, and switch_raised_offset the 95th percentile of its higher hand's
+    # offset below the shoulders on frames where that activity is at least switch_signing_speed, rounded to 0.1. The converter
+    # applies both when it writes the pose files, so a change needs `prepare_yt25.py --stage all --overwrite`.
+    switch_signing_speed: 0.6
+    switch_raised_offset: 0.7
+    # Switch-doubt quarantine, 1 rule for every split and language (data.loader.quarantine_units): a reliable caption unit is
+    # quarantined when at least switch_unit_share of its frames lie inside video_meta.csv switch_runs (the converter keeps the
+    # switch's body, not its default body, prepare_yt25._primary_slots) and at least switch_doubt_share of its frames lie inside
+    # default_signing_runs (that default body signs, so 2 people sign and whom the caption follows is in doubt). No frame is cut
+    # and no unit time moves. A unit with less of its frames in switch_runs keeps the switch's body. The rule passed its label
+    # check on fresh train units, and switch_doubt_share was chosen on earlier labelled train units. The loader reads both,
+    # so a change needs no conversion.
+    switch_unit_share: 0.5
+    switch_doubt_share: 0.3
+    # Exclude when fewer than this share of the caption cues (as the track gives them, before the grouping) fits inside the supplied
+    # pose timeline (1s end tolerance), so no caption rule moves the decision. This doesn't infer the cause, clip offset, or caption
+    # source. 0.0 disables it.
+    min_cue_coverage: 0.5
+
 subtitles:
-    # Caption resolution per video: pick the best usable .vtt in <root>/subs/ (suffix priority below). subs/ is
-    # delivered COMPLETE at prep time by `prepare_yt25.py --stage subs` (curated SignVerse English, provenance in
-    # video_meta.csv caption_source), so there is no load-time fallback dir — a video with no vtt is genuinely
+    # Caption resolution per video: the best usable .vtt in <root>/subs/ (the suffix priority of the corpus's dataset or entry). The
+    # caption folders are complete when they are written (prepare_yt25.py `--stage subs` for YouTube-SL-25, with the provenance in
+    # video_meta.csv caption_source; slp-pose for the benchmarks), so there is no load-time fallback: a video with no .vtt is
     # caption-less and dropped. human_only_splits: on these splits, exclude videos whose caption_source is in
-    # human_only_exclude_sources (default just `mt` = NLLB machine-translation) so BLEU scores against human refs.
+    # human_only_exclude_sources (default just `mt` = NLLB machine translation), so that BLEU scores against human references.
     dedup:
-        # Cross-split de-duplication (data.loader._duplicate_pairs). YouTube re-uploads put the same talk in train 
-        # and dev/test under different video ids; an id-based split does not separate them. The TRAIN copy is removed, 
-        # so the eval sets stay exactly as the split CSV defines them. Every constant below is part of the detector 
-        # spec and should be reported alongside results: they change which videos are considered duplicates.
+        # Cross-split copy check (data.loader.train_copies: _duplicate_pairs). It runs ONCE, in data preparation (`prepare_yt25.py
+        # --stage dedup`, also the last step of `--stage all`), the only step that reads the captions (labels only) of more than 1
+        # split; it writes the video_meta.csv column copy_of, and only the train loader reads it (it refuses a blank value). Run the
+        # stage again after a change of these keys. It changes TRAIN only, so the eval sets stay exactly as the split CSV defines them.
+        # Re-uploads: YouTube puts the same talk in train and dev/test under different video ids, and an id-based split does not
+        # separate them; such a train video is dropped whole. Single sentences that train shares with dev/test stay, as in machine
+        # translation; `report.py results` reports the scores of the eval videos with and without train text (train_text_videos).
+        # A pair of videos scores the higher of 2 tests. The cue test: the shared identifying cues (min_words+ words) over the
+        # identifying cues of the smaller video, which must have min_captions of them; an exact cue-set copy of min_captions x
+        # min_words words or more scores 1. The transcript test: the cues joined in time order, then the shared shingle_words-word
+        # n-grams over the n-grams of the smaller video, which must have min_captions x min_words words (the budget of the
+        # exact-copy rule). A train video that scores above cover with a dev/test video is dropped. Every constant below is part of
+        # the detector spec and should be reported alongside results.
         enabled: true
-        df_cap: 20        # a caption in more videos than this is series boilerplate, not evidence of shared content
-        min_words: 4      # shorter captions are sign-vocabulary labels that match unrelated videos
-        min_captions: 10  # below this the cover fraction is quantized to 1/n and unreliable
-        cover: 0.5        # flag a pair sharing more than this fraction of the smaller video's identifying captions
-    # SCROLLING caption tracks (YouTube's rolling two-line auto-captions: more than half the cues start before previous 
-    # one ends). Every cue time on such a track is a DISPLAY event: a line leaves the screen when line 2 later arrives, 
-    # so its end runs a median 1.9-2.6 s (p90 3.0-3.9 s) past the next cue's start and clamping the overlap would only 
-    # move the next unit's start late by the same amount. Punctuation fixes the grouping of such cues, so the track is 
+        df_cap: 20         # a cue or n-gram in more videos than this is series boilerplate, not evidence of a copy
+        min_words: 4       # shorter cues are sign-vocabulary labels that match unrelated videos
+        min_captions: 4    # identifying cues a video needs for the cue test (x min_words: the words it needs for the transcript test)
+        cover: 0.5         # flag a pair above this score
+        shingle_words: 8   # words per n-gram in the transcript test
+    # SCROLLING caption tracks (YouTube's rolling two-line auto-captions: more than half the cues start before previous
+    # one ends). Every cue time on such a track is a DISPLAY event: a line leaves the screen when line 2 later arrives,
+    # so its end runs a median 1.9-2.6 s (p90 3.0-3.9 s) past the next cue's start and clamping the overlap would only
+    # move the next unit's start late by the same amount. Punctuation fixes the grouping of such cues, so the track is
     # dropped whole rather than repaired: 0 asf, 4 ase, 1 bfi videos.
     drop_scrolling_tracks: true
     human_only_splits: [test]
     human_only_exclude_sources: [mt]
-    preferred_suffixes:
-        - .en-GB.vtt
-        - .en-en-GB.vtt
-        - .en-en.vtt
-        - .en.vtt
-    reject_suffixes:
-        - .en-orig.vtt
-        - .orig.vtt
     min_caption_chars: 2
-    # WRONG-LANGUAGE videos: drop a video when more than this share of its ALPHABETIC caption characters is non-Latin. 
-    # `.en` subtitle track is not a guarantee — ASE pool carries Japanese Sign Language and Chinese-teaching content 
-    # whose captions are largely Japanese/Chinese, which are unusable as English translation targets. Judged per VIDEO, 
-    # never per cue: an English sentence quoting a foreign term ("and <han> in Chinese!") is real data. Measured on ase, 
-    # 2 populations separate cleanly — bilingual videos 0.39-0.48, English-with-quotes below 0.05 — so 0.15 sits in the 
+    # WRONG-LANGUAGE videos: drop a video when more than this share of its ALPHABETIC caption characters is non-Latin.
+    # `.en` subtitle track is not a guarantee — ASE pool carries Japanese Sign Language and Chinese-teaching content
+    # whose captions are largely Japanese/Chinese, which are unusable as English translation targets. Judged per VIDEO,
+    # never per cue: an English sentence quoting a foreign term ("and <han> in Chinese!") is real data. Measured on ase,
+    # 2 populations separate cleanly — bilingual videos 0.39-0.48, English-with-quotes below 0.05 — so 0.15 sits in the
     # empty band between them and drops ~30/10588 videos. Set to 1.0 to disable (required for non-Latin TARGET language).
     max_non_latin_ratio: 0.15
     # Latin-script wrong-language tracks: Spanish and French captions filed as `.en.vtt` pass the script test above.
-    # Share of closed-class English words, over tracks long enough to be prose. Short tracks are exempt because a 
+    # Share of closed-class English words, over tracks long enough to be prose. Short tracks are exempt because a
     # vocabulary list scores near 0 in every language. 0.0 disables this rule.
     min_english_function_word_ratio: 0.10
     language_check_min_words: 100

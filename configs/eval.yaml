@@ -1,16 +1,25 @@
-rq1:
-    # Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration
-    # (delta_s = grid * duration), so every sentence sits at same proportional severity. Absolute seconds would mix regimes
-    # (0.3s wrecks a 1s sentence, barely touches a 10s one). Set severity_mode: absolute to use *_grid_s instead. Negative
-    # tail = right-truncation stress test.
+# The boundary sweep (analyze.py --stage boundary-sweep): one translator on gold units whose edges move on a grid.
+# Perturbation severity is RELATIVE by default: each grid value is a fraction of the anchor sentence's own duration (delta_s = grid * duration),
+# so every sentence sits at same proportional severity. Absolute seconds would mix regimes (0.3s wrecks a 1s sentence, barely touches a 10s one).
+# Set severity_mode: absolute to use *_grid_s instead. Negative tail = right-truncation stress test.
+boundary_sweep:
     severity_mode: relative
     severity_grid_rel: [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3] # fractions of sentence duration
     smoke_grid_rel: [-0.2, 0.0, 0.2]
     severity_grid_s: [-2.0, -1.0, 0.0, 1.0, 2.0] # used only when severity_mode: absolute
     smoke_grid_s: [-1.0, 0.0, 1.0]
     smoke_num_sentences: 10
-    batch_size: 64 # RQ1 windows are translated in length-sorted batches (padding masked → identical text and confidence).
-    # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction + 
+    batch_size: 64 # sweep windows are translated in length-sorted batches (padding masked → identical text and confidence).
+    # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction +
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
-rq2:
-    tiou_thresholds: [0.5, 0.7, 0.9]
+# The scores of every row (eval.py), of the segmenter evaluation and of the stage-2 and segmenter dev monitors.
+scoring:
+    tiou_thresholds: [0.5, 0.7, 0.9] # tIoU scores (metrics.evaluate_predicted_events): sentence tIoU F1 and the DVC of densevid_eval
+    # The main scores (metrics.edge_chunk_scores) all read 1 pairing, the edge chunk match: a caption may hold any run of consecutive
+    # reliable units inside 1 chunk, and it matches that run only when both its edges are within tau of the run's edges. The stage-2
+    # monitor and the segmenter monitor (val_video_f1) read chunk_gap_s and edge_taus_s too.
+    chunk_gap_s: 0.5                     # a chunk = units of 1 stream with caption gaps of at most this; 
+                                         # = δ, kept here so that a δ change leaves the score as it is
+    edge_taus_s: [0.5, 1.0, 2.0]         # every main score (edge chunk F1, its DVC, its SODA-style F1) 
+                                         # is averaged over these: chunk gap, stride, about 1/3 median sentence
+    chunk_gap_rows_s: [0.25, 0.75, 1.0]  # report.py results only: main localization again at these chunk gaps (no row/monitor reads it)

@@ -5,6 +5,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+_ANNOTATION_KEYS = ("annotation_fingerprint", "language_fingerprints")   # label hashes: a change warns, never refuses
+
+def without_annotation(value):
+    # The duration prior stamps the hash of the labels it was fitted on; its fitted numbers still count as config.
+    return {k: v for k, v in value.items() if k != "annotation_signature"} if isinstance(value, dict) else value
 
 def _resolve_checkpoint_file(path: str | Path) -> Path:
     # A checkpoint argument may be a DIRECTORY (checkpoint_dir output); resolve it to the file inside.
@@ -17,8 +22,7 @@ def _resolve_checkpoint_file(path: str | Path) -> Path:
     if not path.exists(): raise FileNotFoundError(f"Checkpoint does not exist: {path}")
     return path
 
-
-def _load_state(path: str | Path) -> dict:
+def load_state(path: str | Path) -> dict:
     path = _resolve_checkpoint_file(path)
     state = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state: state = state["state_dict"]
@@ -88,8 +92,16 @@ def save_train_state(
 def _refuse_meta_drift(path, saved: dict, expected: dict) -> None:
     """Refuse a resume whose training-critical config moved. The configs (inference.yaml, the stage config) are 
     live files that parameterize the run: resuming across a change trains 2 halves under different objectives, 
-    visible afterwards only as an unexplained break in the loss curve."""
-    drift = sorted(k for k in set(saved) | set(expected) if saved.get(k) != expected.get(k))
+    visible afterwards only as an unexplained break in the loss curve. A changed annotation fingerprint only warns."""
+    keys = set(saved) | set(expected)
+    labels = sorted(k for k in keys if k in _ANNOTATION_KEYS and saved.get(k) != expected.get(k))
+    if labels: print(
+        f"WARNING: --resume across changed annotations ({', '.join(labels)}): {path} trained on other labels.", flush=True
+    )
+    drift = sorted(
+        k for k in keys - set(_ANNOTATION_KEYS) 
+        if without_annotation(saved.get(k)) != without_annotation(expected.get(k))
+    )
     if not drift: return
     raise SystemExit(
         f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
@@ -148,17 +160,28 @@ def s1_layout_state(state: dict) -> dict:
 
     The deployed FSM head is the ARM's segmentation branch after joint training (`bio_pose_encoder` + `bio_head`), so joint 
     head can be scored alone: eval.py --segmenter-eval --segmenter-arch s1 --checkpoint checkpoints/{ar,dlm}/<lang>/model.pt.
-    The translator's encoder, LM and decoder tensors are dropped. An S1-layout dict passes through unchanged."""
-    if not any(k.startswith("bio_pose_encoder.") for k in state): return state
+    A one-stream arm (no `bio_pose_encoder`) reads the shared `front_end.pose_encoder`. The LM and decoder tensors (and a 
+    two-stream arm's translator encoder) are dropped. An S1-layout dict passes through unchanged. An arm with `bio_adapter` 
+    is refused: its head also reads the translator's features, which the S1 layout has no place for, so the head alone is 
+    not the deployed head (score it with `eval.py --online --no-translate`).
+    """
+    if any(k.startswith("bio_adapter.") for k in state): raise ValueError(
+        "This arm's BIO head reads the translator's features via bio_adapter, so it can't be scored in the S1 layout. "
+        "Score its segmentation with eval.py --online --no-translate (or --offline) instead."
+    )
+    if any(k.startswith("bio_pose_encoder.") for k in state): encoder = "bio_pose_encoder."
+    elif any(k.startswith("bio_head.") for k in state) and any(k.startswith("front_end.pose_encoder.") for k in state):
+        encoder = "front_end.pose_encoder."
+    else: return state
     out = {}
     for k, v in state.items():
-        if k.startswith("bio_pose_encoder."): out["pose_encoder." + k[len("bio_pose_encoder."):]] = v
+        if k.startswith(encoder): out["pose_encoder." + k[len(encoder):]] = v
         elif k.startswith("bio_head."): out[k] = v
     return out
 
 
 def load_model_checkpoint(module: nn.Module, checkpoint: str | Path, strict: bool = False) -> tuple[list[str], list[str]]:
-    raw = _load_state(checkpoint)
+    raw = load_state(checkpoint)
     missing, unexpected = module.load_state_dict(raw, strict=strict)
     return list(missing), list(unexpected)
 
@@ -171,6 +194,21 @@ def load_checkpoint_meta(checkpoint: str | Path) -> dict:
     try: raw = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     except pickle.UnpicklingError: raw = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     return dict(raw.get("meta") or {}) if isinstance(raw, dict) else {}
+
+
+def warn_pose_geometry(meta: dict, source) -> bool:
+    """Warn when a trained Uni-Sign pose model (S1, a clean floor, an arm) read its poses, itself or through a warm start, in another
+    frame geometry than poses.pose_io.load_pose_frames returns now (a file trained before the reader mapped x to a 16:9 frame stamps
+    none; train.slt and train.bio_pretrain call it on a trained warm start at the start of a run). A file with no meta (the released
+    Uni-Sign checkpoint) is silent. A warning, not a stop, like every label check: retrain before a run you report.
+    False when it warned."""
+    from poses.pose_io import POSE_GEOMETRY   # lazy, as in require_fixed_constants below
+    stale = bool(meta) and meta.get("pose_geometry") != POSE_GEOMETRY
+    if stale: print(
+        f"WARNING: {source} stamps pose_geometry={meta.get('pose_geometry')!r}, not {POSE_GEOMETRY!r}: it, or a warm start it trained "
+        f"from, read poses in another frame geometry (poses.pose_io.load_pose_frames). Retrain it before a run you report.", flush=True
+    )
+    return not stale
 
 
 def require_fixed_constants(meta: dict, inference_cfg: dict, source) -> None:
@@ -186,14 +224,14 @@ def require_fixed_constants(meta: dict, inference_cfg: dict, source) -> None:
         f"so it predates the current labels. Retrain it."
     )
     gate = meta.get("gate") or {}
-    # δ and Λ_min are seconds now (a frame count meant another time at another fps).
+    # δ and Λ_min are seconds; a frame count is a time only at 1 fps, so a file that stamps frames is refused.
     if frame_keys := sorted({"delta", "min_span_frames"} & set(gate)): raise SystemExit(
-        f"{source} stamps {'/'.join(frame_keys)} in frames, but δ and Λ_min are now seconds "
+        f"{source} stamps {'/'.join(frame_keys)} in frames; δ and Λ_min are seconds "
         f"(inference.yaml delta_s, min_span_s). Retrain it under the current constants."
     )
     live = {
-        "buffer_cap_s": inference_cfg.get("buffer_cap_s"),
-        "delta_s": (inference_cfg.get("boundary_stability") or {}).get("delta_s"),
+        "buffer_cap_s": inference_cfg["buffer_cap_s"],
+        "delta_s": inference_cfg["boundary_stability"]["delta_s"],
         "min_span_s": lambda_min_s(inference_cfg)
     }
     stamped = { # δ is a training parameter only of a gated checkpoint; a clean floor stamps it but never reads it.

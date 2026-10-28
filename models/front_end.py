@@ -42,7 +42,7 @@ class SLTFrontEnd(nn.Module):
         # omega_bias (B,1,1,M): the membership prior, added to the LM encoder's self-attention keys (None = ungated).
         raise NotImplementedError
 
-    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
+    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float, omega_bias=None, row_stats: bool = False):
         raise NotImplementedError
 
     def make_dlm_decoder(self, block_size: int) -> OPUTBlockDiffusionDecoder:
@@ -60,7 +60,7 @@ class SLTFrontEnd(nn.Module):
         return CrossAttnOmegaInjector.attach(self.lm_model).with_omega(omega_bias)
 
     @torch.no_grad()
-    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens=128, num_beams=1, omega_bias=None):
+    def ar_generate(self, enc_hidden, enc_mask, max_new_tokens, num_beams, omega_bias=None):
         # AR generation over a precomputed encoder memory. Returns (tokens, per-token confidence). 
         # Under `omega_bias`, every cross-attention step is membership-gated (same Ω the DLM decode uses).
         kwargs = {} if self.decoder_start_id is None else {"decoder_start_token_id": self.decoder_start_id}

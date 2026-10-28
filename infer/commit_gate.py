@@ -1,18 +1,21 @@
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
+import itertools
 
 import torch
 from data.windowing import BIO
 
 
 def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
-    """A span OPENS on a predicted `B`, or O→I mid-buffer.
+    """A span OPENS on a predicted `B`, or O→I mid-buffer: the rule of every emitted span (the FSM, and every offline span
+    path through `candidate_spans`).
 
-    Mirrors `metrics.signing_runs_with_b_splits`: `B` rarely wins argmax (one B per sentence; most adjacent captions 
-    chain with no gap have no visual pause), so 1st signing frame after a gap counts as a start. Buffer-start signing 
-    without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated sentence `I`-without-`B` ("started before 
-    the buffer, don't translate"), which also makes the overlap cut safe — its ≤2δ leftover arrives as buffer-start `I`.
+    `B` rarely wins argmax (1 B/sentence; most adjacent captions chain with no gap have no visual pause), so 1st signing frame 
+    after gap counts as a start. Buffer-start signing without `B` (prev_tag None) doesn't open: Mode-2b labels a left-truncated 
+    sentence `I`-without-`B` ("started before the buffer, don't translate"), and its start is a buffer or stream edge, not a 
+    decision of the head (P1 at inference). FSM's committed overlap never reaches this rule: it's a prefix that the decode tags
+    UNK. `metrics.signing_runs_with_b_splits` (Moryossef-protocol diagnostics only) opens such a run.
     """
     if tag == BIO["B"]: return True
     return (not active) and tag == BIO["I"] and prev_tag == BIO["O"]
@@ -37,34 +40,54 @@ def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, in
     return spans
 
 
-def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int = 0, skip_term_before: int = 0):
-    """Complete spans ≥ `min_span_frames` (Λ_min) terminating after `skip_term_before`, in order. The first is the target of
-    the FSM and of the membership gate's Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each
-    stride (`CommitGate.vote`).
+def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int):
+    """Complete spans ≥ `min_span_frames` (Λ_min), in order. The first is the target of the FSM and of the membership gate's
+    Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each stride (`CommitGate.vote`).
 
-    `skip_term_before` is the commit frontier χ in frames (= frames committed = index of 1st uncommitted frame). A span 
-    terminating at or before χ is already emitted — an overlap-cut leftover or a stale re-detection — so skip it. The bound 
-    is `term <= χ`, not `<`: the cut geometry (`last_commit_t = event.end_s - δ/fps`) makes equality the common case. This 
-    commit-log check is the whole no-re-emission guarantee, so Λ_min and δ need no coupling ("Λ_min > 2δ" rule is infeasible 
-    on short-sentence corpora: on asf 2δ > p10 sentence length). Spans STRADDLING χ stay selectable: δ-overlap stops a late 
-    terminator estimate eating the successor's onset, and their ≤δ committed prefix is attention-floored by Ω's χ term.
+    No re-emission: the frames before the commit frontier χ (the δ overlap the cut keeps) are a prefix that the decode tags 
+    UNK (`DurationDecoder`, commit mask), so a span can open only at or after χ and never ends at or before it. Λ_min and 
+    δ need no coupling ("Λ_min > 2δ" is infeasible on short-sentence corpora: on asf 2δ > p10 sentence length).
 
     Λ_min is a LABEL-domain floor chosen to reject brief flicker. A genuine unit shorter than the floor cannot be
     emitted exactly; report that exclusion when comparing localization scores.
+
+    Every offline span path takes all of these spans whole, with no buffer cap: the --offline row and the stage-2 offline monitor
+    (evaluation.offline.offline_predictions), the --segments span files, --segmenter-eval and val_video_f1 (moryossef26.infer.span_segments).
     """
     for start, term in bio_complete_spans(bio_tags):
-        if term <= int(skip_term_before): continue  # term == χ: all content frames (< term) are committed
         if term - start >= int(min_span_frames): yield (start, term)
 
 
-def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
-    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation, or a buffer-cap 
-    forced commit); None if the buffer ends outside a span.
+def cap_cut_window(cap_s: float, stride_s: float, hysteresis_strides: int) -> tuple[float, float]:
+    """The cap cut's window in buffer time [start, end] (spec §1.4 rule 18), from the cap and the commit horizon: it starts at half the
+    cap, so a cut span (it starts near the buffer start) commits about half the buffer or more, and the next buffer, which starts δ
+    before the cut frame, moves on by at least half the cap - δ; it ends (K - 1) strides before the cap, where the head's banded
+    attention still lacks look-ahead (rule 16). The FSM (`StreamingSLTRunner`) cuts in it, so another cap, stride or K moves it."""
+    start_s, end_s = float(cap_s) / 2, float(cap_s) - (int(hysteresis_strides) - 1) * float(stride_s)
+    if not start_s < end_s: raise ValueError(
+        f"The cap cut window [{start_s:g}, {end_s:g}] s is empty: buffer_cap_s must exceed 2 x (K - 1) x stride_s."
+    )
+    return start_s, end_s
 
-    Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate needs on
-    the forced/open path (docs/membership_gate.md §2.8): Ω anchored here gives γ≡γ_s with no right cliff (Ω≈0 for the
-    all-I interior), while frame 0 would sweep the opening B and floor the span the gate should open. A buffer-start
-    I-run (left-truncated leftover) never opens → None."""
+
+def cap_cut_frame(p_inside: torch.Tensor, rel_s: torch.Tensor, window_start_s: float, window_end_s: float) -> int | None:
+    """The cap cut (spec §7.1, the one declared exception to P1 at inference): the frame with the lowest head P(I) over relative time
+    [window_start_s, window_end_s], both edges included, the first one on a tie; None when no frame is in the window. `p_inside` and
+    `rel_s` are per frame. The FSM (`StreamingSLTRunner.step`) cuts with it."""
+    inside = ((rel_s >= window_start_s) & (rel_s <= window_end_s)).nonzero().flatten()
+    return None if inside.numel() == 0 else int(inside[torch.argmin(p_inside[inside])])
+
+
+def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
+    """Start of a TERMINATOR-LESS span running to the buffer edge (Mode-2a right-truncation); None if the buffer ends
+    outside a span. Such a span is never emitted whole (spec §7.1): the cap keeps it for the next buffer when it starts more
+    than δ after the buffer start, and otherwise commits only its closed part up to the cap cut (`cap_cut_frame`); the stream
+    end drops it.
+
+    Same rule as `bio_complete_spans`, but returns the FINAL still-open span — the anchor the membership gate reads on
+    an open-span decode (the stability trace; docs/membership_gate.md §2.5): Ω anchored here gives
+    γ≡γ_s with no right cliff (Ω≈0 for the all-I interior), while frame 0 would sweep the opening B and floor the span
+    the gate should open. A buffer-start I-run (left-truncated leftover) never opens → None."""
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     start: int | None = None
     prev: int | None = None
@@ -82,6 +105,7 @@ class BoundaryHistory:
     hysteresis_strides: int
     delta_enc_frames: int
     values: deque[tuple[int, int] | None] = field(default_factory=deque)
+    serial: int = -1  # gate's identity for this span; the stability trace records it (StreamingSLTRunner(record_trace=True))
 
     def push(self, span: tuple[int, int] | None) -> None:
         self.values.append(span)
@@ -107,9 +131,10 @@ class CommitGate:
     a later span keeps the votes it earned while it waited, so back-to-back units commit at their own stable time. Token 
     confidences are not a commit signal; events still carry them (infer/stability.py reveal policies).
     """
-    def __init__(self, delta_enc_frames: int, hysteresis_strides: int = 3):
+    def __init__(self, delta_enc_frames: int, hysteresis_strides: int):
         self.delta_enc_frames, self.hysteresis_strides = int(delta_enc_frames), int(hysteresis_strides)
         self.histories: list[BoundaryHistory] = []
+        self._serials = itertools.count()   # never reused, so a span seen after its history is gone gets a new identity
 
     def _match(self, span: tuple[int, int], pool: list[BoundaryHistory]) -> BoundaryHistory | None:
         best, best_gap = None, None
@@ -126,12 +151,17 @@ class CommitGate:
         for span in spans:
             history = self._match(span, pool)
             if history is None:
-                history = BoundaryHistory(self.hysteresis_strides, self.delta_enc_frames)
+                history = BoundaryHistory(self.hysteresis_strides, self.delta_enc_frames, serial=next(self._serials))
                 self.histories.append(history)
             else: pool.remove(history)
             history.push(span)
         for history in pool: history.push(None)
         self.histories = [h for h in self.histories if h.last_seen() is not None]  # unseen for K strides: gone
+
+    def identity(self, span: tuple[int, int]) -> int | None:
+        # The serial of the history `stable` and `retire` match for this span; None when the gate holds none for it.
+        history = self._match(span, self.histories)
+        return None if history is None else history.serial
 
     def stable(self, span: tuple[int, int]) -> bool:
         # Reads votes only: a pass that adds none (cap, EOF drain, post-commit re-check) commits only stability already earned.

@@ -1,37 +1,57 @@
-# S1: pose-only segmentation pretraining on whole-input random chunks, BIO only (data/chunks.py). 
-# The shared base supplies the BIO architecture (bio_* keys, incl. bio_attention_radius_s); its window-sampler
-# blocks (mode_ratios, mode2_subcase_weights, jitter) are stage-2 only. S1 has its own augmentation block below.
+# S1: pose-only segmentation pretraining on the input types of pretrain.inputs, BIO only (data/chunks.py).
+# The shared base supplies BIO architecture (the `bio:` block; train-bio derives the attention band). S1 reads its window-sampler
+# blocks (mode_ratios, mode2_subcase_weights, jitter) only when pretrain.inputs lists windows, and its augmentation block.
 extends: dlm.yaml
 checkpoint:
     dir: checkpoints/bio_s1/${corpus}
     from_pretrained: checkpoints/openasl_pose_only_slt.pth  # Released Uni-Sign pose weights initialize S1 pose encoder
     save_best: true
-    monitor: val_phrase_tiou_f1 # complete-span F1@0.5 over the fixed dev chunks
+    monitor: val_video_f1  # the edge chunk F1 (the main segmentation score) on whole dev streams
     mode: max
     restore_best: true
+    eval_every_epochs: 1
+    dev_batch_size: 32
 wandb:
     name: bio_s1_${corpus}
 
-# Main recipe: same pool and temperature as the external segmenter. No subtitle text enters S1.
-pretrain_languages: [ase, asf, bfi]
-# τ sets each language's share of the per-epoch pool, counted in records (clean segments): τ=1 proportional, τ=0 uniform
-# (the larger languages' slices rotate). The best-epoch floor (one full rotation) is computed and printed at run time.
-# Training exposure is time; the checkpoint stamps each language's hours per epoch (pretrain_hours).
-pretrain_temperature: 0.0
-
-# Longest chunk C: each epoch tiles every training record, from a random phase, with chunks of length U(δ + K·stride, C)
-# (data/chunks.py; δ, K and stride from inference.yaml). train-bio refuses a value below deployed cap (inference.yaml 
-# buffer_cap_s), which the stage-2 head and the FSM run at. Evaluation uses the stamped trained context.
-pretrain_geometry:
-    buffer_cap_s: 40
+# The pretraining data: the language pool and its per-language shares. No subtitle text enters S1.
+pretrain:
+    # The same pool, weights, dev corpora and temperature as the external segmenter (moryossef26.yaml). null = the target language alone.
+    # bobsl_auto: BOBSL's automatic SAT labels on its official train split (noisy, but 1,144 h of BSL), for segmentation only.
+    languages: [ase, asf, bfi, bobsl_auto]
+    # The corpora whose dev sets choose the checkpoint (val_video_f1, each corpus scored apart, then averaged); default: the pool.
+    # bobsl_auto stays out: its labels are SAT's own errors, and its official val holds the 4 dev episodes of bobsl_manual.
+    dev_languages: [ase, asf, bfi]
+    # τ and the weights set each corpus's share of the hours of a pooled epoch (data.loader._pool_targets): share ∝ weight ·
+    # hours^τ, τ=1 proportional, τ=0 equal (the larger corpora's slices rotate). Weights default to 1; bfi and bobsl_auto at 0.5
+    # each give BSL one share, as ASL (ase) and Auslan (asf) have. The best-epoch floor (one full rotation) is computed and printed
+    # at run time, and the checkpoint stamps each corpus's hours per epoch (pretrain_hours).
+    weights: {bfi: 0.5, bobsl_auto: 0.5}
+    temperature: 0.0
+    # Chunk lengths: each epoch tiles every training record, from a random phase, with chunks of length U(δ + K·stride, C)
+    # (data/chunks.py), all from inference.yaml: C is its buffer_cap_s, the context the stage-2 head and the FSM run at.
+    # The checkpoint stamps C, and evaluation uses the stamped trained context.
+    # Input types of the train set. Each tile of the epoch's tiling becomes one listed type, in equal shares, inside its own
+    # record (so each language keeps its share). Dev chunks are always plain chunks. The checkpoint stamps the list (--resume 
+    # refuses a change).
+    #   chunks          the tile itself: a random-phase chunk.
+    #   restart_chunks  a chunk of the same length law that starts δ before a gold terminator of its record (O or B frame after
+    #                   a reliable unit), where the FSM starts its buffer after a correct commit. The frames up to and including
+    #                   the terminator frame are UNK.
+    #   windows         a stage-2 window (the mode_ratios, mode2_subcase_weights and jitter of dlm.yaml) for a reliable unit of 
+    #                   its record, BIO only. Every frame whose receptive field reaches a window edge is UNK; train-bio computes 
+    #                   that reach from the model's modules (ST-GCN and conv-stem kernels, bio.depth x the attention band).
+    # Choices: [chunks] (chunk-only training, the data of the Moryossef segmenter), [windows, restart_chunks],
+    # [chunks, windows, restart_chunks].
+    inputs: [chunks, windows, restart_chunks]
 
 epochs: 100
 batch_size: 32
 grad_accum_steps: 1    # Effective batch = batch_size * grad_accum_steps
-learning_rate: 2.0e-4  # The BIO head (random init)
-# S1's pose encoder starts from the released Uni-Sign weights, so it trains at a smaller rate than the fresh head:
-# 0.5 x learning_rate (discriminative fine-tuning). Only S1 has this key: stage 2 trains every module at one rate.
-backbone_lr: 1.0e-4
+learning_rate: 1.0e-3  # The BIO head (random init)
+# S1's pose encoder starts from the released Uni-Sign weights and trains at backbone_lr, the tuned head rate 
+# (a smaller encoder rate learned too slowly). Only S1 has this key: stage 2 trains every module at 1 rate.
+backbone_lr: 1.0e-3
 weight_decay: 1.0e-4
 early_stopping:
     enabled: true
@@ -39,13 +59,4 @@ early_stopping:
     min_delta: 0.0
 scheduler:
     type: cosine
-    warmup_epochs: 4
-# Pose augmentation, TRAIN chunks only (dev chunks are never augmented; data/chunks.py). A full dict: dlm.yaml sets
-# `augmentation: null`, and a child dict replaces a parent null whole (utils.load_yaml), so no key is inherited.
-# The Moryossef 2026 release recipe, identical in moryossef26.yaml so 2 segmentation arms differ only by model 
-# and input contract. BIO labels are rebuilt from the kept timestamps.
-augmentation:
-    fps: { min_fps: 15.0, max_fps: 30.0 }  # density resampling to U(min_fps, max_fps)
-    frame_dropout: 0.15                    # remove U(0, rate) of the interior frames
-    body_part_dropout: 0.1                 # drop each hand with this probability
-    # speed_aug forbidden and no spatial transform
+    warmup_epochs: 0

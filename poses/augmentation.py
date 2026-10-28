@@ -1,7 +1,8 @@
-"""Pose-sequence augmentation for the TRAIN chunks of both segmentation arms (data/chunks.py `ChunkDataset`, with `release` 
-for the Moryossef arm). Stage 2 uses none. There is 1 recipe, the Moryossef 2026 release's: `apply_hand_dropout` on raw
-COCO-WholeBody-133 keypoints, then the arm's own normalization, then `apply_fps_aug` and `apply_frame_dropout`. Last 2 
-remove frames and return the kept timestamps, so the caller rebuilds BIO labels from them. No spatial transform.
+"""Pose-sequence augmentation for TRAIN inputs of every trained pose model: both segmentation arms (data/chunks.py `ChunkDataset`, 
+with `release` for Moryossef arm. S1's restart chunks and windows too) and stage-2 windows of clean floors and the arms (data/sampler.py 
+`WindowSampler.materialize`). There is 1 recipe, Moryossef 2026 release's: `apply_hand_dropout` on raw COCO-WholeBody-133 keypoints, 
+then the arm's own normalization, then `apply_fps_aug` and `apply_frame_dropout`. Last 2 remove frames and return the kept timestamps, 
+so the caller rebuilds BIO labels from them. No spatial transform.
 """
 import numpy as np
 from . import UNISIGN_LEFT_IDX, UNISIGN_RIGHT_IDX
@@ -11,7 +12,7 @@ def apply_fps_aug(
     poses: np.ndarray, source_timestamps_s: np.ndarray, source_fps: float, target_fps: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Moryossef-style fps augmentation (frame-density resampling to `target_fps`, no speed change). 
-    The caller draws `target_fps` (data/chunks.py), because the release arm needs it before it loads the chunk.
+    The caller draws `target_fps` (data/chunks.py, data/sampler.py), because the release arm needs it before it loads the chunk.
 
     The kept frames keep their source timestamps: `load_pose_window` floors the start frame, so timestamps rebuilt from 
     the requested window start could shift BIO/RoPE timing by up to 1 frame. fps_aug changes frame density, not physical

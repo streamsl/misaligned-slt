@@ -6,16 +6,17 @@ from typing import Any, Iterable
 from pathlib import Path
 from tqdm import tqdm
 
-import re, os, random, csv, html, json, unicodedata, zlib, hashlib, inspect
+import re, os, sys, io, random, csv, html, json, unicodedata, zlib, hashlib, inspect, bisect, itertools, pickle, contextlib
+import importlib.metadata
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler, SequentialSampler
 from data.windowing import SentenceSpan, ANNOTATION_PROTOCOL, TRUSTED_GAP_S, untrusted_o_intervals
 
 from poses import PoseIndex, build_pose_index
-from poses.pose_io import META_FILENAME, base_video_id, load_video_meta
+from poses.pose_io import META_FILENAME, base_video_id, grid_runs, load_video_meta
 from train import distributed as dist
-from utils import LAMBDA_MIN_S, seconds_to_frames
+from utils import cfg_get, lambda_min_s, load_yaml, seconds_to_frames
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -24,7 +25,7 @@ TIMESTAMP_RE = re.compile(
 WORD_TIMING_RE = re.compile(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>")
 _ASR_WORD_TIMING_RE = re.compile(r"<\d\d:\d\d:\d\d\.\d\d\d>")
 _SENTENCE_FINAL_RE = re.compile(r'[.!?][\"\')\]]*\s*$')  # terminal punctuation, allowing closing quotes and brackets
-_WORD_RE = re.compile(r"[A-Za-z][\w']*")
+WORD_RE = re.compile(r"[A-Za-z][\w']*")
 
 # Non-verbal annotations / stylistic markers: (laughter), [music], *flush*. 
 # Newline-free and length-bounded so an unclosed bracket cannot swallow the rest of the cue.
@@ -38,10 +39,11 @@ PAREN_GROUP_RE = re.compile(r"\([^()\n]{0,80}\)")
 LEADING_SYMBOL_RE = re.compile(r"^[\s♪♫•·\-–—>»]+")
 TRAILING_SYMBOL_RE = re.compile(r"[\s♪♫•·]+$")  # a cue often closes with the note it opened with
 TAG_RE = re.compile(r"<[^>]+>")
-# Speaker identifier: ONE word (optionally two, e.g. "MRS SMITH:") then a colon, at the cue start. Bounded to a single token so a genuine 
-# clause like "One thing: ..." keeps its text — that costs recall on rare speaker labels but never deletes signed content.
+# Speaker identifier: ONE capitalised word (optionally two, e.g. "MRS SMITH:") then a colon, at the cue start. Bounded to a single token so
+# a genuine clause like "One thing: ..." keeps its text, and capitalised so a lowercase word before a colon ("today: ...", "one: ...", in
+# lowercase captions too) keeps its text — that costs recall on rare speaker labels but never deletes signed content.
 SPEAKER_PREFIX_RE = re.compile(r"^[A-Z][A-Z\s_-]{1,30}:\s*")
-SPEAKER_ID_RE = re.compile(r"^[A-Za-z][\w'\-]{0,20}(?:\s+[A-Z][\w'\-]{0,20})?:\s+")
+SPEAKER_ID_RE = re.compile(r"^[A-Z][\w'\-]{0,20}(?:\s+[A-Z][\w'\-]{0,20})?:\s+")
 NOISE_WORD_RE = re.compile(r"[a-z]+")
 NOISE_CAPTION_WORDS = {
     "applause", "background", "foreign", "gentle", "inaudible", "laugh", "laughs",
@@ -68,8 +70,14 @@ _PUNCT_NORMALISE = {ord(k): v for k, v in {
 }.items()}
 _PUNKT = None
 _LANG_RECORDS_CACHE: dict[tuple, list[VideoRecord]] = {}
-_FOLD_LEXICON_CACHE: dict[tuple, frozenset[str]] = {}
-RUN_COLUMNS = ("masked_runs", "empty_runs")   # video_meta.csv frame runs the loader cuts out (split_clean_segments)
+RUN_COLUMNS = ("empty_runs",)   # video_meta.csv frame runs the loader cuts out (split_clean_segments)
+# The quarantine kinds (quarantine_units): per kind, the video_meta.csv frame runs that it reads, each with its data.yaml poses 
+# share key. A unit is quarantined when, for every column of the kind, at least that share of its frames lies inside the column's runs.
+QUARANTINE_RULES = {
+    "handless": {"handless_runs": "handless_unit_share"},
+    "switch_doubt": {"switch_runs": "switch_unit_share", "default_signing_runs": "switch_doubt_share"},
+}
+QUARANTINE_COLUMNS = tuple(key for rule in QUARANTINE_RULES.values() for key in rule)
 
 # Measured on asf/bfi/ase train cues: merged prose signs at 0.70 w/s (asf p1) to 2.2 w/s (p50) with 6-11 words per display cue and 4-22% 
 # capitalised tokens; fingerspelling and vocabulary lists sign at ~0.1 w/s with 1.3-2.2 words per cue and 66-78% capitalised tokens. 
@@ -83,8 +91,9 @@ class VideoRecord:
     video_id: str
     pose: PoseIndex
     sentences: tuple[SentenceSpan, ...]
-    # UNK stretches of a clean segment in segment time: the source video's uncaptioned gaps longer than TRUSTED_GAP_S, clipped. 
-    # None on an uncut video, whose labeller finds them itself. A cut must not shorten a long source gap into a trusted O gap.
+    # UNK stretches of a clean segment in segment time: the source video's uncaptioned gaps longer than TRUSTED_GAP_S, clipped.
+    # None on an uncut video, whose labeller finds them itself, unless an unreliable span (mark_unreliable) lies in it: then the gaps of
+    # its kept units. Neither a cut nor a mark may shorten a long source gap into a trusted O gap.
     untrusted_s: tuple[tuple[float, float], ...] | None = None
 
 def _is_pronoun_i(word: str) -> bool:
@@ -93,10 +102,15 @@ def _is_pronoun_i(word: str) -> bool:
 def _fold_rule_id() -> str: # The counting rule's own identity, so an edited rule invalidates every lexicon built under the old one.
     return hashlib.sha256(inspect.getsource(fold_lexicon).encode()).hexdigest()
 
-def _lexicon_key(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> str:
-    # Identity of a built lexicon: the caption BYTES it reads, the selection rules, and the counting rule itself.
-    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, subtitle_cfg, _fold_rule_id()], sort_keys=True, default=str).encode())
-    for subs, ids in sources:
+def _lexicon_key(sources: list[tuple[Path, list[str], dict]]) -> str:
+    # Identity of a built lexicon: the caption BYTES it reads, each corpus's selection rules, the counting rule itself, the Punkt
+    # model that splits the cues into sentences, and the loader code (RECORDS_CODE) that cleans the cue text it counts (a changed
+    # speaker-label or noise rule changes the words), so a train load builds it again after any change of that code.
+    digest = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, _fold_rule_id(), _punkt_identity()], sort_keys=True, default=str).encode())
+    repo = Path(__file__).resolve().parent.parent
+    for path in RECORDS_CODE: digest.update((repo / path).read_bytes())
+    for subs, ids, subtitle_cfg in sources:
+        digest.update(json.dumps(subtitle_cfg, sort_keys=True, default=str).encode())
         want = set(ids)
         # 1 directory glob, not 1 per video: `<vid>.*.vtt` per id is ~2850x slower over a 10k-video corpus.
         # `<vid>.<target>.vtt` -> vid: `Path.stem` strips 1 suffix only, and video ids never contain a dot.
@@ -115,30 +129,28 @@ def _train_captions(data_cfg: dict, language: str) -> tuple[Path, list[str]]:
     ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})
     if not ids: return root / "subs", []
     captioned = {base_video_id(p.name.split(".", 1)[0]) for p in (root / "subs").glob("*.vtt")}   # `<vid>.<target>.vtt` -> vid
-    return root / "subs", [v for v in build_splits(ids, data_cfg.get("splits", {})).get("train", []) if v in captioned]
+    return root / "subs", [v for v in build_splits(ids, corpus_config(data_cfg, language).get("splits", {})).get("train", []) if v in captioned]
 
 def timestamp_to_seconds(value: str) -> float:
     value = value.replace(",", ".")
     hours, minutes, seconds = value.split(":")
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
-def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> frozenset[str]:
+def fold_lexicon(sources: list[tuple[Path, list[str], dict]]) -> frozenset[str]:
     """Words safe to lowercase at a comma-joined sentence start, from the TRAIN splits' raw cues.
 
     Capital at sentence start is positional; after the period becomes comma it is noise decoder must learn ("..., Consequently, this ..."). 
     But a capital can also be lexical (a name, "Deaf" as identity, "BSL"), and only the corpus can tell: a word is foldable when it occurs 
     in lowercase more often than it occurs capitalised INSIDE a sentence (Punkt over each raw cue, so sentence-initial capitals are not 
-    counted as name evidence). Built on train only, applied to every split, so dev/test references never shape the rule and an unattested 
-    word simply keeps its case. `sources` pools the corpora that share a target language — see `case_lexicon`, which owns the pool and the
-    released artifact; this builds and nothing else.
+    counted as name evidence). Built on train only, applied to every split, so dev/test references never shape the rule and an unattested
+    word simply keeps its case. `sources` (subs folder, train ids, that corpus's subtitles block) are the corpora of one data.yaml casing
+    pool — see `case_lexicon`, which owns the pool and the released artifact; this builds and nothing else.
     """
-    key = tuple((str(subs), tuple(sorted(ids))) for subs, ids in sources)
-    if key in _FOLD_LEXICON_CACHE: return _FOLD_LEXICON_CACHE[key]
     tok = _punkt_tokenizer()
     lower: dict[str, int] = {}; cap_inside: dict[str, int] = {}
-    drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
-    for subs, ids in sources:
+    for subs, ids, subtitle_cfg in sources:
+        drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
         for vid in ids:
             path = best_subtitle(subs, vid, subtitle_cfg)
             if path is None: continue
@@ -146,45 +158,75 @@ def fold_lexicon(sources: list[tuple[Path, list[str]]], subtitle_cfg: dict) -> f
             for _, _, text in merge_rolling_captions(parse_vtt(path, drop_noise=drop_noise)):
                 sentences = [text[a:b] for a, b in tok.span_tokenize(text)] if tok is not None else [text]
                 for sentence in sentences:
-                    for i, word in enumerate(_WORD_RE.findall(sentence)):
+                    for i, word in enumerate(WORD_RE.findall(sentence)):
                         if word[0].islower(): lower[word.lower()] = lower.get(word.lower(), 0) + 1
                         elif i > 0: cap_inside[word.lower()] = cap_inside.get(word.lower(), 0) + 1
 
-    lexicon = frozenset(w for w, n in lower.items() if n > cap_inside.get(w, 0))
-    _FOLD_LEXICON_CACHE[key] = lexicon
-    return lexicon
+    return frozenset(w for w, n in lower.items() if n > cap_inside.get(w, 0))
 
 
-def case_lexicon(data_cfg: dict, language: str) -> frozenset[str]:
-    """The fold lexicon for `language`'s TARGET language, pooled over every configured corpus with that target.
+def case_lexicon_entry(data_cfg: dict, language: str) -> tuple[Path, list[str]] | None:
+    # The casing file of corpus `language` (`subtitles.case_lexicon` of its view, which data.yaml names per dataset) and the corpora
+    # whose views name the same file: its pool, whose train captions build it. None for a corpus that names no file or that data.yaml
+    # does not name (only a load with subtitles.merge_sentences needs one: case_lexicon refuses it there).
+    langs = data_cfg["languages"]
+    if language not in langs: return None
+    named = {corpus: corpus_config(data_cfg, corpus)["subtitles"].get("case_lexicon") for corpus in langs}
+    if not named[language]: return None
+    artifact = Path(named[language])
+    pool = sorted(corpus for corpus, file in named.items() if file and Path(file) == artifact)
+    target = lambda corpus: str(langs[corpus].get("target_lang", "en_XX"))
+    if mixed := [corpus for corpus in pool if target(corpus) != target(language)]: raise SystemExit(
+        f"[loader] the casing file {artifact} is named by corpora of another target language than {language}'s ({', '.join(mixed)}): "
+        f"1 file holds the word list of 1 target language, so name another file for them."
+    )
+    return artifact, pool
 
-    Capitalisation convention belongs to the target language, not to the sign corpus: asf's train captions never lowercase "consequently", 
-    ase's do. Pooling measurably renders better where the corpora disagree, and it is what keeps the small corpora's identity capitals
-    ("Deaf", "God", "Bible"), which a corpus-sized rule folds away.
+
+def case_lexicon(data_cfg: dict, language: str, split: str | None = None) -> frozenset[str]:
+    """The fold lexicon of `language`: the word list of its casing file (case_lexicon_entry), built from the train captions of every
+    corpus that names the same file.
+
+    data.yaml names 1 file per dataset: 1 caption source and 1 target language. Inside a source, pooling renders better where the corpora
+    disagree (asf's train captions never lowercase "consequently", ase's do), and it keeps the small corpora's identity capitals ("Deaf",
+    "God", "Bible"), which a corpus-sized rule folds away. Across sources it does not: a word's ordinary case depends on the source as well
+    as on the language ("Bush" in US news is "bush" in British broadcast subtitles, which also write "OK" where YouTube writes "ok"), and
+    the largest source decides the shared list. The pool is the corpora that name the file, not "every corpus of this config", so a
+    config that adds or leaves out a corpus changes no other source's text. A train load (`prepare_yt25.py --stage dedup` makes one) builds the file again when the pooled
+    train captions or the loader code (`_lexicon_key`) changed; a dev or test load reads only the file, because building it reads train captions; a machine that lacks a
+    pooled corpus reads the stored file.
     """
     langs = data_cfg["languages"]
-    target = str(langs[language].get("target_lang", "en_XX"))
-    pool = sorted(l for l, c in langs.items() if str(c.get("target_lang", "en_XX")) == target)
-    artifact = Path(langs[language]["root"]).parent / f"case_lexicon.{target}.json"
+    if (entry := case_lexicon_entry(data_cfg, language)) is None: raise SystemExit(
+        f"[loader] data.yaml names no casing file for the corpus {language} (subtitles.case_lexicon, named per dataset): name the file of "
+        f"its caption source, whose word list folds its sentence-initial capitals; the corpora that name 1 file pool their train captions."
+    )
+    artifact, pool = entry
     try: stored = json.loads(artifact.read_text(encoding="utf-8")) if artifact.exists() else {}
     except ValueError: stored = {}
+    if split in ("dev", "test"):
+        if stored.get("pool") == pool and stored.get("rule") == _fold_rule_id(): return frozenset(stored["words"])
+        raise SystemExit(
+            f"[loader] {artifact} is missing, or it was built for another pool or counting rule; the {split} loader only reads it, "
+            f"because building it reads the train captions. Run `python prepare_yt25.py --stage dedup --languages {language}` (its "
+            f"train load builds it), or copy the file from the machine that built it."
+        )
 
     sources, absent = [], []
     for other in pool:
-        subs, ids = _train_captions(data_cfg, other)
-        if ids: sources.append((subs, ids))
+        subs, ids = _train_captions(data_cfg, other) if other in langs else (None, [])
+        if ids: sources.append((subs, ids, corpus_config(data_cfg, other).get("subtitles", {})))
         else: absent.append(other)
 
     if absent:
         if stored.get("pool") == pool and stored.get("rule") == _fold_rule_id(): return frozenset(stored["words"])
         raise FileNotFoundError(
-            f"[loader] the case lexicon for target {target} pools the train captions of {', '.join(pool)}; this machine has none for "
-            f"{', '.join(absent)}. Copy {artifact} from the machine that holds the whole pool, or fetch the corpus "
-            f"(prepare_yt25.py --languages {' '.join(absent)}), or drop it from data.yaml languages and re-render everything."
+            f"[loader] the casing file {artifact} pools the train captions of {', '.join(pool)} (the corpora that name it); this "
+            f"machine has none for {', '.join(absent)}. Copy {artifact} from the machine that holds the whole pool, or fetch the corpus."
         )
-    key = _lexicon_key(sources, data_cfg.get("subtitles", {}))
+    key = _lexicon_key(sources)
     if stored.get("key") == key: return frozenset(stored["words"])
-    lexicon = fold_lexicon(sources, data_cfg.get("subtitles", {}))
+    lexicon = fold_lexicon(sources)
     artifact.parent.mkdir(parents=True, exist_ok=True)
     
     # Atomic: every rank of a distributed run builds this, and a half-written artifact is a rebuild for everyone after.
@@ -196,10 +238,10 @@ def case_lexicon(data_cfg: dict, language: str) -> frozenset[str]:
 
 def _is_prose(cues: list[tuple], joined: str, duration_s: float) -> bool:
     # Is a multi-cue chain wrapped prose, so that Punkt finding no boundary across its junctions is evidence?
-    words = _WORD_RE.findall(joined)
+    words = WORD_RE.findall(joined)
     if not words or duration_s <= 0: return False
     if len(words) / duration_s < PROSE_MIN_WORDS_PER_S: return False
-    words_per_cue = sum(len(_WORD_RE.findall(text)) for _, _, text in cues) / len(cues)
+    words_per_cue = sum(len(WORD_RE.findall(text)) for _, _, text in cues) / len(cues)
     capitalised = sum(1 for w in words if w[0].isupper()) / len(words)
     return not (words_per_cue <= GLOSS_MAX_WORDS_PER_CUE and capitalised >= GLOSS_MIN_CAPITALISED_SHARE)
 
@@ -207,13 +249,13 @@ def _is_prose(cues: list[tuple], joined: str, duration_s: float) -> bool:
 def _fold_sentence_start(part: str, lexicon: frozenset[str] | None) -> str:
     # Lowercase 1st word of an interior sentence when the corpus says its capital was positional.
     if not lexicon: return part
-    m = _WORD_RE.search(part)
+    m = WORD_RE.search(part)
     if m is None: return part
     word = m.group(0)
     # An ALL-CAPS token carries no positional capital to remove: it is a gloss or emphasis, and folding only its first
     # letter renders "BYE" as "bYE". Also skip I / I'm and fingerspelled single letters.
     if not word[0].isupper() or len(word) == 1 or word.isupper() or _is_pronoun_i(word): return part
-    nxt = _WORD_RE.search(part, m.end())
+    nxt = WORD_RE.search(part, m.end())
     if nxt and nxt.group(0)[0].isupper() and not _is_pronoun_i(nxt.group(0)): return part   # "New Zealand", "Deaf Youth"
     if word.lower() not in lexicon: return part
     return part[:m.start()] + word[0].lower() + part[m.start() + 1:]
@@ -316,6 +358,16 @@ def _punkt_tokenizer():
     return _PUNKT or None
 
 
+def _punkt_identity() -> str | None:
+    # The Punkt model groups the units and splits the casing counts, and an `nltk.download` can replace it with no change of the NLTK
+    # version: its parameters, sorted (the order of a set depends on the hash seed of the process). None without Punkt.
+    tok = _punkt_tokenizer()
+    if tok is None: return None
+    p = tok._params
+    return hashlib.sha256(json.dumps([sorted(p.abbrev_types), sorted(map(list, p.collocations)), sorted(p.sent_starters),
+                                      sorted(p.ortho_context.items())]).encode()).hexdigest()
+
+
 def non_latin_ratio(texts: Iterable[str]) -> float:
     """Share of a video's ALPHABETIC caption characters that are not Latin script.
 
@@ -344,34 +396,56 @@ def english_function_word_ratio(texts: Iterable[str]) -> tuple[int, float]:
     Return the word count too: the caller must not judge a vocabulary list this way. A gloss track carries content
     words alone ("RUBBISH / MESS / CLEAN"), so it scores near zero in any language.
     """
-    words = _WORD_RE.findall(" ".join(texts).lower())
+    words = WORD_RE.findall(" ".join(texts).lower())
     if not words: return 0, 0.0
     return len(words), sum(word in ENGLISH_FUNCTION_WORDS for word in words) / len(words)
 
 
-def _clamp_overlaps(captions: list[tuple[float, float, str]]) -> tuple[list[tuple[float, float, str]], int, int]:
-    """Force a strictly non-overlapping, time-ordered span sequence. Returns (spans, clamped, swallowed).
+def _clamp_overlaps(captions: list[tuple[float, float, str]], max_overlap_s: float) -> tuple[list[tuple], int, int, int, int]:
+    """Force a strictly non-overlapping, time-ordered span sequence. Returns (spans, clamped, swallowed, containers, disputed).
 
     Applied to the FINAL caption stream (after rolling-duplicate merging and sentence reconstruction), so it is the
-    1 place that guarantees the invariant every downstream consumer assumes. A span left fully inside its predecessor 
-    after clamping is dropped: it carries no exclusive frames, so it can never be selected or scored.
+    1 place that guarantees the invariant every downstream consumer assumes. Each start clamps to the previous end. When the
+    overlap is longer than `max_overlap_s` (δ, inference.yaml boundary_stability.delta_s), no boundary between the 2 units is
+    known to δ, so the clamped unit and every kept unit that it overlapped are quarantined (reliable=False): their frames
+    become UNK and neither is a target or a reference; a shorter overlap only moves the later start, by at most δ. A span
+    left fully inside its predecessors after clamping is dropped: it carries no exclusive frames, so it can never be selected
+    or scored. Its TEXT leaves the reference with it, so every kept span that holds its frames is quarantined: that span's
+    text misses words that are signed inside it, so it is neither a correct target nor a correct reference.
 
-    Both counts are per UNIT and disjoint — 1 unit is either moved or deleted — so neither can go negative and their
-    sum is the number of units an overlap touched. A count derived instead from ADJACENT-PAIR overlaps is not on this
-    basis: 1 malformed cue containing 5 short ones is a single adjacent pair and five deletions.
+    The first 2 counts are per UNIT and disjoint — 1 unit is either moved or deleted — so neither can go negative and their
+    sum is the number of units an overlap touched; `containers` counts the kept units quarantined for a deleted one, and
+    `disputed` the units quarantined for an overlap above δ. A count derived instead from ADJACENT-PAIR overlaps is not on
+    this basis: 1 malformed cue containing 5 short ones is a single adjacent pair and five deletions.
     """
     out: list = []
-    clamped = swallowed = 0
+    clamped = swallowed = containers = disputed = 0
     prev_end = float("-inf")
+    reliable = lambda span: len(span) < 4 or bool(span[3])
+    quarantine = lambda span: (*span[:3], False, *span[4:])
+
+    def quarantine_overlapped(start: float, end: float) -> int:
+        # Quarantine the kept spans that overlap (start, end) (out is ordered and disjoint); the number newly quarantined.
+        n = 0
+        for i in range(len(out) - 1, -1, -1):
+            if out[i][1] <= start: break
+            if out[i][0] < end and reliable(out[i]): out[i] = quarantine(out[i]); n += 1
+        return n
+
     # Tuples may carry a 4th `reliable` field (unsupported coverage) — pass any extra fields through untouched.
     for c in sorted(captions, key=lambda x: (x[0], x[1])):
         s, e = max(c[0], prev_end), c[1]
         if e <= s:
-            swallowed += 1  # wholly swallowed by the previous span; its TEXT leaves the reference with it
+            swallowed += 1  # wholly swallowed by the previous spans; its TEXT leaves the reference with it
+            containers += quarantine_overlapped(c[0], e)
             continue
         clamped += s > c[0]
-        out.append((s, e, *c[2:])); prev_end = e
-    return out, clamped, swallowed
+        span = (s, e, *c[2:])
+        if c[0] < prev_end - float(max_overlap_s):   # an overlap above δ: no boundary is known to δ
+            disputed += quarantine_overlapped(c[0], prev_end) + reliable(span)
+            span = quarantine(span)
+        out.append(span); prev_end = e
+    return out, clamped, swallowed, containers, disputed
 
 
 def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s: float = 1.0) -> list[tuple]:
@@ -387,17 +461,17 @@ def _quarantine_end_straddlers(captions: list[tuple], duration_s: float, slack_s
     return [(c[0], float(duration_s), c[2], False) if (c[0] < duration_s and c[1] > duration_s + float(slack_s)) else c for c in captions]
 
 
-def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
+def split_clean_segments(rec: VideoRecord, runs, min_span_s: float) -> list[VideoRecord]:
     """The clean segments of `rec` between pose-invalid frame `runs` (half-open .npy frames [a, b), any order, may overlap).
 
-    Runs closer than Λ_min merge, and a run within Λ_min of a video end reaches it, so no segment is shorter than Λ_min (in frames at the 
-    record's fps). No run: `[rec]`, unchanged. Otherwise segment [a, b) is the record `f"{vid}@{a}"` whose pose is the view `start_frame=a, 
+    Runs closer than Λ_min (`min_span_s`) merge, and a run within Λ_min of a video end reaches it, so no segment is shorter than
+    Λ_min (in frames at the record's fps). No run: `[rec]`, unchanged. Otherwise segment [a, b) is the record `f"{vid}@{a}"` whose pose is the view `start_frame=a, 
     num_frames=b - a` and whose units are in segment time (source time - a/fps). A unit wholly inside a run is gone. A unit that crosses a 
     segment edge stays in each segment it touches, QUARANTINED, with its true times (so start < 0 or end > the segment duration). A unit 
     may end past the LAST segment by the loader's pose-end tolerance.
     """
     n, fps = rec.pose.total_frames, float(rec.pose.fps)
-    floor = seconds_to_frames(LAMBDA_MIN_S, fps)
+    floor = seconds_to_frames(min_span_s, fps)
     cuts: list[list[int]] = []
     for a, b in sorted(runs):
         if cuts and a - cuts[-1][1] < floor: cuts[-1][1] = max(cuts[-1][1], b)
@@ -407,7 +481,7 @@ def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
     if cuts[0][0] < floor: cuts[0][0] = 0
     if n - cuts[-1][1] < floor: cuts[-1][1] = n
     edges = [0, *(x for cut in cuts for x in cut), n]
-    untrusted = untrusted_o_intervals(rec.sentences, rec.pose.duration_s, TRUSTED_GAP_S)
+    untrusted = rec.untrusted_s if rec.untrusted_s is not None else untrusted_o_intervals(rec.sentences, rec.pose.duration_s, TRUSTED_GAP_S)
     out = []
 
     for a, b in zip(edges[::2], edges[1::2]):
@@ -422,34 +496,96 @@ def split_clean_segments(rec: VideoRecord, runs) -> list[VideoRecord]:
     return out
 
 
-def quarantine_handless(rec: VideoRecord, runs, share: float) -> VideoRecord:
-    """`rec` with every reliable unit that has at least `share` of its frames inside `runs` quarantined (reliable=False).
+def quarantine_units(rec: VideoRecord, rule) -> VideoRecord:
+    """`rec` with every reliable unit quarantined (reliable=False) that has, for each (runs, share) pair of `rule`, at least `share` of
+    its frames inside `runs`.
 
-    `runs` are video_meta.csv handless_runs (half-open .npy frames [a, b) where the kept body shows no hand) on the timeline of `rec.pose`. 
-    A unit covers frames [floor(start * fps), ceil(end * fps)), clipped to the pose stream. No unit time moves and no frame is cut, so the 
-    signing transitions into and out of the unit stay in the stream.
+    `rule` holds the columns of one QUARANTINE_RULES kind of video_meta.csv (half-open .npy frames [a, b) on the timeline of `rec.pose`),
+    each with its share: handless_runs, where the kept body shows no hand; or switch_runs, where the kept body is the signer switch's
+    body and not the converter's default body, with default_signing_runs, where that default body signs. A unit covers frames
+    [floor(start * fps), ceil(end * fps)), clipped to the pose stream. No unit time moves and no frame is cut, so the signing transitions
+    into and out of the unit stay in the stream.
     """
     n, fps = rec.pose.total_frames, float(rec.pose.fps)
-    handless = np.zeros(n, dtype=bool)
-    for a, b in runs: handless[a:b] = True
+    marked = []
+    for runs, share in rule:
+        frames = np.zeros(n, dtype=bool)
+        for a, b in runs: frames[a:b] = True
+        marked.append((frames, share))
 
     def inside(s: SentenceSpan) -> bool:
         a, b = max(0, int(np.floor(s.start_s * fps))), min(n, int(np.ceil(s.end_s * fps)))
-        return b > a and float(handless[a:b].mean()) >= share
+        return b > a and all(float(frames[a:b].mean()) >= share for frames, share in marked)
 
     return replace(rec, sentences=tuple(replace(s, reliable=False) if s.reliable and inside(s) else s for s in rec.sentences))
 
 
-def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: int = 60, fold: frozenset[str] | None = None) -> list[tuple]:
+def mark_unreliable(spans: tuple[SentenceSpan, ...], unreliable, video_id: str, duration_s: float) -> tuple[tuple[SentenceSpan, ...], int]:
+    """`spans` with the corpus's unreliable spans (video_meta.csv unreliable_spans, [start_s, end_s] of the source video), and the number
+    of reliable units that they quarantine. Every unit that overlaps a span is quarantined, and each span becomes a quarantined unit
+    with no text, so its frames are UNK (not O), it is never a target, an anchor or gold, and a prediction mostly inside it is not
+    scored. Units that no span touches keep their times and reliability. None or [] (no annotation, or none found) changes nothing."""
+    marks = [(max(0.0, float(a)), min(float(duration_s), float(b))) for a, b in unreliable or []]
+    marks = [(a, b) for a, b in marks if b > a]
+    if not marks: return spans, 0
+    # VTT and sidecar times are whole milliseconds, so an overlap under half of one is float noise, not an overlap: "00:04:55.160"
+    # parses to 295.15999999999997, below the sidecar's 295.16, and a unit that only touches a span would be quarantined.
+    hit = [s.reliable and any(s.start_s < b - 5e-4 and s.end_s > a + 5e-4 for a, b in marks) for s in spans]
+    out = [replace(s, reliable=False) if h else s for s, h in zip(spans, hit)]
+    out += [SentenceSpan(video_id=video_id, start_s=a, end_s=b, text="", reliable=False) for a, b in marks]
+    return tuple(sorted(out, key=lambda s: (s.start_s, s.end_s))), sum(hit)
+
+
+_STOP_END_RE = re.compile(r'(?<!\.)[.!?]["\')\]]*$')   # a cue that ends with 1 sentence-final mark (closing quotes and brackets allowed)
+_ELLIPSIS_END_RE = re.compile(r'\.{2,}["\')\]]*$')     # a cue that ends with an ellipsis ("..", "...")
+UNRELIABLE_MARK = "unreliable_span"   # 5th field of a caption tuple that is a mark of video_meta.csv unreliable_spans, not a cue
+# A title that stands before a name ends no sentence ("my colleague, Dr." | "David Evans", "a teacher in St." | "Patrick's"). Only
+# titles: the other abbreviations of Punkt's list also end sentences ("U.S.", "Inc.", "OK.", "p.m."), and there the cue end is right.
+_TITLE_END_RE = re.compile(r"(?<![A-Za-z])(?:dr|mr|mrs|ms|st|prof|rev|sen|gen|gov|lt|col|capt|sgt|mt)\.$", re.IGNORECASE)
+
+
+def _may_cross(cue: str, nxt: str, cased: bool) -> bool:
+    """May 1 linguistic sentence run from `cue` into the next cue `nxt`? Punkt reads the capital of the next word, so it does not
+    split before a lowercase word and it reads "OK." and an ellipsis as no sentence end; a cue track adds what Punkt cannot see,
+    the cue end. After a cue that ends with . ! or ? a sentence continues only into a lowercase word, and only in a `cased` video
+    (in a video whose captions carry no capitals, a lowercase word says nothing: Auslan-Daily), except after a title (Dr., St.).
+    After an ellipsis it continues into a lowercase word or a cue that starts with "..". Any other junction is Punkt's to decide."""
+    cue, nxt = cue.rstrip(), nxt.lstrip()
+    letter = re.search(r"[^\W\d_]", nxt)
+    lower = bool(letter) and letter.group(0).islower()
+    if _TITLE_END_RE.search(cue): return True
+    if _ELLIPSIS_END_RE.search(cue): return lower or nxt.startswith("..")
+    if _STOP_END_RE.search(cue): return cased and lower
+    return True
+
+
+def _continues_after_pause(nxt: str, cased: bool) -> bool:
+    # May a unit run on into the cue `nxt` after a long pause? Only when `nxt` shows it: a word that starts lowercase, or the pronoun "I"
+    # (always a capital), in a video with both cases. In a video with one case only (Auslan-Daily's lowercase captions, an ALL-CAPS track)
+    # the case says nothing, so Punkt decides as before.
+    if not cased: return True
+    letter, word = re.search(r"[^\W\d_]", nxt), WORD_RE.search(nxt)
+    return bool(letter) and letter.group(0).islower() or bool(word) and _is_pronoun_i(word.group(0))
+
+
+def reconstruct_sentences(
+    captions: list[tuple[float, float, str]], max_tokens: int = 60, fold: frozenset[str] | None = None, pause_s: float | None = None,
+) -> list[tuple]:
     """Group whole display cues into timestamp-supported caption units.
 
-    Punkt reads the original text to find cue junctions inside linguistic sentences. Connected cues form 1 unit; a unit can contain several 
-    linguistic sentences. Its BIO labels describe unit membership, not each linguistic sentence. Only after grouping, internal sentence-final 
-    periods become commas, and the sentence that follows a converted period loses its positional capital when the train lexicon `fold` says 
-    the word is ordinarily lowercase (see `fold_lexicon`; names, "I", initialisms and proper-noun compounds keep theirs). Questions and 
+    Punkt reads the original text to find cue junctions inside linguistic sentences, and the cue ends limit it (_may_cross: a cue that
+    ends a sentence ends its unit unless a lowercase word continues it). Connected cues form 1 unit; a unit can contain several
+    linguistic sentences. Its BIO labels describe unit membership, not each linguistic sentence. Only after grouping, internal sentence-final
+    periods become commas, and the sentence that follows a converted period loses its positional capital when the train lexicon `fold` says
+    the word is ordinarily lowercase (see `fold_lexicon`; names, "I", initialisms and proper-noun compounds keep theirs). Questions and
     exclamations are retained, and the sentence after them keeps its capital.
 
-    Missing punctuation or a sentence above max_tokens leaves the source cues separate. The limit guards unreliable grouping evidence; it does 
+    A pause longer than `pause_s` (the loader passes δ, inference.yaml boundary_stability.delta_s: the training targets join units and
+    the scorer's chunks break at that pause too) ends the unit unless the next cue shows that the sentence runs on (_continues_after_pause):
+    Punkt finds no sentence end where a caption has no full stop, and after a pause a capital most often starts a new sentence ("...studying
+    Yoga Therapy" | 3.2 s | "They explained..."), while "...because of pride" | 1.8 s | "or vanity" is 1 sentence. None: no pause limit.
+
+    Missing punctuation or a sentence above max_tokens leaves the source cues separate. The limit guards unreliable grouping evidence; it does
     not clip text or invent timestamps. Cues are never split.
     """
     if not captions: return []
@@ -461,6 +597,8 @@ def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: 
         parts.append(t); char_cue.extend([ci] * len(t))
 
     text = "".join(parts)
+    # A video whose captions carry both cases: in one with no capitals (Auslan-Daily) or only capitals, case says nothing.
+    cased = any(ch.isupper() for ch in text) and any(ch.islower() for ch in text)
     crossed: set[int] = set()                                 # junction k = boundary between cue k and k+1
     for a, b in tok.span_tokenize(text):
         ids = sorted({c for c in char_cue[a:b] if c != -1})
@@ -468,11 +606,14 @@ def reconstruct_sentences(captions: list[tuple[float, float, str]], max_tokens: 
             # Text evidence alone is not enough to assert membership: the unit is timestamp-SUPPORTED, so a junction
             # the labeller distrusts cannot be crossed. `untrusted_o_intervals` calls an uncaptioned stretch longer
             # than TRUSTED_GAP_S unlocatable and marks it UNK; merging across the same stretch would relabel it I.
-            if y == x + 1 and captions[y][0] - captions[x][1] <= TRUSTED_GAP_S: crossed.add(x)
+            gap = captions[y][0] - captions[x][1]
+            if y == x + 1 and gap <= TRUSTED_GAP_S and _may_cross(captions[x][2], captions[y][2], cased) and (
+                pause_s is None or gap <= float(pause_s) or _continues_after_pause(captions[y][2], cased)
+            ): crossed.add(x)
     out: list[tuple] = []
 
     def emit(run: list[int]) -> None:
-        s0, e1 = captions[run[0]][0], captions[run[-1]][1]
+        s0, e1 = captions[run[0]][0], max(captions[c][1] for c in run)   # an earlier cue of the run can end after the last one
         joined = " ".join(captions[c][2] for c in run).strip()
         sents = [joined[a:b] for a, b in tok.span_tokenize(joined)]
         # A multi-cue chain is merged only when Punkt's failure to split it is INFORMATIVE, i.e. the chain is wrapped prose. A gloss list 
@@ -590,17 +731,24 @@ def find_best_subtitle(
     subtitle_root: str | Path, video_id: str,
     preferred_suffixes: list[str], reject_suffixes: list[str],
     min_caption_chars: int = 2, reject_flattened_transcripts: bool = True,
-    flattened_max_cues: int = 2, flattened_min_chars: int = 500, flattened_max_chars_per_second: float = 120.0, 
-    drop_noise: bool = False, lang_prefix: str | None = None,
+    flattened_max_cues: int = 2, flattened_min_chars: int = 500, flattened_max_chars_per_second: float = 120.0,
+    drop_noise: bool = False, lang_prefix: str | None = None, names: list[str] | None = None, exclude_rejected: bool = False,
 ) -> Path | None:
     subtitle_root = Path(subtitle_root)
     # `lang_prefix` restricts to `<vid>.<prefix>*.vtt` (e.g. "en" → .en-GB/.en; "de" → .de*). The preferred/reject
     # suffix lists are English-oriented and do NOT encode language, so harvesting shard tracks for a non-English
     # target needs this to avoid picking an English track and labelling it the target language.
-    pattern = f"{video_id}.{lang_prefix}*.vtt" if lang_prefix else f"{video_id}*.vtt"
-    candidates = sorted(subtitle_root.glob(pattern))
+    prefix = f"{video_id}.{lang_prefix}" if lang_prefix else video_id
+    # `names`: the folder's sorted file names (`sorted_names`), from a caller that selects for many videos; a glob per video lists the
+    # whole folder again (ase train: 10,761 listings of about 11,000 files). The names that `<prefix>*.vtt` matches are one block of
+    # the sorted list when the prefix is literal (video ids hold no glob character; one that does takes the glob).
+    if names is None or any(c in prefix for c in "*?["): candidates = sorted(subtitle_root.glob(f"{prefix}*.vtt"))
+    else: candidates = [subtitle_root / n for n in itertools.takewhile(
+        lambda n: n.startswith(prefix), itertools.islice(names, bisect.bisect_left(names, prefix), None)
+    ) if n.endswith(".vtt") and len(n) >= len(prefix) + len(".vtt")]
     scored: list[tuple[tuple[int, int, str], Path]] = []
     for path in candidates:
+        if exclude_rejected and any(path.name.endswith(rejected) for rejected in reject_suffixes): continue
         if looks_asr_transcript(path): continue
         try: parsed = parse_vtt(path, drop_noise=drop_noise)
         except OSError: continue
@@ -616,9 +764,16 @@ def find_best_subtitle(
     return min(scored)[1] if scored else None
 
 
-def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, lang_prefix: str | None = None) -> Path | None:
+def sorted_names(folder: str | Path) -> list[str]: # 1 listing of a caption folder for many best_subtitle calls (find_best_subtitle `names`)
+    return sorted(os.listdir(folder)) if Path(folder).is_dir() else []
+
+def best_subtitle(
+    subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, lang_prefix: str | None = None, names: list[str] | None = None,
+) -> Path | None:
     """`find_best_subtitle` driven by the `subtitles:` config block — the ONE selection rule, shared by the loader
-    (lang_prefix=None; only the canonical `<vid>.<target>.vtt` exists) and prepare_yt25 (shard tracks, lang_prefix=target)."""
+    (lang_prefix=None; only the canonical `<vid>.<target>.vtt` exists) and prepare_yt25 (shard tracks, lang_prefix=target).
+    Among raw shard tracks a rejected suffix only loses to every other track; in a prepared caption folder it is never read, because
+    there it is another corpus's track (BOBSL's 2 corpora share subs/), so a video without its own track has no caption."""
     return find_best_subtitle(
         subtitle_root, video_id,
         preferred_suffixes=list(subtitle_cfg.get("preferred_suffixes", [".en.vtt"])),
@@ -628,11 +783,46 @@ def best_subtitle(subtitle_root: str | Path, video_id: str, subtitle_cfg: dict, 
         flattened_max_cues=int(subtitle_cfg.get("flattened_max_cues", 2)),
         flattened_min_chars=int(subtitle_cfg.get("flattened_min_chars", 500)),
         flattened_max_chars_per_second=float(subtitle_cfg.get("flattened_max_chars_per_second", 120.0)),
-        drop_noise=bool(subtitle_cfg.get("drop_noise_captions", True)), lang_prefix=lang_prefix,
+        drop_noise=bool(subtitle_cfg.get("drop_noise_captions", True)), lang_prefix=lang_prefix, names=names,
+        exclude_rejected=lang_prefix is None,
     )
 
 
-def _load_signverse_splits(path: Path) -> dict[str, str]:
+CONFIG_LEVEL_BLOCKS = ("splits", "subtitles", "pose")   # the data.yaml blocks that a dataset and a corpus refine (corpus_config)
+
+
+def dataset_config(data_cfg: dict, dataset: str | None, *corpus: dict) -> dict:
+    """`data_cfg` as the corpora of `dataset` read it: each block of CONFIG_LEVEL_BLOCKS is the global block (the rules of every corpus),
+    then the block of data.yaml `datasets.<dataset>` (what the corpora of 1 source of videos and captions share: split file, track
+    names, casing file, frame size), then the block of each `corpus` entry given; each level replaces only the keys it names."""
+    datasets = data_cfg.get("datasets") or {}
+    if dataset is not None and dataset not in datasets: raise SystemExit(
+        f"[loader] data.yaml names the dataset {dataset!r}, which data.yaml datasets does not define ({', '.join(sorted(datasets))})."
+    )
+    # The global blocks travel with a view, so the view of another corpus taken from a view never inherits this corpus's keys.
+    base = data_cfg.get("_global_blocks") or {block: data_cfg.get(block) or {} for block in CONFIG_LEVEL_BLOCKS}
+    view = {**data_cfg, "_global_blocks": base}
+    levels = [datasets[dataset]] if dataset is not None else []
+    for block in CONFIG_LEVEL_BLOCKS:
+        view[block] = {**base[block], **{k: v for level in (*levels, *corpus) for k, v in (level.get(block) or {}).items()}}
+    return view
+
+
+def corpus_config(data_cfg: dict, language: str) -> dict:
+    """`data_cfg` as corpus `language` reads it (dataset_config with its data.yaml entry): BOBSL's 2 corpora keep their own split file,
+    subtitle track and sidecar on 1 dataset, while every other rule stays shared. Every reader of one corpus's split file, subtitle
+    rules or fallback frame size reads this view."""
+    lang_cfg = data_cfg["languages"][language]
+    return dataset_config(data_cfg, lang_cfg.get("dataset"), lang_cfg)
+
+
+def video_meta_path(data_cfg: dict, language: str) -> Path:
+    # The corpus's sidecar: data.yaml languages.<language>.video_meta where 2 corpora share a root (BOBSL), else <root>/video_meta.csv.
+    lang_cfg = data_cfg["languages"][language]
+    return Path(lang_cfg.get("video_meta") or Path(lang_cfg["root"]) / META_FILENAME)
+
+
+def _load_split_file(path: Path) -> dict[str, str]:
     # str(Path("")) is ".", which exists and is a directory — guard before opening.
     if not path.name or not path.is_file(): return {}
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -656,31 +846,24 @@ def _load_signverse_splits(path: Path) -> dict[str, str]:
 
 
 def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
-    csv_path = str(split_cfg.get("signverse_csv", "") or "")
-    signverse = _load_signverse_splits(Path(csv_path))
-    # Fail loud rather than fall through to the random split: signverse_csv is CWD-relative, so an entry point started
+    csv_path = str(split_cfg.get("file", "") or "")
+    signverse = _load_split_file(Path(csv_path))
+    # Fail loud rather than fall through to the random split: splits.file is CWD-relative, so an entry point started
     # from another directory would silently re-partition every video, making a checkpoint trained under one split and
     # evaluated under the other train-on-test. The fallback below is only for configs that declare no CSV at all.
     if csv_path and not signverse: raise FileNotFoundError(
-        f"splits.signverse_csv={csv_path!r} is configured but unusable from cwd {Path.cwd()} (missing, empty, or "
+        f"splits.file={csv_path!r} is configured but unusable from cwd {Path.cwd()} (missing, empty, or "
         f"no recognised id/split columns). Refusing the random fallback split."
     )
     if signverse:
         splits = {"train": [], "dev": [], "test": []}
-        unmatched = 0
         for video_id in video_ids:
-            split = signverse.get(video_id)
-            if split in splits: splits[split].append(video_id)
-            else: unmatched += 1
+            if (split := signverse.get(video_id)) in splits: splits[split].append(video_id)
         # A CSV that parses but shares no ids with the pose index (wrong language, stale export, ids vs stems) is the
         # same train-on-test hazard as a missing one — without this the loop falls through to the rng below.
         if not any(splits.values()): raise ValueError(
-            f"splits.signverse_csv={csv_path!r} parsed {len(signverse)} rows but matched NONE of the {len(video_ids)} "
+            f"splits.file={csv_path!r} parsed {len(signverse)} rows but matched NONE of the {len(video_ids)} "
             f"pose videos (e.g. {sorted(video_ids)[:3]} vs {sorted(signverse)[:3]}). Refusing the random fallback split."
-        )
-        if unmatched: print(
-            f"[loader] {unmatched}/{len(video_ids)} pose videos absent from the split CSV (dropped from all splits). "
-            f"Add them to {csv_path} to include them.", flush=True
         )
         return {k: sorted(v) for k, v in splits.items()}
 
@@ -697,48 +880,79 @@ def build_splits(video_ids: list[str], split_cfg: dict) -> dict[str, list[str]]:
     }
 
 
-def _split_caption_sets(root: Path, video_ids, subtitle_cfg: dict, drop_noise: bool) -> dict[str, set[str]]:
-    # {video_id: {normalised caption}} for overlap testing. Parses subtitles only (no poses).
-    out: dict[str, set[str]] = {}
+def _split_captions(root: Path, video_ids, subtitle_cfg: dict, drop_noise: bool) -> dict[str, list[str]]:
+    # {video_id: [each display cue (merge_rolling_captions) lowercased, in time order]}: the text the copy check compares. Subtitles only.
+    out: dict[str, list[str]] = {}
+    names = sorted_names(root / "subs")
     for vid in tqdm(video_ids, desc="[loader] Splitting caption sets", unit="vid", leave=False, dynamic_ncols=True):
-        path = best_subtitle(root / "subs", vid, subtitle_cfg)
+        path = best_subtitle(root / "subs", vid, subtitle_cfg, names=names)
         if path is None: continue
-        caps = {
-            " ".join(str(t).lower().split()) 
-            for _, _, t in merge_rolling_captions(parse_vtt(path, drop_noise=drop_noise)) if t
-        }
+        caps = [" ".join(str(t).lower().split()) for _, _, t in merge_rolling_captions(parse_vtt(path, drop_noise=drop_noise)) if t]
         if caps: out[vid] = caps
     return out
 
 
-def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, str, float]]:
-    """Near-duplicate video pairs — the same talk re-uploaded under a different id.
+def _shingles(words: list[str], n: int) -> set[str]:
+    # The n-word runs of `words`, as strings. Storing hash() ints instead would cut the loader's peak memory on ase.
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
 
-    A caption identifies content only if it is RARE (document frequency <= df_cap; above that it is series boilerplate such as a scripted 
-    contact-info outro, which otherwise chains unrelated videos into one cluster) and LONG enough (>= min_words; single-sign vocabulary 
-    clips share a word with everything). A pair is flagged when its shared identifying captions cover more than `cover` of the smaller 
-    video's identifying set. Near-match coverage needs min_captions. Exact caption-set copies can instead meet same evidence budget in words.
-    """
-    df_cap, min_words = int(cfg.get("df_cap", 20)), int(cfg.get("min_words", 4))
-    min_caps, cover = int(cfg.get("min_captions", 10)), float(cfg.get("cover", 0.5))
-    ident = {v: k for v, cs in caps.items() if len(k := {c for c in cs if len(c.split()) >= min_words}) >= min_caps}
+
+def _shared_counts(sets: dict[str, set[str]], df_cap: int) -> dict[tuple[str, str], int]:
+    # {(video a, video b): number of shared items that are RARE (in at most df_cap videos)}.
     inv: dict[str, set[str]] = defaultdict(set)
-    for v, cs in ident.items():
-        for c in cs: inv[c].add(v)
-
+    for v, items in sets.items():
+        for x in items: inv[x].add(v)
     shared: dict[tuple[str, str], int] = defaultdict(int)
-    for c, vs in inv.items():
+    for vs in inv.values():
         if 2 <= len(vs) <= df_cap:
             for a, b in combinations(sorted(vs), 2): shared[(a, b)] += 1
+    return shared
 
-    scores = {(a, b): n / min(len(ident[a]), len(ident[b])) for (a, b), n in shared.items()}
+
+def _duplicate_pairs(caps: dict[str, list[str]], cfg: dict) -> list[tuple[str, str, float]]:
+    """Video pairs that share content: a talk re-uploaded under a different id, or another version of the same script.
+
+    2 tests score a pair, and the higher score counts; a pair is flagged above `cover`. Only RARE items count (in at most df_cap videos;
+    above that an item is series boilerplate such as a scripted contact-info outro, which otherwise chains unrelated videos into one cluster).
+    Cue test: a cue identifies content only if it is also LONG enough (>= min_words; single-sign vocabulary clips share a word with
+    everything). The score is the shared identifying cues over the smaller video's identifying cues, and a video needs min_captions of
+    them. Exact cue-set copies of min_captions x min_words words or more score 1.
+    Transcript test: the same words broken into other cue lines. The cues are joined in time order, and the score is the shared word
+    n-grams (shingle_words words) over the smaller video's n-grams. A video needs min_captions x min_words words, the evidence budget of
+    the exact-copy rule.
+    """
+    df_cap, min_words, min_caps = int(cfg["df_cap"]), int(cfg["min_words"]), int(cfg["min_captions"])
+    cover, n = float(cfg["cover"]), int(cfg["shingle_words"])
+    cue_sets = {v: set(cs) for v, cs in caps.items()}
+    ident = {v: k for v, cs in cue_sets.items() if len(k := {c for c in cs if len(c.split()) >= min_words}) >= min_caps}
+    scores = {(a, b): k / min(len(ident[a]), len(ident[b])) for (a, b), k in _shared_counts(ident, df_cap).items()}
     exact: dict[frozenset[str], list[str]] = defaultdict(list)
-    for vid, cs in caps.items():
+    for vid, cs in cue_sets.items():
         if sum(len(c.split()) for c in cs) >= min_caps * min_words: exact[frozenset(cs)].append(vid)
     for vids in exact.values():
         if 2 <= len(vids) <= df_cap:
             for pair in combinations(sorted(vids), 2): scores[pair] = 1.0
+    grams = {v: _shingles(w, n) for v, cs in caps.items() if len(w := WORD_RE.findall(" ".join(cs))) >= min_caps * min_words}
+    for (a, b), k in _shared_counts(grams, df_cap).items():
+        scores[(a, b)] = max(scores.get((a, b), 0.0), k / min(len(grams[a]), len(grams[b])))
     return sorted([(a, b, score) for (a, b), score in scores.items() if score > cover], key=lambda p: -p[2])
+
+
+def train_copies(train: list[VideoRecord], splits: dict[str, list[str]], root: Path, subtitle_cfg: dict) -> dict[str, list]:
+    """{train video: copy_of}: the video-level copy check (subtitles.dedup). `prepare_yt25.py --stage dedup` runs it once and writes the
+    result to the video_meta.csv column copy_of; it is the only code that reads the captions of more than 1 split.
+
+    `train` are the train records before the copy check (`load_language_records(..., before_dedup=True)`); they are compared with every dev
+    and test video of `splits` that has a caption. A train video that shares content with a dev/test video (`_duplicate_pairs`: a re-upload,
+    or another version of the same script) is a copy: [that video, score] (the highest score, then the first ids), and the train loader
+    drops it whole. Every other train video is [] (not a copy). The eval sets stay as the split CSV defines them."""
+    cfg = subtitle_cfg["dedup"]
+    eval_ids = {v for s in ("dev", "test") for v in splits.get(s, [])}
+    caps = _split_captions(root, [r.video_id for r in train] + sorted(eval_ids), subtitle_cfg, bool(subtitle_cfg.get("drop_noise_captions", True)))
+    copy_of: dict[str, list] = {}
+    for a, b, frac in sorted(_duplicate_pairs(caps, cfg), key=lambda p: (-p[2], p[0], p[1])):
+        if (a in eval_ids) != (b in eval_ids): copy_of.setdefault(b if a in eval_ids else a, [a if a in eval_ids else b, round(frac, 4)])
+    return {r.video_id: copy_of.get(r.video_id, []) for r in train}
 
 
 class PooledEpochRecords:
@@ -755,10 +969,12 @@ class PooledEpochRecords:
         return resolve_pretrain_records(self.cfg, self.data_cfg, self.language, "train", epoch=epoch)[0]
 
     def cycle_epochs(self) -> int:
-        # Consecutive epochs until the rotation has drawn every train video once: the slowest language's ceil(n / per-epoch target).
-        counts = {str(l): len(_cached_language_records(self.data_cfg, str(l), "train")) for l in self.cfg["pretrain_languages"]}
-        targets = _pool_targets(counts, float(self.cfg["pretrain_temperature"]))
-        return max(-(-n // targets[l]) for l, n in counts.items())
+        # Consecutive epochs until the rotation has drawn every train record once: the slowest language's ceil(hours / hours per epoch).
+        hours = {str(l): sum(r.pose.duration_s for r in cached_language_records(self.data_cfg, str(l), "train")) / 3600.0
+                 for l in self.cfg["pretrain"]["languages"]}
+        targets = _pool_targets(hours, float(self.cfg["pretrain"]["temperature"]), self.cfg["pretrain"].get("weights"))
+        # 1e-9: the corpus that sets the epoch size divides its own hours exactly, up to float rounding
+        return max(int(np.ceil(h / targets[l] - 1e-9)) for l, h in hours.items())
 
 
 def resolve_pretrain_records(
@@ -766,21 +982,25 @@ def resolve_pretrain_records(
 ) -> tuple[list[VideoRecord], dict[str, int] | None]:
     """Records for a SEGMENTATION trainer: the target language alone, or the multilingual pretraining pool.
 
-    `pretrain_languages` in trainer config switches it on. Both segmentation trainers (S1 and the Moryossef baseline) route through here, 
-    so 2 arms can never end up trained on different pools by accident — which is what would make a cascade comparison unfair.
+    `pretrain.languages` in trainer config switches it on. Both segmentation trainers (S1 and the Moryossef baseline) route through here, 
+    so 2 arms can never end up trained on different pools by accident — which is what would make a cascade comparison unfair. The dev
+    split reads `pretrain.dev_languages` (default: the pool): the corpora whose dev labels choose the checkpoint, so a corpus can train
+    without its dev set joining the check (BOBSL's automatic labels, and its official val holds the manual dev episodes).
     """
-    langs = cfg.get("pretrain_languages") or None
+    langs = cfg_get(cfg, "pretrain", "languages")
+    if langs and split != "train": langs = cfg_get(cfg, "pretrain", "dev_languages") or langs
     if not langs:
         recs, _ = load_language_records(data_cfg, language, split=split)
         return recs, None
     
     if requested: raise SystemExit(
-        f"--language {requested!r} is meaningless with pretrain_languages={list(langs)}. "
-        f"Drop --language to pretrain, or set pretrain_languages: null for a monolingual run on that language."
+        f"--language {requested!r} is meaningless with pretrain.languages={list(langs)}. "
+        f"Drop --language to pretrain, or set pretrain.languages: null for a monolingual run on that language."
     )
     langs = [str(x) for x in langs]
     recs, realised = load_multilingual_records(
-        data_cfg, langs, split=split, temperature=float(cfg["pretrain_temperature"]), seed=int(cfg.get("seed", 42)), epoch=int(epoch),
+        data_cfg, langs, split=split, temperature=float(cfg["pretrain"]["temperature"]), seed=int(cfg.get("seed", 42)), epoch=int(epoch),
+        weights=cfg["pretrain"].get("weights"),
     )
     return recs, realised
 
@@ -790,22 +1010,39 @@ def segmenter_language_fingerprints(cfg: dict, data_cfg: dict, language: str, tr
 
     A pooled run trains on a rotating sub-sample, so its epoch-0 records cannot be compared with a stage-2 or eval run, 
     which reads one whole language. These per-language stamps can (train.bio_pretrain.require_segmenter_data)."""
-    langs = cfg.get("pretrain_languages")
+    langs = cfg_get(cfg, "pretrain", "languages")
     if not langs: return {str(language): annotation_fingerprint(train_records)}
-    return {str(l): annotation_fingerprint(_cached_language_records(data_cfg, str(l), "train")) for l in langs}
+    return {str(l): annotation_fingerprint(cached_language_records(data_cfg, str(l), "train")) for l in langs}
 
 
-def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[VideoRecord]:
+def stale_language_fingerprints(stamped: dict | None, data_cfg: dict, known: dict[str, str] | None = None) -> list[str]:
+    """The corpora of per-language stamps (segmenter_language_fingerprints) whose whole train split is labelled otherwise now. A pooled
+    segmenter trained on every corpus of its pool, so each stamped corpus is compared with its own current labels, whatever corpus a
+    run reads (a benchmark target is in no pool). `known`: current fingerprints that the caller already has. A corpus that data.yaml
+    does not name, or whose pose files this machine does not hold, is not compared."""
+    langs, stale = data_cfg.get("languages") or {}, []
+    for corpus, stamp in (stamped or {}).items():
+        if corpus in (known or {}): now = known[corpus]
+        elif corpus in langs:
+            try: now = annotation_fingerprint(cached_language_records(data_cfg, corpus, "train"))
+            except FileNotFoundError: continue
+        else: continue
+        if now != stamp: stale.append(corpus)
+    return stale
+
+
+def cached_language_records(data_cfg: dict, language: str, split: str) -> list[VideoRecord]:
     """Per-language record lists for the pool, parsed ONCE per process.
 
     The per-epoch rotation re-resolves the pool every epoch, but only the sub-sample changes — the underlying corpus does not. Without this 
-    cache each epoch re-parses every subtitle file, re-runs Punkt sentence reconstruction and the dedup pair scan for all pooled languages. 
+    cache each epoch re-parses every subtitle file and re-runs Punkt sentence reconstruction for all pooled languages.
     Keyed by the config content that shapes the records, so an edited data config is not served a stale corpus; records are never mutated 
     downstream (the pool copies before shuffling), so sharing one list across epochs is safe.
     """
+    lang_cfg = (data_cfg.get("languages") or {}).get(language) or {}
+    corpus = dataset_config(data_cfg, lang_cfg.get("dataset"), lang_cfg)   # its corpus_config view
     lang_fingerprint = json.dumps(
-        {"lang": (data_cfg.get("languages") or {}).get(language), "subtitles": data_cfg.get("subtitles"),
-         "splits": data_cfg.get("splits"), "poses": data_cfg.get("poses")},
+        {"lang": lang_cfg, **{block: corpus[block] for block in CONFIG_LEVEL_BLOCKS}, "poses": data_cfg.get("poses")},
         sort_keys=True, default=str,
     )
     # The active loader function is part of the key: tests monkeypatch `load_language_records`, and a key of
@@ -817,6 +1054,7 @@ def _cached_language_records(data_cfg: dict, language: str, split: str) -> list[
 
 def load_multilingual_records(
     data_cfg: dict, languages: list[str], split: str, temperature: float, seed: int = 42, epoch: int = 0,
+    weights: dict[str, float] | None = None,
 ) -> tuple[list[VideoRecord], dict[str, int]]:
     """Records pooled across languages for language-agnostic SEGMENTATION pretraining.
 
@@ -824,10 +1062,11 @@ def load_multilingual_records(
     head can be pretrained on several corpora at once. Translation cannot: it is language-specific and stays monolingual (stage 2).
 
     Corpora differ in size by several-fold, so proportional pooling would make the largest one the de-facto training set. Sampling 
-    weights are TEMPERATURE-FLATTENED, the standard multilingual-NMT recipe: `p_l propto n_l ** temperature` — 1.0 is proportional, 
-    0.0 uniform, 0.5 the usual compromise.
+    weights are TEMPERATURE-FLATTENED, the standard multilingual-NMT recipe: `p_l propto w_l * h_l ** temperature` over each corpus's
+    hours h_l (record durations: the loss sees time, and a BOBSL record lasts about 5 times a YouTube one), with an optional weight w_l
+    per corpus (`weights`, pretrain.weights; default 1) — 1.0 is proportional, 0.0 uniform, 0.5 the usual compromise.
 
-    Balance is reached by SUB-sampling the over-represented languages, never by replicating the under-represented ones. Replicating
+    Balance is reached by SUB-sampling the over-represented languages (train only), never by replicating the under-represented ones. Replicating
     up to the largest corpus would make the pool as big as the most-scaled-up language demands: on ase/asf/bfi a 16x epoch with
     each asf video repeated ~5 times WITHIN 1 epoch, so the model would see many epochs' worth of data (and heavy repetition) 
     before the first checkpoint. Sub-sampling keeps 1 epoch a bounded, comparable unit of compute.
@@ -836,109 +1075,191 @@ def load_multilingual_records(
     spread across epochs instead of forced into one. Deterministic in (seed, epoch), so a resumed run replays its epoch exactly.
 
     Returns the pooled records and the realised per-language record counts (records are clean segments), which belong in the paper: 
-    the sampling rates are part of the experimental setup, not an implementation detail.
+    the sampling rates are part of the experimental setup, not an implementation detail (the S1 checkpoint also stamps the hours).
     """
     if not languages: raise ValueError("load_multilingual_records needs at least one language")
     per_lang: dict[str, list[VideoRecord]] = {}
-    for lang in languages: per_lang[lang] = _cached_language_records(data_cfg, lang, split)
+    for lang in languages: per_lang[lang] = cached_language_records(data_cfg, lang, split)
 
     # A configured language that contributes nothing means this machine lacks that corpus. Skipping it would train a
     # DIFFERENT model that still stamps the configured pool key, and nothing downstream compares the realised mix.
     empty = sorted(l for l, recs in per_lang.items() if not recs)
     if empty: raise FileNotFoundError(
-        f"pretrain_languages lists {list(languages)}, but {', '.join(empty)} has no {split} record on this machine. "
-        f"Fetch the corpus (prepare_yt25.py --languages {' '.join(empty)}), or drop it from pretrain_languages."
+        f"pretrain.languages lists {list(languages)}, but {', '.join(empty)} has no {split} record on this machine. "
+        f"Fetch the corpus (prepare_yt25.py --languages {' '.join(empty)}), or drop it from pretrain.languages."
     )
-    if len(per_lang) == 1 or split == "test": # TEST is pooled AS-IS: it is a REPORTING set.
+    # Dev and test are pooled AS-IS, every record of each language: the segmenter monitor scores each language apart and averages the
+    # languages (evaluation.segmenter_eval.segmenter_dev_scores), so no language outweighs another and no dev video is left out.
+    if len(per_lang) == 1 or split != "train":
         pooled = [r for recs in per_lang.values() for r in recs]
         return pooled, {k: len(v) for k, v in per_lang.items()}
 
-    counts = {k: len(v) for k, v in per_lang.items()}
-    targets = _pool_targets(counts, temperature)
+    hours = {k: sum(r.pose.duration_s for r in v) / 3600.0 for k, v in per_lang.items()}
+    targets = _pool_targets(hours, temperature, weights)
     rng = random.Random(int(seed))
     pooled: list[VideoRecord] = []
     realised: dict[str, int] = {}
 
     for lang, recs in per_lang.items():
-        target = targets[lang]
-        # ROTATE the slice per epoch so a sub-sampled corpus is never permanently truncated: a language reduced to
-        # `target` of `n` videos covers all of them every ceil(n / target) epochs. Order is shuffled once per
-        # language (seeded, so it is stable across epochs and resumes) and the window then advances by `target`.
+        # ROTATE the slice per epoch so a sub-sampled corpus is never permanently truncated: the records lie end to end on a circle of
+        # the corpus's hours, in an order shuffled once per language (seeded, so it is stable across epochs and resumes), and epoch e
+        # takes the records that start in the window [e * target, (e + 1) * target) of it. A corpus reduced to `target` of `h` hours
+        # covers all of them every ceil(h / target) epochs; the corpus that sets the epoch size gives every record every epoch.
         order = list(recs)
-        # crc32, NOT hash(): str.__hash__ is PYTHONHASHSEED-salted, so hash() would give a DIFFERENT sub-sample on
-        # every process launch — train and dev alike — and best-checkpoint selection would compare scores measured
-        # on different dev sets. crc32 is stable across processes, so a run is reproducible and resumable.
+        # crc32, NOT hash(): str.__hash__ is PYTHONHASHSEED-salted, so hash() would give a DIFFERENT train slice on
+        # every process launch, and a resumed run would not replay its epoch. crc32 is stable across processes, so a
+        # run is reproducible and resumable.
         random.Random(int(seed) ^ zlib.crc32(lang.encode())).shuffle(order)
-        offset = (int(epoch) * target) % len(order)
-        pooled.extend((order + order)[offset:offset + target])
-        realised[lang] = target
+        length = np.array([r.pose.duration_s for r in order]) / 3600.0
+        starts, total = np.concatenate([[0.0], np.cumsum(length)[:-1]]), float(length.sum())
+        lo = (int(epoch) * targets[lang]) % total if total > 0 else 0.0
+        taken = [r for r, s in zip(order, starts) if lo <= s < lo + targets[lang] or lo <= s + total < lo + targets[lang]]
+        pooled.extend(taken)
+        realised[lang] = len(taken)
 
     rng.shuffle(pooled)
-    shares = {k: round(v / sum(realised.values()), 3) for k, v in realised.items()}
-    print(f"[loader] multilingual {split}: records {counts} -> sampled {realised} (tau={temperature}, shares {shares})", flush=True)
+    shares = {k: round(targets[k] / sum(targets.values()), 3) for k in targets}
+    print(f"[loader] multilingual {split}: hours {({k: round(v, 1) for k, v in hours.items()})} -> {({k: round(v, 1) for k, v in targets.items()})} "
+          f"per epoch, records {realised} (tau={temperature}, weights {weights or {}}, hour shares {shares})", flush=True)
     return pooled, realised
 
 
-def _pool_targets(counts: dict[str, int], temperature: float) -> dict[str, int]:
-    """Records each language contributes to one pooled epoch, for per-language record counts `counts` (a record is one clean segment).
+def _pool_targets(amounts: dict[str, float], temperature: float, weights: dict[str, float] | None = None) -> dict[str, float]:
+    """Hours each language contributes to one pooled epoch, for per-language hours `amounts` (the durations of its train records).
 
-    SUB-sample to target shares: pick the pool size that the most over-represented language can support WITHOUT replication, i.e. largest 
-    total for which every target <= that language's real video count. Upsampling instead (scaling up to biggest corpus) repeats the small 
-    corpora several times inside ONE epoch, so the model sees many epochs' worth of a language before the first checkpoint and overfits 
-    during epoch 1 — the failure this bound exists to prevent. Temperature then only sets the SHARES, never the repetition, so lowering 
-    it rebalances instead of inflating the epoch.
+    SUB-sample to target shares: pick the epoch size that the most over-represented language can support WITHOUT replication, i.e. the
+    largest total for which every target <= that language's own hours. Upsampling instead (scaling up to the biggest corpus) repeats the
+    small corpora several times inside ONE epoch, so the model sees many epochs' worth of a language before the first checkpoint and
+    overfits during epoch 1 — the failure this bound exists to prevent. Temperature and the weights (pretrain.weights: 0.5 each for 2
+    corpora of 1 sign language gives that language one share) then only set the SHARES, never the repetition.
     """
-    weights = {k: n ** float(temperature) for k, n in counts.items()}
-    total_w = sum(weights.values())
-    scale = min(counts[k] * total_w / weights[k] for k in counts)
-    return {k: max(1, min(n, int(round(scale * weights[k] / total_w)))) for k, n in counts.items()}
+    shares = {k: float((weights or {}).get(k, 1.0)) * float(h) ** float(temperature) for k, h in amounts.items()}
+    if any(w <= 0 for w in shares.values()): raise ValueError(f"pool weights must be positive: {shares}")
+    total_w = sum(shares.values())
+    scale = min(amounts[k] * total_w / shares[k] for k in amounts)
+    return {k: min(float(h), scale * shares[k] / total_w) for k, h in amounts.items()}
 
+
+# The code that decides a load's records, so a change to it misses the records cache (records_cache_key).
+RECORDS_CODE = ("data/loader.py", "data/windowing.py", "poses/pose_io.py", "utils.py")
+
+def records_cache_key(data_cfg: dict, language: str, split: str | None) -> str:
+    """Digest of everything that decides `load_language_records(data_cfg, language, split)`: the loader code (RECORDS_CODE), data.yaml
+    (less the translation warm starts, which no record reads), configs/inference.yaml (Λ_min), the Python and NLTK versions, the Punkt
+    model (_punkt_identity), and the
+    name, size and change time of every file that a load reads: the casing file, and the split CSV, the sidecar and every pose and
+    caption file of this corpus and of each corpus in its casing pool (a train load folds case by the train captions of the pool)."""
+    cfg = json.loads(json.dumps(data_cfg, default=str))
+    for lang_cfg in cfg["languages"].values(): lang_cfg.pop("pretrained_slt", None)
+    try: nltk_version = importlib.metadata.version("nltk")
+    except importlib.metadata.PackageNotFoundError: nltk_version = None
+    h = hashlib.sha256(json.dumps([ANNOTATION_PROTOCOL, language, split, list(sys.version_info[:2]), nltk_version, _punkt_identity(), cfg],
+                                  sort_keys=True).encode())
+    repo = Path(__file__).resolve().parent.parent
+    for path in (*(repo / p for p in RECORDS_CODE), Path("configs/inference.yaml")): h.update(path.read_bytes())
+    langs = cfg["languages"]
+    # The casing file and its pool decide the texts only when the load folds case (subtitles.merge_sentences).
+    entry = case_lexicon_entry(cfg, language) if corpus_config(cfg, language).get("subtitles", {}).get("merge_sentences") else None
+    lexicon_file, pool = entry or (None, [])
+    files = [lexicon_file] if lexicon_file else []
+    for other in sorted({language, *(l for l in pool if l in langs)}):
+        root = Path(langs[other]["root"])
+        # A pool corpus's split CSV decides which of its captions are train captions, and so the casing file.
+        if split_file := str(corpus_config(cfg, other)["splits"].get("file", "") or ""): files.append(Path(split_file))
+        files.append(video_meta_path(cfg, other))
+        for folder in (root / "poses", root / "subs"):
+            if folder.is_dir(): files += sorted(Path(entry.path) for entry in os.scandir(folder))
+    for path in files:
+        try: stat = path.stat(); h.update(f"{path}\t{stat.st_size}\t{stat.st_mtime_ns}\n".encode())
+        except OSError: h.update(f"{path}\tmissing\n".encode())
+    return h.hexdigest()
+
+class _Tee(io.TextIOBase): # Prints through to `out` and keeps a copy: the lines that a load from the records cache prints again.
+    def __init__(self, out, copy: io.StringIO): self.out, self.copy = out, copy
+    def write(self, text: str) -> int: self.copy.write(text); return self.out.write(text)
+    def flush(self) -> None: self.out.flush()
 
 def load_language_records(
-    data_cfg: dict, language: str, split: str | None = None, report: dict | None = None,
+    data_cfg: dict, language: str, split: str | None = None, report: dict | None = None, before_dedup: bool = False,
+) -> tuple[list[VideoRecord], dict[str, list[str]]]:
+    """`_build_language_records`, cached on disk: `<root>/.cache/records_<language>_<split>.pkl` holds the records of the last load with its
+    `records_cache_key`, and a load with the same key reads them (seconds, not minutes) and prints that load's messages again. Any
+    change of the key loads again and rewrites the file; deleting the file does too. A load that fills `report` or asks for the
+    records `before_dedup` is not cached."""
+    if report is not None or before_dedup: return _build_language_records(data_cfg, language, split, report, before_dedup)
+    # Named by the corpus, because 2 corpora may share a root (BOBSL's automatic and manual labels).
+    path = Path(data_cfg["languages"][language]["root"]) / ".cache" / f"records_{language}_{split or 'all'}.pkl"
+    key = records_cache_key(data_cfg, language, split)
+    try:
+        with path.open("rb") as f:
+            if pickle.load(f) == key:
+                records, splits, printed = pickle.load(f)
+                print(printed, end="", flush=True)
+                print(f"[loader] {language}/{split or 'all'}: {len(records)} records from {path}, written by a load of the same inputs "
+                      f"(the loader code, data.yaml, and every pose, caption and sidecar file); delete it to load again.", flush=True)
+                return records, splits
+    except Exception: pass   # no file, a half-written one, or one that this Python cannot read: load again
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(_Tee(sys.stdout, printed)): records, splits = _build_language_records(data_cfg, language, split)
+    # Atomic: the ranks of a torchrun job load at once, and a half-written file only makes the next start load again.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("wb") as f:
+            pickle.dump(key, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((records, splits, printed.getvalue()), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"[loader] WARNING: cannot write the records cache {path} ({exc}); every start loads again.", flush=True)
+    return records, splits
+
+def _build_language_records(
+    data_cfg: dict, language: str, split: str | None = None, report: dict | None = None, before_dedup: bool = False,
 ) -> tuple[list[VideoRecord], dict[str, list[str]]]:
     """Records of the clean segments of every kept video (`split_clean_segments`): the id is the source video id, or
-    `f"{vid}@{a}"` for a video cut at a visual run, and `rec.pose.video_id` is always the source id.
+    `f"{vid}@{a}"` for a video cut at an empty run, and `rec.pose.video_id` is always the source id.
 
     `report`, when given, is filled with the per-rule tallies of this load (videos and cues kept or dropped by each
-    pipeline rule) — the corpus audit `report.py data` prints. Every consumer of the records is unaffected."""
+    pipeline rule) — the corpus audit `report.py data` prints. Every consumer of the records is unaffected.
+    `before_dedup` returns the source records before the copy check, the quarantines and the cuts: the input of `train_copies`."""
     lang_cfg = data_cfg["languages"][language]
     root = Path(lang_cfg["root"])
+    corpus = corpus_config(data_cfg, language)   # this corpus's split file, subtitle rules and fallback frame size
+    meta_path = video_meta_path(data_cfg, language)
     # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
     # config pose_fps is only the fallback for a video without a sidecar row: on it timestamps drift ~2x and ~44% of captions get dropped.
-    video_meta = load_video_meta(root / META_FILENAME)
+    video_meta = load_video_meta(meta_path)
     # A sidecar without the run columns predates the visual cuts: every stream would stay uncut, so refuse it. A blank
-    # value in an existing column is one unknown video and only warns (below).
+    # value in an existing column is one unknown video and only warns (below). A column that the loader does not read
+    # (masked_runs of an earlier converter) is ignored, and unreliable_spans may be absent (a corpus with no such annotation).
     header: list[str] = []
-    if (root / META_FILENAME).exists():
-        with (root / META_FILENAME).open("r", encoding="utf-8", newline="") as f: header = next(csv.reader(f), [])
-    if missing := [key for key in (*RUN_COLUMNS, "handless_runs") if key not in header]: raise SystemExit(
-        f"[loader] {root / META_FILENAME} has no {'/'.join(missing)} column (stale or absent sidecar). For SignVerse poses run "
-        f"`python prepare_yt25.py --stage all --overwrite --languages {language}`; for poses extracted outside SignVerse run "
-        f"`python prepare_yt25.py --stage meta --languages {language}` (it fills handless_runs from the pose files; its blank "
-        f"masked_runs/empty_runs then warn as unknown)."
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8", newline="") as f: header = next(csv.reader(f), [])
+    if missing := [key for key in (*RUN_COLUMNS, *QUARANTINE_COLUMNS) if key not in header]: raise SystemExit(
+        f"[loader] {meta_path} has no {'/'.join(missing)} column (stale or absent sidecar). For SignVerse poses run "
+        f"`python prepare_yt25.py --stage all --overwrite --languages {language}`: a sidecar without these columns comes from a converter "
+        f"that chose the kept body without the signer switch, so its pose files are converted again (`--stage person-counts`, "
+        f"`--stage subs` and `--stage convert` without `--overwrite` refuse such a file); for poses from slp-pose, write its metadata "
+        f"again with the current slp-pose; for other poses run `python prepare_yt25.py --stage meta --languages {language}` (it fills "
+        f"handless_runs from the pose files; its blank empty_runs/switch_runs/default_signing_runs then warn as unknown)."
     )
-    pose_cfg = lang_cfg.get("pose", {}) or {}
-    fps_fallback = float(pose_cfg.get("fps", 25.0))
-    pose_index = build_pose_index(
-        root / "poses", fps=fps_fallback, video_meta=video_meta,
-        width=int(pose_cfg["width"]) if pose_cfg.get("width") is not None else None,
-        height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
-    )
-    if not pose_index: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
+    pose_cfg = corpus["pose"]   # the fallback frame size (and rate) of its dataset, then its own
+    fps_fallback = pose_cfg.get("fps")   # optional: every video's rate is its frames / video_meta.csv duration_s
+    all_ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})   # the file names only: the split lists need no header
+    if not all_ids: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
         f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
         f"For SignVerse-2M languages (asf/bfi) run `python prepare_yt25.py --stage all --languages {language}` "
         f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
     )
-    missing_meta = [vid for vid in pose_index if vid not in video_meta]
-    if missing_meta: print(
-        f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from {root / META_FILENAME}; falling back "
-        f"to pose.fps={fps_fallback} for them — run `python prepare_yt25.py --stage meta --root {root.parent} --languages {root.name}` "
-        f"(yt-dlp metadata fetch, no video download)."
-    )
-    subtitle_cfg = data_cfg.get("subtitles", {})
-    splits = build_splits(sorted(pose_index.keys()), data_cfg.get("splits", {}))
-    selected_ids = splits.get(split, []) if split else sorted(pose_index.keys())
+    subtitle_cfg = corpus.get("subtitles", {})
+    splits = build_splits(all_ids, corpus.get("splits", {}))
+    # Not an error: a corpus that shares its pose folder with another (BOBSL's manual alignment) puts only its own videos in train, dev
+    # or test. Only the corpus's own load prints this, never the casing file's scan of its pool.
+    if (loaded := sum(map(len, splits.values()))) < len(all_ids): print(
+        f"[loader] {language}: {corpus.get('splits', {}).get('file')} puts {loaded} of the {len(all_ids)} videos in {root / 'poses'} in "
+        f"train, dev or test; this corpus loads only those.", flush=True)
+    selected_ids = splits.get(split, []) if split else all_ids
     drop_noise = bool(subtitle_cfg.get("drop_noise_captions", True))
 
     # Human-caption-only splits (default: test). NLLB machine-translated references are noisy BLEU targets — scoring against them 
@@ -957,12 +1278,33 @@ def load_language_records(
             f"[loader] {language}/{split}: excluded {before - len(selected_ids)} video(s) with "
             f"{'/'.join(sorted(exclude_sources))} captions (human references only; subtitles.human_only_splits).", flush=True
         )
-    min_covered = float((data_cfg.get("poses", {}) or {}).get("min_unit_coverage", 0.0))
+    # The .npy headers (frame counts) of this load's own videos only, and the whole file of a video with repeated frames: a loader reads
+    # no pose file of another split.
+    pose_index = build_pose_index(
+        root / "poses", fps=fps_fallback, video_meta=video_meta, video_ids=selected_ids,
+        width=int(pose_cfg["width"]) if pose_cfg.get("width") is not None else None,
+        height=int(pose_cfg["height"]) if pose_cfg.get("height") is not None else None,
+        model_fps=float(data_cfg["poses"]["model_fps"]),
+        pulldown=(tuple(data_cfg["poses"]["pulldown_content_fps"]), float(data_cfg["poses"]["pulldown_line_ratio"]),
+                  float(data_cfg["poses"]["pulldown_repeat_motion"])),
+    )
+    # The run columns hold stored frames; every rule below reads the grid that the reader gives a video (poses.pose_io.grid_runs).
+    for vid, index in pose_index.items():
+        if vid in video_meta: video_meta[vid] = {
+            **video_meta[vid], **{key: grid_runs(index, video_meta[vid].get(key)) for key in (*RUN_COLUMNS, *QUARANTINE_COLUMNS)}
+        }
+    missing_meta = [vid for vid in pose_index if vid not in video_meta]
+    if missing_meta and fps_fallback is not None: print(
+        f"[loader] WARNING: {len(missing_meta)}/{len(pose_index)} {language} videos missing from {meta_path}; falling back "
+        f"to pose.fps={fps_fallback} for them — run `python prepare_yt25.py --stage meta --root {root.parent} --languages {root.name}` "
+        f"(yt-dlp metadata fetch, no video download)."
+    )
+    min_covered = float((data_cfg.get("poses", {}) or {}).get("min_cue_coverage", 0.0))
     dropped_uncovered: list[tuple[str, float]] = []
     records: list[VideoRecord] = []
     dropped_no_caption, dropped_all_quarantined = 0, 0
     per_video: dict[str, dict[str, int]] = {}
-    fold = case_lexicon(data_cfg, language) if subtitle_cfg.get("merge_sentences") else None
+    fold = case_lexicon(data_cfg, language, split) if subtitle_cfg.get("merge_sentences") else None
 
     # 1.0 disables the filter (no video can exceed a full share). The key is GLOBAL under `subtitles:`, which is correct while every 
     # corpus targets English; non-Latin-target corpus need a per-language override which would switch the filter off for English corpora.
@@ -973,8 +1315,13 @@ def load_language_records(
     dropped_wrong_language: list[tuple[str, float]] = []
     drop_scrolling = bool(subtitle_cfg.get("drop_scrolling_tracks", True))
     dropped_scrolling: list[tuple[str, float]] = []
+    # δ (inference.yaml boundary_stability.delta_s): the longest overlap of 2 units that _clamp_overlaps repairs, and the pause after
+    # which a unit runs on only into a cue that continues its sentence (reconstruct_sentences); the loader reads configs/inference.yaml
+    # itself, as for Λ_min, so every stage builds the same units.
+    delta_s = float(load_yaml("configs/inference.yaml")["boundary_stability"]["delta_s"])
+    names = sorted_names(root / "subs")
     for video_id in tqdm(selected_ids, desc=f"[loader] {language}/{split or 'all'}", unit="vid", leave=False, dynamic_ncols=True):
-        subtitle_path = best_subtitle(root / "subs", video_id, subtitle_cfg)
+        subtitle_path = best_subtitle(root / "subs", video_id, subtitle_cfg, names=names)
         if subtitle_path is None:
             dropped_no_caption += 1
             continue
@@ -990,7 +1337,7 @@ def load_language_records(
         raw_cues = merge_rolling_captions(source_cues)
         captions = raw_cues
         if subtitle_cfg.get("merge_sentences"):  # group display-wrapped cues into caption units (Punkt over the caption stream)
-            captions = reconstruct_sentences(captions, fold=fold)
+            captions = reconstruct_sentences(captions, fold=fold, pause_s=delta_s)
         min_dur = float(subtitle_cfg.get("min_duration_s", 0.2))
         # Caption times refer to the source video. The supplied pose timeline can be shorter; a caption onset
         # outside it has no pose evidence. This comparison does not identify why the source poses stop.
@@ -998,14 +1345,30 @@ def load_language_records(
         # Some source VTTs ship genuinely OVERLAPPING cues with distinct text. merge_rolling_captions only fuses overlapping DUPLICATES, 
         # so these survive, and overlapping SentenceSpans corrupt BIO labels — a neighbour's `I` overwrites the closing `O`, and the 
         # first-complete-span target becomes ill-defined. Clamp each start to the previous end: it trims the disputed frames from the 
-        # LATER sentence (whose onset is the less certain of the two) and never invents a boundary.
+        # LATER sentence (whose onset is the less certain of the two) and never invents a boundary; an overlap above δ quarantines both.
         ordered = sorted(captions, key=lambda c: (c[0], c[1]))
-        # Measure temporal coverage before any text removal or overlap repair. Otherwise a short or textless
-        # unit would count as missing pose data. Use the same one-second end tolerance as the span filter.
-        covered = sum(0 <= c[0] < dur and c[1] <= dur + 1.0 for c in ordered) / max(1, len(ordered))
+        # Measure temporal coverage on the cues as the track gives them, before the grouping, any text removal and the overlap repair:
+        # the share then depends on the 2 timelines alone, so no caption rule moves a video's decision (on units, a split of the units
+        # after the pose end could drop a whole video), and a short or textless cue still counts as covered. Use the same one-second
+        # end tolerance as the span filter.
+        covered = sum(0 <= c[0] < dur and c[1] <= dur + 1.0 for c in raw_cues) / max(1, len(raw_cues))
         # Quarantine unsupported ends before overlap repair so they remain untrusted supervision.
         captions = _quarantine_end_straddlers(captions, dur)
-        captions, clamped, swallowed = _clamp_overlaps(captions)
+        straddlers = sum(1 for c in captions if len(c) > 3 and not c[3])
+        # The corpus's own marks of where its track does not hold the signing (video_meta.csv unreliable_spans) enter the overlap repair as
+        # text-less quarantined cues, so 1 rule holds for every pair of cues: an overlap of at most δ is trimmed, a longer one quarantines
+        # both, and a unit that holds a mark is quarantined. They become unlabelled spans with the unusable units below. The overlap counts
+        # are those between the captions; `marked` is what the marks cost: the reliable units with text that they remove or quarantine.
+        marks = [(max(0.0, float(a)), min(float(dur), float(b)), "", False, UNRELIABLE_MARK)
+                 for a, b in (video_meta.get(video_id) or {}).get("unreliable_spans") or []]
+        marks = [m for m in marks if m[1] > m[0]]
+        repaired, clamped, swallowed, containers, disputed = _clamp_overlaps(captions, delta_s)
+        marked = 0
+        if marks:
+            reliable_text = lambda cues: sum(1 for c in cues if c[2] and (len(c) < 4 or c[3]))
+            with_marks = _clamp_overlaps([*captions, *marks], delta_s)[0]
+            marked, repaired = reliable_text(repaired) - reliable_text(with_marks), with_marks
+        captions = repaired
         # WRONG-LANGUAGE videos. `.en` track is not a guarantee: ASE pool carries Japanese Sign Language and Chinese-teaching content whose 
         # captions are largely Japanese/Chinese. As TRANSLATION TARGETS those are unusable — the model is asked to emit non-English from ASL 
         # — and they also corrupt any batch they land in. Judged per VIDEO on script share, never per cue: an English sentence quoting a 
@@ -1023,13 +1386,24 @@ def load_language_records(
                 continue
         # 3 independent reasons a unit cannot be supervision, attributed to the FIRST that fires so the rows sum to the drop: shorter than 
         # minimum unit, outside the pose stream, or carrying no letters at all (a cue of digits or punctuation is not a translation target).
-        kept, too_short, outside_poses, no_text = [], 0, 0, 0
-        for c in captions:
-            if not min_dur <= (c[1] - c[0]): too_short += 1; continue
+        # A too-short or letterless unit still marks signing ("Good." in 0.1 s, "999."): it becomes an unlabelled span (UNK), as an
+        # unreliable span does below, never O. A too-short unit's times collapsed, so its signing lies somewhere in the uncaptioned gap
+        # around it: that whole gap, from the cue before it to the cue after it (the captions are in order and disjoint here), becomes its
+        # span (BOBSL's collapsed SAT alignments, 0.16 s, are such units). A unit outside the pose stream has no frames to label.
+        kept, too_short, outside_poses, no_text, unusable = [], 0, 0, 0, []
+        for i, c in enumerate(captions):
+            if len(c) > 4 and c[4] == UNRELIABLE_MARK: unusable.append(c[:2]); continue   # a mark of the corpus (above)
+            if not min_dur <= (c[1] - c[0]):
+                too_short += 1
+                unusable.append((min(c[0], captions[i - 1][1]) if i else c[0], max(c[1], captions[i + 1][0]) if i + 1 < len(captions) else c[1]))
+                continue
             if not (c[0] < dur and c[1] <= dur + 1.0): outside_poses += 1; continue
-            if not any(ch.isalpha() for ch in c[2]): no_text += 1; continue
+            if not any(ch.isalpha() for ch in c[2]): no_text += 1; unusable.append(c[:2]); continue
             kept.append(SentenceSpan(video_id=video_id, start_s=c[0], end_s=c[1], text=c[2], reliable=bool(c[3]) if len(c) > 3 else True))
-        spans = tuple(kept)
+        # The marks and the unusable units become unlabelled spans (after the overlap repair, no kept unit overlaps one). A span only adds
+        # UNK: the long uncaptioned stretches stay those of the kept units, so a span inside one does not make its sides short (trusted O).
+        spans, _ = mark_unreliable(tuple(kept), unusable, video_id, dur)
+        untrusted = tuple(untrusted_o_intervals(kept, dur, TRUSTED_GAP_S)) if len(spans) > len(kept) else None
         # Exclude poor temporal coverage as a whole-video data-quality rule. Do not stretch the pose timestamps
         # to the caption duration: neither an offset nor a different frame rate is established by this mismatch.
         if covered < min_covered:
@@ -1040,17 +1414,18 @@ def load_language_records(
         if not any(sp.reliable for sp in spans):
             dropped_all_quarantined += 1
             continue
-        records.append(VideoRecord(language, video_id, pose_index[video_id], spans))
+        records.append(VideoRecord(language, video_id, pose_index[video_id], spans, untrusted))
         per_video[video_id] = {
             "source_cues": len(source_cues), "rolling_duplicates_merged": len(source_cues) - len(raw_cues),
             "units_after_grouping": len(ordered), "overlaps_swallowed": swallowed, "overlaps_clamped": clamped,
-            "end_straddlers_quarantined": sum(1 for c in captions if len(c) > 3 and not c[3]), "spans_kept": len(spans), 
+            "end_straddlers_quarantined": straddlers, "overlaps_containers_quarantined": containers, "overlaps_disputed_quarantined": disputed, "spans_kept": len(kept), 
             "spans_dropped_too_short": too_short, "spans_dropped_outside_poses": outside_poses, "spans_dropped_no_text": no_text,
+            "units_quarantined_unreliable": marked,
         }
     if dropped_uncovered: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_uncovered)} video(s) dropped as POSE-TRUNCATED "
-        f"(under {min_covered:.0%} of their caption units fall inside the supplied pose timeline; e.g. "
-        + ", ".join(f"{v} {c:.0%}" for v, c in sorted(dropped_uncovered, key=lambda x: x[1])[:3]) + "); poses.min_unit_coverage.", flush=True
+        f"(under {min_covered:.0%} of their caption cues fall inside the supplied pose timeline; e.g. "
+        + ", ".join(f"{v} {c:.0%}" for v, c in sorted(dropped_uncovered, key=lambda x: x[1])[:3]) + "); poses.min_cue_coverage.", flush=True
     )
     if dropped_scrolling: print(
         f"[loader] {language}/{split or 'all'}: {len(dropped_scrolling)} video(s) dropped as SCROLLING "
@@ -1073,55 +1448,77 @@ def load_language_records(
         f"[loader] {language}/{split or 'all'}: {dropped_no_caption}/{len(selected_ids)} videos dropped "
         f"(no usable caption in {root / 'subs'}).", flush=True
     )
-    # Cross-split de-duplication. YouTube corpora contain RE-UPLOADS: the same talk under different video ids, so an id-based
-    # split puts it in BOTH train and dev/test and the model scores by memorisation. Removal is TRAIN-side, following the
-    # decontamination convention (keep the benchmark intact, purge the training copy) — deleting the eval twin instead would
-    # shrink an already small eval set and bias what remains toward content unlike training.
-    dedup_cfg = subtitle_cfg.get("dedup", {}) or {}
+    # Cross-split copy check. YouTube corpora contain RE-UPLOADS: the same talk under different video ids, so an id-based split puts it
+    # in BOTH train and dev/test and the model scores by memorisation. Removal is TRAIN-side, following the decontamination convention
+    # (keep the benchmark intact, purge the training copy): a train copy of a dev/test video is dropped whole. Single sentences that a
+    # train video shares with dev/test stay, as in machine translation; report.py results discloses that overlap (train_text_videos).
+    # The decisions are made ONCE, in data preparation (`prepare_yt25.py --stage dedup`, `train_copies`), and stored in the video_meta.csv
+    # column copy_of. Only the train loader reads it; dev and test change nothing.
+    dedup_cfg = subtitle_cfg["dedup"]
     deduplicated_train = 0
-    if dedup_cfg.get("enabled") and split == "train" and records:
-        eval_ids = {v for s in ("dev", "test") for v in splits.get(s, [])}
-        caps = _split_caption_sets(root, [r.video_id for r in records] + sorted(eval_ids), subtitle_cfg, drop_noise)
-        pairs = _duplicate_pairs(caps, dedup_cfg)
-        drop: dict[str, str] = {}
-        for a, b, frac in pairs:
-            if (a in eval_ids) != (b in eval_ids):
-                drop.setdefault(b if a in eval_ids else a, f"{frac:.0%} of {b if a in eval_ids else a}")
-        if drop:
+    if before_dedup: return records, splits
+    if dedup_cfg["enabled"] and split == "train":
+        if unknown := sorted(r.video_id for r in records if (video_meta.get(r.video_id) or {}).get("copy_of") is None): raise SystemExit(
+            f"[loader] {meta_path} has no copy_of value for {len(unknown)} train video(s) (e.g. {', '.join(unknown[:3])}), "
+            f"so the train copies of dev/test videos are unknown (a stage that writes captions blanks the column). Run "
+            f"`python prepare_yt25.py --stage dedup --languages {language}`: it reads the train, dev and test captions once and writes it."
+        )
+        # Only checked train videos hold a value, so a dev or test video with one moved there from train after the check.
+        if moved := sorted(v for s in ("dev", "test") for v in splits.get(s, []) if (video_meta.get(v) or {}).get("copy_of") is not None):
+            raise SystemExit(
+                f"[loader] {meta_path} holds a copy_of value for {len(moved)} dev/test video(s) (e.g. {', '.join(moved[:3])}): "
+                f"the split changed after the copy check. Run `python prepare_yt25.py --stage dedup --languages {language}`."
+            )
+        if drop := {r.video_id for r in records if video_meta[r.video_id]["copy_of"]}:
             records = [r for r in records if r.video_id not in drop]
             print(f"[loader] {language}/train: de-duplicated {len(drop)} train video(s) whose content also appears in dev/test "
-                  f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); subtitles.dedup.", flush=True)
+                  f"({', '.join(sorted(drop)[:5])}{'...' if len(drop) > 5 else ''}); video_meta.csv copy_of, subtitles.dedup.", flush=True)
             deduplicated_train = len(drop)
 
     # NO VISIBLE HANDS, every split: a reliable unit with at least poses.handless_unit_share of its frames in handless_runs (the
     # kept body shows no hand: credits, a URL, an end card, lyrics over a person whose hands are out of shot) is quarantined
     # in source time, BEFORE the cuts. No frame is cut and no unit time moves.
-    # VISUAL CUTS, every split: frames where a second real body moves (masked_runs) or no real body is present (empty_runs)
-    # leave every stream, and each clean segment between them is a record (split_clean_segments). Split AFTER the dedup
-    # above, which reads captions by source id. A blank column is unknown: warn, and cut or quarantine nothing for that kind.
-    handless_share = float(data_cfg["poses"]["handless_unit_share"])
-    for key in (*RUN_COLUMNS, "handless_runs"):
+    # SWITCH DOUBT, every split, the same way: a reliable unit with at least poses.switch_unit_share of its frames in switch_runs (the
+    # converter keeps the signer switch's body, not its default body) and at least poses.switch_doubt_share of its frames in
+    # default_signing_runs (that default body signs: two people sign, so whom the caption follows is in doubt).
+    # VISUAL CUTS, every split: frames where no real body is present (empty_runs) leave every stream, and each clean segment
+    # between them is a record (split_clean_segments). A second person in the frame cuts nothing: the signer switch keeps the
+    # person who signs, and the switch doubt above quarantines a unit where the switch keeps another body while the default body
+    # signs. Split AFTER the copy check above, which reads copy_of by source id. A blank column is unknown: warn, and cut or
+    # quarantine nothing for that kind.
+    rules = {kind: [(key, float(data_cfg["poses"][share])) for key, share in rule.items()] for kind, rule in QUARANTINE_RULES.items()}
+    for key in (*RUN_COLUMNS, *QUARANTINE_COLUMNS):
         if unknown := sum(1 for r in records if (video_meta.get(r.video_id) or {}).get(key) is None): print(
-            f"[loader] {language}/{split or 'all'}: WARNING {unknown}/{len(records)} videos have no {key} in video_meta.csv; "
-            f"run `prepare_yt25.py --stage person-counts` to measure them. Nothing is "
-            f"{'cut' if key in RUN_COLUMNS else 'quarantined'} for them by that column.", flush=True
+            f"[loader] {language}/{split or 'all'}: WARNING {unknown}/{len(records)} videos have no {key} in video_meta.csv; " + (
+                "for SignVerse poses, the current converter did not write their pose files (an older converter, or a stopped `--overwrite` "
+                "run): run `prepare_yt25.py --stage all` to convert them again." if key in QUARANTINE_RULES["switch_doubt"] else
+                "run `prepare_yt25.py --stage person-counts` to measure them."
+            ) + f" Nothing is {'cut' if key in RUN_COLUMNS else 'quarantined'} for them by that column.", flush=True
         )
     segments: list[VideoRecord] = []
+    # Λ_min (inference.yaml span_selection.min_span_s): no clean segment is shorter than the shortest span the FSM may commit.
+    min_span_s = lambda_min_s(load_yaml("configs/inference.yaml"))
     for source in records:
         meta = video_meta.get(source.video_id) or {}
         cut_runs = [run for key in RUN_COLUMNS for run in meta.get(key) or []]
-        parts = split_clean_segments(quarantine_handless(source, meta.get("handless_runs") or [], handless_share), cut_runs)
+        # The cut is attributed first, then each quarantine kind in QUARANTINE_RULES order: a unit that the cut alone removes or
+        # quarantines is a cut unit, also when it is handless (an empty run is always a handless run). A reliable unit lies in
+        # exactly 1 segment, so these sums count units.
+        parts = split_clean_segments(source, cut_runs, min_span_s)
         reliable = sum(sp.reliable for part in parts for sp in part.sentences)
+        counts = {"units_cut": sum(sp.reliable for sp in source.sentences) - reliable}
+        quarantined = source
+        for kind, rule in rules.items():
+            quarantined = quarantine_units(quarantined, [(meta.get(key) or [], share) for key, share in rule])
+            parts = split_clean_segments(quarantined, cut_runs, min_span_s)
+            before, reliable = reliable, sum(sp.reliable for part in parts for sp in part.sentences)
+            counts[f"units_quarantined_{kind}"] = before - reliable
         if not reliable:  # the all-quarantined rule, after the cuts
             dropped_all_quarantined += 1
             continue
         segments.extend(parts)
-        # The cut is attributed first: a unit that the cut alone removes or quarantines is a cut unit, also when it is
-        # handless (an empty run is always a handless run). A reliable unit lies in exactly 1 segment, so these sums count units.
-        reliable_after_cut = sum(sp.reliable for part in split_clean_segments(source, cut_runs) for sp in part.sentences)
         per_video[source.video_id].update({
-            "units_cut": sum(sp.reliable for sp in source.sentences) - reliable_after_cut,
-            "units_quarantined_handless": reliable_after_cut - reliable,
+            **counts,
             "frames_cut": source.pose.total_frames - sum(part.pose.total_frames for part in parts),
             **{f"frames_{key}": sum(b - a for a, b in meta.get(key) or []) for key in RUN_COLUMNS},
         })
@@ -1131,7 +1528,7 @@ def load_language_records(
         kept_meta = [video_meta.get(v) or {} for v in kept]
         known = [(m["undetected_ratio"], pose_index[v].total_frames) for v, m in zip(kept, kept_meta) if m.get("undetected_ratio") is not None]
         report.update({
-            "videos_in_split": len(splits.get(split, [])) if split else len(pose_index), "videos_kept": len(kept),
+            "videos_in_split": len(splits.get(split, [])) if split else len(all_ids), "videos_kept": len(kept),
             "segments_kept": len(records), "videos_cut": len(kept) - sum(r.video_id == r.pose.video_id for r in records),
             "dropped_mt_caption": dropped_mt_caption, "dropped_no_caption": dropped_no_caption,
             "dropped_wrong_language": len(dropped_non_latin) + len(dropped_wrong_language), "dropped_scrolling": len(dropped_scrolling),
@@ -1139,7 +1536,7 @@ def load_language_records(
             "deduplicated_train": deduplicated_train, "dropped_all_quarantined": dropped_all_quarantined,
             "frames_kept": sum(r.pose.total_frames for r in records),
             "frames_undetected": int(round(sum(u * f for u, f in known))), "undetected_ratio_known_videos": len(known),
-            **{f"{key}_unknown": sum(1 for m in kept_meta if m.get(key) is None) for key in (*RUN_COLUMNS, "handless_runs")},
+            **{f"{key}_unknown": sum(1 for m in kept_meta if m.get(key) is None) for key in (*RUN_COLUMNS, *QUARANTINE_COLUMNS)},
             # Summed over the SURVIVORS only (see `per_video` above).
             **{k: sum(per_video[v][k] for v in kept) for k in (per_video[kept[0]] if kept else {})},
         })
@@ -1149,17 +1546,28 @@ def load_language_records(
 class StreamingWindowDataset(Dataset):
     """On-the-fly Stage 2 window dataset. `__getitem__` samples from the training distribution rather than indexing
     a fixed window table, keeping the stochastic sampler inside PyTorch/HF Trainer's map-style interface. 1 epoch
-    holds 1 index per anchor, so every reliable sentence anchors exactly 1 window/epoch."""
-    def __init__(self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any], deterministic: bool = False):
+    holds 1 index per anchor, so every reliable sentence anchors exactly 1 row/epoch. A train set turns each index into 1 of its
+    `inputs` (dlm.yaml train_inputs, data/sampler.py spec_for); `edge_reach` (the reach of an arm's BIO head modules) masks the edges
+    of its windows for the BIO loss. Dev sets draw windows only."""
+    def __init__(
+        self, records: list[VideoRecord], slt_cfg: dict[str, Any], inference_cfg: dict[str, Any], deterministic: bool = False,
+        edge_reach: dict | None = None, inputs=("windows",),
+    ):
+        if deterministic and (edge_reach is not None or tuple(inputs) != ("windows",)): raise ValueError(
+            "dev sets draw windows only, with no edge mask; edge_reach and other inputs are for a train set"
+        )
         self.records = records
         self.records_by_id = {record.video_id: record for record in records}
-        # Lazy, NOT module-level: data.sampler imports VideoRecord from this module, so a top-level import here is a data.loader 
+        # Lazy, NOT module-level: data.sampler imports VideoRecord from this module, so a top-level import here is a data.loader
         # <-> data.sampler cycle that breaks every entry point at import time. WindowSampler is only ever used inside methods.
         from data.sampler import WindowSampler
-        self.sampler = WindowSampler.from_slt_config(records, slt_cfg, inference_cfg)
+        # Train rows get the shared pose augmentation (dlm.yaml `augmentation`); dev windows never do.
+        self.sampler = WindowSampler.from_slt_config(
+            records, slt_cfg, inference_cfg, augmentation=None if deterministic else slt_cfg["augmentation"], edge_reach=edge_reach, inputs=inputs,
+        )
         self._epoch = 0
-        # Eval loaders set deterministic=True: an index then always yields the SAME window (the sampler seeds every draw from the 
-        # index and no epoch shift applies), so the early-stopping monitor scores a fixed dev set each epoch instead of a fresh draw.
+        # Eval loaders set deterministic=True: an index then always yields the SAME window (the sampler seeds every draw from the
+        # index and no epoch shift applies, and no augmentation), so the early-stopping monitor scores a fixed dev set each epoch.
         self.deterministic = bool(deterministic)
 
     def __len__(self) -> int:
@@ -1227,31 +1635,62 @@ class LengthBucketSampler(torch.utils.data.Sampler):
         return iter(batches)
 
 
+class RankSlice(torch.utils.data.Sampler):
+    """This rank's part of every GLOBAL batch that `batches` (a batch sampler at the global batch size) yields: the global batch split
+    into world-size parts in order, sizes within 1. So N ranks (torchrun) train on the global batches of 1 process. A last global
+    batch with fewer items than ranks is dropped (every rank needs an item); the batch samplers here can make only the last one short.
+    A dev set (`keep_short`) keeps that batch: every rank receives it whole, and train.slt.evaluate_slt computes it on rank 0 alone."""
+    def __init__(self, batches, num_items: int, batch_size: int, keep_short: bool = False):
+        if batch_size < dist.world_size(): raise SystemExit(
+            f"batch {batch_size} is a GLOBAL batch and gives no item to some of the {dist.world_size()} ranks: use a batch_size (or "
+            f"checkpoint.dev_batch_size) of at least the world size, or fewer ranks.")
+        self.batches, self.short, self.keep_short = batches, 0 < num_items % batch_size < dist.world_size(), bool(keep_short)
+
+    def set_epoch(self, epoch: int) -> None:   # the trainer's per-epoch reshuffle reaches the global batch sampler or its sampler
+        for sampler in (self.batches, getattr(self.batches, "sampler", None)):
+            if hasattr(sampler, "set_epoch"): sampler.set_epoch(epoch)
+
+    def __len__(self) -> int:
+        return len(self.batches) - int(self.short and not self.keep_short)
+
+    def __iter__(self):
+        for batch in self.batches:
+            if len(batch) >= dist.world_size(): yield np.array_split(np.asarray(batch), dist.world_size())[dist.rank()].tolist()
+            elif self.keep_short: yield list(batch)
+
+
 def streaming_loader(
     dataset: StreamingWindowDataset, batch_size: int, collate_fn, num_workers: int = 0,
-    bucket_by_length: bool = False, bucket_seed: int = 0
+    bucket_by_length: bool = False, bucket_seed: int = 0, split_dev: bool = False,
 ) -> DataLoader:
     """The ONE DataLoader constructor for the window and chunk datasets (stage 2, S1 and the Moryossef segmenter).
 
     num_workers is a plain throughput knob: the ANCHOR is a deterministic function of the global sample index (WindowSampler.sample → 
     anchors[index % N]). Every anchor is realized exactly once per epoch however indices are partitioned — no duplication or lost coverage. 
     Every per-window draw is seeded from the index (WindowSampler.spec_for, ChunkDataset.__getitem__), so forked workers need no reseed.
+
+    `batch_size` is the GLOBAL batch. Under torchrun each rank of a training set loads its part of each global batch (RankSlice), so
+    N ranks draw the global batches of 1 process. A deterministic (dev) set keeps its order. With `split_dev` (the dev windows of
+    train-slt) each rank loads its part of each global dev batch too, and a last batch with fewer items than ranks whole; train.slt.
+    evaluate_slt merges the parts in the 1-process order. Otherwise (S1's and the Moryossef segmenter's dev chunks) every rank reads
+    all of it at `batch_size`, as 1 process does.
     """
+    deterministic = bool(getattr(dataset, "deterministic", False))
     # A dataset whose __getitem__ depends on the epoch cannot use persistent workers.
-    epoch_stateful = hasattr(dataset, "set_epoch") and not bool(getattr(dataset, "deterministic", False))
+    epoch_stateful = hasattr(dataset, "set_epoch") and not deterministic
     persistent = num_workers > 0 and not epoch_stateful
+    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour.
+    bucketed = bucket_by_length and hasattr(dataset, "sampler")
     sampler = None
-    # A training set is shuffled per epoch (the trainer's set_epoch reseeds it), so a global batch is 
-    # not a block of consecutive anchors from 1 or 2 videos; a deterministic (dev) set keeps its order.
-    if dist.is_distributed(): sampler = DistributedSampler(
-        dataset, num_replicas=dist.world_size(), rank=dist.rank(),
-        shuffle=not bool(getattr(dataset, "deterministic", False)), seed=int(bucket_seed),
-    )
-    # Length bucketing: same index set, grouped so a batch is not padded to a much longer neighbour. Incompatible with DistributedSampler 
-    # (both decide the index order), so it is single-process only; multi-GPU already splits the batch and gets its speed there.
-    if bucket_by_length and sampler is None and hasattr(dataset, "sampler"): return DataLoader(
-        dataset, batch_sampler=LengthBucketSampler(dataset, int(batch_size), seed=int(bucket_seed)), 
-        num_workers=int(num_workers), persistent_workers=persistent, collate_fn=collate_fn,
+    # Any other training set is shuffled per epoch by a DistributedSampler with world size 1 (the trainer's set_epoch reseeds it): a 
+    # batch is not a run of consecutive anchors from 1 or 2 videos. A deterministic (dev) set keeps its order.
+    if not (deterministic or bucketed): sampler = DistributedSampler(dataset, num_replicas=1, rank=0, shuffle=True, seed=int(bucket_seed))
+    batches = LengthBucketSampler(dataset, int(batch_size), seed=int(bucket_seed)) if bucketed else None
+    if dist.world_size() > 1 and (split_dev or not deterministic):
+        batches = RankSlice(batches or BatchSampler(sampler or SequentialSampler(dataset), int(batch_size), drop_last=False),
+                            len(dataset), int(batch_size), keep_short=deterministic)
+    if batches is not None: return DataLoader(
+        dataset, batch_sampler=batches, num_workers=int(num_workers), persistent_workers=persistent, collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(), prefetch_factor=4 if num_workers > 0 else None,
     )
     return DataLoader(

@@ -15,27 +15,19 @@ from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
 from infer.duration_decode import DurationDecoder
-from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
+from infer.commit_gate import candidate_spans
+from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics
+from utils import seconds_to_frames
 
 
-def bio_tags_to_segments(tags, timestamps_s) -> list[Segment]:
-    """BIO argmax tags → time-domain phrase Segments (shared span-decode rule).
-
-    Spans = contiguous signing runs (Moryossef's `likeliest_probs_to_segments` never needs a predicted `B`), split
-    at interior `B`s to keep adjacent sentences separate. End = onset of the next frame, extrapolated one step past
-    sequence end for open spans.
-    """
-    if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
+def span_segments(tags, timestamps_s, fps: float, min_span_s: float) -> list[Segment]:
+    """Decoded BIO tags of 1 whole stream → time-domain phrase Segments by the span rule of every offline row (the --offline row's):
+    the FSM's complete spans of at least Λ_min (`min_span_s`, utils.lambda_min_s; infer.commit_gate.candidate_spans), each whole, with
+    no buffer cap. So the --segments span files, --segmenter-eval and the segmenters' val_video_f1 score the spans of a standard
+    offline row. End = the terminator frame's onset."""
     times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
-    if not times: return []
-
-    step = (times[-1] - times[-2]) if len(times) > 1 else 0.04  # assume 25fps when a single frame
-    segments: list[Segment] = []
-    for seg in signing_runs_with_b_splits(tags):
-        end_idx = int(seg["end"]) + 1
-        end_t = times[end_idx] if end_idx < len(times) else times[-1] + step
-        segments.append(Segment(times[int(seg["start"])], end_t))
-    return segments
+    spans = candidate_spans(torch.as_tensor(tags).cpu(), seconds_to_frames(min_span_s, fps))
+    return [Segment(times[start], times[end]) for start, end in spans]
 
 
 def _phrase_logits(
@@ -74,9 +66,10 @@ def whole_video_logits(model, record: VideoRecord, device: torch.device, velocit
 @torch.no_grad()
 def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
-    rope_chunk_s: float | None = None, duration=None
+    rope_chunk_s: float | None = None, duration=None, *, min_span_s: float,
 ) -> dict[str, list[Segment]]:
-    # 1 decode/stream: spans keyed by record id on the stream's own clock (eval.to_source maps them to the source video).
+    # 1 decode/stream: spans keyed by record id on the stream's own clock 
+    # (evaluation.predictions.to_source maps them to the source video).
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -90,7 +83,7 @@ def predict_phrase_segments(
             timestamps_s=torch.as_tensor(timestamps, device=logits.device)[None]
         )[0]
         else: tags = logits.argmax(dim=-1)[0].detach().cpu()
-        predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
+        predictions[record.video_id] = span_segments(tags, timestamps, float(record.pose.fps), min_span_s)
     return predictions
 
 
@@ -117,7 +110,7 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
 @torch.no_grad()
 def evaluate_moryossef_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
-    tiou_thresholds: tuple[float, ...] = (0.5,), return_segments: bool = False, duration=None,
+    tiou_thresholds: tuple[float, ...] = (0.5,), return_segments: bool = False, duration=None, min_span_s: float | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, list[Segment]]]:
     """Moryossef evaluate.py-style STANDALONE eval: whole streams, GT phrase BIO from caption spans, frame-F1 and
     1-to-1 tIoU segment P/R/F1 averaged over streams. A stream is a record: a whole video, or one clean segment of 
@@ -127,16 +120,16 @@ def evaluate_moryossef_whole_video(
     `rope_chunk_s` (S1 only): trained context in SECONDS (= buffer_cap_s) → frames per stream.
     Gold follows both arms' training label rule (TRUSTED_GAP_S): long uncaptioned stretches → UNK (excluded), not O,
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
-    `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
+    `tiou_thresholds`: eval.yaml scoring.tiou_thresholds → comparable to the tIoU block of the rows.
 
-    The current window monitor pools complete-span counts at 1 threshold. Whole-video scoring uses different context, 
-    units and aggregation. Compare checkpoints under both protocols before attributing a gap to training; a protocol 
-    difference does not rule out a model or implementation failure.
+    The segmenters' checkpoint monitor (`val_video_f1`, evaluation.segmenter_eval.segmenter_dev_scores) decodes the 
+    same whole-video pass with the duration prior and scores it with the row scores of `--segmenter-eval`. The dev-chunk 
+    numbers it also logs use other context, units and aggregation and are diagnostics only.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []
     # `return_segments`: the SAME decoded tags, as time-domain spans (keyed by record id, stream clock) BEFORE 
-    # the UNK ignore-region masking — the caller feeds them to the RQ2 scoring path, whose quarantine rule 
+    # the UNK ignore-region masking — the caller feeds them to the scoring path of the rows, whose quarantine rule 
     # (drop majority-quarantined events) replaces the frame-level mask. 1 decode, 2 protocols.
     segments_by_video: dict[str, list[Segment]] = {}
 
@@ -155,14 +148,14 @@ def evaluate_moryossef_whole_video(
             )[0]
             logits = torch.nn.functional.one_hot(tags.long(), num_classes=logits.shape[-1]).float().unsqueeze(0)
         if return_segments:
-            raw_tags = logits[0].argmax(dim=-1)
-            segments_by_video[record.video_id] = bio_tags_to_segments(raw_tags, timestamps.tolist())
+            raw_tags = logits[0].argmax(dim=-1)   # the offline span rule (`min_span_s` floor, no buffer cap) on the decoded tags
+            segments_by_video[record.video_id] = span_segments(raw_tags, timestamps, float(record.pose.fps), min_span_s)
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
         # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right 
         # nor wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
         unk_mask = labels[0] == BIO["UNK"]
         # A stream with no gold signing (all UNK, or O/UNK only: a clean segment with no reliable unit) gets no row: its F1
-        # is undefined, and a 0 or 1 there would move the mean. Its spans are returned above and still reach rq2_protocol.
+        # is undefined, and a 0 or 1 there would move the mean. Its spans are returned above and still reach the row scores (edge_chunk, tiou).
         if not ((labels[0] == BIO["B"]) | (labels[0] == BIO["I"])).any(): continue
         if unk_mask.any():
             logits = logits.clone()

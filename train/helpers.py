@@ -10,11 +10,11 @@ from contextlib import contextmanager, nullcontext
 import torch
 from torch.utils.data import DataLoader
 from models.checkpointing import load_train_state, save_train_state, save_model_checkpoint
-from utils import cfg_get, checkpoint_dir
 from train import distributed as dist
 from train.losses import bio_nll_dice_loss
+from infer.duration_decode import DurationDecoder, DurationModel
 from metrics import CompleteSpanMetrics, bio_frame_metrics
-from infer.duration_decode import DurationDecoder
+from utils import cfg_get, checkpoint_dir, lambda_min_s, load_yaml
 
 
 def move_to_device(value, device: torch.device):
@@ -101,7 +101,11 @@ class AmpHelper:
             self.scaler.update()
             return self.scaler.get_scale() >= previous_scale
         else:
-            torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm), error_if_nonfinite=True)
+            # bf16 and fp32 have no loss scale to lower, so a non-finite gradient skips the step, as GradScaler skips it in fp16 (under
+            # torchrun every rank holds the same averaged gradient, so all ranks skip together). A stop here would come back on every
+            # --resume, which replays the same index-seeded batch; run_epoch_loop stops a run whose whole epoch took no step.
+            norm = torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
+            if not torch.isfinite(norm): return False
             optimizer.step()
             return True
 
@@ -265,11 +269,10 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         keys = list(keys)
 
         def group(prefix: str) -> list[str]:
-            # Tuple key ranks bare `{prefix}loss` < other `*_loss` (A–Z) < the rest (A–Z), so val reads val_loss,
-            # val_bio_loss, val_translation_loss, … mirroring the train row instead of scattering component losses
-            # through the alphabetical metrics.
+            # Tuple key ranks bare `{prefix}loss` < other `*_loss` (A–Z) < the checkpoint monitor < the rest (A–Z), 
+            # so val reads val_loss, val_bio_loss, val_translation_loss, then the score that selects the checkpoint.
             return sorted((k for k in keys if k.startswith(prefix)),
-                          key=lambda k: (k != f"{prefix}loss", not k.endswith("_loss"), k))
+                          key=lambda k: (k != f"{prefix}loss", not k.endswith("_loss"), k != self.monitor, k))
 
         train, val = group("train_"), group("val_")
         tail = [k for k in ("took", "eta", "ckpt") if k in keys]
@@ -290,11 +293,10 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
     def _save_history_files(self) -> None:
         if not self._rows or self._history_csv is None: return
         self._history_csv.parent.mkdir(parents=True, exist_ok=True)
-        # A RESUMED run starts with an empty _rows, so rewriting would drop epochs 1..k of the curve — the only
-        # record of them when wandb is off. Carry those forward, but ONLY on a resume: a fresh run in the same
-        # checkpoint dir would otherwise inherit the tail of a longer previous run (its epochs beyond this run's
-        # last), producing a file that reads as one curve with an unexplained jump. `_resumed` is set by the
-        # training loop; without it, a fresh run truncates the file to its own rows.
+        # A RESUMED run starts with an empty _rows, so rewriting would drop epochs 1..k of the curve — the only record of them when wandb 
+        # is off. Carry those forward, but ONLY on a resume: a fresh run in same checkpoint dir would otherwise inherit the tail of a 
+        # longer previous run (its epochs beyond this run's last), producing a file that reads as one curve with an unexplained jump. 
+        # `_resumed` is set by the training loop. Without it, a fresh run truncates the file to its own rows.
         rows = self._rows
         if self._resumed and self._history_csv.exists():
             with self._history_csv.open("r", encoding="utf-8", newline="") as f:
@@ -340,6 +342,7 @@ def run_epoch_loop(
                                 others pass 0. A selected record can still lose a chunk tail to fixed epoch size (data.chunks).
     """
     model.to(device)
+    dist.broadcast_state(model)
     model.train()
     log_rows = 0
     accum = int(cfg.get("grad_accum_steps", 1) or 1)
@@ -352,18 +355,24 @@ def run_epoch_loop(
     amp = AmpHelper.from_config(cfg, device)
     control = TrainControl.from_config(cfg, default_monitor=default_monitor, default_mode=default_mode)
     control.best_epoch_floor = int(best_epoch_floor)
+    # Without a cadence no epoch is evaluated, so nothing is selected or stopped early, and train.py ships the last epoch.
+    if evaluate_fn is not None and dev_loader is not None and control.eval_every_epochs <= 0: raise SystemExit(
+        f"{name} | checkpoint.eval_every_epochs must be >= 1 when a dev set exists (got {control.eval_every_epochs})."
+    )
     # A run shorter than the floor selects no best, and train.py would then ship its last, pre-cycle epoch as model.pt.
     if control.best_epoch_floor > int(epochs): raise SystemExit(
         f"{name} | epochs={int(epochs)} ends before the best-epoch floor {control.best_epoch_floor} (1 full pool rotation); "
         f"train at least {control.best_epoch_floor} epochs."
     )
     if control.best_epoch_floor and dist.is_main(): print(
-        f"{name} | best-epoch floor {control.best_epoch_floor} of {int(epochs)} epochs: "
-        f"earlier epochs are neither a best candidate nor a patience step", flush=True
+        f"{name} | best-epoch floor {control.best_epoch_floor} of {int(epochs)} epochs: selecting every pooled training "
+        f"record once requires {control.best_epoch_floor} epochs. Earlier epochs haven't selected all records, so "
+        "best-checkpoint saving (model.pt/best.json) and early-stopping patience wait. Training and latest.pt saves "
+        "continue. This counts selected records, not full frame coverage.", flush=True
     )
     # Side effects (checkpoint writes, wandb, history.csv, progress bars) are rank 0's alone: concurrent writers
     # would race on one path, and N copies of the same numbers make the console unreadable. Every rank still runs
-    # the identical control logic on ALL-REDUCED metrics, so their best/early-stop decisions never diverge.
+    # the identical control logic on rank 0's dev numbers, so their best/early-stop decisions never diverge.
     if dist.is_main(): attach_save_best(control, cfg, name, save_model_checkpoint, meta=checkpoint_meta)
     logger = TrainLogger(
         name, cfg, epochs=int(epochs), steps_per_epoch=opt_steps_per_epoch, 
@@ -373,11 +382,9 @@ def run_epoch_loop(
         f"{name} | {int(cfg.get('batch_size', 0))} batch x {accum} grad_accum_steps = {int(cfg.get('batch_size', 0)) * accum} "
         f"effective batch: {len(loader)} micro-batches/epoch -> {opt_steps_per_epoch} optimizer steps/epoch", flush=True
     )
+    # fp16 under torchrun: every rank's GradScaler starts at the same scale and unscales the same averaged gradient, so all ranks
+    # find the same inf, skip the same steps and keep the same scale.
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
-    if dist.is_distributed() and amp.scaler.is_enabled(): raise SystemExit(
-        "fp16 AMP is unsafe under multi-GPU here: each rank keeps its OWN GradScaler, so ranks can disagree about the loss scale "
-        "(and about skipping a step) and drift apart. Use mixed_precision: bf16 (A100/H100) or mixed_precision: none."
-    )
     # Preemption safety (Colab): latest.pt = full resumable state, rewritten every epoch; loses at most one epoch.
     ckpt_dir = checkpoint_dir(cfg)
     latest_path = Path(ckpt_dir) / "latest.pt" if ckpt_dir else None
@@ -410,13 +417,10 @@ def run_epoch_loop(
         if dist.is_main(): print(f"{name} | resumed {latest_path} -> starting epoch {start_epoch}/{epochs} "
                                  f"(best {control.monitor}={control.best_value} @ epoch {control.best_epoch})", flush=True)
 
-    if not resume and evaluate_fn is not None and dev_loader is not None and control.eval_every_epochs > 0:
-        # Epoch 0 scores the INITIALIZATION under the same monitor, so selection can only keep a fine-tuned 
-        # state that beats its starting point (stage 2 starts exactly at S1 + the clean translator).
-        with amp.autocast(): metrics = dist.reduce_metrics(evaluate_fn(0))
-        control.update(model, metrics, 0)
-        logger.epoch_summary(0, train={}, val=metrics, saved_path=control.last_saved_path)
-
+    # torchrun: each rank draws its own dropout, OPUT masks and GT-crop jitter (one seed on every rank would repeat them across ranks);
+    # after the resume, which loads rank 0's RNG state on every rank. The data draws are seeded by index, so the global batches stay
+    # those of 1 process. 1 process: the RNG is not touched.
+    if dist.is_distributed(): torch.manual_seed(int(torch.randint(2 ** 62, (1,))) + dist.rank())
     for epoch in range(start_epoch, int(epochs) + 1):
         # Re-shuffle the shard boundaries per epoch where the sampler supports it (DistributedSampler), and advance the 
         # dataset's own epoch (StreamingWindowDataset shifts its per-index seeds, so each epoch draws new modes and edges).
@@ -431,10 +435,11 @@ def run_epoch_loop(
             
         epoch_logs: list[dict[str, float]] = []
         n_micro = len(loader)
+        steps = skipped = 0   # optimizer steps of this epoch, and those skipped for a non-finite gradient (AmpHelper.clip_and_step)
         for step, batch in enumerate(loader, start=1):
             batch = move_to_device(batch, device)
             if (step - 1) % accum == 0: optimizer.zero_grad(set_to_none=True)
-            with amp.autocast():
+            with amp.autocast(), dist.train_step():   # torchrun: BatchNorm statistics and losses of the global batch
                 loss, step_logs = step_fn(batch, epoch)
 
             # Scale so the accumulated gradient is the MEAN over the group, matching one batch of accum*batch_size.
@@ -451,37 +456,46 @@ def run_epoch_loop(
             # applies the identical update — clipping per-rank first would make the clip threshold rank-dependent.
             dist.average_gradients(model.parameters())
             stepped = amp.clip_and_step(optimizer, [p for p in model.parameters() if p.requires_grad], max_grad_norm)
+            steps += 1; skipped += not stepped
             if stepped: scheduler.step_batch()
             logger.log_step(epoch, opt_step, row)
 
+        if skipped and dist.is_main(): print(f"WARNING: {name} epoch {epoch}: {skipped} of {steps} optimizer steps skipped "
+                                             f"(non-finite gradient)", flush=True)
+        # Every rank skips the same steps, so every rank stops here together.
+        if steps and skipped == steps: raise SystemExit(
+            f"{name} epoch {epoch}: every optimizer step had a non-finite gradient, so the weights did not change: the run diverged. "
+            f"latest.pt holds the last finished epoch."
+        )
         train_means = dist.reduce_metrics(mean_logs(epoch_logs))
+        metrics, control.last_saved_path = None, None
         if evaluate_fn is not None and dev_loader is not None and control.should_eval(epoch, epochs):
-            with amp.autocast():  # dev eval in the same precision as training steps (fp32 eval takes about 2x as long)
-                eval_metrics = evaluate_fn(epoch)
-            metrics = dist.reduce_metrics(eval_metrics)
+            dist.broadcast_state(model)   # every rank evaluates rank 0's weights and buffers (equal up to float rounding)
+            # Dev eval runs in the same precision as training steps (fp32 eval takes about 2x as long). It leaves the torch RNGs as it
+            # found them (a dev DataLoader iterator draws its base seed, the DLM's dev loss draws masks), so the eval cadence and the
+            # dev batch never change the training draws. Under torchrun every rank evaluates (the monitors split the dev videos over
+            # the ranks; the dev windows are not split, data.loader.streaming_loader) and takes rank 0's numbers, the 1-process ones.
+            rng_devices = [device] if device.type != "cpu" else []
+            with amp.autocast(), torch.random.fork_rng(devices=rng_devices, device_type=device.type):
+                metrics = dist.broadcast_object(evaluate_fn(epoch))
             control.update(model, metrics, epoch)
-            logger.epoch_summary(epoch, train=train_means, val=metrics, saved_path=control.last_saved_path)
-            if control.stopped_early:
-                if dist.is_main(): print(
-                    f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value} @ "
-                    f"epoch {control.best_epoch})", flush=True
-                )
-                break
-        else: logger.epoch_summary(epoch, train=train_means)
         if dist.is_main() and latest_path is not None: save_train_state(
             latest_path, model=model, optimizer=optimizer,
             scheduler_state=scheduler.scheduler.state_dict() if scheduler.scheduler is not None else None,
             scaler_state=amp.scaler.state_dict() if amp.scaler.is_enabled() else None,
             control_state=control.state_dict(), epoch=epoch, epochs=int(epochs), meta=checkpoint_meta,
         )
+        logger.epoch_summary(epoch, train=train_means, val=metrics, saved_path=control.last_saved_path)
+        if control.stopped_early:
+            if dist.is_main(): print(
+                f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value} @ "
+                f"epoch {control.best_epoch})", flush=True
+            )
+            break
     control.restore(model)
-    # train.py saves model.pt with this same dict, so the shipped file names the epoch it holds (0 = the initialization).
+    # train.py saves model.pt with this same dict, so the shipped file names the epoch it holds.
     if checkpoint_meta is not None and control.restore_best and control.best_value is not None:
         checkpoint_meta["best_epoch"] = int(control.best_epoch)
-        if control.best_epoch == 0 and dist.is_main(): print(
-            f"{name} | WARNING: best epoch is 0, no trained epoch beat the initialization on "
-            f"{control.monitor}: the shipped model is the initialization", flush=True
-        )
     logger.finish()
     return log_rows
 
@@ -500,13 +514,39 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
     gold_rate = next((v for k, v in out.items() if k.endswith("_gold_b_rate")), None)
     if b_rate is not None and gold_rate and b_rate < 0.1 * gold_rate: print(
         f"[{prefix}] WARNING: B-class collapse — predicted B rate {b_rate:.5f} vs gold {gold_rate:.5f}. "
-        f"Check bio_class_weights (train/losses.py documents this failure).", flush=True
+        f"Check bio.class_weights (train/losses.py documents this failure).", flush=True
     )
     return out
 
 
+def segmenter_monitor_config(data_cfg: dict, dev_records) -> dict:
+    """What the segmenter dev monitor (`evaluate_segmenter`) reads, as plain values in the run config: the train-fitted duration
+    prior of each dev language (the prior its rows decode with), the span floor of every offline row (Λ_min of configs/inference.yaml,
+    read as the loader reads it; complete spans, no buffer cap) and the edge chunk score's chunk gap and taus (configs/eval.yaml scoring)."""
+    languages, scoring_cfg = sorted({str(record.language) for record in dev_records}), load_yaml("configs/eval.yaml")["scoring"]
+    return {
+        "priors": {language: DurationModel.for_language(data_cfg, language).to_dict() for language in languages},
+        "min_span_s": lambda_min_s(load_yaml("configs/inference.yaml")),
+        "edge": {"chunk_gap_s": float(scoring_cfg["chunk_gap_s"]), "edge_taus_s": [float(t) for t in scoring_cfg["edge_taus_s"]]},
+    }
+
+
+def evaluate_segmenter(
+    model: torch.nn.Module, loader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None,
+    monitor: dict, velocity: bool, rope_chunk_s: float | None,
+) -> dict[str, float]:
+    """Both segmenters' dev monitor. Checkpoint selection reads `val_video_f1`: the main segmentation score on the whole dev streams
+    (evaluation.segmenter_eval.segmenter_dev_scores: the whole-video pass of `--segmenter-eval`, each language's duration prior, the
+    edge chunk F1 averaged over the edge taus, then over languages). Dev-chunk losses and counts stay as diagnostics."""
+    from evaluation.segmenter_eval import segmenter_dev_scores
+    result = evaluate_bio_chunks(model, loader, device, dice_weight, class_weights)
+    priors = {language: DurationModel(**values) for language, values in monitor["priors"].items()}
+    scores = segmenter_dev_scores(model, loader.dataset.records, device, velocity, rope_chunk_s, priors, monitor["edge"], monitor["min_span_s"])
+    return {**result, **{f"val_{key}": value for key, value in scores.items()}}
+
+
 @torch.no_grad()
-def evaluate_bio_chunks( # Both arms' dev monitor: frame losses and complete-span F1 on legal BIO paths (no duration prior).
+def evaluate_bio_chunks( # Dev-chunk diagnostics of both segmenters: frame losses and complete-span F1 on legal BIO paths (no prior).
     model: torch.nn.Module, loader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None, 
 ) -> dict[str, float]:
     rows = []
@@ -524,7 +564,7 @@ def evaluate_bio_chunks( # Both arms' dev monitor: frame losses and complete-spa
             rows.append(row)
             spans.update(tags, labels, lengths)
     result = mean_logs(rows, prefix="val")
-    result.update(spans.compute(prefix="val_phrase"))  # val_phrase_tiou_f1: the checkpoint monitor of both arms
+    result.update(spans.compute(prefix="val_phrase"))
     return result
 
 
@@ -554,13 +594,15 @@ class TrainControl:
     @classmethod
     def from_config(cls, cfg: dict, default_monitor: str = "val_loss", default_mode: Literal["min", "max"] = "min") -> "TrainControl":
         # Separate concerns:
-        #   checkpoint: monitor / mode / restore_best      -> best-model SELECTION (active whenever a dev set exists)
-        #   early_stopping: enabled / patience / min_delta -> TERMINATION only (opt-in; drop the block to disable)
+        #   checkpoint: eval_every_epochs / monitor / mode / restore_best -> dev cadence and best-model SELECTION
+        #   early_stopping: enabled / patience / min_delta                -> TERMINATION only (opt-in; drop the block to disable)
+        if "eval_every_epochs" in cfg: raise SystemExit(   # read from nowhere: the run would get no (or the inherited) dev cadence
+            "checkpoint.eval_every_epochs: move the key from the top level of the config into its checkpoint block.")
         ckpt = cfg.get("checkpoint", {})
         early = cfg.get("early_stopping", {})
         early_enabled = bool(early.get("enabled", False))
         return cls(
-            eval_every_epochs=int(cfg.get("eval_every_epochs", 0) or 0),
+            eval_every_epochs=int(ckpt.get("eval_every_epochs", 0) or 0),
             early_stopping_patience=int(early.get("patience", 0) or 0) if early_enabled else 0,
             early_stopping_min_delta=float(early.get("min_delta", 0.0)),
             monitor=str(ckpt.get("monitor", default_monitor)),
@@ -659,8 +701,8 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, epochs: int, st
 
     total_steps = max(1, int(epochs) * max(1, int(steps_per_epoch)))
     if sched_type == "cosine":
-        # Optional linear warmup (scheduler.warmup_epochs, fractional ok; 0 = none). The segmenters warm up; stage 2 and the 
-        # clean floor start at their configured rate. Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
+        # Optional linear warmup (scheduler.warmup_epochs, fractional ok; 0 = none).
+        # Stepped per-STEP: a per-epoch step over a short horizon is a staircase.
         warmup_epochs = float(sched_cfg.get("warmup_epochs", 0.0))
         warmup_steps = int(round(warmup_epochs * max(1, int(steps_per_epoch))))
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(

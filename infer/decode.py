@@ -21,10 +21,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# DMax Breakflag: a block is final once every active slot's max-prob reaches this. 0.8 is where label smoothing 0.2
-# (configs/dlm.yaml) puts the per-token loss MINIMISER, not a ceiling — exceeding it costs 0.044 nats against a
-# 2.99-nat floor — so this test does fire, and how often is a property of the trained model. It is a live part of the
-# pass budget, not a dead constant: measured 466 passes against 488 with it disabled on the tiny fixture at block 16.
+# DMax Breakflag: a block is final once every active slot's max-prob reaches this. dlm.yaml oput.label_smoothing puts the
+# per-token loss MINIMISER at max-prob 1 - smoothing, which is not a ceiling, so this test does fire, and how often is a
+# property of the trained model. It is a live part of the pass budget, not a dead constant. It isn't yet a dlm.yaml spd key:
+# train/slt.py accepts only the spd keys of SPD_CONFIG_KEYS and passes them by name.
 SETTLE_CONFIDENCE = 0.9
 
 
@@ -49,7 +49,7 @@ def longest_confident_prefix_mask(confidence: torch.Tensor, mask_index: torch.Te
 
 def spd_hybrid_embeddings(
     embedding_layer: nn.Embedding, token_ids: torch.Tensor, logits: torch.Tensor, active_mask: torch.Tensor,
-    mask_token_id: int, top_k: int = 1, renormalize: bool = True, eps: float = 1e-6,
+    mask_token_id: int, top_k: int, renormalize: bool, eps: float = 1e-6,
 ) -> torch.Tensor:
     """DMax SPD embeddings for one block (parallel_strategy.py decode_uniform, soft-embedding part). Active non-mask
     slots get sum_k p_k e(y_k) + (1 - sum_k p_k) e(MASK), rescaled to the probability-weighted target norm (DMax Eq. 10); 
@@ -83,7 +83,7 @@ def block_diffusion_decode(
     forward: Callable[[torch.Tensor, torch.Tensor | None, int, int], torch.Tensor],
     finalize: Callable[[torch.Tensor, int, int], None] | None, embedding_layer: nn.Embedding, initial_token_ids: torch.Tensor, 
     mask_token_id: int, block_size: int, threshold: float, eos_token_id: int | None = None, pad_token_id: int | None = None,
-    spd_top_k: int = 1, spd_renormalize: bool = True,
+    *, spd_top_k: int, spd_renormalize: bool,
 ) -> DecodeResult:
     """Cold-start block decode under fixed conditioning.
 
@@ -140,8 +140,8 @@ def block_diffusion_decode(
                 confidence[:, lo:hi] = torch.where(update, maxp, confidence[:, lo:hi])
 
                 # decode_uniform's Breakflag per row: every active slot at max-prob >= SETTLE_CONFIDENCE, or nothing changed. 
-                # DMax tests it before checking for masks; with a threshold above 0.9 that could end a block with a mask left, 
-                # so here a row must be mask-free first.
+                # DMax tests it before checking for masks; with spd.tau_dec above SETTLE_CONFIDENCE that could end a block 
+                # with a mask left, so here a row must be mask-free first.
                 no_mask = ~(slots == mask_id).any(dim=1)
                 settled = ((maxp >= SETTLE_CONFIDENCE) | ~active).all(dim=1)
                 stable = ~changed.any(dim=1)

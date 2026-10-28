@@ -1,4 +1,4 @@
-"""Whole-video-chunk dataset for the faithful Moryossef segmenter (the RQ2 cascade floor).
+"""Whole-video-chunk dataset for the faithful Moryossef segmenter (the cascade rows' segmenter).
 
 The release input contract that S1's chunk pipeline (data/chunks.py ChunkDataset with `release`) applies for this arm: 
 the release's 50-landmark layout, its standardisation and velocity features; the trainer uses fixed-length chunks. 
@@ -10,6 +10,7 @@ import numpy as np
 
 from data.batch import collate_windows
 from poses import load_pose_window
+from poses.pose_io import REFERENCE_ASPECT
 from poses.preprocessing import UNISIGN_LEFT_IDX, UNISIGN_RIGHT_IDX
 
 # ── The RELEASED weights' own input contract (this arm trains and infers under it) ────────────────────────────
@@ -30,9 +31,10 @@ def collate_moryossef_chunks(batch: list[dict]) -> dict:
     return out
 
 def pose_aspect(pose_index) -> float | None:
-    # width/height of the source video (video_meta.csv, else data.yaml pose.width/height; poses.build_pose_index), or None.
+    # width/height of the frame that poses.load_pose_frames returns: the 16:9 reference (pose_io.REFERENCE_ASPECT) for a video
+    # with a size (video_meta.csv, else data.yaml pose.width/height), None for one without, which the reader leaves as stored.
     w, h = getattr(pose_index, "width", None), getattr(pose_index, "height", None)
-    return float(w) / float(h) if w and h else None
+    return REFERENCE_ASPECT[0] / REFERENCE_ASPECT[1] if w and h else None
 
 def fit_release_stats(records, frames_per_video: int = 256, max_videos: int = 400, seed: int = 42) -> dict:
     """Per-keypoint-per-dimension mean/std of the shoulder-normalised coordinates, over the training corpus.
@@ -73,9 +75,9 @@ def _shoulder_normalised(raw: np.ndarray, conf_thr: float = 0.3, aspect: float |
     # Their pre_process_pose: select their 50 landmarks, centre and scale on shoulders, re-centre each hand on its 
     # own root, and hold 2 hip slots at 0. Undetected point is NaN — it carries no position. `aspect` = width/height. 
     # Their .pose files hold MediaPipe in PIXELS (pose_format holistic: x*width, y*height), which is ISOTROPIC; ours 
-    # are stored x/W, y/H (poses/preprocessing.py), which is not. Shoulder vector is near-horizontal, so dividing 
-    # both axes by its norm does NOT undo that — y would stay stretched by W/H. y/H divided by W/H is y/W, so both 
-    # axes land in units of W and shoulder division then removes W. None leaves the stretch.
+    # come from poses.load_pose_frames in the geometry of a 16:9 frame (x in units of 16/9 H, y in units of H), which is 
+    # not. Shoulder vector is near-horizontal, so dividing both axes by its norm does NOT undo that. y divided by the 
+    # aspect (16/9) puts both axes in units of 16/9 H, and shoulder division then removes the unit. None leaves the stretch.
     kp = np.nan_to_num(np.asarray(raw, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     xy = kp[:, RELEASE_KP_IDX, :2].copy()
     xy[kp[:, RELEASE_KP_IDX, 2] <= float(conf_thr)] = np.nan

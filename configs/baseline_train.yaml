@@ -1,4 +1,4 @@
-# Train the clean translator of a language (README B2a), also one with its own released translator (data.yaml released_slt).
+# Train the pretrimmed translator of a language (README B2a), also one with its own released translator (data.yaml released_slt).
 # Recipe = Uni-Sign stage-3 pose-only SLT transfer (reference repo fine_tuning.py + train_stage3.sh), strict 
 # warm-start from a released checkpoint (data.yaml released_slt of the language, else checkpoint.from_pretrained below; 
 # NOT data.yaml pretrained_slt).
@@ -10,8 +10,8 @@
 # remain in the training windows. The boundary sweep's curve is self-anchored at (0,0).
 # Deliberate deviations from Uni-Sign: no 256-frame random subsampling (their memory heuristic: the frame rate then 
 # follows the clip length, 6.4 fps for a 40 s clip, which deployment never produces), and single-GPU batch sizing below. 
-# The floor trains with the shared augmentation of dlm.yaml instead: a bounded density range whose top is the native rate, 
-# as every trained pose model (S1, the arms) does, so the arm that starts from this floor keeps its input distribution.
+# The pretrimmed translator trains with the shared augmentation of dlm.yaml instead: a bounded density range whose top is the
+# native rate, as every trained pose model (S1, the arms) does, so the arm that starts from it keeps its input distribution.
 #
 # Decoder: baseline_eval.yaml `decoder` (ar: CE; dlm: OPUT, selected on the block decode). Each decoder has its own folder.
 # After training: set data.yaml <lang>.pretrained_slt.<decoder> to checkpoints/baseline_train_<decoder>/<lang>/model.pt 
@@ -50,9 +50,10 @@ jitter:
 
 checkpoint:
     dir: checkpoints/baseline_train_${decoder}/${language}  # 1 folder per decoder (baseline_eval.yaml decoder)
-    # The clean floor ALWAYS starts from released weights, never from data.yaml pretrained_slt: after the README B2b re-root
+    # The pretrimmed translator ALWAYS starts from released weights, never from data.yaml pretrained_slt: after the README B2b re-root
     # that key names this recipe's own previous output. A language with its own released translator (data.yaml released_slt)
-    # starts both of its floors from that file instead of this one (utils.resolve_pretrained). train-slt refuses a trained warm start.
+    # starts both of its pretrimmed translators from that file instead of this one (utils.resolve_pretrained). train-slt refuses a
+    # trained warm start.
     from_pretrained: checkpoints/openasl_pose_only_slt.pth
     bio_head_init: null              # explicit: extends deep-merges, so dlm.yaml's S1 path would otherwise leak through
                                      # this partial checkpoint override (lambda_bio: 0 also builds no segmentation branch)

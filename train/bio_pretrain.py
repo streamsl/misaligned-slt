@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from data.batch import collate_windows
 from data.chunks import ChunkDataset, shortest_chunk_s
 from data.loader import (ANNOTATION_PROTOCOL, PooledEpochRecords, resolve_pretrain_records, streaming_loader, 
-                         annotation_fingerprint, segmenter_language_fingerprints, stale_language_fingerprints, cached_language_records)
+                         annotation_fingerprint, segmenter_language_fingerprints, cached_language_records)
 from data.sampler import WindowSampler
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead, band_frames, band_radius_s
@@ -97,18 +97,19 @@ def slowest_train_fps(cfg: dict, data_cfg: dict, train_records: list) -> float:
     return round(min(float(r.pose.fps) for r in records), 2)
 
 
-def require_segmenter_data(meta: dict, data_cfg: dict, known: dict[str, str], buffer_cap_s: float, source: str) -> None:
+def require_segmenter_data(meta: dict, known: dict[str, str], buffer_cap_s: float, source: str) -> None:
     """Refuse a segmenter (S1 or Moryossef) trained under another annotation protocol or on chunks shorter than the deployed cap;
     warn when its train labels are not the current ones. A re-convert, a person-counts re-measure or a caption rule changes the
-    labels, and a strict state_dict load cannot see that. Every corpus that it stamps is compared with its own whole current train
-    split (data.loader.stale_language_fingerprints), also when the run reads a corpus outside the pool (a benchmark target): the
-    segmenter is stale for every target when its pool's labels changed. `known`: the current fingerprints the caller already has."""
+    labels, and a strict state_dict load cannot see that. `known`: the current fingerprints of the corpora that the run reads anyway
+    (stage 2: its target; an evaluation: its source corpus); only those stamps are compared, so no other corpus of the pool loads, and
+    a machine that holds only the run's corpus can run it. A label change of another pooled corpus is not seen here: train the
+    segmenter again after any label change of its pool (README "After a change")."""
     if meta.get("annotation_protocol") != ANNOTATION_PROTOCOL: raise SystemExit(
         f"{source} was trained under annotation protocol {meta.get('annotation_protocol')!r}, not {ANNOTATION_PROTOCOL!r}: retrain it."
     )
     stamped = meta.get("language_fingerprints")
     if stamped is None: print(f"WARNING: {source} stamps no language_fingerprints, so its train labels cannot be compared.", flush=True)
-    elif stale := stale_language_fingerprints(stamped, data_cfg, known): print(
+    elif stale := [corpus for corpus, now in known.items() if corpus in stamped and stamped[corpus] != now]: print(
         f"WARNING: {source} was trained on other {', '.join(stale)} train labels (a re-convert, re-measured "
         f"cuts or a caption rule changed them). Retrain it before a run you report.", flush=True
     )
@@ -201,7 +202,7 @@ def build_bio_s1(
         window_sampler=WindowSampler.from_slt_config(train_records, cfg, inference_cfg) if windows else None,
     )
     # Dev holds every record of each dev corpus (pretrain.dev_languages, default the pool; `load_multilingual_records` pools dev as-is).
-    # Checkpoint selection averages the per-language edge F1 (`val_video_f1`), so the largest corpus does not outweigh the others; the
+    # Checkpoint selection averages the per-language main score (`val_video_f1`), so the largest corpus does not outweigh the others; the
     # dev-chunk diagnostics (`val_bio_*`,
     # `val_phrase_*`) pool all chunks, so ase dominates them. The realised counts are stamped (`pretrain_dev_mix`), because a monitor
     # is only interpretable next to its dev set. Its chunks are drawn once from the seed and never rotate, so every epoch is scored on
@@ -209,8 +210,9 @@ def build_bio_s1(
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = dev_mix
     dev_dataset = ChunkDataset(dev_records, chunk_s, min_chunk_s, seed=seed, deterministic=True)
-    # Checkpoint selection scores these dev records as whole streams under the scoring of the rows (train.helpers.evaluate_segmenter).
-    cfg["video_monitor"] = segmenter_monitor_config(data_cfg, dev_records)
+    # Checkpoint selection scores these dev records as whole streams under the scoring of the rows and the decode of segmenter_decode
+    # (train.helpers.evaluate_segmenter).
+    cfg["video_monitor"] = segmenter_monitor_config(cfg, data_cfg, dev_records)
 
     # The pool balances hours (data.loader._pool_targets). Stamp the hours each language contributes to an epoch as the tiling made them.
     hours: dict[str, float] = {}
@@ -239,9 +241,10 @@ def train_bio_s1_epochs(
     dice_weight = float(cfg["bio"]["dice_loss_weight"])
     class_weights = bio_class_weight_tensor(cfg["bio"]["class_weights"])
     if class_weights is not None: class_weights = class_weights.to(device)
-    print("bio_s1 | monitor: val_video_f1, the edge chunk F1 (the main segmentation score) on whole dev streams (semi-Markov Viterbi "
-          f"with each language's duration prior, averaged over the edge taus {cfg['video_monitor']['edge']['edge_taus_s']} s, then over "
-          "languages)", flush=True)
+    edge = cfg["video_monitor"]["edge"]
+    print("bio_s1 | monitor: val_video_f1, the main score of a row on whole dev streams (decode "
+          f"{cfg['video_monitor']['decode']}): the F1 of the tIoU x edge-limit grid at tau avg (edge taus {edge['edge_taus_s']} s) and tIoU "
+          f"avg (thresholds {edge['tiou_thresholds']}), then the mean over languages", flush=True)
     # Head at learning_rate, the pretrained pose encoder at backbone_lr (both required keys of bio_pretrain.yaml).
     optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -259,7 +262,7 @@ def train_bio_s1_epochs(
         "language_fingerprints": cfg.get("language_fingerprints"),  # whole train split per language: require_segmenter_data
         # The frame geometry of the poses it read (poses.pose_io.load_pose_frames); eval warns on any other value.
         "pose_geometry": POSE_GEOMETRY,
-        "monitor_decode": "semi_markov_viterbi", "monitor_protocol": "edge_chunk_f1_avg_complete_spans", "monitor_edge": cfg["video_monitor"]["edge"],
+        "monitor_decode": cfg["video_monitor"]["decode"], "monitor_protocol": "edge_chunk_grid_f1_complete_spans", "monitor_edge": cfg["video_monitor"]["edge"],
         "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, 
         "initialization": init,
         "bio_class_weights": cfg["bio"]["class_weights"], "language": cfg.get("language"),

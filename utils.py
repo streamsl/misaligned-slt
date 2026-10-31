@@ -15,10 +15,10 @@ UNIT_SEPARATOR = "<extra_id_0>"
 # (a frame time saved as seconds, a per-video fps from a duration rounded to 1 ms).
 FRAME_SLACK = 0.01
 
-# Artifact folders under outputs/, one per kind: the offline and online rows (each events file with its scores), 
-# segmenter files (dev/test evaluation and span files), analyses (segmenter error types, boundary sweeps), the display 
-# replays of --stability (policy scores and provisional texts) and report.py's reports and debug views.
-OUTPUT_KINDS = ("offline", "online", "segmenter", "analysis", "stability", "report")
+# Artifact folders under outputs/, one per kind: the offline and online rows (each events file with its scores, the spans
+# of a no-text row too), analyses (segmenter error types, boundary sweeps), the display replays of --stability (policy
+# scores and provisional texts) and report.py's reports and debug views.
+OUTPUT_KINDS = ("offline", "online", "analysis", "stability", "report")
 
 def seconds_to_frames(seconds: float, fps: float) -> int:
     # `seconds` as a frame count at `fps`, at least 1: the one conversion of every time constant (Λ_min, δ, the run rules).

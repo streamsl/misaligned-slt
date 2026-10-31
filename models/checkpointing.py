@@ -93,6 +93,8 @@ def _refuse_meta_drift(path, saved: dict, expected: dict) -> None:
     """Refuse a resume whose training-critical config moved. The configs (inference.yaml, the stage config) are 
     live files that parameterize the run: resuming across a change trains 2 halves under different objectives, 
     visible afterwards only as an unexplained break in the loss curve. A changed annotation fingerprint only warns."""
+    # plain: the stored name of argmax in a run that started before the decodes were named argmax and viterbi (the same monitor).
+    if saved.get("monitor_decode") == "plain": saved = {**saved, "monitor_decode": "argmax"}
     keys = set(saved) | set(expected)
     labels = sorted(k for k in keys if k in _ANNOTATION_KEYS and saved.get(k) != expected.get(k))
     if labels: print(
@@ -158,16 +160,18 @@ def save_model_checkpoint(
 def s1_layout_state(state: dict) -> dict:
     """A stage-2 (MisalignedSLTModel) state dict re-keyed to the S1 layout (BioS1Model: pose_encoder.* + bio_head.*).
 
-    The deployed FSM head is the ARM's segmentation branch after joint training (`bio_pose_encoder` + `bio_head`), so joint 
-    head can be scored alone: eval.py --segmenter-eval --segmenter-arch s1 --checkpoint checkpoints/{ar,dlm}/<lang>/model.pt.
-    A one-stream arm (no `bio_pose_encoder`) reads the shared `front_end.pose_encoder`. The LM and decoder tensors (and a 
+    The deployed FSM head is the ARM's segmentation branch after joint training (`bio_pose_encoder` + `bio_head`), so the joint
+    head can be read alone as an S1 (evaluation.systems.load_segmenter). Its rows read the whole arm and carry its name: eval.py
+    --offline or --online --spans ar|dlm --text none --arm-checkpoint checkpoints/{ar,dlm}/<lang>/model.pt (evaluation.rows refuses a
+    stage-2 file as --spans s1 --segmenter-checkpoint, whose rows take S1's name).
+    A one-stream arm (no `bio_pose_encoder`) reads the shared `front_end.pose_encoder`. The LM and decoder tensors (and a
     two-stream arm's translator encoder) are dropped. An S1-layout dict passes through unchanged. An arm with `bio_adapter` 
     is refused: its head also reads the translator's features, which the S1 layout has no place for, so the head alone is 
-    not the deployed head (score it with `eval.py --online --no-translate`).
+    not the deployed head (score it with `eval.py --offline --spans ar|dlm --text none`, or the same with --online).
     """
     if any(k.startswith("bio_adapter.") for k in state): raise ValueError(
         "This arm's BIO head reads the translator's features via bio_adapter, so it can't be scored in the S1 layout. "
-        "Score its segmentation with eval.py --online --no-translate (or --offline) instead."
+        "Score its segmentation with eval.py --offline (or --online) --spans ar|dlm --text none instead."
     )
     if any(k.startswith("bio_pose_encoder.") for k in state): encoder = "bio_pose_encoder."
     elif any(k.startswith("bio_head.") for k in state) and any(k.startswith("front_end.pose_encoder.") for k in state):

@@ -1009,26 +1009,10 @@ def segmenter_language_fingerprints(cfg: dict, data_cfg: dict, language: str, tr
     """Annotation fingerprint of the FULL train split of every language a segmenter trains on: the pool, or the target alone.
 
     A pooled run trains on a rotating sub-sample, so its epoch-0 records cannot be compared with a stage-2 or eval run, 
-    which reads one whole language. These per-language stamps can (train.bio_pretrain.require_segmenter_data)."""
+    which reads one whole language. These per-language stamps can: each run compares the stamp of the corpus that it reads (train.bio_pretrain.require_segmenter_data, evaluation.systems.model_annotation)."""
     langs = cfg_get(cfg, "pretrain", "languages")
     if not langs: return {str(language): annotation_fingerprint(train_records)}
     return {str(l): annotation_fingerprint(cached_language_records(data_cfg, str(l), "train")) for l in langs}
-
-
-def stale_language_fingerprints(stamped: dict | None, data_cfg: dict, known: dict[str, str] | None = None) -> list[str]:
-    """The corpora of per-language stamps (segmenter_language_fingerprints) whose whole train split is labelled otherwise now. A pooled
-    segmenter trained on every corpus of its pool, so each stamped corpus is compared with its own current labels, whatever corpus a
-    run reads (a benchmark target is in no pool). `known`: current fingerprints that the caller already has. A corpus that data.yaml
-    does not name, or whose pose files this machine does not hold, is not compared."""
-    langs, stale = data_cfg.get("languages") or {}, []
-    for corpus, stamp in (stamped or {}).items():
-        if corpus in (known or {}): now = known[corpus]
-        elif corpus in langs:
-            try: now = annotation_fingerprint(cached_language_records(data_cfg, corpus, "train"))
-            except FileNotFoundError: continue
-        else: continue
-        if now != stamp: stale.append(corpus)
-    return stale
 
 
 def cached_language_records(data_cfg: dict, language: str, split: str) -> list[VideoRecord]:
@@ -1148,7 +1132,8 @@ def records_cache_key(data_cfg: dict, language: str, split: str | None) -> str:
     (less the translation warm starts, which no record reads), configs/inference.yaml (Λ_min), the Python and NLTK versions, the Punkt
     model (_punkt_identity), and the
     name, size and change time of every file that a load reads: the casing file, and the split CSV, the sidecar and every pose and
-    caption file of this corpus and of each corpus in its casing pool (a train load folds case by the train captions of the pool)."""
+    caption file of this corpus, and for a train load of each corpus in its casing pool too (a train load can build the casing file from
+    the train captions of the pool; a dev or test load only reads that file, so it scans no other corpus)."""
     cfg = json.loads(json.dumps(data_cfg, default=str))
     for lang_cfg in cfg["languages"].values(): lang_cfg.pop("pretrained_slt", None)
     try: nltk_version = importlib.metadata.version("nltk")
@@ -1162,7 +1147,7 @@ def records_cache_key(data_cfg: dict, language: str, split: str | None) -> str:
     entry = case_lexicon_entry(cfg, language) if corpus_config(cfg, language).get("subtitles", {}).get("merge_sentences") else None
     lexicon_file, pool = entry or (None, [])
     files = [lexicon_file] if lexicon_file else []
-    for other in sorted({language, *(l for l in pool if l in langs)}):
+    for other in sorted({language, *(l for l in pool if l in langs and split in (None, "train"))}):
         root = Path(langs[other]["root"])
         # A pool corpus's split CSV decides which of its captions are train captions, and so the casing file.
         if split_file := str(corpus_config(cfg, other)["splits"].get("file", "") or ""): files.append(Path(split_file))
@@ -1230,6 +1215,14 @@ def _build_language_records(
     # Per-video fps from the video_meta.csv sidecar (our extractions vary per video; SignVerse is fixed 24 fps).
     # config pose_fps is only the fallback for a video without a sidecar row: on it timestamps drift ~2x and ~44% of captions get dropped.
     video_meta = load_video_meta(meta_path)
+    # First the pose files: a corpus with none is absent on this machine (FileNotFoundError, which the pooled label check skips),
+    # before its sidecar is judged.
+    all_ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})   # the file names only: the split lists need no header
+    if not all_ids: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
+        f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
+        f"For SignVerse-2M languages (asf/bfi) run `python prepare_yt25.py --stage all --languages {language}` "
+        f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
+    )
     # A sidecar without the run columns predates the visual cuts: every stream would stay uncut, so refuse it. A blank
     # value in an existing column is one unknown video and only warns (below). A column that the loader does not read
     # (masked_runs of an earlier converter) is ignored, and unreliable_spans may be absent (a corpus with no such annotation).
@@ -1246,12 +1239,6 @@ def _build_language_records(
     )
     pose_cfg = corpus["pose"]   # the fallback frame size (and rate) of its dataset, then its own
     fps_fallback = pose_cfg.get("fps")   # optional: every video's rate is its frames / video_meta.csv duration_s
-    all_ids = sorted({base_video_id(p) for p in (root / "poses").glob("*.npy")})   # the file names only: the split lists need no header
-    if not all_ids: raise FileNotFoundError( # empty/missing poses/ → 0 records everywhere; fail loud
-        f"[loader] no pose .npy files under {root / 'poses'} for language '{language}'. "
-        f"For SignVerse-2M languages (asf/bfi) run `python prepare_yt25.py --stage all --languages {language}` "
-        f"(docs/run_real_data.md §2a); for own extractions, place per-video (T,133,3) .npy there."
-    )
     subtitle_cfg = corpus.get("subtitles", {})
     splits = build_splits(all_ids, corpus.get("splits", {}))
     # Not an error: a corpus that shares its pose folder with another (BOBSL's manual alignment) puts only its own videos in train, dev

@@ -20,19 +20,16 @@ from infer.stream import MoryossefRunnerAdapter, S1RunnerAdapter
 from models.bio_head import require_band_reach
 from train import distributed as dist
 
-from metrics import moryossef_segment_metrics
+from metrics import frame_scores
 from evaluation.predictions import corpus_token, prediction_events, PredictionEvent, to_source
 from evaluation.systems import (
-    build_eval_model, build_streaming_runner, load_segmenter, method_config_path, model_annotation, source_language, translator_token,
-    translator_decoder
+    SEGMENTERS, build_eval_model, build_streaming_runner, load_segmenter, method_config_path, model_annotation, parse_grid,
+    source_language, translator_token, translator_decoder
 )
 from evaluation.offline import dev_monitor_scores
+from evaluation.segmenter_eval import segmenter_decode
 from metrics import accumulate_policy, merged_policy, score_policy
 from utils import load_yaml, output_dir, pick_device, UNIT_SEPARATOR
-
-
-def online_segmenter_arch(args): # No explicit segmenter keeps the joint arm; clean translator defaults to external segmenter.
-    return getattr(args, "segmenter_arch", None) or ("moryossef" if getattr(args, "method", None) == "baseline" else None)
 
 
 def _track_units(tracks, events, sentences, cover: float = 0.5) -> dict[int, tuple[float, float, int]]:
@@ -59,18 +56,14 @@ def _track_units(tracks, events, sentences, cover: float = 0.5) -> dict[int, tup
 def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     """Drive the sawtooth FSM end-to-end over each stream (a clean segment, from t = 0) → committed events on the source timeline.
 
-    This is the *usable inference engine* of the online rows: Our own BIO head + commit gate, recompute-each-stride, no cross-stride decoder state. 
-    AR/DLM use their joint head. Online Moryossef/S1 cascades use the clean translator on each proposed raw crop.
+    This is the *usable inference engine* of the online rows: a BIO head + commit gate, recompute-each-stride, no cross-stride decoder
+    state. --spans ar|dlm: the arm's own head, and with --text the same arm its own translator. --spans moryossef|s1: the standalone
+    segmenter under the same FSM (the online cascade), and with --text pretrimmed the pretrimmed translator on each proposed raw crop at commit.
+    --text none: the spans alone, and the frame and run scores of the Moryossef protocol on the FSM's stitched tags (`run_online.last_frame`,
+    the key set of the offline rows); evaluation.rows translates the spans for any other text (evaluation.offline.run_cascade).
     """
-    segmenter_arch = online_segmenter_arch(args)
-    no_translate = bool(getattr(args, "no_translate", False))
-    if segmenter_arch is not None and not no_translate and args.method != "baseline":
-        raise SystemExit("Online segmenter cascades use --method baseline; use --no-translate for segmentation only.")
-    plain = getattr(args, "segmenter_decode", None) == "plain"
-    if plain and segmenter_arch is None: raise ValueError(
-        "--segmenter-decode plain is a segmenter control: the joint arm's head trained under its duration "
-        "model and its gate reads the same scores, so an arm row cannot drop them. Use it with --segmenter-arch."
-    )
+    segmenter_arch = args.spans if args.spans in SEGMENTERS else None
+    translate = args.text != "none"
     data_cfg = load_yaml(args.data_config)
     inference_cfg = load_yaml(args.inference_config)
     source = source_language(args)   # the models' corpus (stamps, warm start, duration prior); the streams are --language's
@@ -78,46 +71,51 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     run_online.last_model_annotation = None   # Translator's labels (model_annotation); none when nothing translates
 
     if segmenter_arch is not None:
-        # The runner reads the method config also with --no-translate. A segmenter cascade has no Ω: the clean translator and the
-        # segmenter adapters are ungated, whatever --method names.
-        method_cfg = load_yaml(method_config_path(args), language=source)
+        # The runner reads the pretrimmed translator's method config also with no text. A segmenter cascade has no Ω: the pretrimmed translator
+        # and the segmenter adapters are ungated.
+        method_cfg = load_yaml(method_config_path(args, "baseline"), language=source)
         method_cfg = {**method_cfg, "membership_gate": {**method_cfg["membership_gate"], "enabled": False}}
-        segmenter_args = argparse.Namespace(**{**vars(args), "segmenter_arch": segmenter_arch})
-
-        if not no_translate: segmenter_args.checkpoint = None  # --checkpoint names the clean translator
-        model, device, velocity, _, segmenter_checkpoint = load_segmenter(segmenter_args)
+        model, device, velocity, _, segmenter_checkpoint = load_segmenter(args)
         model.eval().to(device)
         run_online.last_checkpoint = segmenter_checkpoint
         tokenizer = None
 
-        if not no_translate:
+        if translate:
             if int(getattr(args, "num_beams", None) or method_cfg["validation"]["num_beams"]) != 1:
                 raise ValueError("The online rows (the cascade and the arms) use greedy decoding (num_beams=1).")
             cascade_model, tokenizer = build_eval_model(
-                "baseline", args.checkpoint, source, data_cfg, method_cfg, inference_cfg, device
+                "baseline", args.pretrimmed_checkpoint, source, data_cfg, method_cfg, inference_cfg, device
             )
             run_online.last_translation_checkpoint = getattr(cascade_model, "checkpoint_path", None)
             run_online.last_model_annotation = model_annotation(cascade_model, data_cfg, source)
 
         model = (S1RunnerAdapter(model) if segmenter_arch == "s1" else MoryossefRunnerAdapter(model, velocity)).eval().to(device)
-        # One decoder for both segmenters: the train-fitted duration prior of the models' corpus, no per-segmenter tuning.
-        model.duration_model = None if plain else DurationModel.for_language(data_cfg, source)
-        if plain: print("[online] plain decode: legal BIO paths only, no duration scores (a decoder control).", flush=True)
+        # The segmenter's decode (evaluation.segmenter_eval.segmenter_decode: --decode, else the decode that selected its checkpoint;
+        # argmax online only by --decode argmax). The duration decode reads the train-fitted prior of the models' corpus, no
+        # per-segmenter tuning; viterbi and argmax read no prior.
+        decode = segmenter_decode(args, segmenter_checkpoint)
+        model.duration_model = DurationModel.for_language(data_cfg, source) if decode == "duration" else None
+        if decode == "viterbi": print("[online] viterbi decode: legal BIO paths only, no duration scores.", flush=True)
+        if decode == "argmax": print("[online] argmax decode: each frame its most likely tag, no legal BIO path and no duration "
+                                     "scores; the FSM's span, vote, cap and commit rules are the same.", flush=True)
     else:
-        method_cfg = load_yaml(method_config_path(args), language=source)
+        decode = "duration"   # the arm's own head, under the duration model it trained with
+        method_cfg = load_yaml(method_config_path(args, args.spans), language=source)
         if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
         device = pick_device(args.device)
-        model, tokenizer = build_eval_model(args.method, args.checkpoint, source, data_cfg, method_cfg, inference_cfg, device)
+        model, tokenizer = build_eval_model(args.spans, args.arm_checkpoint, source, data_cfg, method_cfg, inference_cfg, device)
         run_online.last_arm_checkpoint = getattr(model, "checkpoint_path", None)
         run_online.last_model_annotation = model_annotation(model, data_cfg, source)
 
+    run_online.last_decode = decode   # the {decode} field of the row's name (evaluation.rows)
     run_online.last_duration_model = model.duration_model.to_dict() if model.duration_model is not None else None
-    run_online.last_segmentation_decode = "semi_markov_viterbi" if model.duration_model is not None else "legal_viterbi"
+    run_online.last_segmentation_decode = "bio_argmax" if decode == "argmax" else \
+        "semi_markov_viterbi" if model.duration_model is not None else "legal_viterbi"
     run_online.last_velocity = bool(velocity) if segmenter_arch == "moryossef" else False
-    if no_translate: print("[online] Segmentation only: no decode, events carry no text.", flush=True)
+    if not translate: print("[online] Segmentation only: no decode, events carry no text.", flush=True)
     runner = build_streaming_runner(
-        model, inference_cfg, method_cfg, translate=not no_translate, cascade_model=cascade_model,
-        record_trace=bool(getattr(args, "stability", False)),
+        model, inference_cfg, method_cfg, translate=translate, cascade_model=cascade_model,
+        record_trace=bool(getattr(args, "stability", False)), argmax=decode == "argmax",
     )
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     # The runner refuses each stream at a rate where the head reads past the commit horizon (spec §1.4 rule 16) when it starts it:
@@ -139,7 +137,11 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
                                                        if hasattr(tokenizer, "convert_ids_to_tokens") else None
 
     predicted: dict[str, list[PredictionEvent]] = {}
-    fsm_bio_rows: list[dict[str, float]] = []
+    # The frame block of a no-text row (metrics.frame_scores, the key set of the offline rows) at the row's tIoU thresholds; a row with
+    # text has none.
+    thresholds = None if translate else parse_grid(
+        getattr(args, "tiou_thresholds", None), load_yaml(args.eval_config)["scoring"]["tiou_thresholds"])
+    frame_rows: list[dict[str, float]] = []
     stride_seconds: list[tuple[float, float]] = []
     for record in tqdm(records, desc="Processing records"):
         poses, timestamps = load_pose_window(record.pose, 0.0, record.pose.duration_s, normalize=False)
@@ -169,11 +171,11 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
                 "text": tokenizer.decode(h.token_ids.tolist(), skip_special_tokens=True).strip() if tokenizer is not None else "",
             } for h in tr.hyps]} for tr in tracks)
 
-        predicted[record.video_id] = prediction_events(record.video_id, events, None if no_translate else tokenizer)
+        predicted[record.video_id] = prediction_events(record.video_id, events, tokenizer if translate else None)
 
-        # BIO P/R/F1 on the runner's stitched legal tags (including committed frontier, 
-        # as FSM read them; not raw argmax) vs GT captions: latest estimate per frame.
-        if runner._bio_timeline is not None:
+        # The frame and run scores of the Moryossef protocol on the runner's stitched tags (the decode's tags, the argmax decode's too,
+        # including the committed frontier, as the FSM read them; both key families read them) vs GT captions: latest estimate per frame.
+        if thresholds is not None and runner._bio_timeline is not None:
             gold = make_bio_labels(
                 timestamps, record.sentences, 0.0, float(record.pose.duration_s), 
                 video_duration_s=record.pose.duration_s, untrusted=record.untrusted_s,
@@ -187,9 +189,7 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             if not ((gold_t == BIO["B"]) | (gold_t == BIO["I"])).any(): continue
             tags[gold_t == BIO["UNK"]] = BIO["UNK"]
             logits_1hot = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=4).float().unsqueeze(0) * 10.0
-            fsm_bio_rows.append(moryossef_segment_metrics(
-                logits_1hot, torch.as_tensor(np.asarray(gold)).long().unsqueeze(0), prefix="fsm_bio"
-            ))
+            frame_rows.append(frame_scores(logits_1hot, logits_1hot, gold_t.unsqueeze(0), thresholds))
 
     # Real time: wall time per stride against the buffer length, on this device (ReSCUE App. G reports the mean, the p95 and 
     # the longest-buffer step). Live use needs each stride done within stride_s, the long buffers near the cap included.
@@ -245,8 +245,8 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         r = rows["commit_only"]
         print(f"[stability] LAAL on {r['n_laal_tracks']} of {r['n_tracks']} committed sentences (those holding >= half of a gold unit); "
               f"boundary flips per sentence {r['boundary_flip_rate']:.3f}", flush=True)
-        # An online cascade is named after its segmenter, with -dlm when it translates with a DLM clean floor (its AR names stay).
-        name = translator_token(args, run_online.last_arm_checkpoint) if segmenter_arch is None else segmenter_arch + (
+        # An online cascade is named after its segmenter, with -dlm when it translates with a pretrimmed DLM translator (its AR names stay).
+        name = translator_token(args, args.spans, run_online.last_arm_checkpoint) if segmenter_arch is None else segmenter_arch + (
             "-dlm" if cascade_model is not None and translator_decoder("baseline", run_online.last_translation_checkpoint) == "dlm" else "")
         out = output_dir("stability") / f"stability_{name}_{corpus_token(args.language, source)}_{args.split}.json"
         out.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -260,19 +260,21 @@ def run_online(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         }, "tracks": provisional_rows}, indent=1) + "\n", encoding="utf-8")
         print(f"[stability] {sum(len(t['hypotheses']) for v in provisional_rows.values() for t in v)} recorded decodes -> {texts}", flush=True)
 
-    if fsm_bio_rows:
-        fsm_bio = {k: float(sum(r[k] for r in fsm_bio_rows) / len(fsm_bio_rows)) for k in fsm_bio_rows[0]}
-        print("[online] FSM BIO (stitched decoded FSM tags vs GT): " + 
-              " ".join(f"{k}={v:.3f}" for k, v in sorted(fsm_bio.items())), flush=True)
+    # The frame block of a no-text row (evaluation.rows saves it as `frame` and does not print it); None: no stream had gold signing.
+    run_online.last_frame = {
+        **{k: float(sum(r[k] for r in frame_rows) / len(frame_rows)) for k in frame_rows[0]}, "metrics_mean_over": "streams",
+        "frame_metrics_decode": {"bio": "fsm_stitched_tags", "phrase": "fsm_stitched_tags"},
+    } if frame_rows else None
     return to_source(predicted, records)
 
 
 @torch.no_grad()
 def online_dev_scores(model, records, inference_cfg: dict, method_cfg: dict, edge_cfg: dict, char_level: bool) -> dict[str, float]:
     """Checkpoint selection on the deployed path (train/slt.py evaluate_slt, checkpoint.monitor val_online_score): streaming FSM 
-    over `records` (whole source videos), scored with the main scores (`dev_monitor_scores`; `edge_cfg` = eval.yaml scoring chunk_gap_s
-    and edge_taus_s). Each rank streams every world_size-th record and the events are merged, so every rank returns the same scores.
-    `online_score` = edge chunk F1 avg x the BLEU-4 of its matched pairs."""
+    over `records` (whole source videos), scored as a row's main score (`dev_monitor_scores`; `edge_cfg` = eval.yaml scoring chunk_gap_s,
+    edge_taus_s and tiou_thresholds). Each rank streams every world_size-th record and the events are merged, so every rank returns the
+    same scores. `online_score` = the F1 of the tIoU x edge-limit grid (tau avg, tIoU avg) x the DVC BLEU-4 of the pairs that count (the
+    same avg)."""
     started = time.perf_counter()
     runner = build_streaming_runner(model, inference_cfg, method_cfg)
 

@@ -1,8 +1,11 @@
 """Shared semi-Markov BIO scores and exact Viterbi decoding.
 
 A path scores the head's O/B/I log-probabilities + a duration prior fitted to the TRAIN unit durations; there is no tuned per-span 
-bonus or B-evidence weight. The online plain decoder control (--online --segmenter-decode plain) and the dev-chunk diagnostics use 
-the same state grammar without duration factors. Caption membership is computed from these scores in models.membership_gate.
+bonus or B-evidence weight. The viterbi decode of a standalone segmenter (eval.py --decode viterbi, DurationDecoder(None)) and the
+dev-chunk diagnostics use the same state grammar without duration factors. With no certified start, the leading fragment is exactly
+the head's own leading I-run (`_leading_fragment`), and the first span may also open on O -> I after an all-O start. Caption
+membership is computed from these scores in models.membership_gate. `argmax_tags` is the argmax decode of a standalone segmenter in the FSM (eval.py --online --decode argmax):
+no path search.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
@@ -93,6 +96,8 @@ class BIOPathScores:
     initial: torch.Tensor
     lengths: torch.Tensor
     prefix: torch.Tensor
+    fragment: torch.Tensor   # (B,) frames 0..fragment-1 are the leading fragment and nothing else (`_leading_fragment`); 0: none
+    known: torch.Tensor      # (B,) certified start; without one the first span may also open on I right after an all-O start
 
     def restore(self, values):
         t = values.shape[1]
@@ -109,11 +114,12 @@ class DurationDecoder: # Max-product decoding and score preparation shared with 
     def path_scores(self, logits, lengths, commit_mask=None, known_start=False, *, timestamps_s=None, min_age_states=1):
         e, n, prefix = _inputs(logits, lengths, commit_mask)
         b, t, _ = e.shape
-        if not b or not t: return BIOPathScores(e, e.new_empty((b, 4, 0)), e.new_empty((b, 0)), n, prefix)
+        known = torch.as_tensor(known_start, device=e.device, dtype=torch.bool).expand(b)
+        if not b or not t: return BIOPathScores(e, e.new_empty((b, 4, 0)), e.new_empty((b, 0)), n, prefix, torch.zeros_like(n), known)
         factors = _factors(n, prefix, self.model, timestamps_s, min_age_states, t).to(e)
-        outside, leading, first_b = _initial(e, known_start)
-        initial = torch.cat((torch.stack((outside, leading, first_b), 1), e.new_full((b, factors.shape[-1] - 1), -torch.inf)), 1)
-        return BIOPathScores(e, factors, initial, n, prefix)
+        e, fragment = _leading_fragment(e, n, known)
+        initial = torch.cat((_initial(e, known, fragment), e.new_full((b, factors.shape[-1] - 1), -torch.inf)), 1)
+        return BIOPathScores(e, factors, initial, n, prefix, fragment, known)
 
     @torch.no_grad()
     def decode(self, logits, lengths, commit_mask=None, known_start=False, *, timestamps_s=None):
@@ -128,7 +134,11 @@ class DurationDecoder: # Max-product decoding and score preparation shared with 
         ages = end.shape[1]
         state = np.full((b, ages + 2), -np.inf)
         state[:, :3] = scores.initial[:, :3].cpu().numpy()
-        boundaries, tails = np.zeros((t, b), np.int32), np.zeros((t, b), bool)
+        fragment = scores.fragment.cpu().numpy()
+        # Without a certified start the first span may also open on I right after an all-O start (frame 0 onward), as the span rule
+        # reads O -> I. `all_o` scores that start on the state's scale; `via_i` marks a first frame entered that way (tagged I).
+        all_o = np.where(scores.known.cpu().numpy(), -np.inf, emissions[:, 0, 0])
+        boundaries, tails, via_i = np.zeros((t, b), np.int32), np.zeros((t, b), bool), np.zeros((t, b), bool)
         sizes, offsets = n.cpu().numpy(), prefix.cpu().numpy()
 
         for k in range(1, t):
@@ -141,26 +151,48 @@ class DurationDecoder: # Max-product decoding and score preparation shared with 
 
             next_state = np.full_like(state, -np.inf)
             next_state[:, 0] = best + emissions[:, k, 0]
-            next_state[:, 1] = state[:, 1] + rstay[:, min(k - 1, ages - 1)] + emissions[:, k, 2]
+            # The leading fragment continues only on the head's own leading I-run (`_leading_fragment`).
+            next_state[:, 1] = np.where(k < fragment, state[:, 1] + rstay[:, min(k - 1, ages - 1)] + emissions[:, k, 2], -np.inf)
             next_state[:, 2] = best + emissions[:, k, 1]
+            via_i[k] = all_o + emissions[:, k, 2] > next_state[:, 2]   # B wins a tie
+            next_state[:, 2] = np.maximum(next_state[:, 2], all_o + emissions[:, k, 2])
 
             if ages > 1:
                 next_state[:, 3:] = grown[:, :-1] + emissions[:, k, 2:3]
                 tails[k] = grown[:, -1] > grown[:, -2]
                 next_state[:, -1] = np.maximum(grown[:, -1], grown[:, -2]) + emissions[:, k, 2]
-            state = np.where((k < sizes)[:, None], next_state, state)
-            state -= state.max(1)[:, None]
+            valid = k < sizes
+            state = np.where(valid[:, None], next_state, state)
+            shift = state.max(1)
+            state -= shift[:, None]
+            all_o = np.where(valid, all_o + emissions[:, k, 0], all_o) - shift
 
         for row, size in enumerate(sizes):
             if not size: continue
             q = int(state[row].argmax()); tags = []
             for k in range(int(size) - 1, -1, -1):
-                tags.append(BIO['O'] if q == 0 else BIO['B'] if q == 2 else BIO['I'])
+                tags.append(BIO['O'] if q == 0 else BIO['B'] if q == 2 and not via_i[k, row] else BIO['I'])
                 if k:
+                    if q == 2 and via_i[k, row]: tags += [BIO['O']] * k; break   # the all-O start of an O -> I start
                     if q in (0, 2): q = int(boundaries[k, row])
                     elif q > 2 and not (q == ages + 1 and tails[k, row]): q -= 1
             result[row, offsets[row]:offsets[row] + size] = torch.tensor(tags[::-1], device=result.device)
         return result
+
+
+def argmax_tags(logits, lengths, commit_mask=None, known_start=False):
+    """(B, T) tags of the argmax decode: each frame its most likely tag over every class of the head (`logits.argmax(dim=-1)`), the
+    tags of the offline argmax row (moryossef26.infer.predict_phrase_segments). The FSM reads them with 2 rules of its buffer, the
+    rules of `DurationDecoder.decode`: (1) the committed prefix (`commit_mask`, which must be a prefix) and the frames past each row's
+    length are UNK, so no span opens again in content that the FSM committed; (2) with `known_start`, the first frame after the prefix
+    is B where its argmax is I, because the committed terminator frame certifies a start there, as the legal decodes read it (an O or a
+    B stays as it is). No other tag changes, so the tags need not be a legal BIO path: the span rule (infer.commit_gate._span_opens)
+    opens a span on B or on O -> I."""
+    _, n, prefix = _inputs(logits, lengths, commit_mask)
+    position = torch.arange(logits.shape[1], device=logits.device)[None]
+    tags = logits.argmax(dim=-1).masked_fill((position < prefix[:, None]) | (position >= (prefix + n)[:, None]), BIO['UNK'])
+    if known_start: tags = tags.masked_fill((position == prefix[:, None]) & (tags == BIO['I']), BIO['B'])
+    return tags
 
 
 def _inputs(logits, lengths, commit_mask=None):
@@ -219,10 +251,22 @@ def _factors(n, prefix, duration, timestamps_s, floor, t):
     return torch.as_tensor(np.stack([[x[np.arange(ages).clip(max=len(x)-1)] for x in row] for row in tables]))
 
 
-def _initial(e, known_start):
-    b = len(e)
-    known = torch.as_tensor(known_start, device=e.device, dtype=torch.bool).expand(b)
-    # A certified frontier supplies start evidence; unknown initial I remains a leading fragment.
+def _leading_fragment(e, lengths, known):
+    """With no certified start, the leading fragment (a unit that began before the buffer; the span rule never opens it, P1) is
+    EXACTLY the head's own leading I-run: the frames from frame 0 whose most likely tag of O, B, I is I. O and B are closed on these
+    frames, and the fragment ends where the run ends. So no path stretches it over a frame that the head reads O or B, which would
+    take the unit after that frame into the fragment and leave it with no caption, and the prior cannot give it a unit that the head
+    opens. A row with a certified start, or whose frame 0 the head does not read I, has no fragment. Returns (emissions, length)."""
+    frames = torch.arange(e.shape[1], device=e.device)[None]
+    run = ((e.argmax(-1) == 2) & (frames < lengths[:, None])).long().cumprod(1).sum(1)
+    fragment = torch.where(known, torch.zeros_like(run), run)
+    closed = (frames < fragment[:, None])[..., None]
+    return torch.cat((e[..., :2].masked_fill(closed, -torch.inf), e[..., 2:]), -1), fragment
+
+
+def _initial(e, known, fragment):
+    # A certified frontier supplies start evidence. Without one a path starts in O, in B, or in the leading fragment, which exists
+    # only on the head's own leading I-run (`_leading_fragment` closed O and B there).
     first_b = torch.where(known, torch.logaddexp(e[:, 0, 1], e[:, 0, 2]), e[:, 0, 1])
-    leading = torch.where(known, torch.full_like(first_b, -torch.inf), e[:, 0, 2])
-    return e[:, 0, 0], leading, first_b
+    leading = torch.where(fragment > 0, e[:, 0, 2], torch.full_like(first_b, -torch.inf))
+    return torch.stack((e[:, 0, 0], leading, first_b), 1)

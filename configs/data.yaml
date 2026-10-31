@@ -60,15 +60,21 @@ datasets:
 
 # The corpora. Each names its dataset, its root, its target language and its translators:
 # - `pretrained_slt`: the translation warm start of each decoder (utils.resolve_pretrained reads the entry of the config's `decoder`).
-#   After the pre-trimmed baseline (the clean floor) fine-tunes, re-root each entry on the LOCAL clean floor of that decoder (the
-#   commented values), so each stage-2 arm and every later `--method baseline` eval of that decoder share 1 init (§1.4 + controlled
-#   comparison). train-slt refuses a stage-2 arm while its entry points at a file without clean-floor meta (a released checkpoint) or at
-#   the floor of the other decoder. The released start for an English target is Uni-Sign's OpenASL release (openasl_pose_only_slt.pth):
-#   its mT5 is tuned to emit English (OpenASL is ASL->English SLT), its pose encoder saw sign skeletons, and it strict-loads.
-# - `released_slt`: a released translator trained on this corpus. Both clean floors of the corpus start from it (README B2a), in place
-#   of baseline_train.yaml checkpoint.from_pretrained.
+#   After the pretrimmed translator fine-tunes (README B2a), re-root each entry on the LOCAL pretrimmed translator of that decoder
+#   (the commented values), so each stage-2 arm and every later `--text pretrimmed` eval of that decoder share 1 init (§1.4 +
+#   controlled comparison). train-slt refuses a stage-2 arm while its entry points at a file without the meta of a pretrimmed
+#   translator (a released checkpoint) or at the pretrimmed translator of the other decoder. The released start for an English
+#   target is Uni-Sign's OpenASL release (openasl_pose_only_slt.pth): its mT5 is tuned to emit English (OpenASL is ASL->English
+#   SLT), its pose encoder saw sign skeletons, and it strict-loads.
+# - `released_slt`: a released translator trained on this corpus. Both pretrimmed translators of the corpus start from it (README
+#   B2a), in place of baseline_train.yaml checkpoint.from_pretrained.
 # - `lowercase_references: true`: every text of the corpus's rows is scored in lowercase, for every system alike (metrics.text_level).
 # - `video_meta`: the corpus's own sidecar, when 2 corpora share a root (default <root>/video_meta.csv).
+# - `floor_corpus`: the corpus whose train split the pretrimmed translators of this corpus train on (default: this corpus). Its arms
+#   and its rows then start from that corpus's pretrimmed translators: point `pretrained_slt` at them (README B2b). BOBSL's manual
+#   alignment takes the automatic alignment of the official train split, as LiTFiC and StreamSLST train.
+# - `dev_corpus`: the corpus whose dev split chooses the epoch of this corpus's train-slt runs (default: this corpus). BOBSL's automatic
+#   alignment chooses on the hand-aligned Sent-Val of the manual alignment, as LiTFiC develops.
 languages:
     ase:
         dataset: youtube-sl-25
@@ -122,10 +128,12 @@ languages:
             dlm: checkpoints/openasl_pose_only_slt.pth
             # ar: checkpoints/baseline_train_ar/auslan_daily/model.pt
             # dlm: checkpoints/baseline_train_dlm/auslan_daily/model.pt
-    # The automatic SAT alignment on the official split: S1 pretraining only (its test split is never read).
+    # The automatic SAT alignment on the official split: S1 pretraining and the pretrimmed translators of bobsl_manual (its test split is
+    # never read).
     bobsl_auto:
         dataset: bobsl
         name: BSL (BOBSL, automatic alignment, official split)
+        dev_corpus: bobsl_manual   # its pretrimmed translators choose their epoch on the hand-aligned Sent-Val
         target_lang: en_XX
         root: data/bobsl
         splits:
@@ -136,10 +144,11 @@ languages:
         pretrained_slt:
             ar: checkpoints/openasl_pose_only_slt.pth
             dlm: checkpoints/openasl_pose_only_slt.pth
-    # The manual alignment on the re-split by interpreter: the BOBSL target.
+    # The manual alignment on the official split (train 16 episodes, dev = Sent-Val, test = Sent-Test): the BOBSL target.
     bobsl_manual:
         dataset: bobsl
-        name: BSL (BOBSL, manual alignment, re-split by interpreter)
+        name: BSL (BOBSL, manual alignment, official split)
+        floor_corpus: bobsl_auto
         target_lang: en_XX
         root: data/bobsl
         video_meta: data/bobsl/video_meta_manual.csv
@@ -151,8 +160,8 @@ languages:
         pretrained_slt:
             ar: checkpoints/openasl_pose_only_slt.pth
             dlm: checkpoints/openasl_pose_only_slt.pth
-            # ar: checkpoints/baseline_train_ar/bobsl_manual/model.pt
-            # dlm: checkpoints/baseline_train_dlm/bobsl_manual/model.pt
+            # ar: checkpoints/baseline_train_ar/bobsl_auto/model.pt
+            # dlm: checkpoints/baseline_train_dlm/bobsl_auto/model.pt
 
 # ---- The rules of every corpus ----
 

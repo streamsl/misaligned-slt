@@ -7,7 +7,7 @@
 stride_s: 1.0
 # Latency/capacity bound: at this buffer length a complete span is force-committed (flagged PARTIAL). 40s covers the train 
 # p99 unit duration in current corpora and is S1's longest training chunk (train-bio reads it here, and the checkpoint
-# stamps it). Every translation recipe (clean floor, arms) clamps its windows here.
+# stamps it). Every translation recipe (pretrimmed translator, arms) clamps its windows here.
 # A hysteresis commit needs δ of lead-in (buffer starts at previous terminator − δ, or δ before a span that the cap kept) 
 # + (K-1)·stride after terminator (plus up to 1 stride of quantization), so unit longer than about 40 - 0.5 - 2 = 37.5s 
 # commits only via forced path. An open span gets no whole event (P1 at inference): the cap keeps one that starts more 

@@ -6,11 +6,15 @@ checkpoint:
     dir: checkpoints/bio_s1/${corpus}
     from_pretrained: checkpoints/openasl_pose_only_slt.pth  # Released Uni-Sign pose weights initialize S1 pose encoder
     save_best: true
-    monitor: val_video_f1  # the edge chunk F1 (the main segmentation score) on whole dev streams
+    monitor: val_video_f1  # the no-text row's main score (the F1 of the tIoU x edge-limit grid, tau avg and tIoU avg) on whole dev streams
     mode: max
     restore_best: true
     eval_every_epochs: 1
     dev_batch_size: 32
+# The decode of val_video_f1 and of this segmenter's rows (the checkpoint stamps it as monitor_decode): argmax, the most likely tag of
+# each frame, as the Moryossef segmenter (validation with the plain decode, as a translator validates with greedy decoding); viterbi
+# and the duration decode are inference-side decodes of the rows (eval.py --decode).
+segmenter_decode: argmax
 wandb:
     name: bio_s1_${corpus}
 

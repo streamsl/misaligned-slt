@@ -23,10 +23,10 @@ def _span_opens(tag: int, prev_tag: int | None, active: bool) -> bool:
 
 def bio_complete_spans(bio_tags: torch.Tensor | list[int]) -> list[tuple[int, int]]:
     # Complete predicted spans as [start_idx, terminator_idx]; open per `_span_opens`, terminate on O, next B, or UNK.
-    # UNK closes like O, as in `metrics.signing_runs_with_b_splits`. It matters only in LABEL domain, where UNK marks 
-    # quarantined region: without it, reliable sentence abutting a quarantine has no terminator, so its label-domain 
-    # span swallows the quarantine and the gate's GT anchor stops matching the sampler's target (WindowSampler.materialize) 
-    # — the two are required to agree.
+    # UNK closes like O, as in `metrics.signing_runs_with_b_splits`. In the LABEL domain UNK marks a quarantined region:
+    # without it, reliable sentence abutting a quarantine has no terminator, so its label-domain span swallows the
+    # quarantine and the gate's GT anchor stops matching the sampler's target (WindowSampler.materialize) — the two are
+    # required to agree. In the prediction domain only the argmax decode can put UNK on a free frame (`argmax_tags`).
     if not isinstance(bio_tags, torch.Tensor): bio_tags = torch.as_tensor(bio_tags)
     spans: list[tuple[int, int]] = []
     start: int | None = None
@@ -45,14 +45,15 @@ def candidate_spans(bio_tags: torch.Tensor | list[int], min_span_frames: int):
     Ω anchor (`next(candidate_spans(...), None)`); every one gets a hysteresis vote each stride (`CommitGate.vote`).
 
     No re-emission: the frames before the commit frontier χ (the δ overlap the cut keeps) are a prefix that the decode tags 
-    UNK (`DurationDecoder`, commit mask), so a span can open only at or after χ and never ends at or before it. Λ_min and 
+    UNK (`DurationDecoder` or `argmax_tags`, commit mask), so a span can open only at or after χ and never ends at or before it. Λ_min and 
     δ need no coupling ("Λ_min > 2δ" is infeasible on short-sentence corpora: on asf 2δ > p10 sentence length).
 
     Λ_min is a LABEL-domain floor chosen to reject brief flicker. A genuine unit shorter than the floor cannot be
     emitted exactly; report that exclusion when comparing localization scores.
 
     Every offline span path takes all of these spans whole, with no buffer cap: the --offline row and the stage-2 offline monitor
-    (evaluation.offline.offline_predictions), the --segments span files, --segmenter-eval and val_video_f1 (moryossef26.infer.span_segments).
+    (evaluation.offline.offline_predictions), the offline rows of the segmenters (eval.py --offline --spans moryossef|s1, with or
+    without text) and val_video_f1 (moryossef26.infer.span_segments).
     """
     for start, term in bio_complete_spans(bio_tags):
         if term - start >= int(min_span_frames): yield (start, term)
@@ -92,7 +93,7 @@ def open_span_start(bio_tags: torch.Tensor | list[int]) -> int | None:
     start: int | None = None
     prev: int | None = None
     for idx, tag in enumerate(bio_tags.tolist()):
-        if start is not None and tag in (BIO["O"], BIO["B"]): start = None
+        if start is not None and tag in (BIO["O"], BIO["B"], BIO["UNK"]): start = None   # UNK closes, as in bio_complete_spans
         if _span_opens(tag, prev, start is not None): start = idx
         prev = tag
     return start

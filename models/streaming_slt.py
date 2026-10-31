@@ -1,5 +1,6 @@
-"""Stage-2 composition: a segmentation branch (own pose encoder + BIO head), the translator front end, the Ω crop of the
-selected span between them, an AR or DLM decoder, and the stage-2 training loss (`MisalignedSLTModel.forward_loss`)."""
+"""Stage-2 composition: a segmentation branch (own pose encoder, or the translator's in the one-stream arm, + BIO head), the
+translator front end, the Ω crop of the selected span between them, an AR or DLM decoder, and the stage-2 training loss
+(`MisalignedSLTModel.forward_loss`)."""
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,9 +98,10 @@ class MisalignedSLTModel(nn.Module):
     At step 0 the branches hold S1's and the clean translator's weights. The gate-off AR arm decodes as the AR clean floor token for
     token, and the gate-off DLM arm as the DLM clean floor (its canvas loads from that floor's file).
 
-    `shared_pose_encoder` (one-stream arm): no `bio_pose_encoder`; ONE pose encoder, the clean translator's, which the BIO head and the 
-    translator both read and both losses train. train/slt.py folds a least-squares map from its tokens to S1's encoder tokens into the 
-    head (`fold_s1_stitch`), so step 0 is S1's head behind that map and exactly the clean translator.
+    `shared_pose_encoder` (one-stream arm): no `bio_pose_encoder`; ONE pose encoder, the clean translator's, which the BIO head and the
+    translator both read and both losses train. train/slt.py folds a least-squares map from its tokens to S1's encoder tokens into the
+    head (`fold_s1_stitch`), so step 0 is S1's head behind that map and exactly the clean translator. Its no-text control is the
+    two-stream arm's, `membership_gate.detach_omega`: there the text reads that encoder under stop-gradient, so BIO alone trains it.
 
     `decoder="dlm"` → block-diffusion decoder (OPUT training / block decode with SPD), `"ar"` → AR seq2seq. Nothing else differs — 
     front end, BIO head, sampler, FSM, commit gate identical — which is what makes AR-vs-DLM a clean test.
@@ -169,11 +171,11 @@ class MisalignedSLTModel(nn.Module):
         also reads translator's per-frame features, stop-gradient, as inference builds them: in eval mode the caller's `extract_bio_tap`
         output (`translator_tap`); in training an eval-mode pass (BatchNorm on its running statistics, no dropout), because the
         train-mode window pass normalizes with batch statistics that inference never has. 
-        With `shared_pose_encoder`, the head reads those features themselves, WITH gradient (the one encoder is the translator's and both 
-        losses train it). Returns the head output."""
-        if self.bio_head is None: raise RuntimeError("the clean-floor model has no segmentation branch")
+        With `shared_pose_encoder`, the head reads those features themselves, WITH gradient (the one encoder is the translator's: BIO
+        trains it, and so does text unless detach_omega, `forward_loss`). Returns the head output."""
+        if self.bio_head is None: raise RuntimeError("the pretrimmed translator has no segmentation branch")
         if frame_mask is None: frame_mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=poses.device)
-        if self.shared_pose_encoder:   # one encoder (the translator's): BIO and text both train it
+        if self.shared_pose_encoder:   # one encoder (the translator's): BIO trains it, and text unless detach_omega (forward_loss)
             features = translator_tap if translator_tap is not None else self.front_end.extract_bio_tap(poses, frame_mask)[0]
             return self.bio_head(features, timestamps_s=timestamps_s, frame_mask=frame_mask)
         features, residual = self.bio_pose_encoder(poses, frame_mask), None
@@ -420,13 +422,17 @@ class MisalignedSLTModel(nn.Module):
           than δ from its last unit to the record's next unit, `target_pause_after`), text loss also trains segmentation branch via
           where the span from the last unit's B frame ends (`_end_survival`): frames up to that B frame count as committed, so the text
           can move only the run's end, never a boundary inside it (a gradient there would reward merging A and B), and the text's best
-          end there is the caption's end. An abutting successor has no pose evidence, so those rows give no gradient.
-          `gate_detach_omega` turns it off.
+          end there is the caption's end. An abutting successor has no pose evidence, so those rows give no gradient. In the
+          one-stream arm (`shared_pose_encoder`) the head reads the translator's own pose encoder, so there the text of EVERY
+          supervised row also trains segmentation, through that encoder.
+          `gate_detach_omega` is the no-text control of both arms: no end-side term and, in the one-stream arm, the text reads that
+          encoder under stop-gradient. Text then trains no module the head reads (that encoder, its pose_proj included, and the
+          head) and still trains the LM encoder and the decoder; BIO alone trains the encoder and the head. Only gradients change.
         - Other rows (truncated, headless, interior, gap): BIO only. A truncated window never receives text (P1).
 
         Gate off (clean floor): every complete target trains the translator on the whole window.
         """
-        # Translator features and the segmentation branch read the same frames through separate pose encoders.
+        # Translator features and the segmentation branch read the same frames, through separate pose encoders or the translator's 1.
         bio_tap, bio_mask, timestamps = self.front_end.extract_bio_tap(batch["poses"], batch["frame_mask"], batch.get("timestamps_s"))
         bio_out = None
         if self.bio_head is not None and (float(lambda_bio) != 0.0 or gate_enabled):
@@ -475,9 +481,13 @@ class MisalignedSLTModel(nn.Module):
             labels = target_tokens["labels"].to(bio_tap.device)
             om = None if omega_bias is None else omega_bias[idx]
             poses, ts = batch["poses"][idx], None if timestamps is None else timestamps[idx]
-            # The crop pass is on gradient path: the text trains the translator's pose encoder through it 
-            # (BatchNorm on its running statistics, as every inference read; support_crop).
+            # The crop pass is on gradient path: the text trains the translator's pose encoder through it
+            # (BatchNorm on its running statistics, as every inference read; support_crop). In the one-stream arm's no-text control
+            # (shared_pose_encoder with detach_omega) the head reads that encoder, so the text reads the whole read (the crop pass and
+            # the window features it keeps) under stop-gradient. Detached after the pass, not a no-grad pass: the same kernels run, so
+            # every forward value stays the joint arm's.
             tap, mask, read = support_crop(self.front_end, poses, ts, bio_tap[idx], bio_mask[idx], om, gate_eps)
+            if self.shared_pose_encoder and gate_detach_omega: tap = tap.detach()
             enc_hidden, enc_mask = self.encode_memory(tap, mask, omega_bias=read)
             if self.decoder_type == "ar":
                 translation_loss, row_sum, row_valid = self.front_end.ar_loss(

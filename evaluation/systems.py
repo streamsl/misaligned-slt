@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from transformers import T5Tokenizer
 from data.batch import repeat_last_frame
-from data.loader import cached_language_records, annotation_fingerprint, stale_language_fingerprints
+from data.loader import cached_language_records, annotation_fingerprint
 from poses import load_pose_window, normalize_keypoints_unisign
 
 from infer.duration_decode import DurationModel
@@ -25,6 +25,9 @@ from models.checkpointing import (load_state, load_checkpoint_meta, load_model_c
 from utils import checkpoint_dir, lambda_min_s, load_yaml, pick_device, pool_key, resolve_pretrained, seconds_to_frames
 
 METHOD_CONFIGS = {"baseline": "configs/baseline_eval.yaml", "ar": "configs/ar.yaml", "dlm": "configs/dlm.yaml"}
+SEGMENTERS, ARMS = ("moryossef", "s1"), ("ar", "dlm")   # eval.py --spans: the standalone segmenters, and the arms whose head cuts the spans
+# eval.py --text -> the key of METHOD_CONFIGS that a translator's build, decode and provenance read (pretrimmed: the pretrimmed translator).
+TEXT_METHODS = {"pretrimmed": "baseline", "ar": "ar", "dlm": "dlm"}
 
 def source_language(args) -> str:
     """The corpus the run's models trained on: eval.py / analyze.py --source-language, default --language. Their method config,
@@ -33,7 +36,7 @@ def source_language(args) -> str:
     return getattr(args, "source_language", None) or args.language
 
 def model_annotation(model, data_cfg: dict, language: str) -> dict | None:
-    """The train labels behind a built translator (an arm, or a trained clean floor; `build_eval_model` keeps its meta) and behind
+    """The train labels behind a built translator (an arm, or a trained pretrimmed translator; `build_eval_model` keeps its meta) and behind
     the inits it stamps, beside the current `language` train labels (the corpus the model trained on, `source_language`): {train,
     model, translator_init, segmentation_init}, for the provenance. Warns, never refuses, when one differs. None for a file with no
     training meta (the released Uni-Sign weights)."""
@@ -47,30 +50,35 @@ def model_annotation(model, data_cfg: dict, language: str) -> dict | None:
         # S1 trains on a pool: its own fingerprint hashes every pooled language, so the per-language stamp is the one to compare.
         "translator_init": inits.get("translator"), "segmentation_init": s1_langs.get(language),
     }
-    # The other corpora of S1's pool, each against its own current labels (a benchmark target is in no pool).
-    found["segmentation_pool_stale"] = [l for l in stale_language_fingerprints(s1_langs, data_cfg, {language: found["train"]}) if l != language]
+    # A corpus that trains its pretrimmed translators on another corpus (data.yaml floor_corpus) compares them with that corpus's labels:
+    # the pretrimmed translator itself (a --text pretrimmed row) and an arm's translator warm start.
+    floor = ((data_cfg.get("languages") or {}).get(language) or {}).get("floor_corpus")
+    if floor and floor != language: found["floor_train"] = annotation_fingerprint(cached_language_records(data_cfg, floor, "train"))
     warn_model_labels(found, getattr(model, "checkpoint_path", None))
     return found
 
 def warn_model_labels(found: dict | None, source) -> bool:
     names = {"model": "the model", "translator_init": "its translator warm start", "segmentation_init": "its S1 init"}
-    stale = [name for key, name in names.items() if (found or {}).get(key) not in (None, (found or {}).get("train"))]
+    found = found or {}
+    # With a floor corpus (floor_train, model_annotation), the translator warm start follows that corpus's labels, and the model may be
+    # that pretrimmed translator itself.
+    floor = found.get("floor_train")
+    refs = {"model": {found.get("train"), floor}, "translator_init": {floor or found.get("train")}, "segmentation_init": {found.get("train")}}
+    stale = [name for key, name in names.items() if found.get(key) is not None and found.get(key) not in refs[key]]
     if stale: print(
         f"WARNING: {source}: {', '.join(stale)} trained on other train labels than {found.get('train')}, the train labels "
         f"at eval time. Its spans or text can follow the old labels: retrain before a run you report.", flush=True
     )
-    if pool := (found or {}).get("segmentation_pool_stale"): print(
-        f"WARNING: {source}: its S1 init trained on other train labels of its pool corpora {', '.join(pool)} than those at eval time: "
-        f"retrain S1 and this model before a run you report.", flush=True
-    )
-    return not (stale or pool)
+    return not stale
 
 def parse_grid(value: str | None, fallback: list[float]) -> list[float]:
     if not value: return [float(x) for x in fallback]
     return [float(x.strip()) for x in value.split(",") if x.strip()]
 
-def method_config_path(args: argparse.Namespace) -> str:
-    return str(args.method_config) if args.method_config else METHOD_CONFIGS[args.method]
+def method_config_path(args: argparse.Namespace, method: str) -> str:
+    # The config of `method` (a key of METHOD_CONFIGS): --method-config, else its own file. evaluation.rows gives the span pass of a
+    # cascade no --method-config, so it replaces the config of the row's translator, or with no text, of the model that cuts the spans.
+    return str(args.method_config) if getattr(args, "method_config", None) else METHOD_CONFIGS[method]
 
 def build_eval_model(
     method: str, checkpoint: str | None, language: str, data_cfg: dict, 
@@ -78,7 +86,8 @@ def build_eval_model(
 ):
     """Uni-Sign pose-only model. LM (`language_model.name`) and checkpoint (`checkpoint.from_pretrained` / `checkpoint.dir`) both come from  
     METHOD config — no separate stage-1 config. Plain scalars so analyze/visualize need no fake Namespace. The file actually loaded (for the
-    baseline: --checkpoint or data.yaml pretrained_slt) passes fixed-constant check here, so every row that builds a model is covered once.
+    pretrimmed translator: --pretrimmed-checkpoint or data.yaml pretrained_slt) passes fixed-constant check here, so every row that builds a
+    model is covered once.
     The model keeps that file's meta; the boundary sweep and the rows compare its train labels (model_annotation)."""
     if method != "baseline":
         name = checkpoint or checkpoint_dir(method_cfg, default="")
@@ -103,21 +112,23 @@ def build_eval_model(
     lm_name = str(method_cfg["language_model"]["name"])
 
     if method == "baseline":
-        # Released Uni-Sign mT5 pose-only model (AR), or an in-domain clean floor of the decoder it stamps (translator_decoder).
+        # Released Uni-Sign mT5 pose-only model (AR), or an in-domain pretrimmed translator of the decoder it stamps (translator_decoder).
         # Same MisalignedSLTModel as the arms, without a segmentation branch (no BIO head, no second pose encoder).
-        # --checkpoint or data.yaml pretrained_slt ONLY (the released file, or this language's clean floor after the B2b re-root)
-        # — no `checkpoint.dir` fallback, so a concurrent train-slt run can't slip trained weights in.
+        # --pretrimmed-checkpoint or data.yaml pretrained_slt ONLY (the released file, or this language's pretrimmed translator after
+        # the B2b re-root) — no `checkpoint.dir` fallback, so a concurrent train-slt run can't slip trained weights in.
         name = checkpoint or resolve_pretrained(method_cfg, data_cfg, language, default="")
         ckpt = Path(name or "")
         if not name or not ckpt.exists(): raise FileNotFoundError(
-            f"Missing released Uni-Sign checkpoint for baseline (language '{language}'): {ckpt!s}. Set languages.{language}."
-            f"pretrained_slt.<decoder> in configs/data.yaml (or checkpoint.from_pretrained / --checkpoint)."
+            f"Missing the checkpoint of the pretrimmed translator (language '{language}'): {ckpt!s}. Set languages.{language}."
+            f"pretrained_slt.<decoder> in configs/data.yaml (or checkpoint.from_pretrained / --pretrimmed-checkpoint)."
         )
-        # A trained file must be THIS language's clean floor (not an arm, not another language's floor) under the fixed constants;
-        # the released Uni-Sign file carries no meta and passes both checks.
+        # A trained file must be the pretrimmed translator (not an arm) of THIS language, or of the corpus that it trains its pretrimmed
+        # translators on (data.yaml floor_corpus), under the fixed constants; the released Uni-Sign file carries no meta and passes both
+        # checks.
         meta = load_checkpoint_meta(ckpt)
-        if meta and (meta.get("architecture") != "clean_translation" or str(meta.get("language")) != str(language)): raise ValueError(
-            f"{ckpt}: the baseline needs the {language!r} clean translator, "
+        floor = str(((data_cfg.get("languages") or {}).get(language) or {}).get("floor_corpus") or language)
+        if meta and (meta.get("architecture") != "clean_translation" or str(meta.get("language")) != floor): raise ValueError(
+            f"{ckpt}: --text pretrimmed needs the {floor!r} pretrimmed translator, "
             f"found architecture={meta.get('architecture')!r}, language={meta.get('language')!r}"
         )
         require_fixed_constants(meta, inference_cfg, ckpt)
@@ -130,13 +141,13 @@ def build_eval_model(
             print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
                   f"{rep['pose_missing'] + rep['mt5_missing']}, unexpected {rep['pose_unexpected'] + rep['mt5_unexpected']})", flush=True)
         else:
-            # A DLM floor, as the DLM arm: decoded at the block it trained with (block_size), and its block decode has no beam
+            # A pretrimmed DLM translator, as the DLM arm: decoded at the block it trained with (block_size), and its block decode has no beam
             # search (a num_beams above 1 would be recorded but not run). It loads whole and strict, so a missing canvas fails.
             if meta["block_size"] != int(method_cfg["block_size"]): raise ValueError(
                 f"{ckpt}: expected block_size={int(method_cfg['block_size'])!r}, found {meta['block_size']!r}"
             )
             if int(method_cfg["validation"]["num_beams"]) != 1: raise SystemExit(
-                f"{ckpt} is a DLM clean floor: its block decode has no beam search, so num_beams must be 1."
+                f"{ckpt} is a pretrimmed DLM translator: its block decode has no beam search, so num_beams must be 1."
             )
             model = MisalignedSLTModel(front_end=front_end, decoder="dlm", block_size=int(method_cfg["block_size"]), segmentation_branch=False)
             load_model_checkpoint(model, ckpt, strict=True)
@@ -164,33 +175,35 @@ def build_eval_model(
 
 
 def translator_decoder(method: str, checkpoint) -> str:
-    # The decoder of a row's translator: an arm's own method, or the decoder a clean floor file stamps. The released Uni-Sign file
+    # The decoder of a row's translator: an arm's own method, or the decoder a pretrimmed translator's file stamps. The released Uni-Sign file
     # stamps nothing and is an AR mT5, and so is a missing file (the build then refuses it): the one place of that rule.
     if method != "baseline": return str(method)
     meta = load_checkpoint_meta(checkpoint) if checkpoint and Path(str(checkpoint)).exists() else {}
     return str(meta["decoder"]) if meta else "ar"
 
 
-def translator_token(args: argparse.Namespace, checkpoint: str | None = None) -> str:
-    """The `translator` field: `clean` (the AR clean floor or the released file), `clean-dlm` (a DLM clean floor), `ar`, `dlm`,
-    or an arm running a non-default method config. `checkpoint` is the file the row loaded (the arm, or the clean floor).
+def translator_token(args: argparse.Namespace, method: str, checkpoint: str | None = None, translate: bool = True) -> str:
+    """The name of the model of `method` that a row loaded (`checkpoint`: the arm, or the pretrimmed translator): `pretrimmed` (the
+    pretrimmed AR translator or the released file), `pretrimmed-dlm` (a pretrimmed DLM translator), `ar` or `dlm`; `none` with the
+    model's tokens when it translates nothing (`translate` False: the `text` field of a no-text row). A non-default --method-config
+    adds its stem, and an arm its variant tokens.
 
     An ablation run is the same method under another config, so without the config stem it writes the main row's
     events, scores and stability file over the top and prints nothing.
     """
     cfg = getattr(args, "method_config", None)
-    suffix = "" if not cfg or str(cfg) == METHOD_CONFIGS[args.method] \
+    suffix = "" if not cfg or str(cfg) == METHOD_CONFIGS[method] \
                 else "-" + Path(cfg).stem.removeprefix("ablation_").replace("_", "-")
-    if args.method != "baseline" and checkpoint: suffix += "".join(arm_variant_tokens(args, checkpoint))
-    if getattr(args, "no_translate", False): return "none" + suffix
-    if args.method != "baseline": return str(args.method) + suffix
-    return ("clean-dlm" if translator_decoder("baseline", checkpoint) == "dlm" else "clean") + suffix
+    if method != "baseline" and checkpoint: suffix += "".join(arm_variant_tokens(args, method, checkpoint))
+    if not translate: return "none" + suffix
+    if method != "baseline": return str(method) + suffix
+    return ("pretrimmed-dlm" if translator_decoder("baseline", checkpoint) == "dlm" else "pretrimmed") + suffix
 
 
-def arm_variant_tokens(args: argparse.Namespace, arm_checkpoint: str) -> list[str]:
+def arm_variant_tokens(args: argparse.Namespace, method: str, arm_checkpoint: str) -> list[str]:
     # Name tokens for an arm whose stamps differ from the method config this run reads.
     meta = load_checkpoint_meta(arm_checkpoint)
-    live = load_yaml(method_config_path(args), language=getattr(args, "language", None))
+    live = load_yaml(method_config_path(args, method), language=getattr(args, "language", None))
     tokens = ["-onestream"] if meta.get("architecture") == "one_stream_slt" else []
     detach = (meta.get("gate") or {}).get("detach_omega")
     if detach is not None and bool(detach) != bool(live["membership_gate"]["detach_omega"]):
@@ -208,20 +221,17 @@ def arm_variant_tokens(args: argparse.Namespace, arm_checkpoint: str) -> list[st
 
 
 def load_segmenter(args):
-    """Trained segmenter by --segmenter-arch (shared by eval --segmenter-eval and analyze --stage segmenter-infer).
+    """The standalone segmenter of eval.py --spans (moryossef or s1), from --segmenter-checkpoint, else its pooled folder.
 
-    moryossef (default): faithful Moryossef segmenter (UNet) on THEIR input contract — no preprocessing shared with the FSM head. 
+    moryossef: faithful Moryossef segmenter (UNet) on THEIR input contract — no preprocessing shared with the FSM head. 
     It supplies the spans of the cascade rows. s1 is the in-system BIO head, isolating system design from segmentation competence. 
     rope_chunk_s is SECONDS (s1) or None (moryossef).
     """
-    args.segmenter_arch = args.segmenter_arch or "moryossef"
+    arch = args.spans
     source = source_language(args)   # the corpus the segmenter trained on: its config, default folder and stamp checks
     device = pick_device(args.device)
-    # The untrained controls exist only for the arm whose input contract is a reconstruction of a RELEASED model's.
-    if getattr(args, "segmenter_init", "finetuned") != "finetuned" and args.segmenter_arch != "moryossef": raise SystemExit(
-        f"--segmenter-init {args.segmenter_init} is moryossef-only; --segmenter-arch {args.segmenter_arch} has no untrained control."
-    )
-    if args.segmenter_arch == "s1":
+    # The untrained controls (--segmenter-init, the Moryossef segmenter only; evaluation.rows refuses another) reconstruct a RELEASED model.
+    if arch == "s1":
         cfg = load_yaml(args.bio_config, language=source)
         # A pooled (multilingual) S1 is ONE language-agnostic checkpoint; per-language analysis on any --language
         # reads the same pool directory. This is zero-shot only for a language excluded from all S1 training.
@@ -241,7 +251,7 @@ def load_segmenter(args):
         if init == "released" and (not released or not Path(released).exists()):
             raise SystemExit(f"--segmenter-init released needs checkpoint.from_pretrained; {released!r} is missing.")
         model = build_moryossef(args.moryossef_config, pretrained=init == "released", seed=None if init == "released" else int(args.seed))
-        stats_from = Path(args.checkpoint or Path(checkpoint_dir(cfg, default=f"checkpoints/moryossef/{source}")) / "model.pt")
+        stats_from = Path(args.segmenter_checkpoint or Path(checkpoint_dir(cfg, default=f"checkpoints/moryossef/{source}")) / "model.pt")
         model.release_stats = (load_checkpoint_meta(str(stats_from)) or {}).get("release_stats")
         if model.release_stats is None: raise SystemExit(
             f"--segmenter-init {init} needs the arm's fitted release_stats, absent from {stats_from}. Train the "
@@ -258,39 +268,52 @@ def load_segmenter(args):
         velocity, rope_chunk_s = bool(cfg["velocity"]), None  # UNet chunks internally at num_frames
 
     ckpt_dir = checkpoint_dir(cfg, default=ckpt_default)
-    checkpoint = args.checkpoint or str(Path(ckpt_dir) / "model.pt")
+    checkpoint = args.segmenter_checkpoint or str(Path(ckpt_dir) / "model.pt")
     _meta = load_checkpoint_meta(checkpoint)
-    if args.segmenter_arch == "s1":
+    # With no --decode a row decodes as the checkpoint's epoch was chosen (monitor_decode; plain is the stored name of argmax), so that
+    # stamp must be the decode that the config names for the segmenter's rows (segmenter_decode): else it is another monitor's choice.
+    from train.helpers import segmenter_config_decode
+    stamp = _meta.get("monitor_decode")
+    if stamp and not getattr(args, "decode", None) and (stamp == "semi_markov_viterbi") != (segmenter_config_decode(cfg) == "duration"):
+        raise SystemExit(
+            f"{checkpoint} chose its epoch under monitor_decode {stamp!r}, but its config names segmenter_decode "
+            f"{segmenter_config_decode(cfg)!r} for the rows of this segmenter: train it again, or name a decode with --decode."
+        )
+    if arch == "s1":
         # The head's attention band is in no tensor: the model is built with the band the checkpoint stamps (S1 derives it, an arm
         # stamps its S1's; no stamp = full attention). A stage-2 checkpoint (the deployed arm) is accepted for the S1 arch: its
-        # segmentation branch is re-keyed to the S1 layout (models.checkpointing.s1_layout_state), so the joint head can be scored alone.
+        # segmentation branch is re-keyed to the S1 layout (models.checkpointing.s1_layout_state). The rows refuse it (evaluation.rows):
+        # the rows of an arm's head read the whole arm (--spans ar|dlm).
         from train.bio_pretrain import build_bio_s1_model
         model = build_bio_s1_model(cfg, _meta.get("bio_attention_radius_s"))
         model.load_state_dict(s1_layout_state(load_state(checkpoint)), strict=True)
     else: load_model_checkpoint(model, checkpoint, strict=True)
-    print(f"segmenter | {args.segmenter_arch} weights from {checkpoint} (pool {_meta.get('pretrain_pool')!r}, "
+    print(f"segmenter | {arch} weights from {checkpoint} (pool {_meta.get('pretrain_pool')!r}, "
           f"train inputs {_meta.get('pretrain_inputs')!r})", flush=True)   # the segmenter's pretrain.inputs; None: a file trained before the stamp (plain chunks for the Moryossef segmenter)
     # Only S1 (or an arm's head) reads the Uni-Sign geometry. The Moryossef arm stamps none: its shoulder normalisation removes the
     # reader's x map (moryossef26.dataset.pose_aspect), so a file trained before the map reads the same coordinates, except in the rare
     # frames with one visible shoulder, which the normalisation does not scale.
-    if args.segmenter_arch == "s1": warn_pose_geometry(_meta, checkpoint)
+    if arch == "s1": warn_pose_geometry(_meta, checkpoint)
     # S1's RoPE chunk is the buffer cap the head TRAINED under, which the checkpoint records. It wins over the live buffer_cap_s, because a 
     # cap edit would re-chunk a trained head over context it never saw. PROVENANCE: config says which pool this run expects. The checkpoint 
     # records which pool produced it. A mismatch means the wrong segmenter is about to be evaluated — silently, with a plausible-looking 
     # score — so it fails loud. A stage-2 arm scored through its S1-layout head stamps no `pretrain_pool` and is exempt.
     if "pretrain_pool" in _meta and _meta.get("pretrain_pool") != pool_key(cfg): raise SystemExit(
-        f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --checkpoint "
+        f"{checkpoint} was trained on pool {_meta.get('pretrain_pool')!r}, but this config expects {pool_key(cfg)!r}. Point --segmenter-checkpoint "
         f"at the matching model, or align `pretrain.languages` (a pooled checkpoint is a DIFFERENT model from a monolingual one)."
     )
     if "pretrain_pool" in _meta:  # a segmenter checkpoint (S1 or Moryossef); a stage-2 arm's head carries the arm's own provenance
         from train.bio_pretrain import require_segmenter_data
-        require_segmenter_data(_meta, load_yaml(args.data_config), {}, load_yaml(args.inference_config)["buffer_cap_s"], checkpoint)
-    if args.segmenter_arch == "moryossef":
+        # Only the corpus whose labels this run reads (the source corpus) is compared, so no other corpus of the pool loads.
+        source, stamped = source_language(args), _meta.get("language_fingerprints") or {}
+        known = {source: annotation_fingerprint(cached_language_records(load_yaml(args.data_config), source, "train"))} if source in stamped else {}
+        require_segmenter_data(_meta, known, load_yaml(args.inference_config)["buffer_cap_s"], checkpoint)
+    if arch == "moryossef":
         model.release_stats = _meta.get("release_stats")
         if model.release_stats is None: raise SystemExit(
             f"{checkpoint} stamps no release_stats, so its training coordinates cannot be reproduced. Retrain the Moryossef arm."
         )
-    if args.segmenter_arch == "s1": # S1 stamps rope_eval_chunk_s. A arm stamps the cap it trained under (its head's context) as buffer_cap_s.
+    if arch == "s1": # S1 stamps rope_eval_chunk_s. A arm stamps the cap it trained under (its head's context) as buffer_cap_s.
         trained_chunk = _meta.get("rope_eval_chunk_s") or _meta.get("buffer_cap_s")
         if trained_chunk:
             if abs(float(trained_chunk) - float(rope_chunk_s)) > 1e-6: print(
@@ -325,7 +348,7 @@ def box_normalized_window(pose, start_s: float, end_s: float, box_start_s: float
     return normalize_keypoints_unisign(box)[first:first + raw.shape[0]], timestamps
 
 def decode_provenance(decoder: str, method_cfg: dict) -> dict:
-    # A DLM's decode threshold as run (a fixed constant; an arm or a DLM clean floor), recorded so every payload names the decode
+    # A DLM's decode threshold as run (a fixed constant; an arm or a pretrimmed DLM translator), recorded so every payload names the decode
     # that made it. `decoder` is the row's translator decoder (translator_decoder).
     if decoder != "dlm": return {}
     spd_cfg = method_cfg["spd"]
@@ -333,7 +356,7 @@ def decode_provenance(decoder: str, method_cfg: dict) -> dict:
             "spd_top_k": int(spd_cfg["top_k"]), "spd_renormalize": bool(spd_cfg["renormalize"])}
 
 def generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, fps: list[float]) -> dict:
-    # Main AR rows are greedy; only a DLM (an arm or a DLM clean floor) reads the block-decode params, which the AR generate
+    # Main AR rows are greedy; only a DLM (an arm or a pretrimmed DLM translator) reads the block-decode params, which the AR generate
     # ignores. `fps`: 1 pose rate per row of the batch. The decode canvas is the training canvas of the method config
     # (max_text_tokens): a shorter one would truncate exactly the long units the arm was trained to emit, and an unreached slot
     # costs nothing, as the block decode stops once every row has emitted EOS.
@@ -420,8 +443,10 @@ def translate_windows(
 
 def build_streaming_runner(
     model, inference_cfg: dict, method_cfg: dict, translate: bool = True, cascade_model=None, 
-    record_trace: bool = False,
+    record_trace: bool = False, argmax: bool = False,
 ) -> StreamingSLTRunner:
+    # argmax: the argmax decode of a standalone segmenter's row (eval.py --online --decode argmax, infer.duration_decode.argmax_tags);
+    # else the legal path search under the model's duration_model (None: viterbi). An arm's head always takes the legal path.
     spd = method_cfg["spd"]
     boundary = inference_cfg["boundary_stability"]
     # The BIO head's reach, which the runner checks against each stream's fps (spec §1.4 rule 16): an S1 (the online cascade's
@@ -450,5 +475,5 @@ def build_streaming_runner(
         tau_dec=float(spd["tau_dec"]),  # same source as generation_kwargs
         spd_top_k=int(spd["top_k"]), spd_renormalize=bool(spd["renormalize"]),
         translate=bool(translate), cascade_model=cascade_model, 
-        record_trace=bool(record_trace), band_reach=band_reach,
+        record_trace=bool(record_trace), band_reach=band_reach, argmax=bool(argmax),
     )

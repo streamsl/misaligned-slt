@@ -13,7 +13,7 @@ from infer.stream import join_unit_text
 from metrics import text_level, text_scores
 from evaluation.predictions import corpus_token
 from evaluation.systems import (
-    arm_variant_tokens, build_eval_model, decode_provenance, method_config_path, 
+    TEXT_METHODS, arm_variant_tokens, build_eval_model, decode_provenance, method_config_path, 
     parse_grid, translate_windows, model_annotation, source_language, translator_token, translator_decoder
 )
 from utils import cfg_get, load_yaml, pick_device, target_language
@@ -82,19 +82,24 @@ def controlled_windows(
 
 
 def run_boundary_sweep(args: argparse.Namespace) -> "pd.DataFrame":
+    """One translator (--text pretrimmed, ar or dlm; its file --pretrimmed-checkpoint or --arm-checkpoint, as in eval.py) on the gold units with
+    their edges moved on a grid."""
     if args.split == "test" and not args.allow_test: raise SystemExit("Refusing to run the boundary sweep on test without --allow-test")
+    if args.text is None: raise SystemExit("--stage boundary-sweep needs --text pretrimmed, ar or dlm: the translator of the sweep.")
+    method = TEXT_METHODS[args.text]
+    checkpoint = args.pretrimmed_checkpoint if method == "baseline" else args.arm_checkpoint
     data_cfg = load_yaml(args.data_config)
     eval_cfg = load_yaml(args.eval_config)
     source = source_language(args)   # the translator's corpus; the gold units and the text scoring are --language's
-    method_cfg = load_yaml(method_config_path(args), language=source)
+    method_cfg = load_yaml(method_config_path(args, method), language=source)
     if args.output and source != args.language and corpus_token(args.language, source) not in Path(args.output).name: raise SystemExit(
         f"A zero-shot sweep ({source} model on {args.language}): put {corpus_token(args.language, source)!r} in --output ({args.output}), "
         f"so it cannot overwrite an in-corpus sweep."
     )
     # Optional per-run search override. Main comparisons use the greedy default.
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
-    if args.method == "baseline" and (beams := int(method_cfg["validation"]["num_beams"])) != 1: print(
-        f"[boundary-sweep] WARNING: baseline decodes with num_beams={beams} while the ar/dlm arms are greedy — "
+    if method == "baseline" and (beams := int(method_cfg["validation"]["num_beams"])) != 1: print(
+        f"[boundary-sweep] WARNING: the pretrimmed translator decodes with num_beams={beams} while the ar/dlm arms are greedy — "
         f"this run is not search-budget matched.", flush=True
     )
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
@@ -119,15 +124,13 @@ def run_boundary_sweep(args: argparse.Namespace) -> "pd.DataFrame":
     records_by_id = {record.video_id: record for record in records}
     device = pick_device(args.device)
     inference_cfg = load_yaml(args.inference_config)
-    model, tokenizer = build_eval_model(
-        args.method, args.checkpoint, source, data_cfg, method_cfg, inference_cfg, device
-    )
+    model, tokenizer = build_eval_model(method, checkpoint, source, data_cfg, method_cfg, inference_cfg, device)
     labels = model_annotation(model, data_cfg, source)
-    arm_token = translator_token(args, getattr(model, "checkpoint_path", None))
-    decoder = translator_decoder(args.method, getattr(model, "checkpoint_path", None))
-    # A variant arm, or a DLM clean floor: its sweep must not overwrite the main arm's or the AR floor's (report.py progress reads 
-    # boundary_sweep_baseline_<lang>.json as the AR floor's confidence panel).
-    if args.method != "baseline": variant = arm_variant_tokens(args, model.checkpoint_path) if getattr(model, "checkpoint_path", None) else []
+    arm_token = translator_token(args, method, getattr(model, "checkpoint_path", None))
+    decoder = translator_decoder(method, getattr(model, "checkpoint_path", None))
+    # A variant arm, or a pretrimmed DLM translator: its sweep must not overwrite the main arm's or the pretrimmed AR translator's
+    # (report.py progress reads boundary_sweep_pretrimmed_<lang>.json as the confidence panel of the pretrimmed AR translator).
+    if method != "baseline": variant = arm_variant_tokens(args, method, model.checkpoint_path) if getattr(model, "checkpoint_path", None) else []
     else: variant = ["-dlm"] if decoder == "dlm" else []
 
     if args.output and (missing := [t.lstrip("-") for t in variant if t.lstrip("-") not in Path(args.output).name]):
@@ -163,7 +166,7 @@ def run_boundary_sweep(args: argparse.Namespace) -> "pd.DataFrame":
 
         if not chunk: continue
         results = translate_windows(
-            model=model, tokenizer=tokenizer, method=args.method, method_cfg=method_cfg, inference_cfg=inference_cfg, 
+            model=model, tokenizer=tokenizer, method=method, method_cfg=method_cfg, inference_cfg=inference_cfg, 
             device=device, items=[(poses, timestamps, w.window_start_s, float(records_by_id[w.video_id].pose.fps)) 
                                   for (w, poses, timestamps) in chunk]
         )
@@ -233,7 +236,7 @@ def run_boundary_sweep(args: argparse.Namespace) -> "pd.DataFrame":
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
-            "analysis": "boundary_sweep", "language": args.language, "source_language": source, "split": args.split, "method": args.method,
+            "analysis": "boundary_sweep", "language": args.language, "source_language": source, "split": args.split, "method": method,
             "translator": arm_token, "text_level": asdict(_char_level),
             "annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
             # Per-axis grids as ACTUALLY swept: with head/tail overrides `grid` alone misdescribes the axes.
@@ -241,12 +244,12 @@ def run_boundary_sweep(args: argparse.Namespace) -> "pd.DataFrame":
             # Decode provenance, mirroring the stamp of a row's events, so 2 sweeps under different flags 
             # stay distinguishable and cross-method sweep comparisons never mix decode budgets.
             "provenance": {
-                "num_beams": int(method_cfg["validation"]["num_beams"]) if args.method == "baseline" else 1,
+                "num_beams": int(method_cfg["validation"]["num_beams"]) if method == "baseline" else 1,
                 **decode_provenance(decoder, method_cfg),
                 "gate": bool(method_cfg["membership_gate"]["enabled"]),
                 "checkpoint": getattr(model, "checkpoint_path", None),   # the file actually loaded
                 "model_annotation": labels,   # its train labels and its inits', beside the train labels at eval time
-                "segmentation_decode": "none" if args.method == "baseline" else "semi_markov_viterbi",
+                "segmentation_decode": "none" if method == "baseline" else "semi_markov_viterbi",
                 "batch_size": batch_size,     # the unit of mean_decoder_passes: per window at 1, per chunk above
             },
             "windows": len(rows), "severity": severity, "rows": rows,

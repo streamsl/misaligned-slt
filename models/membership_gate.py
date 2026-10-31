@@ -158,14 +158,16 @@ class MembershipGate(nn.Module): # First-eligible-span probabilities and the Ω 
         return run
 
     @staticmethod
-    def _forward_step(previous, emission, end, stay, residual_end, residual_stay, prefix_closures, valid):
+    def _forward_step(previous, emission, end, stay, residual_end, residual_stay, all_o, prefix_closures, valid):
         finished = (previous[:, :, 2:] + end[:, None]).masked_fill(prefix_closures, -torch.inf)
         boundary = _lse(torch.cat((previous[:, :, :1], previous[:, :, 1:2] + residual_end[:, None, None], finished), -1))
         grown = previous[:, :, 2:] + stay[:, None]
         continuation = torch.cat((grown[:, :, :-2], _lse(grown[:, :, -2:])[:, :, None]), -1) if end.shape[1] > 1 else grown[:, :, :0]
+        # A unit's first frame: B after any boundary, or I right after the all-O start (DurationDecoder.decode).
+        first = _lse(torch.stack((boundary + emission[:, None, 1], (all_o + emission[:, 2])[:, None].expand_as(boundary)), -1))
         advanced = torch.cat(((boundary + emission[:, None, 0])[:, :, None],
                               (previous[:, :, 1] + residual_stay[:, None] + emission[:, None, 2])[:, :, None],
-                              (boundary + emission[:, None, 1])[:, :, None], continuation + emission[:, None, 2:3]), -1)
+                              first[:, :, None], continuation + emission[:, None, 2:3]), -1)
         scale = torch.where(valid, _lse(advanced[:, 0]), torch.zeros_like(emission[:, 0]))
         state = torch.where(valid[:, None, None], advanced - scale[:, None, None], previous)
         return state, scale
@@ -215,6 +217,11 @@ class MembershipGate(nn.Module): # First-eligible-span probabilities and the Ω 
         scale = _lse(initial); full = initial - scale[:, None]
         pref = full
         prefixes, scales = [pref], [scale]
+        # The start rules of the decode (DurationDecoder.decode): the leading fragment continues only on the head's own leading
+        # I-run, and without a certified start the first unit may also open on I right after an all-O start, whose mass `all_o` is
+        # the same in both recurrences (it holds no completion). The suffix recurrence below needs neither: it scores what follows a
+        # unit, and both rules act only before the first unit.
+        all_o = full[:, 0].masked_fill(scores.known, -torch.inf)
 
         # Carry full-path and no-earlier-completion recurrences together.
         state = torch.stack((full, pref), 1)
@@ -226,7 +233,9 @@ class MembershipGate(nn.Module): # First-eligible-span probabilities and the Ω 
         for k in range(1, t):
             age = min(k - 1, ages - 1)
             step = self._forward_step if k == 1 else forward_step
-            state, scale = step(state, emissions[k], end, stay, residual_end[:, age], residual_stay[:, age], prefix_closures, k < n)
+            fragment_stay = residual_stay[:, age].masked_fill(k >= scores.fragment, -torch.inf)
+            state, scale = step(state, emissions[k], end, stay, residual_end[:, age], fragment_stay, all_o, prefix_closures, k < n)
+            all_o = torch.where(k < n, all_o + emissions[k][:, 0] - scale, all_o)
             prefixes.append(state[:, 1]); scales.append(scale)
 
         # After a visible start, a suffix can enter O or another sentence, never the initial leading fragment.

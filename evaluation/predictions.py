@@ -2,8 +2,8 @@
 
 An event is 1 timed unit with its text, on source-video timeline. This module maps a stream's clock to its source video, builds the reliable 
 gold and other inputs of the scores of a row (gold chunks of edge chunk score, UNK stretches of long-form score, scoreable events of segmenter spans), 
-applies the quarantine rule of scoring, turns runner and translator outputs into events, and reads and writes span files, events files, 
-gold segments, their annotation stamps and the artifact names of the rows. Every metric calculation is in `metrics.py`.
+applies the quarantine rule of scoring, turns runner and translator outputs into events, writes events files, reads events files and 
+span files with their annotation stamps, and makes the artifact names of the rows. Every metric calculation is in `metrics.py`.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
@@ -11,13 +11,14 @@ from pathlib import Path
 from typing import Any
 import json
 
-from data.loader import (WORD_RE, annotation_fingerprint, ANNOTATION_PROTOCOL, VideoRecord, best_subtitle, corpus_config,
+from data.loader import (WORD_RE, annotation_fingerprint, VideoRecord, best_subtitle, corpus_config,
                          merge_rolling_captions, parse_vtt, sorted_names)
 from data.windowing import TRUSTED_GAP_S, untrusted_o_intervals
 from infer.stream import join_unit_text
 from metrics import Segment
 
 CHUNK_CLASSES = ("over_cap", "video_start", "cut_start", "after_quarantine", "end_blocked", "free")
+BOUNDARY_CLASSES = ("abutting", "pause", "quarantine", "stream")   # the boundary at a gold unit edge (gold_edges)
 
 @dataclass(frozen=True)
 class PredictionEvent:
@@ -36,19 +37,11 @@ class PredictionEvent:
         return Segment(self.start_s, self.end_s)
 
 
-def translated_events(video_id: str, spans, results, src_rows=None) -> list[PredictionEvent]:
-    # Translated spans -> 1 event per span (never cut), carrying the commit time, forced and cap-cut flags of the span's source 
-    # row when known. A text with UNIT_SEPARATOR keeps its unit texts, joined with spaces (infer.stream.join_unit_text).
-    out = []
-    for i, (span, (text, _, _)) in enumerate(zip(spans, results)):
-        row = (src_rows[i] if src_rows and i < len(src_rows) else None) or {}
-        ct = row.get("commit_time_s")
-        out.append(PredictionEvent(
-            video_id=video_id, start_s=span.start_s, end_s=span.end_s, text=join_unit_text(text),
-            commit_time_s=None if ct is None else float(ct), flagged_partial=bool(row.get("flagged_partial", False)),
-            cap_cut=bool(row.get("cap_cut", False)),
-        ))
-    return out
+def translated_events(video_id: str, spans, results) -> list[PredictionEvent]:
+    # Translated spans -> 1 event per span (never cut). A text with UNIT_SEPARATOR keeps its unit texts, joined with spaces
+    # (infer.stream.join_unit_text).
+    return [PredictionEvent(video_id=video_id, start_s=span.start_s, end_s=span.end_s, text=join_unit_text(text))
+            for span, (text, _, _) in zip(spans, results)]
 
 def to_source(events: dict[str, list[PredictionEvent]], records: list[VideoRecord]) -> dict[str, list[PredictionEvent]]:
     """Record-keyed events on each stream's local clock -> the source video id and source time. A cut video is 1 stream per clean segment 
@@ -113,6 +106,29 @@ def gold_chunks(records: list[VideoRecord], gap_s: float) -> dict[str, list[list
             if reliable: 
                 chunk.append(PredictionEvent(video_id=rec.pose.video_id, start_s=u.start_s + off, end_s=u.end_s + off, text=u.text))
         if chunk: chunks.append(chunk)
+    return out
+
+def gold_edges(records: list[VideoRecord], gap_s: float) -> dict[str, list[tuple[str, float, str]]]:
+    """{source video: [(side, time, class)]}: the start and the end of every reliable unit of `gold_events`, in source time, each with
+    the class of its boundary (BOUNDARY_CLASSES), read from the nearest unit on that side in the same stream, reliable or quarantined:
+    before a start, the unit that ends last of those that start earlier; after an end, the next unit to start. The gap is the later
+    start minus the earlier end (an overlap is a negative gap). abutting: that unit is reliable and the gap is at most `gap_s`
+    (eval.yaml scoring.chunk_gap_s), so the edge is inside a chunk of `gold_chunks`; quarantine: it is quarantined and the gap is at
+    most `gap_s`; pause: a longer gap, or no unit on that side and the stream edge more than `gap_s` away; stream: no unit on that side
+    and the stream edge within `gap_s`. Input of `metrics.edge_boundary_hits`."""
+    kind = lambda w, gap: "pause" if gap > gap_s else "stream" if w is None else "abutting" if getattr(w, "reliable", True) else "quarantine"
+    out: dict[str, list[tuple[str, float, str]]] = {}
+    for rec in records:
+        off, edges, last = rec.pose.offset_s, out.setdefault(rec.pose.video_id, []), None   # last: the unit that ends last so far
+        units = sorted(rec.sentences, key=lambda u: u.start_s)
+        for k, u in enumerate(units):
+            if getattr(u, "reliable", True):
+                after = units[k + 1] if k + 1 < len(units) else None
+                # a gap to a unit from the source-time floats that gold_chunks compares (a stream-time gap of exactly gap_s can round
+                # to the other side of it); a gap to the stream edge in stream time
+                edges += [("start", u.start_s + off, kind(last, u.start_s + off - (last.end_s + off) if last else u.start_s)),
+                          ("end", u.end_s + off, kind(after, after.start_s + off - (u.end_s + off) if after else rec.pose.duration_s - u.end_s))]
+            if last is None or u.end_s > last.end_s: last = u
     return out
 
 def chunk_classes(records: list[VideoRecord], gap_s: float, max_span_s: float) -> dict[str, list[str]]:
@@ -190,7 +206,7 @@ def unk_stretches(records) -> dict:
 
 def segment_events(segments_by_video: dict, records: list[VideoRecord], tag: str) -> dict[str, list[PredictionEvent]]:
     """Segmenter spans on each stream's clock (keyed by record id) -> the scoreable events of the scores of a row: source time, 
-    the quarantine drop. `--segmenter-eval` and the segmenter dev monitor share it."""
+    the quarantine drop, as a row applies them (evaluation.rows). The segmenter dev monitor reads it."""
     return scoreable_predictions(to_source({vid: [
         PredictionEvent(video_id=vid, start_s=float(s.start_s), end_s=float(s.end_s)) for s in segs
     ] for vid, segs in segments_by_video.items()}, records), records, tag=tag)
@@ -204,39 +220,26 @@ def prediction_events(video_id: str, events, tokenizer) -> list[PredictionEvent]
         text=None if tokenizer is None else join_unit_text(tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True)),
     ) for ev in events]
 
-def save_prediction_file(predictions: dict[str, list[Segment]], path: str | Path, provenance: dict) -> Path:
-    # Predicted spans + WHO produced them. Without the stamp a predictions file is just spans, and the
-    # arch/decode that made it is unrecoverable — a cascade row could silently inherit the wrong decode.
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = {
-        video_id: [{"start_s": float(s.start_s), "end_s": float(s.end_s)} for s in segments]
-        for video_id, segments in sorted(predictions.items())
-    }
-    payload = {"provenance": dict(provenance), "predictions": rows}
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path
-
-def _require_never_cut(rows_by_video: dict, path) -> dict:
-    # Every row writes one event per committed span (never cut). A row with `parts` > 1 is one word-share part of a span:
-    # read as a caption, each part would score a split under the never-cut name.
-    if any(int(row.get("parts", 1)) > 1 for rows in rows_by_video.values() for row in rows if isinstance(row, dict)): raise ValueError(
+def _event_rows(path) -> dict:
+    # The rows {vid: [event]} of an events file (write_events_json, under `events`), the one file of spans that a row writes; a span
+    # file is the events file of a no-text row. Every row writes one event per committed span (never cut). A row with `parts` > 1 is
+    # one word-share part of a span: read as a caption, each part would score a split under the never-cut name.
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("events"), dict): raise ValueError(
+        f"{path} is not the events file of a row (no `events`): give the events file that an eval.py row wrote (for spans alone, the "
+        f"one of a --text none row)"
+    )
+    if any(int(row.get("parts", 1)) > 1 for rows in raw["events"].values() for row in rows if isinstance(row, dict)): raise ValueError(
         f"{path}: rows with parts > 1 are word-share parts of one span, not never-cut events; run the row that wrote it again"
     )
-    return rows_by_video
+    return raw["events"]
 
 def load_prediction_file(path: str | Path) -> dict[str, list[Segment]]:
-    # Predicted-segments JSON: a stamped dict {vid: [{start_s, end_s}]} under `predictions`, `segments` or `events`.
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(raw, dict) and "predictions" in raw: raw = raw["predictions"]  # stamped form
-    if isinstance(raw, dict) and "segments" in raw: raw = raw["segments"]  # stamped gold-segments file (write_gold_segments)
-    if isinstance(raw, dict) and "events" in raw: raw = raw["events"]  # events file of a row: its spans feed the same-span control.
-    if not isinstance(raw, dict): raise TypeError(f"{path}: a prediction file is a stamped JSON dict, not {type(raw).__name__}")
-    return {str(vid): [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows]
-            for vid, rows in _require_never_cut(raw, path).items()}
+    # The spans of an events file, as Segments.
+    return {str(vid): [Segment(float(row["start_s"]), float(row["end_s"])) for row in rows] for vid, rows in _event_rows(path).items()}
 
 def stamped_annotation(path: str | Path) -> str | None:
-    # Annotation fingerprint an artifact was made under: flat (boundary sweep, segmenter-eval payloads) or under `provenance`.
+    # Annotation fingerprint an artifact was made under: flat (a boundary sweep) or under `provenance`.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict): return None
     return raw.get("annotation_fingerprint") or (raw.get("provenance") or {}).get("annotation_fingerprint")
@@ -251,27 +254,6 @@ def warn_annotation_mismatch(path: str | Path, records: list[VideoRecord], what:
     )
     return stamped == live
 
-def load_prediction_rows(path: str | Path) -> dict[str, list[dict]]:
-    # Rows of an events file, aligned with load_prediction_file's spans (1 per event); empty for a plain segments file. 
-    # Carries what a Segment cannot: commit time, forced-partial and cap-cut flags, so a re-translated row keeps emitter's record.
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not (isinstance(raw, dict) and "events" in raw): return {}
-    return {str(vid): list(rows) for vid, rows in raw["events"].items()}
-
-def write_gold_segments(records: list[VideoRecord], path: str | Path) -> Path:
-    # GT sentence spans in the `--segments` schema (load_prediction_file dict form).
-    # Feeds the rows on true cuts (rows 1 and 2 of the result table): `eval.py --segments <this>`.
-    rows = {vid: [{"start_s": ev.start_s, "end_s": ev.end_s, "text": ev.text} for ev in evs] for vid, evs in gold_events(records).items()}
-    out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "provenance": {"annotation_protocol": ANNOTATION_PROTOCOL, "annotation_fingerprint": annotation_fingerprint(records),
-                       "segmenter_arch": "gold", "decode": "none"},
-        "segments": rows
-    }
-    out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return out
-
 def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEvent:
     if isinstance(value, dict):
         vid = str(value.get("video_id", video_id or ""))
@@ -285,27 +267,21 @@ def _segment_from_any(value: Any, video_id: str | None = None) -> PredictionEven
     raise TypeError(f"Unsupported prediction segment row: {value!r}")
 
 def load_event_predictions(path: str | Path) -> dict[str, list[PredictionEvent]]:
-    # An events file (write_events_json), or a span file (save_prediction_file, write_gold_segments): spans with no text, which
-    # `eval.py --predictions` scores as a segmentation-only row (the chance rows of analyze.py --stage chance-spans).
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    for key in ("events", "predictions", "segments"):
-        if isinstance(data, dict) and key in data:
-            data = data[key]
-            break
-    if not isinstance(data, dict): raise TypeError(f"{path}: an events file is a stamped JSON dict, not {type(data).__name__}")
+    # An events file: what eval.py --predictions scores again and what eval.py --spans <file> reads.
     return {str(video_id): [_segment_from_any(row, video_id=str(video_id)) for row in segments]
-            for video_id, segments in _require_never_cut(data, path).items()}
+            for video_id, segments in _event_rows(path).items()}
 
 def corpus_token(language: str, source_language: str | None = None) -> str:
     # The corpus field of an artifact name: the evaluated corpus, or `<source>-to-<language>` for a zero-shot run (models trained on
     # eval.py --source-language), so a zero-shot artifact never takes the name of an in-corpus one.
     return language if source_language in (None, language) else f"{source_language}-to-{language}"
 
-def output_stem(when: str, spans: str, decode: str, translator: str, language: str, split: str) -> str:
-    # Name shape for every row: `{when}_{spans}_{decode}_{translator}_{lang}_{split}`, in outputs/{when}/; `lang` is corpus_token's.
-    for field, value in (("when", when), ("spans", spans), ("decode", decode), ("translator", translator)):
+def output_stem(when: str, spans: str, decode: str, text: str, corpus: str, split: str) -> str:
+    # Name shape for every row: `{when}_{spans}_{decode}_{text}_{corpus}_{split}`, in outputs/{when}/: each field follows a flag of
+    # eval.py (--offline/--online, --spans, --decode, --text, --language with --source-language, --split); `corpus` is corpus_token's.
+    for field, value in (("when", when), ("spans", spans), ("decode", decode), ("text", text)):
         if not value or "_" in str(value): raise ValueError(f"row output {field}={value!r}: one non-empty token, no underscore")
-    return f"{when}_{spans}_{decode}_{translator}_{language}_{split}"
+    return f"{when}_{spans}_{decode}_{text}_{corpus}_{split}"
 
 def write_events_json(predicted: dict[str, list[PredictionEvent]], path: str | Path, provenance: dict | None = None,) -> Path:
     out = Path(path)

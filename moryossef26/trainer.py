@@ -2,8 +2,9 @@
 
 Their 50 landmarks (+ velocity) → UNet CNN → RoPE Transformer → phrase BIO head: their own input contract, not the
 in-system head's Uni-Sign features. Standalone on whole-video chunks, never the FSM head's bio_head_init. Everything else 
-is S1's (train/bio_pretrain.py): pool and rotation, chunk tiling, augmentation, labels, dev monitor and best-epoch floor. It draws
-plain chunks only (the release trains on chunks), not S1's windows or restart chunks; ChunkDataset refuses them with `release`.
+is S1's (train/bio_pretrain.py): pool and rotation, chunk tiling, augmentation, labels, dev monitor (under the decode of its own
+config's segmenter_decode) and best-epoch floor. It draws plain chunks only (the release trains on chunks), not S1's windows or
+restart chunks; ChunkDataset refuses them with `release`.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -71,10 +72,11 @@ def build_moryossef_loaders(
     # Stamped for the same reason S1 stamps it: the two arms' monitors are only comparable next to their dev sets.
     dev_records, dev_mix = resolve_pretrain_records(cfg, data_cfg, language, "dev")
     if dev_mix: cfg["pretrain_dev_mix"] = cfg["checkpoint_meta"]["pretrain_dev_mix"] = dev_mix
-    # S1's checkpoint selection: these dev records as whole streams under the scoring of the rows (train.helpers.evaluate_segmenter).
-    cfg["video_monitor"] = segmenter_monitor_config(data_cfg, dev_records)
+    # S1's checkpoint selection: these dev records as whole streams under the scoring of the rows, with the decode of this config's
+    # segmenter_decode (train.helpers.evaluate_segmenter).
+    cfg["video_monitor"] = segmenter_monitor_config(cfg, data_cfg, dev_records)
     cfg["checkpoint_meta"].update(
-        monitor_decode="semi_markov_viterbi", monitor_protocol="edge_chunk_f1_avg_complete_spans", monitor_edge=cfg["video_monitor"]["edge"],
+        monitor_decode=cfg["video_monitor"]["decode"], monitor_protocol="edge_chunk_grid_f1_complete_spans", monitor_edge=cfg["video_monitor"]["edge"],
     )
     # One fixed chunk length, C = L_min = (num_frames - 1) / fps: a floored-and-ceiled window loads at most num_frames frames,
     # so a training chunk is one RoPE pass. fps is the highest record rate, so no record's chunk holds more than num_frames; 

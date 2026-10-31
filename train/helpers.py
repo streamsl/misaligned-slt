@@ -519,15 +519,31 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
     return out
 
 
-def segmenter_monitor_config(data_cfg: dict, dev_records) -> dict:
-    """What the segmenter dev monitor (`evaluate_segmenter`) reads, as plain values in the run config: the train-fitted duration
-    prior of each dev language (the prior its rows decode with), the span floor of every offline row (Λ_min of configs/inference.yaml,
-    read as the loader reads it; complete spans, no buffer cap) and the edge chunk score's chunk gap and taus (configs/eval.yaml scoring)."""
+def segmenter_config_decode(cfg: dict) -> str:
+    # `segmenter_decode` of a segmenter config (S1 or the Moryossef segmenter): the decode of its checkpoint selection and its rows.
+    decode = cfg.get("segmenter_decode")
+    if decode not in ("argmax", "duration"): raise SystemExit(
+        f"The segmenter config sets segmenter_decode={decode!r}: set it to argmax or duration, the decode of the segmenter's checkpoint "
+        f"selection (val_video_f1) and of its rows."
+    )
+    return decode
+
+
+def segmenter_monitor_config(cfg: dict, data_cfg: dict, dev_records) -> dict:
+    """What the segmenter dev monitor (`evaluate_segmenter`) reads, as plain values in the run config: the decode that the segmenter
+    config `cfg` names, as the checkpoint stamps it (`monitor_decode`: semi_markov_viterbi for the duration decode, argmax for the most
+    likely tag of each frame), the train-fitted duration prior of each dev language for the duration decode (the prior its rows decode
+    with; None for argmax, which reads no prior), the span floor of every offline row (Λ_min of configs/inference.yaml, read as the
+    loader reads it; complete spans, no buffer cap) and the grid of the main score: the chunk gap, the edge taus and the tIoU thresholds
+    (configs/eval.yaml scoring)."""
+    duration = segmenter_config_decode(cfg) == "duration"
     languages, scoring_cfg = sorted({str(record.language) for record in dev_records}), load_yaml("configs/eval.yaml")["scoring"]
     return {
-        "priors": {language: DurationModel.for_language(data_cfg, language).to_dict() for language in languages},
+        "decode": "semi_markov_viterbi" if duration else "argmax",
+        "priors": {language: DurationModel.for_language(data_cfg, language).to_dict() for language in languages} if duration else None,
         "min_span_s": lambda_min_s(load_yaml("configs/inference.yaml")),
-        "edge": {"chunk_gap_s": float(scoring_cfg["chunk_gap_s"]), "edge_taus_s": [float(t) for t in scoring_cfg["edge_taus_s"]]},
+        "edge": {"chunk_gap_s": float(scoring_cfg["chunk_gap_s"]),
+                 **{k: [float(t) for t in scoring_cfg[k]] for k in ("edge_taus_s", "tiou_thresholds")}},
     }
 
 
@@ -535,12 +551,14 @@ def evaluate_segmenter(
     model: torch.nn.Module, loader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None,
     monitor: dict, velocity: bool, rope_chunk_s: float | None,
 ) -> dict[str, float]:
-    """Both segmenters' dev monitor. Checkpoint selection reads `val_video_f1`: the main segmentation score on the whole dev streams
-    (evaluation.segmenter_eval.segmenter_dev_scores: the whole-video pass of `--segmenter-eval`, each language's duration prior, the
-    edge chunk F1 averaged over the edge taus, then over languages). Dev-chunk losses and counts stay as diagnostics."""
+    """Both segmenters' dev monitor. Checkpoint selection reads `val_video_f1`: the main score of a row on the whole dev streams
+    (evaluation.segmenter_eval.segmenter_dev_scores: the whole-video pass of `eval.py --offline --text none` under the monitor's decode, with each
+    language's duration prior for the duration decode, the F1 of the tIoU x edge-limit grid at tau avg and tIoU avg, then the mean over
+    languages). Dev-chunk losses and counts stay as diagnostics."""
     from evaluation.segmenter_eval import segmenter_dev_scores
     result = evaluate_bio_chunks(model, loader, device, dice_weight, class_weights)
-    priors = {language: DurationModel(**values) for language, values in monitor["priors"].items()}
+    # No priors: argmax (segmenter_monitor_config).
+    priors = None if monitor["priors"] is None else {language: DurationModel(**values) for language, values in monitor["priors"].items()}
     scores = segmenter_dev_scores(model, loader.dataset.records, device, velocity, rope_chunk_s, priors, monitor["edge"], monitor["min_span_s"])
     return {**result, **{f"val_{key}": value for key, value in scores.items()}}
 

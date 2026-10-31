@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import T5Tokenizer
 
 from data.batch import WindowCollator
@@ -124,11 +124,12 @@ def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
         "train_inputs": slt_cfg.get("train_inputs"),
         # The checkpoint monitor; online_dev_hours only for the online monitor (the offline monitor reads the whole dev set).
         "monitor": slt_cfg.get("checkpoint", {}).get("monitor"), "seed": slt_cfg.get("seed"),
-        # What a row monitor computes (`evaluation.offline.dev_monitor_scores`) and its edge chunk settings (eval.yaml scoring), so --resume
-        # refuses a run selected under another one. The inference settings a monitor reads (inference.yaml stride_s and K, and with them
-        # the cap cut window, the FSM and span rules) are not stamped: a change can select another epoch, and --resume does not refuse a
-        # run across it (README "After a change"). The clean floor's monitor (val_translation_bleu4) stamps neither.
-        **({"monitor_protocol": "edge_chunk_f1_x_edge_dvc_bleu4", "monitor_edge": slt_cfg.get("monitor_edge")}
+        # What a row monitor computes (`evaluation.offline.dev_monitor_scores`) and the grid of its main score (eval.yaml scoring: chunk
+        # gap, edge taus, tIoU thresholds), so --resume refuses a run selected under another one. The inference settings a monitor reads
+        # (inference.yaml stride_s and K, and with them the cap cut window, the FSM and span rules) are not stamped: a change can select
+        # another epoch, and --resume does not refuse a run across it (README "After a change"). The clean floor's monitor
+        # (val_translation_bleu4) stamps neither.
+        **({"monitor_protocol": "edge_chunk_grid_f1_x_dvc_bleu4", "monitor_edge": slt_cfg.get("monitor_edge")}
            if str(slt_cfg.get("checkpoint", {}).get("monitor", "")).startswith(("val_offline_", "val_online_")) else
            {"monitor_protocol": None, "monitor_edge": None}),
         "online_dev_hours": slt_cfg.get("checkpoint", {}).get("online_dev_hours")
@@ -198,23 +199,26 @@ def assert_targets_fit(records, tokenizer, max_text_tokens: int, buffer_cap_s: f
 
 def require_translator_init(
     pretrained_path, segmentation_branch: bool, language: str, inference_cfg: dict, fingerprint, decoder: str, block_size: int,
-    augmentation: dict,
+    augmentation: dict, *, floor_corpus: str | None = None,
 ) -> dict:
     """Translator warm start of a train-slt run. Clean floor starts from released Uni-Sign weights (no training meta): the corpus's own
     released translator (data.yaml released_slt) or the method's checkpoint.from_pretrained (utils.resolve_pretrained). An arm starts
-    from THIS language's clean floor of its own decoder (a DLM floor at its own block size, trained under the arm's augmentation),
-    trained under fixed constants (other annotations only warn). Returns the warm start's meta."""
+    from the clean floor of its own decoder (a DLM floor at its own block size, trained under the arm's augmentation) of THIS language,
+    or of `floor_corpus` when the language trains its clean translators there (data.yaml floor_corpus), trained under fixed constants
+    (other annotations only warn). Returns the warm start's meta."""
+    floor_corpus = str(floor_corpus or language)
     # A trained warm start carries meta; the released Uni-Sign file carries none.
     init_meta = load_checkpoint_meta(pretrained_path) if Path(str(pretrained_path)).exists() else {}
     key = f"data.yaml languages.{language}.pretrained_slt.{decoder}"
     if segmentation_branch and not init_meta: raise SystemExit(
-        f"Stage 2 must warm-start the translator from this language's trained {decoder} clean floor, but {pretrained_path} "
-        f"carries no training meta (the released file, or no file). Train that clean floor (README B2a), then set {key} to it (B2b)."
+        f"Stage 2 must warm-start the translator from this language's trained pretrimmed {decoder} translator, but {pretrained_path} "
+        f"carries no training meta (the released file, or no file). Train that pretrimmed translator (README B2a), then set {key} to "
+        f"it (B2b)."
     )
     # After the B2b re-root, data.yaml pretrained_slt names the previous clean floor: warm-starting the floor from it would
     # silently fine-tune the old floor a second time.
     if not segmentation_branch and init_meta: raise SystemExit(
-        f"The clean floor must warm-start from released Uni-Sign weights, but {pretrained_path} is a trained checkpoint "
+        f"The pretrimmed translator must warm-start from released Uni-Sign weights, but {pretrained_path} is a trained checkpoint "
         f"(architecture={init_meta.get('architecture')!r}). Point data.yaml languages.{language}.released_slt (the corpus's own "
         f"released translator, when it has one) or else checkpoint.from_pretrained (baseline_train.yaml) at a released file, "
         f"or point {key} back at it."
@@ -227,17 +231,18 @@ def require_translator_init(
         found = {"architecture": init_meta.get("architecture"), "language": init_meta.get("language"),
                  "decoder": init_meta.get("decoder"), "block_size": init_meta.get("block_size"),
                  "augmentation": init_meta.get("augmentation")}
-        want = {"architecture": "clean_translation", "language": str(language), "decoder": str(decoder), "augmentation": augmentation}
+        want = {"architecture": "clean_translation", "language": floor_corpus, "decoder": str(decoder), "augmentation": augmentation}
         if decoder == "dlm": want["block_size"] = int(block_size)
         bad = [f"{k}={found[k]!r} (need {want[k]!r})" for k in want if found[k] != want[k]]
         if bad: raise SystemExit(
-            f"Stage 2 warm-starts the translator from {pretrained_path}, but it is not this language's {decoder} clean translator: "
-            f"{'; '.join(bad)}. Train that clean floor (README B2a), then set {key} to it (B2b)."
+            f"Stage 2 warm-starts the translator from {pretrained_path}, but it is not the pretrimmed {decoder} translator of "
+            f"{floor_corpus}: {'; '.join(bad)}. Train that pretrimmed translator (README B2a), then set {key} to it (B2b)."
         )
-        if init_meta.get("annotation_fingerprint") != fingerprint: print(
+        # A floor of another corpus trained on that corpus's labels, which stage 2 does not load: every row's provenance compares them.
+        if floor_corpus == str(language) and init_meta.get("annotation_fingerprint") != fingerprint: print(
             f"WARNING: the translator warm start {pretrained_path} trained on other {language} "
             f"annotations ({init_meta.get('annotation_fingerprint')!r}, now {fingerprint!r}). "
-            f"Retrain the clean baseline before a run you report.", flush=True
+            f"Retrain the pretrimmed translator before a run you report.", flush=True
         )
         require_fixed_constants(init_meta, inference_cfg, pretrained_path)  # same rule eval applies to it
     return init_meta
@@ -248,7 +253,8 @@ def fold_s1_stitch(model: MisalignedSLTModel, s1_pose_sd: dict, batches, ridge: 
     """One-stream arm: pooled S1's head reads clean translator's encoder E through the affine least-squares map from E's tokens
     to S1's encoder tokens, folded exactly into `bio_head.input_proj` (W <- W M, b <- W m + b; no new parameter). S1's encoder 
     is only regression target on unlabeled train rows. It's not kept, and the head and E then train on both losses. Ridge
-    1e-6·tr(XᵀX)/d on the weights, none on the offset. Returns frame count and the in-sample R² (pooled over dimensions)."""
+    1e-6·tr(XᵀX)/d on the weights, none on the offset. Under torchrun each rank reads its share of the rows and the sums are added
+    over ranks, so every rank folds the fit of all rows. Returns frame count and the in-sample R² (pooled over dimensions)."""
     student = model.front_end.pose_encoder
     teacher = copy.deepcopy(student)
     teacher.load_state_dict(s1_pose_sd, strict=True)
@@ -264,6 +270,10 @@ def fold_s1_stitch(model: MisalignedSLTModel, s1_pose_sd: dict, batches, ridge: 
         x, y = student(poses, mask)[mask].float().cpu().double(), teacher(poses, mask)[mask].float().cpu().double()
         x = torch.cat([x, x.new_ones(len(x), 1)], 1)
         gram += x.T @ x; cross += x.T @ y; y_sum += y.sum(0); y_sq += float((y * y).sum()); n += len(y)
+    if dist.is_distributed():
+        on = device if device.type == "cuda" else torch.device("cpu")   # NCCL reduces CUDA tensors, gloo CPU ones
+        gram, cross, y_sum, tail = (dist.all_sum(t.to(on)).cpu() for t in (gram, cross, y_sum, torch.tensor([y_sq, n], dtype=torch.float64)))
+        y_sq, n = float(tail[0]), int(tail[1])
 
     shrink = torch.zeros(d + 1, dtype=torch.float64)
     shrink[:d] = ridge * gram.diagonal()[:d].sum() / d
@@ -281,7 +291,7 @@ def fold_s1_stitch(model: MisalignedSLTModel, s1_pose_sd: dict, batches, ridge: 
 
 def build_slt_components(
     data_config: str = "configs/data.yaml", slt_config: str = "configs/dlm.yaml", inference_config: str = "configs/inference.yaml",
-    include_dev: bool = False, language: str | None = None, bio_config: str = BIO_S1_CONFIG,
+    include_dev: bool = False, language: str | None = None, bio_config: str = BIO_S1_CONFIG, resume: bool = False,
 ) -> SLTComponents:
     data_cfg = load_yaml(data_config)
     slt_cfg = load_yaml(slt_config)
@@ -312,7 +322,7 @@ def build_slt_components(
     segmentation_branch = gate_on or bool(bio_init)
     if segmentation_branch != (float(slt_cfg["lambda_bio"]) != 0.0): raise SystemExit(
         "lambda_bio must be > 0 exactly when the recipe has a segmentation branch (gate on or bio_head_init set): "
-        "without a branch there is no BIO loss, and a branch without BIO supervision is incoherent. The clean-floor "
+        "without a branch there is no BIO loss, and a branch without BIO supervision is incoherent. The pretrimmed-translator "
         "recipe sets lambda_bio: 0, bio_head_init: null and membership_gate.enabled: false. The architecture stamp "
         "and the duration fit key on lambda_bio, so the two must agree."
     )
@@ -321,6 +331,13 @@ def build_slt_components(
     if segmentation_branch and not (bio_init and Path(bio_init).exists()): raise SystemExit(
         f"checkpoint.bio_head_init {bio_init!r} not found: stage 2 needs a trained S1 for its segmentation branch. "
         f"Run `train.py --stage train-bio` first, or fix the path/cwd."
+    )
+    # A corpus may train its clean translators on another corpus (data.yaml floor_corpus: BOBSL's manual alignment takes the automatic
+    # alignment of the official train split, LiTFiC's protocol); its own run of the clean floor would train another protocol.
+    floor_corpus = str(((data_cfg.get("languages") or {}).get(language) or {}).get("floor_corpus") or language)
+    if not segmentation_branch and floor_corpus != language: raise SystemExit(
+        f"The pretrimmed translators of {language} train on {floor_corpus} (data.yaml languages.{language}.floor_corpus). Train this "
+        f"pretrimmed translator with --language {floor_corpus} (README B2a), then point languages.{language}.pretrained_slt at it (B2b)."
     )
     
     slt_cfg["decoder"] = str(slt_cfg.get("decoder", "dlm"))
@@ -333,10 +350,13 @@ def build_slt_components(
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     # The dev scores' text level is declared, not sniffed (metrics.text_level): the target language, and lowercase on both sides when
     # data.yaml sets lowercase_references, as every row of this corpus scores. Not stamped: a new meta key would refuse every --resume.
+    # A corpus may choose its epoch on another corpus's dev split (data.yaml dev_corpus: BOBSL's automatic alignment on the hand-aligned
+    # Sent-Val of the manual alignment, as LiTFiC develops); the dev texts then score at that corpus's level.
+    dev_corpus = str(data_cfg["languages"][language].get("dev_corpus") or language)
     slt_cfg["target_lang"] = target_lang
-    slt_cfg["lowercase_references"] = bool(data_cfg["languages"][language].get("lowercase_references", False))
+    slt_cfg["lowercase_references"] = bool(data_cfg["languages"][dev_corpus].get("lowercase_references", False))
     if slt_cfg["lowercase_references"] and dist.is_main(): print(
-        f"slt | dev text scores in lowercase (data.yaml languages.{language}.lowercase_references)", flush=True)
+        f"slt | dev text scores in lowercase (data.yaml languages.{dev_corpus}.lowercase_references)", flush=True)
     # Uni-Sign front end. language_model.name picks the mT5 checkpoint and its tokenizer.
     lm_name = str(cfg_get(slt_cfg, "language_model", "name", default="google/mt5-base"))
     prompt_lang = PROMPT_LANG_BY_TARGET.get(str(target_lang or ""), "English")
@@ -357,9 +377,10 @@ def build_slt_components(
     num_workers = int(slt_cfg.get("num_workers", 0))
     dev_loader, monitor_records = None, None
     if include_dev:
-        dev_records, _ = load_language_records(data_cfg, language, split="dev")
+        dev_records, _ = load_language_records(data_cfg, dev_corpus, split="dev")
+        if dev_corpus != language and dist.is_main(): print(f"slt | dev split of {dev_corpus} (data.yaml languages.{language}.dev_corpus)", flush=True)
         assert_targets_fit(dev_records, tokenizer, collator.max_text_tokens, inference_cfg["buffer_cap_s"],
-                           float(inference_cfg["boundary_stability"]["delta_s"]), f"{language}/dev")
+                           float(inference_cfg["boundary_stability"]["delta_s"]), f"{dev_corpus}/dev")
         # Dev scores the same experimental unit as standard SLT training: 1 window per reliable sentence anchor 
         # (the dataset's length), not 1 per video. deterministic: the same dev windows every epoch.
         dev_dataset = StreamingWindowDataset(dev_records, slt_cfg=slt_cfg, inference_cfg=inference_cfg, deterministic=True)
@@ -373,14 +394,15 @@ def build_slt_components(
         elif segmentation_branch and monitor.startswith("val_online_") and hours > 0:
             monitor_records, total_s = online_monitor_records(dev_records, hours, int(slt_cfg.get("seed", 42)))
         if monitor_records:
-            scoring_cfg = load_yaml("configs/eval.yaml")["scoring"]   # the monitor reads the main scores (the edge chunk match)
-            slt_cfg["monitor_edge"] = {"chunk_gap_s": float(scoring_cfg["chunk_gap_s"]), "edge_taus_s": [float(t) for t in scoring_cfg["edge_taus_s"]]}
+            scoring_cfg = load_yaml("configs/eval.yaml")["scoring"]   # the monitor reads a row's main score: its tau x tIoU grid
+            slt_cfg["monitor_edge"] = {"chunk_gap_s": float(scoring_cfg["chunk_gap_s"]),
+                                       **{k: [float(t) for t in scoring_cfg[k]] for k in ("edge_taus_s", "tiou_thresholds")}}
             if dist.is_main(): print(f"slt | dev monitor: {len({r.pose.video_id for r in monitor_records})} "
                                      f"dev videos, {len(monitor_records)} streams, {total_s / 3600:.2f} h", flush=True)
     pretrained_path = resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth")
     init_meta = require_translator_init(
         pretrained_path, segmentation_branch, language, inference_cfg, slt_cfg.get("annotation_fingerprint"),
-        slt_cfg["decoder"], int(slt_cfg["block_size"]), slt_cfg["augmentation"],
+        slt_cfg["decoder"], int(slt_cfg["block_size"]), slt_cfg["augmentation"], floor_corpus=floor_corpus,
     )
     # `pretrained_path` (the clean floor of this decoder for an arm, the released Uni-Sign file for the floor itself) is loaded inside
     # MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the block-diffusion decoder inherits its pose + LM weights; a DLM
@@ -427,7 +449,7 @@ def build_slt_components(
     warn_pose_geometry(init_meta, pretrained_path)
     slt_cfg["pose_geometry"] = POSE_GEOMETRY
     if not segmentation_branch: print(
-        "slt | clean floor: no segmentation branch (lambda_bio 0, gate off, no bio_head_init). The released front end trains alone. "
+        "slt | pretrimmed translator: no segmentation branch (lambda_bio 0, gate off, no bio_head_init). The released front end trains alone. "
         "S1's segmentation-adapted encoder stays out, so this row remains a faithful Uni-Sign transfer.", flush=True
     )
     else:
@@ -449,8 +471,9 @@ def build_slt_components(
             f"{bio_init} was trained on pool {_s1_meta.get('pretrain_pool')!r}, but bio_pretrain.yaml expects "
             f"{pool_key(bio_cfg)!r}. Retrain S1 for this pool, or point checkpoint.bio_head_init at the matching model."
         )
-        # Labels are not in any tensor either: an S1 trained before a re-convert or re-measured cuts would load silently.
-        require_segmenter_data(_s1_meta, data_cfg, {language: slt_cfg["annotation_fingerprint"]}, inference_cfg["buffer_cap_s"], str(bio_init))
+        # Labels are not in any tensor either: an S1 trained before a re-convert or re-measured cuts would load silently. Stage 2 compares
+        # only the target's own stamp, so no other corpus loads and it runs on a machine that holds only its target.
+        require_segmenter_data(_s1_meta, {language: slt_cfg["annotation_fingerprint"]}, inference_cfg["buffer_cap_s"], str(bio_init))
         warn_pose_geometry(_s1_meta, str(bio_init))
         model.bio_head.load_state_dict(head_sd, strict=True)
         slt_cfg["resolved_inits"] = _resolved_inits(pretrained_path, init_meta, bio_init, _s1_meta)
@@ -465,13 +488,20 @@ def build_slt_components(
             print(f"slt | loaded S1 from {bio_init}: {len(head_sd)} head tensors and {len(pose_sd)} pose-encoder "
                   f"tensors into the segmentation branch; the translator keeps its own encoder", flush=True)
         else:
-            picks = torch.linspace(0, len(train_dataset) - 1, 400).long().unique().tolist()
-            fit = fold_s1_stitch(model, pose_sd, (collator(
-                [train_dataset[i] for i in picks[k:k + 16]]) for k in range(0, len(picks), 16)
+            # The fit reads every train row once at its epoch-1 draw, rank r the rows r, r + N, ... (fold_s1_stitch adds the sums over
+            # ranks). A resumed run skips it: latest.pt holds the trained input_proj, which its load would write over the fit.
+            rows = Subset(train_dataset, range(dist.rank(), len(train_dataset), dist.world_size()))
+            fit = None if resume else fold_s1_stitch(model, pose_sd, DataLoader(
+                rows, batch_size=dist.per_rank_batch_size(int(slt_cfg["checkpoint"]["dev_batch_size"])), collate_fn=collator,
+                num_workers=num_workers,
             ))
-            print(f"slt | one stream: clean translator's encoder is shared. S1's head ({len(head_sd)} tensors, {bio_init}) reads "
-                  f"it via a least-squares map to S1's encoder tokens folded into bio_head.input_proj ({fit['frames']} train "
-                  f"frames, R^2 {fit['r2']:.3f}); S1's encoder is not kept", flush=True)
+            if dist.is_main(): print(
+                f"slt | one stream: 1 pose encoder, the pretrimmed translator's, feeds the translator and the BIO head, and both losses "
+                f"train it. The head is S1's ({len(head_sd)} tensors, {bio_init}); it reads this encoder through a linear map to S1's "
+                f"encoder features, folded into bio_head.input_proj, which trains (no new weight). " + (
+                    "Resumed run: input_proj comes from latest.pt, so no new fit." if fit is None else
+                    f"Least-squares fit on all {len(train_dataset)} train rows: {fit['frames']} unlabeled frames, in-sample R^2 "
+                    f"{fit['r2']:.3f}.") + " S1's own pose encoder only gives the fit its targets: it is not in the model", flush=True)
 
     print(f"slt | model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters, all trained at 1 rate", flush=True)
     return SLTComponents(
@@ -488,8 +518,9 @@ def evaluate_slt(
 ) -> dict[str, float]:
     """Every run logs its dev-window losses (val_loss and its parts). Joint training logs the row scores of whole dev videos for the 
     protocol that checkpoint.monitor names: val_offline_* for offline row (evaluation.offline.offline_dev_scores), val_online_* 
-    for online row, the streaming FSM (evaluation.online.online_dev_scores). The monitor is edge chunk F1 avg x the edge chunk DVC
-    BLEU-4 avg (the main scores), logged with both parts and events per gold unit."""
+    for online row, the streaming FSM (evaluation.online.online_dev_scores). The monitor is the main score of the row, the F1 of the
+    tIoU x edge-limit grid (tau avg, tIoU avg), x the DVC BLEU-4 of the pairs that count (the same avg), logged with both parts and
+    events per gold unit."""
     was_training = model.training
     model.eval()
     arm = float(slt_cfg["lambda_bio"]) != 0.
@@ -608,8 +639,8 @@ def train_slt_epochs(
         offline = str(slt_cfg.get("checkpoint", {}).get("monitor", "")).startswith("val_offline_")
         name, row = ("offline", "--offline row on whole dev set: each video segmented once, each span translated") \
                     if offline else ("online", "--online row, streaming FSM, on whole dev videos up to checkpoint.online_dev_hours")
-        print(f"slt | checkpoint monitor: val_{name}_score = val_{name}_f1 (edge chunk F1) x val_{name}_bleu4 (edge chunk DVC BLEU-4) "
-              f"({row}, the main scores)", flush=True)
+        print(f"slt | checkpoint monitor: val_{name}_score = val_{name}_f1 (the main score: the F1 of the tIoU x edge-limit grid at tau avg "
+              f"and tIoU avg) x val_{name}_bleu4 (the DVC BLEU-4 of the pairs that count, the same avg) ({row})", flush=True)
 
     def step_fn(batch, epoch: int):
         output = training_loss(model, batch, slt_cfg)

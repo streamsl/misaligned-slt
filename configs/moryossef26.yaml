@@ -5,8 +5,9 @@
 # Its training recipe is S1's: pool, augmentation, labels, optimizer schedule, dev monitor and best-epoch floor 
 # (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`). 
 # Declared differences: the model, the input contract, the initialization (released weights here, Uni-Sign encoder + 
-# random head in S1), the chunk length (fixed (num_frames - 1) / fps s here, U(δ + K·stride, C) s in S1) and input types
-# (pretrain.inputs: [chunks] here, the release's chunk-only training; S1 lists its own types in bio_pretrain.yaml).
+# random head in S1), the chunk length (fixed (num_frames - 1) / fps s here, U(δ + K·stride, C) s in S1), input types
+# (pretrain.inputs: [chunks] here, the release's chunk-only training; S1 lists its own types in bio_pretrain.yaml) and the
+# decode of its rows (segmenter_decode: argmax here and in S1, the plain decode of both dev monitors).
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
@@ -14,11 +15,14 @@ checkpoint:
     # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
     dir: checkpoints/moryossef/${corpus}
     save_best: true
-    monitor: val_video_f1  # S1's monitor: the edge chunk F1 on whole dev streams (train.helpers.evaluate_segmenter)
+    monitor: val_video_f1  # S1's monitor: the no-text row's main score (the F1 of the tIoU x edge-limit grid, tau avg and tIoU avg) on whole dev streams (train.helpers.evaluate_segmenter)
     mode: max
     restore_best: true
     eval_every_epochs: 1
     from_pretrained: checkpoints/moryossef26.safetensors
+# The decode of val_video_f1 and of this segmenter's rows (the checkpoint stamps it as monitor_decode): argmax, the most likely tag of
+# each frame, as published and as S1 (offline and online by default; viterbi and duration are --decode rows).
+segmenter_decode: argmax
 wandb:
     enabled: false
     project: misaligned-slt

@@ -9,7 +9,7 @@ from poses import normalize_keypoints_unisign
 from models.bio_head import require_band_reach
 from models.streaming_slt import support_crop
 
-from infer.duration_decode import DurationDecoder
+from infer.duration_decode import DurationDecoder, argmax_tags
 from infer.commit_gate import CommitGate, candidate_spans, cap_cut_frame, cap_cut_window, open_span_start
 from infer.stability import display_prefix
 from utils import UNIT_SEPARATOR, seconds_to_frames
@@ -83,11 +83,14 @@ class StreamingSLTRunner:
 
     No decoder state across strides: each stride recomputes features/BIO for the buffer and cold-starts translation for 
     the selected target span (first complete span ≥ Λ_min); only the commit log and the per-span boundary votes persist.
+    The buffer's BIO tags come from the legal path search (DurationDecoder: viterbi, or the semi-Markov decode with the model's
+    duration prior) or, with `argmax` (a standalone segmenter only), from each frame's most likely tag (argmax_tags). Every
+    rule after the tags (the spans, the votes, the cap, the commit, the trace and the stitched timeline) is the same for each decode.
     """
     def __init__(
         self, model, *, stride_s: float, buffer_cap_s: float, delta_s: float, hysteresis_strides: int, min_span_s: float,
         max_text_tokens: int, tau_dec: float, spd_top_k: int, spd_renormalize: bool, gate_eps: float, band_reach: dict | None,
-        gate_enabled: bool = False, record_trace: bool = False, translate: bool = True, cascade_model=None,
+        gate_enabled: bool = False, record_trace: bool = False, translate: bool = True, cascade_model=None, argmax: bool = False,
     ):
         # Joint arm decodes under Ω, a hard crop of selected span, and reads Ω support as a crop of buffer (models.streaming_slt.support_crop),
         # as in its stage-2 training. Emitted boundaries come from the BIO span. P1 at inference: an event needs both edges from the decode,
@@ -105,7 +108,10 @@ class StreamingSLTRunner:
         # The tokenizer of the translator that writes the text (the clean translator in an online cascade, 
         # whose segmenter adapter has none): the trace cuts each decode at its EOS with it.
         self.text_tokenizer = getattr(cascade_model if cascade_model is not None else model, "tokenizer", None)
-        if cascade_model is not None and gate_enabled: raise ValueError("The online cascade uses an ungated clean translator.")
+        if cascade_model is not None and gate_enabled: raise ValueError("The online cascade uses an ungated pretrimmed translator.")
+        # The argmax decode (eval.py --online --decode argmax) tags each frame alone; a gated arm's Ω reads its legal path.
+        if argmax and gate_enabled: raise ValueError("The argmax decode is for a standalone segmenter, whose FSM has no gate.")
+        self.argmax = bool(argmax)
         self.stride_s = float(stride_s)
         self.buffer_cap_s = float(buffer_cap_s)
         if not all(0.0 < value < float("inf") for value in (self.stride_s, self.buffer_cap_s)):
@@ -257,10 +263,11 @@ class StreamingSLTRunner:
         mask, ts = mask_b, ts_b
         bio_output = self.model.segment(poses_b, mask_b, ts_b, translator_tap=bio_tap)
         bio_logits = bio_output.logits
-        bio_tags = DurationDecoder(getattr(self.model, "duration_model", None)).decode(
-            bio_logits, mask.long().sum(1), chi, known_start=self._committed_is_terminator, timestamps_s=ts
-        )[0]
-        # Stitch this stride's Viterbi tags into whole-stream timeline (latest estimate wins on revisits) so a row can score the segmentation
+        # The decode's tags, with the committed prefix UNK and the certified start (known_start) read as a start by each decode.
+        bio_tags = (argmax_tags(bio_logits, mask.long().sum(1), chi, known_start=self._committed_is_terminator) if self.argmax else
+                    DurationDecoder(getattr(self.model, "duration_model", None)).decode(
+                        bio_logits, mask.long().sum(1), chi, known_start=self._committed_is_terminator, timestamps_s=ts))[0]
+        # Stitch this stride's tags into whole-stream timeline (latest estimate wins on revisits) so a row can score the segmentation
         # the FSM actually acted on. Committed prefix decodes as UNK, so it keeps tags the FSM acted on when it committed them.
         if self._bio_timeline is not None and bio_tags.numel() == int(in_buffer.sum().item()):
             fresh = ~chi[0].cpu()

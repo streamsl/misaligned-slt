@@ -14,17 +14,18 @@ checkpoint:
     # and this file never carries a stale copy of the pool name. An explicit path still wins.
     bio_head_init: auto
     # Translator warm start: data.yaml `languages[lang].pretrained_slt.<decoder>` (utils.resolve_pretrained; dlm here, ar for
-    # ar.yaml), which must be re-rooted to this language's clean floor of the same decoder. train-slt refuses a file without
-    # clean-floor meta (the released file), and refuses a local file of other language, decoder, block_size (dlm), augmentation
-    # or cap. A file of another annotation set only warns. A DLM arm also loads its DLM floor's canvas ([MASK] row, tables).
+    # ar.yaml), which must be re-rooted to this language's pretrimmed translator of the same decoder. train-slt refuses a file
+    # without its meta (the released file), and refuses a local file of other language, decoder, block_size (dlm), augmentation
+    # or cap. A file of another annotation set only warns. A DLM arm also loads the canvas of its pretrimmed DLM translator
+    # ([MASK] row, tables).
     save_best: true # write on every new best dev value (not just end of training)
-    monitor: val_offline_score  # edge chunk F1 avg x edge chunk DVC BLEU-4 avg (the main scores) of the --offline row
+    monitor: val_offline_score  # the --offline row's main score (the F1 of the tIoU x edge-limit grid, tau avg and tIoU avg) x the DVC BLEU-4 of the pairs that count (the same avg)
     mode: max
     restore_best: true
     eval_every_epochs: 1        # early_stopping.patience counts evaluations, so set them together
     # Only for monitor val_online_score: the streaming FSM reads whole dev source videos in a seeded random order up to this
-    # many pose hours (0 = off), which caps the cost of 1 evaluation. The offline monitor does not read it. The clean floor
-    # has no segmentation branch, so it runs no monitor of this kind.
+    # many pose hours (0 = off), which caps the cost of 1 evaluation. The offline monitor does not read it. The pretrimmed
+    # translator has no segmentation branch, so it runs no monitor of this kind.
     online_dev_hours: 4.0
     dev_batch_size: 16
 decoder: dlm
@@ -53,8 +54,10 @@ membership_gate: # Ω = a hard crop of the selected first span (its terminator f
     # the GT target within δ, else the δ-jittered GT span (models/streaming_slt.py). Crop's value carries no gradient. Text 
     # trains segmentation branch only on rows whose target (1 unit or a joined run) is followed by a pause (> δ): via where the span
     # from the target's last unit ends (a straight-through estimator), never at or before that unit's B frame, so text never rewards
-    # a merge.
-    detach_omega: false   # true = the ablation "text never trains segmentation" 
+    # a merge. In the one-stream arm (shared_pose_encoder) the text of every supervised row also trains the 1 pose encoder that the
+    # head reads. true = the no-text control of either arm, "text never trains segmentation": no end-side term and, in the one-stream
+    # arm, the text reads that encoder under stop-gradient, so BIO alone trains it (the stamp gate.detach_omega records it).
+    detach_omega: false
 # Stage-2 train rows (data/sampler.py WindowSampler.spec_for): each index draws one listed type that fits its anchor, in equal shares
 # from an rng of the index, so 1 and N GPUs draw the same rows. A restart chunk needs a reliable unit just before the anchor; at the
 # other anchors the index draws among the other listed types, so that type is a little rarer. Every row takes its text by the
@@ -64,7 +67,7 @@ membership_gate: # Ω = a hard crop of the selected first span (its terminator f
 #   restart_chunks  starts δ before the gold terminator of the unit just before the anchor, length U(δ + K·stride, buffer cap): the
 #                   FSM's buffer after it commits that unit. The frames before the terminator frame are committed; through it, UNK.
 #   chunks          the same length law, with the anchor's onset at a uniform place; its left edge commits nothing.
-# Any non-empty subset; restart_chunks alone is refused (not every anchor has one). The clean floor reads [windows] (baseline_train.yaml).
+# Any non-empty subset; restart_chunks alone is refused (not every anchor has one). The pretrimmed translator reads [windows] (baseline_train.yaml).
 train_inputs: [chunks, windows, restart_chunks]
 # Fixed coverage mix, shared by all datasets (and by S1's window inputs, bio_pretrain.yaml pretrain.inputs). 
 mode_ratios:     # Edges and Mode-2 cut depths come from the designed `jitter:` block below
@@ -79,7 +82,7 @@ mode2_subcase_weights:
     right: 0.45
     left: 0.45
     both: 0.10
-# Pose augmentation of every TRAIN input of every trained pose model: S1 and the clean floors and arms inherit this block
+# Pose augmentation of every TRAIN input of every trained pose model: S1, the pretrimmed translators and the arms inherit this block
 # (bio_pretrain.yaml, baseline_*.yaml, ar.yaml); moryossef26.yaml, which extends nothing, holds a copy (a test checks that
 # they are equal). Dev inputs, eval and the FSM read each record's native grid. A project adaptation of the Moryossef 2026
 # release's density resampling (the release draws 25-50 fps on 50 fps poses, with a 5 % tempo stretch). The target rate is
@@ -120,11 +123,12 @@ bio:
   # Translator -> segmentation features: BIO head reads RMSNorm(input_proj(u)) + W LN(sg(v)) (the term joins after the head's
   # input norm, so W acts at that scale whatever S1's token size), with u the segmentation pose encoder's output, v the 
   # translator's per-frame ST-GCN features (bounded temporal look-ahead) and W zero-initialized, so step 0 is S1 + the 
-  # clean floor. Stop-gradient keeps BIO gradients out of the translator.
+  # pretrimmed translator. Stop-gradient keeps BIO gradients out of the translator.
   adapter: true  # false = two streams share nothing but Omega
-# One-stream arm (true): ONE pose encoder, clean translator's, read by BIO head and the translator and trained by both losses. 
-# Pooled S1's head reads it via a least-squares map to S1's encoder tokens, fitted on train windows when train-slt starts and 
-# folded into bio_head.input_proj (S1's encoder is only that target).
+# One-stream arm (true): ONE pose encoder, the pretrimmed translator's, read by BIO head and the translator and trained by both losses
+# (by BIO alone under membership_gate.detach_omega: true, its no-text control). It needs bio.adapter: false.
+# Pooled S1's head reads it via a least-squares map to S1's encoder tokens, fitted on every train row once when train-slt starts
+# and folded into bio_head.input_proj (S1's encoder is only that target).
 shared_pose_encoder: false
 jitter:
     # Designed window edges for stage 2, and for S1's window inputs when bio_pretrain.yaml pretrain.inputs lists windows (S1 
@@ -138,14 +142,14 @@ mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on
 batch_size: 16
 grad_accum_steps: 1 # Effective batch = batch_size * grad_accum_steps
 num_workers: 4
-# Stage 2 fine-tunes 2 CONVERGED models (S1 and the clean translator), so 1 rate trains every module in 1 optimizer group,
+# Stage 2 fine-tunes 2 CONVERGED models (S1 and the pretrimmed translator), so 1 rate trains every module in 1 optimizer group,
 # both pose encoders included (nothing is frozen).
 learning_rate: 1.0e-4
 weight_decay: 1.0e-4
 epochs: 50
 early_stopping:    # Opt-in TERMINATION only (best-checkpoint monitor lives in `checkpoint:`). Remove this block or set
     enabled: false # enabled: false to train the full `epochs`. Stage 2 trains them all, so latest.pt holds the last epoch
-                   # (end of cosine) and model.pt the dev-selected best. S1, Moryossef and clean floor set their own block.
+                   # (end of cosine) and model.pt the dev-selected best. S1, Moryossef and the pretrimmed translator set their own block.
     patience: 20   # evaluations: 20 x checkpoint.eval_every_epochs 1 = 20 epochs without a new best
     min_delta: 0.0
 scheduler:

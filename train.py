@@ -103,7 +103,7 @@ if __name__ == "__main__":
         # --language re-points ${language} in checkpoint.dir for training and the save below.
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
-            include_dev=True, language=args.language, bio_config=args.bio_config
+            include_dev=True, language=args.language, bio_config=args.bio_config, resume=args.resume,
         )
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))

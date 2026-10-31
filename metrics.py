@@ -2,26 +2,36 @@
 the scoreable events of a file) and runs these; `report.py` and `reporting/` only read them.
 
 SEGMENTS (Segment(start_s, end_s) seconds): temporal_iou, match_segments, segmentation_prf.
-BIO TAGS (training and segmenter diagnostics): bio_frame_metrics, CompleteSpanMetrics, moryossef_segment_metrics.
+BIO TAGS (training and segmenter diagnostics): bio_frame_metrics, CompleteSpanMetrics, moryossef_segment_metrics, and frame_scores
+(the `frame` block of a no-text row).
 TEXT (TEXT_KEYS: BLEU-4, BLEURT, ROUGE-L, METEOR, CIDEr-D; SODA_KEYS without CIDEr-D): pair_text_scores (per pair), 
 text_scores (1 set of pairs), sentence_bleu_scores, the BLEU count rows (bleu_pair_counts, bleu_from_counts) and the
 shared preprocessing (_uni_sign_preprocess) at the scoring level that each corpus declares (text_level: per character or per word,
 and lowercase).
 
-2 aggregations of matched pairs: densevid_text_metrics (the DVC of densevid_eval: per gold video, garbage references for 
+2 aggregations of matched pairs: densevid_text_metrics (the DVC of densevid_eval: per gold video, garbage references for
 unmatched predictions, the mean over gold videos) and soda_scores (the SODA-style text F1, which charges missed gold).
 
-MAIN SCORES of a row, all on 1 pairing, the edge chunk match: edge_chunk_scores (edge chunk F1, and the DVC and the SODA-style text F1 
-of its pairs). tIoU SCORES of a row, on the tIoU pairing: evaluate_predicted_events (the sentence tIoU F1 and the DVC of densevid_eval).
+MAIN SCORES of a row, all on 1 pairing, the edge chunk match: edge_chunk_scores. Per video the captions and the runs of reliable units
+inside 1 chunk pair 1 to 1 once, by tIoU; a pair counts in the cell (tau, t) of the grid (eval.yaml scoring.edge_taus_s x
+scoring.tiou_thresholds) when its tIoU >= t and both its edges are within tau (tau is an extra limit on the edges of a pair that passed
+the tIoU test). Per cell the F1 of the counted pairs, and their DVC and SODA-style text F1; each average (per tau, per t, all cells)
+takes the means of the cells' precision and recall and the F1 of these means, as the NeurIPS protocol does (`_grid_mean`). The main
+score of a row is the F1 of the tIoU x edge-limit grid at tau avg and tIoU avg (`avg["f1"]`). Beside the grid, in no average, the
+`no_edge_limit` reference row: the same pairs counted at t with no edge test. DENSEVID SCORES of a row, on the one-caption-per-unit
+tIoU pairing, in the same shape: evaluate_predicted_events (per tIoU threshold the sentence tIoU F1 and the DVC of densevid_eval).
 
 PER UNIT: uncaptioned_units, unit_holders, held_unit_latency, long_form_scores.
-REPORT READOUTS (report.py results only, no `_scores.json` key): caption_shape, cue_edge_share, edge_chunk_classes, cap_cut_captions.
-ERROR TYPES of the edge chunk match (report.py results and progress, analyze.py --stage segmenter-errors): edge_error_types.
+REPORT READOUTS (report.py results only, no `_scores.json` key): caption_shape, cue_edge_share, edge_chunk_classes, cap_cut_captions,
+edge_boundary_hits.
+ERROR TYPES of the edge chunk match, per cell of the grid (report.py results and progress, analyze.py --stage segmenter-errors):
+edge_error_types.
 DISPLAY REPLAY (`--stability`): score_policy, accumulate_policy, merged_policy, laal.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import product
 from types import SimpleNamespace
 from typing import Any
 import os
@@ -100,8 +110,8 @@ def bio_frame_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str = 
 
 
 def signing_runs_with_b_splits(tags: torch.Tensor | list[int]) -> list[dict]:
-    """Signing runs split at interior `B`: the run rule of `moryossef_segment_metrics` (Moryossef-protocol frame and run scores 
-    that --segmenter-eval and the online `fsm_bio` rows print beside the main scores) and of the `report.py` debug view, applied to the 
+    """Signing runs split at interior `B`: the run rule of `moryossef_segment_metrics` (Moryossef-protocol frame and run scores
+    that the no-text rows save as `frame`, offline and online, `frame_scores`) and of the `report.py` debug view, applied to the
     tags and the labels alike. It is not the rule of an emitted span, nor of `val_phrase_*` (CompleteSpanMetrics): those use
     infer.commit_gate.bio_complete_spans, which opens no headless run and emits no run without a terminator (P1 at inference).
 
@@ -141,7 +151,7 @@ def macro_frame_f1(pred: torch.Tensor, gold: torch.Tensor, classes=(BIO["O"], BI
 
 
 def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_threshold: float) -> dict[str, float]:
-    # One-to-one tIoU-matched precision/recall/F1/matches: the sentence tIoU F1 (a tIoU score of a row).
+    # One-to-one tIoU-matched precision/recall/F1/matches: the sentence tIoU F1 (a densevid score of a row).
     # Unit-agnostic (tIoU is scale-invariant): seconds or frame-unit Segments. Nothing predicted AND nothing gold = perfect.
     if not predicted and not gold: return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "matches": 0.0}
     matches = match_segments(predicted, gold, threshold=tiou_threshold)
@@ -221,6 +231,31 @@ def moryossef_segment_metrics(
         f"{prefix}_seg_precision": avg(precisions), f"{prefix}_seg_recall": avg(recalls),
         f"{prefix}_n_matches": n_matches, f"{prefix}_n_pred": n_pred, f"{prefix}_n_gold": n_gold,
     }
+
+
+def frame_scores(frame_logits: torch.Tensor, phrase_logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds) -> dict[str, float]:
+    """The `frame` block of a no-text row for 1 stream with gold signing (the frame and run scores of the Moryossef protocol), with 1
+    key set offline and online: `bio_*` (binary signing frames of `frame_logits`, `bio_frame_metrics`), `bio_iou`, and `phrase_*` (the
+    O/B/I frames and the runs of `phrase_logits`, `moryossef_segment_metrics`): the frame F1, the run counts and their ratio, then per tIoU
+    threshold t the run tIoU F1, precision, recall and matches (`@t`), and the mean of the first 3 over the thresholds (`_avg`). The
+    offline whole-video pass of a segmenter reads its raw argmax as `frame_logits` and its decoded tags as `phrase_logits`; the FSM
+    reads its stitched tags as both. `labels`: gold BIO, UNK ignored."""
+    row = bio_frame_metrics(frame_logits, labels, prefix="bio")
+    # Moryossef 2023's IoU (binary signing-vs-not, per stream) = PR/(P+R−PR), algebraically F1/(2−F1). Reported for the cross-paper
+    # (F1, IoU, %) triple; weak alone: on dense corpora 1 all-signing span scores a high IoU while it resolves no boundary.
+    p, r = row["bio_precision"], row["bio_recall"]
+    row["bio_iou"] = p * r / (p + r - p * r) if p + r - p * r > 0 else 0.0
+    keys = ("tiou_f1", "seg_precision", "seg_recall")
+    for t in tiou_thresholds:
+        seg = moryossef_segment_metrics(phrase_logits, labels, prefix="phrase", tiou_threshold=float(t))
+        # Moryossef 2023's "%": the predicted / gold run count ratio. The counts come from the decode, not the matching, so they hold
+        # at every threshold; a right count with wrong places scores 1.0.
+        row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
+        row.setdefault("phrase_n_pred", seg["phrase_n_pred"]); row.setdefault("phrase_n_gold", seg["phrase_n_gold"])
+        row.setdefault("phrase_segment_count_ratio", float(seg["phrase_n_pred"]) / max(1.0, float(seg["phrase_n_gold"])))
+        for k in (*keys, "n_matches"): row[f"phrase_{k}@{float(t):g}"] = seg[f"phrase_{k}"]
+    for k in keys: row[f"phrase_{k}_avg"] = float(sum(row[f"phrase_{k}@{float(t):g}"] for t in tiou_thresholds) / len(tiou_thresholds))
+    return row
 
 
 @lru_cache(maxsize=8)
@@ -343,10 +378,11 @@ def bleu_from_counts(rows: list[dict]) -> float:
 
 # ---------------------------------------------------------------- text scores
 
-# 1 metric set for every text table (the boundary sweep, the edge chunk DVC, the tIoU DVC), in this column order.
+# 1 metric set for every text table (the boundary sweep, the DVC of the main grid, the densevid DVC), in this column order.
 TEXT_KEYS = ("bleu4", "bleurt", "rougeL", "meteor", "cider")
 # SODA-style F1 sums per-pair scores. CIDEr-D needs a corpus document frequency, so it has no per-pair score and no SODA column.
 SODA_KEYS = ("bleu4", "bleurt", "rougeL", "meteor")
+TEXT_NAME = {"bleu4": "BLEU-4", "bleurt": "BLEURT", "rougeL": "ROUGE-L", "meteor": "METEOR", "cider": "CIDEr-D"}   # TEXT_KEYS on screen and in tables
 
 @lru_cache(maxsize=None)
 def _warn_once(message: str) -> None:   # a scorer that cannot run reads 0.0; say so once per run, not once per call
@@ -433,9 +469,9 @@ def soda_scores(
     """The SODA-style text F1 (Fujita et al. 2020) of matched pairs, per `keys` (SODA_KEYS or a part of it). `pairs` = {video:
     [(caption text, gold text, gold units the pair holds)]}; `n_captions` and `n_units` = {video: count}. Per video: precision = 
     summed pair scores / captions, recall = summed (pair score x the units of the pair) / units, F1 = 2PR / (P + R), 0 for a video 
-    with no pair; then the mean F1 over the videos with captions or units. With 1 unit/pair this is SODA's sum over the matched gold. 
-    A caption that holds a run of k units credits each of k units, as the edge chunk F1 does. Per-pair scores (`pair_text_scores`) 
-    are cached in `memo` ((caption, gold) -> scores), so the taus of 1 row score each pair once."""
+    with no pair; then the mean F1 over the videos with captions or units. With 1 unit/pair this is SODA's sum over the matched gold.
+    A caption that holds a run of k units credits each of k units, as the recall of the main grid does. Per-pair scores
+    (`pair_text_scores`) are cached in `memo` ((caption, gold) -> scores), so the cells of 1 row score each pair once."""
     memo = {} if memo is None else memo
     todo = sorted({(h, g) for v in pairs for h, g, _ in pairs[v]} - memo.keys())
     for pair, score in zip(todo, pair_text_scores([h for h, _ in todo], [g for _, g in todo], char_level, bleurt_checkpoint, keys)):
@@ -452,7 +488,7 @@ def soda_scores(
         out[k] = float(np.mean(f1)) if f1 else 0.0
     return out
 
-# ---------------------------------------------------------------- tIoU scores of a row: sentence tIoU F1 and the DVC of densevid_eval
+# ---------------------------------------------------------------- densevid scores of a row: sentence tIoU F1 and the DVC of densevid_eval
 
 DENSEVID_GARBAGE_SEED = 1337  # the original draws unseeded; we seed for reproducible tables (documented deviation)
 
@@ -476,14 +512,15 @@ def densevid_text_metrics(
     per_video: bool = False, keys: tuple[str, ...] = TEXT_KEYS,
 ) -> dict[str, float] | dict[str, dict[str, float]]:
     """The DVC aggregation of densevid_eval (ranjaykrishna/densevid_eval) over given pairs, with the repository's text scores
-    (`text_scores`, `keys` of TEXT_KEYS). `pairs_by_video` = {gold video: [(prediction text, gold text, or None for a prediction 
-    with no gold pair)]}, for 1 threshold. The caller makes the pairs (`densevid_pairs` for the tIoU pairing, `edge_chunk_scores` 
-    for the edge chunk pairing). A GARBAGE reference for a prediction with no gold pair (a random lowercase string of length 10..20; 
-    ref None marks these). PER-VIDEO scoring, then the MEAN over gold videos (a gold video with no predictions scores 0). Deliberate 
-    deviations: the garbage rng is SEEDED, and tokenization is the shared Uni-Sign preprocessing + sacrebleu 13a, not COCO BLEU with 
-    PTB tokenization. BLEU-4 is corpus BLEU over each video's pairs with NO smoothing, as COCO BLEU (`bleu_from_counts` gives the same 
-    number). CIDEr-D takes its IDF from the video's references, as densevid_eval does. BLEURT, ROUGE-L and METEOR are per-pair means. 
-    The aggregation is RECALL-BLIND: a gold unit with no pair adds nothing; the SODA-style F1 (`soda_scores`) charges it."""
+    (`text_scores`, `keys` of TEXT_KEYS). `pairs_by_video` = {gold video: [(prediction text, gold text, or None for a prediction
+    with no gold pair)]}, for 1 threshold or 1 cell. The caller makes the pairs (`densevid_pairs` for the densevid tIoU pairing,
+    `edge_chunk_scores` for the counted pairs of 1 cell of the main grid). A GARBAGE reference for a prediction with no gold pair (a
+    random lowercase string of length 10..20; ref None marks these). PER-VIDEO scoring, then the MEAN over gold videos (a gold video
+    with no predictions scores 0). Deliberate deviations: the garbage rng is SEEDED, and tokenization is the shared Uni-Sign
+    preprocessing + sacrebleu 13a, not COCO BLEU with PTB tokenization. BLEU-4 is corpus BLEU over each video's pairs with NO
+    smoothing, as COCO BLEU (`bleu_from_counts` gives the same number). CIDEr-D takes its IDF from the video's references, as
+    densevid_eval does. BLEURT, ROUGE-L and METEOR are per-pair means. The aggregation is RECALL-BLIND: a gold unit with no pair adds
+    nothing; the SODA-style F1 (`soda_scores`) charges it."""
     rng = random.Random(DENSEVID_GARBAGE_SEED)
     out: dict[str, dict[str, float]] = {}
     for vid in sorted(pairs_by_video):
@@ -497,11 +534,13 @@ def densevid_text_metrics(
 def evaluate_predicted_events(
     predicted: dict[str, list], gold: dict[str, list], thresholds: list[float], char_level: bool = False, densevid: bool = False,
 ) -> dict[str, Any]:
-    """tIoU scores of a row (the main scores are `edge_chunk_scores`). Per tIoU threshold: predictions and gold are matched 
-    1-to-1 by tIoU (`match_segments`), and the segmentation block reports that sentence-level P/R/F1. With densevid=True the text 
-    block holds the DVC columns of densevid_eval: many-to-many tIoU pairs (`densevid_pairs`), garbage references for unmatched 
-    predictions, per-video corpus scores averaged over gold videos (`densevid_text_metrics`). They do not charge missed gold. 
-    `threshold_average` averages the threshold grid; emission latency and matched tIoU are reported separately."""
+    """The densevid scores of a row (the main scores are `edge_chunk_scores`), in the shape of the main block. Per tIoU threshold
+    (`by_tiou`): predictions and gold are matched 1-to-1 by tIoU (`match_segments`), and precision, recall and F1 are that sentence
+    tIoU F1 (precision averaged over the videos with predictions, recall over the videos with gold). With densevid=True `dvc` holds
+    the DVC of densevid_eval (TEXT_KEYS): many-to-many tIoU pairs (`densevid_pairs`), garbage references for unmatched predictions,
+    per-video corpus scores averaged over gold videos (`densevid_text_metrics`); it does not charge missed gold. Without it `dvc` is
+    None. `avg` averages the thresholds by the rule of the main block (`_grid_mean`): the means of precision and recall, the F1 of
+    these means, the per key mean of `dvc`. Each threshold row also holds its counts, the matched tIoU and the emission latency."""
     results = []
     all_video_ids = sorted(set(predicted) | set(gold))
     for threshold in thresholds:
@@ -513,7 +552,7 @@ def evaluate_predicted_events(
             if not pred_events and not gold_events: continue
             total_pred += len(pred_events); total_gold += len(gold_events)
 
-            # SEGMENTATION: sentence tIoU F1 — greedy 1-to-1 tIoU matching, shared verbatim with segmenter-eval and the BIO monitor. 
+            # SEGMENTATION: sentence tIoU F1 — greedy 1-to-1 tIoU matching, shared verbatim with the Moryossef protocol and the BIO monitor. 
             # densevid's own proposal P/R is coverage-based (many-to-many), which lets duplicate spans all "match" 1 gold and keeps 
             # precision at 1.0; 1-to-1 charges the duplicate, so it is the defensible number for a segmentation claim.
             pred_segs, gold_segs = [ev.segment for ev in pred_events], [gt.segment for gt in gold_events]
@@ -536,7 +575,7 @@ def evaluate_predicted_events(
             n_pairs += sum(1 for pi, gi, _ in one_to_one if pred_events[pi].text is not None and gold_events[gi].text is not None)
             n_unmatched_pred += len(pred_events) - len(one_to_one)
 
-        text_metrics = densevid_text_metrics(dv_pairs, char_level=char_level) if densevid else {}
+        dvc = densevid_text_metrics(dv_pairs, char_level=char_level) if densevid else None
         precision = float(np.mean(vid_prec)) if vid_prec else 0.0
         recall = float(np.mean(vid_rec)) if vid_rec else 0.0
         
@@ -556,24 +595,19 @@ def evaluate_predicted_events(
                 "max": float(np.max(arr))
             }
         results.append({
-            "tiou_threshold": float(threshold),
-            "segmentation": {
-                "precision": precision, "recall": recall,
-                "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-            },
-            "text_metrics": text_metrics,
+            "tiou": float(threshold), "precision": precision, "recall": recall,
+            "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+            "dvc": {k: dvc[f"densevid_{k}"] for k in TEXT_KEYS} if densevid else None,
             # scored_pairs: the 1-to-1 pairs with text; unmatched_predictions support `precision`, missed_gold `recall`.
             "scored_pairs": n_pairs, "unmatched_predictions": n_unmatched_pred, "missed_gold": n_missed_gold,
             "total_predictions": total_pred, "total_gold": total_gold,
             "mean_matched_tiou": float(np.mean(best_tious)) if best_tious else 0.0,
             "matched_tiou_distribution": tiou_block, "emission_latency": latency_block,
         })
-    keys = results[0]["text_metrics"] if results else {}
-    summary = {k: float(np.mean([r["text_metrics"][k] for r in results])) for k in keys}
-    summary["segmentation_f1"] = float(np.mean([r["segmentation"]["f1"] for r in results]))
-    return {"thresholds": results, "threshold_average": summary}
+    # The average holds the scores only: the counts, the matched tIoU and the latency stay per threshold.
+    return {"by_tiou": results, "avg": _grid_mean(results, ("dvc",))}
 
-# ---------------------------------------------------------------- main scores of a row: the edge chunk match, its F1 and its text scores
+# ---------------------------------------------------------------- main scores of a row: the edge chunk match on the tau x tIoU grid
 
 def _edge_items(chunks: list[list]) -> list[tuple[float, float, str, range]]:
     # The admissible gold items of 1 video: every run of consecutive units inside 1 chunk, as (start of its first unit, 
@@ -586,96 +620,124 @@ def _edge_items(chunks: list[list]) -> list[tuple[float, float, str, range]]:
         first += len(chunk)
     return items
 
-def _edge_matches(events: list, items: list, tau: float) -> list[tuple[int, int]]:
-    # (event, item) pairs: an event matches an item only when its start AND its end are within tau of the item's. Greedy 1-to-1
-    # by the summed edge error, ties by event then item order; each event is used once, and an item is taken only when none of its
-    # units is used yet. No tIoU floor. It scans all events x items of a video; vectorise it if long test chunks make it slow.
-    cand = sorted(
-        (abs(e.start_s - it[0]) + abs(e.end_s - it[1]), pi, gi) 
-        for pi, e in enumerate(events) for gi, it in enumerate(items) 
-        if abs(e.start_s - it[0]) <= tau and abs(e.end_s - it[1]) <= tau
-    )
+def _tiou_matches(events: list, items: list, threshold: float) -> list[tuple[int, int]]:
+    # The greedy 1-to-1 tIoU match of a video's events with its items: an event matches an item when their tIoU is at least
+    # `threshold`. The highest tIoU first, ties by event then item order; each event is used once, and an item is taken only when
+    # none of its units is used yet. It scans all events x items of a video; vectorise it if long test chunks make it slow.
+    ious = ((temporal_iou(Segment(e.start_s, e.end_s), Segment(it[0], it[1])), pi, gi)
+            for pi, e in enumerate(events) for gi, it in enumerate(items))
+    cand = sorted((-iou, pi, gi) for iou, pi, gi in ious if iou >= threshold)
     used_events, used_units, pairs = set(), set(), []
     for _, pi, gi in cand:
         if pi in used_events or used_units.intersection(items[gi][3]): continue
         used_events.add(pi); used_units.update(items[gi][3]); pairs.append((pi, gi))
     return pairs
 
+def _cell_pairs(events: list, items: list, taus, thresholds) -> list[list[tuple[int, int]]]:
+    """The (event, item) pairs that count in each cell (tau, t) of the grid, tau-major (`product(taus, thresholds)`). 1 match per
+    video: `_tiou_matches` at the lowest threshold. A matched pair counts in (tau, t) when its tIoU >= t and its start and its end are
+    both within tau of the item's (inclusive). The greedy takes the candidates in 1 order (the highest tIoU first), so the pairs of
+    tIoU >= t are its decisions on a prefix of that order: with no tau test, the pairs that count at t are exactly
+    `_tiou_matches(events, items, t)`, and a cell does not depend on the other cells of the grid."""
+    scored = [(pi, gi, temporal_iou(Segment(events[pi].start_s, events[pi].end_s), Segment(items[gi][0], items[gi][1])),
+               max(abs(events[pi].start_s - items[gi][0]), abs(events[pi].end_s - items[gi][1])))
+              for pi, gi in _tiou_matches(events, items, min(map(float, thresholds)))]
+    return [[(pi, gi) for pi, gi, iou, err in scored if iou >= t and err <= tau] for tau, t in product(taus, thresholds)]
+
 def _table_prf(t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per column (an edge tau) of a (videos, columns, 4) table of precision, has events, recall, has gold: precision averaged over
-    the videos with events, recall over the videos with gold, and their F1. The headline F1 avg is the mean of the F1s; it is not a
-    mean over videos."""
+    """Per column (a cell of the grid) of a (videos, columns, 4) table of precision, has events, recall, has gold: precision averaged
+    over the videos with events, recall over the videos with gold, and their F1 (not a mean over videos of a per-video F1)."""
     has_p, has_g = t[:, :, 1], t[:, :, 3]
     p = (t[:, :, 0] * has_p).sum(0) / np.maximum(has_p.sum(0), 1)
     r = (t[:, :, 2] * has_g).sum(0) / np.maximum(has_g.sum(0), 1)
     return p, r, np.where(p + r > 0, 2 * p * r / np.maximum(p + r, 1e-12), 0.0)
 
-def edge_chunk_table(pred: dict, chunks: dict, taus, vids: list[str]) -> tuple[np.ndarray, list[dict[str, dict[int, tuple[str, int]]]]]:
-    """The edge chunk match of `pred` on `vids`: a (videos, taus, 4) table, the form `_table_prf` reads: precision (matched 
-    captions / captions), has captions, recall (units inside matched items / units), has units; and per tau the matches as 
-    {video: {index of the caption in pred[video]: (joined text of its item, units in the item)}}."""
-    t, matches = np.zeros((len(vids), len(taus), 4)), [{} for _ in taus]
+def _grid_mean(rows: list[dict], blocks: tuple[str, ...]) -> dict:
+    # The average of score rows (cells of the grid, or the thresholds of the densevid block), the rule of the NeurIPS protocol:
+    # precision and recall are the means of the rows and F1 = 2PR / (P + R) of these means (0 when P + R = 0), not the mean of the F1s;
+    # each text block of `blocks` is the per key mean (None when the rows have no text).
+    p, r = (float(np.mean([x[k] for x in rows])) for k in ("precision", "recall"))
+    return {"precision": p, "recall": r, "f1": 2 * p * r / (p + r) if p + r > 0 else 0.0,
+            **{b: None if rows[0][b] is None else {k: float(np.mean([x[b][k] for x in rows])) for k in rows[0][b]} for b in blocks}}
+
+def edge_chunk_table(pred: dict, chunks: dict, taus, thresholds, vids: list[str]
+                     ) -> tuple[np.ndarray, list[dict[str, dict[int, tuple[str, int]]]]]:
+    """The edge chunk match of `pred` on `vids` on the grid of `taus` x `thresholds` (`_cell_pairs`, tau-major cells): a (videos,
+    cells, 4) table, the form `_table_prf` reads: precision (counted captions / captions), has captions, recall (units inside counted
+    items / units), has units; and per cell the counted pairs as {video: {index of the caption in pred[video]: (joined text of its
+    item, units in the item)}}."""
+    n_cells = len(taus) * len(thresholds)
+    t, matches = np.zeros((len(vids), n_cells, 4)), [{} for _ in range(n_cells)]
     for i, v in enumerate(vids):
         items, evs, n_units = _edge_items(chunks.get(v, [])), pred.get(v, []), sum(map(len, chunks.get(v, [])))
-        for j, tau in enumerate(taus):
-            matched = _edge_matches(evs, items, float(tau))
-            covered = sum(len(items[gi][3]) for _, gi in matched)   # matched items share no unit
+        for j, counted in enumerate(_cell_pairs(evs, items, taus, thresholds)):
+            covered = sum(len(items[gi][3]) for _, gi in counted)   # counted items share no unit
             t[i, j] = (
-                len(matched) / len(evs) if evs else 0.0, float(bool(evs)),
+                len(counted) / len(evs) if evs else 0.0, float(bool(evs)),
                 covered / n_units if n_units else 0.0, float(bool(n_units))
             )
-            matches[j][v] = {pi: (items[gi][2], len(items[gi][3])) for pi, gi in matched}
+            matches[j][v] = {pi: (items[gi][2], len(items[gi][3])) for pi, gi in counted}
     return t, matches
 
 def edge_chunk_scores(
-    pred: dict, chunks: dict, taus, char_level: bool, 
+    pred: dict, chunks: dict, taus, thresholds, char_level: bool,
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", keys: tuple[str, ...] = TEXT_KEYS,
 ) -> dict:
-    """The main scores of a row. All read the edge chunk match. A chunk is a run of reliable units that no pause separates
-    (`evaluation.predictions.gold_chunks`). A caption may hold any run of consecutive units inside 1 chunk (an item), so a merge 
-    inside a chunk is correct when both of its outer edges are within tau. An edge more than tau from every run edge (past a pause, 
-    or inside a unit) matches nothing. A caption matches an item when both its edges are within tau of the item's (`_edge_matches`). 
-    Its gold text is the joined text of the item's units. Per tau:
-      * the edge chunk F1 (where): precision = matched captions / captions per video, averaged over the videos with captions. 
-        recall = units inside matched items / units per video, averaged over the videos with units; F1 of the two;
-      * `dvc` (what): the DVC aggregation of densevid_eval on these pairs (`densevid_text_metrics`, the `keys` of TEXT_KEYS): 
-        per gold video, each caption against the gold text of its match, a caption with no match against a garbage reference; 
-        the mean over gold videos;
-      * `soda` (what, missed units charged): the SODA-style text F1 on the same pairs (`soda_scores`, the `keys` of SODA_KEYS).
-        `f1_avg`, `dvc_avg` and `soda_avg` average all taus (eval.yaml scoring.edge_taus_s). The text blocks are None for a row with 
-        no caption text (segmentation only).
-    """
+    """The main scores of a row, on the edge chunk match. A chunk is a run of reliable units that no pause separates
+    (`evaluation.predictions.gold_chunks`). A caption may hold any run of consecutive units inside 1 chunk (an item), so a merge
+    of abutting units can be correct, and no item crosses a pause. Per video the captions and the items pair 1 to 1 once, by tIoU
+    (`_tiou_matches` at the lowest threshold). A pair counts in the cell (tau, t) when its tIoU >= t AND both its edges are within
+    tau of the item's edges: tau is an extra limit on the edges of a pair that passed the tIoU test (`_cell_pairs`). Its gold text
+    is the joined text of the item's units. Per cell (`taus` = eval.yaml scoring.edge_taus_s x `thresholds` =
+    scoring.tiou_thresholds, tau-major):
+      * precision = counted captions / captions per video, averaged over the videos with captions; recall = units inside counted
+        items / units per video, averaged over the videos with units; `f1` = 2PR / (P + R) of the two;
+      * `dvc`: the DVC aggregation of densevid_eval on the cell's pairs (`densevid_text_metrics`, the `keys` of TEXT_KEYS): per
+        gold video, each caption against the gold text of its counted pair, any other caption against a garbage reference; the
+        mean over gold videos;
+      * `soda`: the SODA-style text F1 on the same pairs, which charges missed units (`soda_scores`, the `keys` of SODA_KEYS).
+    `by_tau` averages each tau over the thresholds, `by_tiou` each threshold over the taus, and `avg` all cells, by 1 rule
+    (`_grid_mean`, as the NeurIPS protocol): precision and recall are the means of the cells, F1 is the F1 of these means (not the
+    mean of the F1s), and `dvc` and `soda` are the per key means. THE MAIN SCORE of a row is `avg["f1"]`: the F1 of the tIoU x
+    edge-limit grid (tau avg, tIoU avg). `no_edge_limit` is a reference row in no average and in no monitor: the pairs of the
+    same match that count at t with no edge test (exactly `_tiou_matches` at t, the DVC tIoU test alone on runs of units; not
+    densevid_eval, which is `evaluate_predicted_events`), scored as a cell per threshold (`by_tiou`), and `avg` over the thresholds
+    by `_grid_mean`. The text blocks are None for a row with no caption text (segmentation only)."""
+    taus, thresholds = [float(x) for x in taus], [float(x) for x in thresholds]
     vids = sorted(v for v in set(pred) | set(chunks) if pred.get(v) or chunks.get(v))
-    t, matches = edge_chunk_table(pred, chunks, taus, vids)
+    # 1 more tau row, inf: no edge limit, so its cells are the `no_edge_limit` rows (still 1 tIoU match per video).
+    row_taus = taus + [float("inf")]
+    t, matches = edge_chunk_table(pred, chunks, row_taus, thresholds, vids)
     p, r, f1 = _table_prf(t)
     has_text = any(e.text is not None for v in vids for e in pred.get(v, []))
     n_captions = {v: len(pred.get(v, [])) for v in vids}
     n_units = {v: sum(map(len, chunks.get(v, []))) for v in vids}
-    soda_keys, memo, rows = tuple(k for k in keys if k in SODA_KEYS), {}, []
-    for j, tau in enumerate(taus):
-        row = {
-            "tau_s": float(tau), "precision": float(p[j]), "recall": float(r[j]), 
+    soda_keys, memo, cells = tuple(k for k in keys if k in SODA_KEYS), {}, []
+    for j, (tau, th) in enumerate(product(row_taus, thresholds)):
+        cell = {
+            "tau_s": tau, "tiou": th, "precision": float(p[j]), "recall": float(r[j]),
             "f1": float(f1[j]), "dvc": None, "soda": None,
-            "matched_captions": sum(map(len, matches[j].values())), 
+            "matched_captions": sum(map(len, matches[j].values())),
             "matched_units": sum(k for m in matches[j].values() for _, k in m.values())
         }
         if has_text:
             dvc = densevid_text_metrics({v: [
-                (e.text, matches[j][v][pi][0] if pi in matches[j][v] else None) 
+                (e.text, matches[j][v][pi][0] if pi in matches[j][v] else None)
                 for pi, e in enumerate(pred.get(v, [])) if e.text is not None
             ] for v in vids if n_units[v]}, char_level=char_level, bleurt_checkpoint=bleurt_checkpoint, keys=keys)
-            row["dvc"] = {k: dvc[f"densevid_{k}"] for k in keys}
-            row["soda"] = soda_scores({v: [
+            cell["dvc"] = {k: dvc[f"densevid_{k}"] for k in keys}
+            cell["soda"] = soda_scores({v: [
                 (pred[v][pi].text, g, k) for pi, (g, k) in matches[j][v].items() if pred[v][pi].text is not None
             ] for v in vids}, n_captions, n_units, char_level, bleurt_checkpoint, soda_keys, memo)
-        rows.append(row)
-    over_taus = lambda name: {
-        k: float(np.mean([x[name][k] for x in rows])) for k in rows[0][name]
-    } if rows and has_text else None
+        cells.append(cell)
+    n_t, blocks = len(thresholds), ("dvc", "soda")
+    cells, free = cells[:-n_t], [{k: x for k, x in c.items() if k != "tau_s"} for c in cells[-n_t:]]
     return {
-        "f1_avg": float(f1.mean()), "precision_avg": float(p.mean()), "recall_avg": float(r.mean()),
-        "dvc_avg": over_taus("dvc"), "soda_avg": over_taus("soda"), "taus": rows, "captions": sum(n_captions.values()), 
-        "units": sum(n_units.values()), "chunks": sum(len(chunks.get(v, [])) for v in vids),
+        "taus_s": taus, "tiou_thresholds": thresholds, "avg": _grid_mean(cells, blocks),
+        "by_tau": [{"tau_s": tau, **_grid_mean(cells[i * n_t:(i + 1) * n_t], blocks)} for i, tau in enumerate(taus)],
+        "by_tiou": [{"tiou": th, **_grid_mean(cells[j::n_t], blocks)} for j, th in enumerate(thresholds)],
+        "cells": cells, "no_edge_limit": {"by_tiou": free, "avg": _grid_mean(free, blocks)},
+        "captions": sum(n_captions.values()), "units": sum(n_units.values()), "chunks": sum(len(chunks.get(v, [])) for v in vids),
     }
 
 # ---------------------------------------------------------------- scores per reliable gold unit
@@ -778,13 +840,14 @@ def _union_inside(intervals, lo: float, hi: float) -> float:   # the length of t
     return total
 
 def cue_edge_share(pred: dict, gold: dict, breaks: dict, taus) -> dict:
-    """Do the captions cut inside a unit where the captioner broke the display? `breaks` = {video: [(end of display cue k, start 
-    of cue k + 1)]} (`evaluation.predictions.cue_breaks`). A junction is inner to a reliable unit when it lies strictly inside it, 
-    so a unit of n display cues holds n - 1 of them. Per tau: an inside edge is a start/end of a caption that lies in a reliable 
-    unit and more than tau from both of its edges (it can match no run at tau). `at_cue_break` = the share of inside edges within 
-    tau of an inner junction of that unit. `chance` = mean over same edges of |N ∩ I| / |I|, I = (unit start + tau, unit end - tau) 
-    and N = the union of [cue end - tau, next cue start + tau] over the unit's inner junctions. A share above chance means the 
-    captions cut inside units where the display breaks. Also: the units, the units with an inner junction and inner junctions."""
+    """Do the captions cut inside a unit where the captioner broke the display? `breaks` = {video: [(end of display cue k, start
+    of cue k + 1)]} (`evaluation.predictions.cue_breaks`). A junction is inner to a reliable unit when it lies strictly inside it,
+    so a unit of n display cues holds n - 1 of them. Per tau: an inside edge is a start/end of a caption that lies in a reliable
+    unit and more than tau from both of its edges (no caption with that edge counts at tau). `at_cue_break` = the share of inside
+    edges within tau of an inner junction of that unit. `chance` = mean over same edges of |N ∩ I| / |I|, I = (unit start + tau,
+    unit end - tau) and N = the union of [cue end - tau, next cue start + tau] over the unit's inner junctions. A share above
+    chance means the captions cut inside units where the display breaks. Also: the units, the units with an inner junction and
+    inner junctions."""
     # 1e-6 s: a junction at a unit edge stays outside it after the round trip of the times through a cut stream's clock
     inner = {vid: [[
         (min(x, y), max(x, y)) for x, y in breaks.get(vid, []) if g.start_s + 1e-6 < min(x, y) and max(x, y) < g.end_s - 1e-6
@@ -804,20 +867,20 @@ def cue_edge_share(pred: dict, gold: dict, breaks: dict, taus) -> dict:
     held = [j for units in inner.values() for j in units]
     return {"taus": rows, "units": len(held), "units_with_break": sum(1 for j in held if j), "breaks": sum(map(len, held))}
 
-def edge_chunk_classes(pred: dict, chunks: dict, classes: dict, taus) -> dict:
+def edge_chunk_classes(pred: dict, chunks: dict, classes: dict, taus, thresholds) -> dict:
     """The edge chunk match per class of chunk. `classes` = {video: 1 class per chunk of chunks[video], in its order}
-    (`evaluation.predictions.chunk_classes`). Per class: its reliable units, the matched share (units inside the runs 
-    that the match pairs / the units, pooled over videos, then the mean over taus) and the uncaptioned units (no caption 
-    overlaps them, the rule of `uncaptioned_units`, so the classes sum to its count)."""
+    (`evaluation.predictions.chunk_classes`). Per class: its reliable units, the matched share (units inside the runs that
+    count in a cell of the grid of `edge_chunk_scores` / the units, pooled over videos, then the mean over the cells) and the
+    uncaptioned units (no caption overlaps them, the rule of `uncaptioned_units`, so the classes sum to its count)."""
     out: dict[str, dict] = {}
     for vid, video_chunks in chunks.items():
         evs, items = pred.get(vid, []), _edge_items(video_chunks)
         units = [(c, u) for c, chunk in zip(classes[vid], video_chunks) for u in chunk]
-        matched = [{i for _, gi in _edge_matches(evs, items, float(tau)) for i in items[gi][3]} for tau in taus]
+        matched = [{i for _, gi in cell for i in items[gi][3]} for cell in _cell_pairs(evs, items, taus, thresholds)]
         for i, (c, u) in enumerate(units):
             row = out.setdefault(c, {"units": 0, "matched": 0.0, "uncaptioned": 0})
             row["units"] += 1
-            row["matched"] += sum(i in m for m in matched) / len(taus)
+            row["matched"] += sum(i in m for m in matched) / len(matched)
             row["uncaptioned"] += not any(e.end_s > u.start_s and e.start_s < u.end_s for e in evs)
     return {c: {
         "units": r["units"], "matched_share": r["matched"] / r["units"], "uncaptioned": r["uncaptioned"]
@@ -827,29 +890,33 @@ def edge_chunk_classes(pred: dict, chunks: dict, classes: dict, taus) -> dict:
 EDGE_CAPTION_TYPES = ("matched", "joined", "cut", "bridged", "offset", "phantom")
 EDGE_UNIT_TYPES = ("matched", "joined", "cut", "bridged", "offset", "missed")
 
-def edge_error_types(pred: dict, chunks: dict, taus, cover: float = 0.5) -> dict:
-    """The error types of the edge chunk match (the one error table of `analyze.py --stage segmenter-errors` and `report.py`).
-    A caption holds a unit when it covers at least `cover` of the unit (`holds`). An edge cuts a unit when it lies inside the unit
-    and more than tau from both of the unit's edges, so it can match no run edge at tau. Per tau, each caption and each reliable
-    unit takes the first type whose rule fits:
-      captions: matched (it matches a run of 1 unit), joined (it matches a run of 2 or more units of 1 chunk), cut (an edge cuts a
-        unit), bridged (it holds units of 2 or more chunks), offset (it holds units of 1 chunk, but an edge is more than tau from
-        the run edges, or another caption took the match), phantom (it holds no unit and cuts none);
-      units: matched and joined (inside a matched run of 1 unit, of 2 or more units), cut (a caption edge cuts it), bridged (a
+def edge_error_types(pred: dict, chunks: dict, taus, thresholds, cover: float = 0.5) -> dict:
+    """The error types of the edge chunk match (the one error table of `analyze.py --stage segmenter-errors` and `report.py`), per
+    cell (tau, t) of the grid of `edge_chunk_scores` (tau-major), on the pairs that count in that cell (`_cell_pairs`), so they agree
+    with the main score. A caption holds a unit when it covers at least `cover` of the unit (`holds`). An edge cuts a unit when it
+    lies inside the unit and more than tau from both of the unit's edges, so it is the edge of no run within tau. Per cell, each
+    caption and each reliable unit takes the first type whose rule fits:
+      captions: matched (it counts with a run of 1 unit), joined (it counts with a run of 2 or more units of 1 chunk), cut (an edge
+        cuts a unit), bridged (it holds units of 2 or more chunks), offset (it holds units of 1 chunk but does not count in this cell:
+        an edge more than tau from the run edges, a tIoU below t, or another caption took the match), phantom (it holds no unit and
+        cuts none);
+      units: matched and joined (inside a counted run of 1 unit, of 2 or more units), cut (a caption edge cuts it), bridged (a
         caption holds it and a unit of another chunk), offset (a caption holds it), missed (no caption holds it or cuts it;
         every unit of `uncaptioned_units` is missed).
     A share is a count of 1 video over its captions (units), averaged over the videos with captions (units), as `_table_prf`
-    averages. So at each tau the matched and joined caption shares sum to the edge chunk precision, and the unit shares to its
-    recall. `*_avg` is the mean over taus. Per tau, `cut_positions` holds each cutting edge as its place in the unit,
-    (edge - unit start) / unit duration. Per video: `held`, the units each caption holds; `pairs`, each caption that holds
-    exactly 1 unit that no other caption holds, as (caption, unit, edge offsets start - unit start and end - unit end, tIoU), with
-    no tau; and per tau the type of each caption and of each unit, and `runs`, the pairs of the main score as (caption, the units
-    of its run). A unit is its index in the video's units in chunk order (the ids of `_edge_items`)."""
-    taus = [float(t) for t in taus]
+    averages. So in each cell the matched and joined caption shares sum to the cell's edge chunk precision, and the unit shares
+    to its recall. `captions_avg` and `units_avg` are the means over the cells. Per cell, `cut_positions` holds each cutting edge
+    as its place in the unit, (edge - unit start) / unit duration (it reads tau only). Per video: `held`, the units each caption
+    holds; `pairs`, each caption that holds exactly 1 unit that no other caption holds, as (caption, unit, edge offsets start -
+    unit start and end - unit end, tIoU), with no tau or t; and per cell (`cells`, in the order of the top-level `cells`) the type
+    of each caption and of each unit, and `runs`, the counted pairs of the main score as (caption, the units of its run). A unit is
+    its index in the video's units in chunk order (the ids of `_edge_items`)."""
+    taus, thresholds = [float(t) for t in taus], [float(t) for t in thresholds]
+    grid = list(product(taus, thresholds))
     vids = sorted(v for v in set(pred) | set(chunks) if pred.get(v) or chunks.get(v))
-    cap = np.zeros((len(vids), len(taus), len(EDGE_CAPTION_TYPES)))
-    unit = np.zeros((len(vids), len(taus), len(EDGE_UNIT_TYPES)))
-    has_c, has_u, positions, per_video = np.zeros(len(vids)), np.zeros(len(vids)), [[] for _ in taus], {}
+    cap = np.zeros((len(vids), len(grid), len(EDGE_CAPTION_TYPES)))
+    unit = np.zeros((len(vids), len(grid), len(EDGE_UNIT_TYPES)))
+    has_c, has_u, positions, per_video = np.zeros(len(vids)), np.zeros(len(vids)), [[] for _ in grid], {}
     for i, v in enumerate(vids):
         evs, video_chunks = pred.get(v, []), chunks.get(v, [])
         units = [(c, u) for c, chunk in enumerate(video_chunks) for u in chunk]   # the unit ids of `_edge_items`
@@ -858,16 +925,16 @@ def edge_error_types(pred: dict, chunks: dict, taus, cover: float = 0.5) -> dict
         bridging = [len({units[k][0] for k in h}) > 1 for h in held]
         holders = [[pi for pi, h in enumerate(held) if k in h] for k in range(len(units))]
         has_c[i], has_u[i] = float(bool(evs)), float(bool(units))
-        out = per_video[v] = {"held": [len(h) for h in held], "taus": [], "pairs": [
+        out = per_video[v] = {"held": [len(h) for h in held], "pairs": [
             (pi, h[0], e.start_s - units[h[0]][1].start_s, e.end_s - units[h[0]][1].end_s,
              temporal_iou(Segment(e.start_s, e.end_s), Segment(units[h[0]][1].start_s, units[h[0]][1].end_s)))
-            for pi, (e, h) in enumerate(zip(evs, held)) if len(h) == 1 and holders[h[0]] == [pi]]}
-        for j, tau in enumerate(taus):
-            pairs = _edge_matches(evs, items, tau)   # the pairs of the main score
+            for pi, (e, h) in enumerate(zip(evs, held)) if len(h) == 1 and holders[h[0]] == [pi]], "cells": []}
+        cuts_at = {tau: [[(k, (t - u.start_s) / (u.end_s - u.start_s)) for t in (e.start_s, e.end_s)   # the cut rule reads tau only
+                          for k, (_, u) in enumerate(units) if u.start_s + tau < t < u.end_s - tau] for e in evs] for tau in taus}
+        for j, ((tau, _), pairs) in enumerate(zip(grid, _cell_pairs(evs, items, taus, thresholds))):   # the pairs of the main score
             run = {pi: len(items[gi][3]) for pi, gi in pairs}
             in_run = {k: len(items[gi][3]) for _, gi in pairs for k in items[gi][3]}
-            cuts = [[(k, (t - u.start_s) / (u.end_s - u.start_s)) for t in (e.start_s, e.end_s)
-                     for k, (_, u) in enumerate(units) if u.start_s + tau < t < u.end_s - tau] for e in evs]
+            cuts = cuts_at[tau]
             positions[j] += [x for c in cuts for _, x in c]
             cut_units = {k for c in cuts for k, _ in c}
             types_c = [("matched" if run[pi] == 1 else "joined") if pi in run else "cut" if cuts[pi] else
@@ -877,42 +944,79 @@ def edge_error_types(pred: dict, chunks: dict, taus, cover: float = 0.5) -> dict
                        for k in range(len(units))]
             for x, name in enumerate(EDGE_CAPTION_TYPES): cap[i, j, x] = types_c.count(name) / len(evs) if evs else 0.0
             for x, name in enumerate(EDGE_UNIT_TYPES): unit[i, j, x] = types_u.count(name) / len(units) if units else 0.0
-            out["taus"].append({"captions": types_c, "units": types_u, "runs": [(pi, list(items[gi][3])) for pi, gi in pairs]})
+            out["cells"].append({"captions": types_c, "units": types_u, "runs": [(pi, list(items[gi][3])) for pi, gi in pairs]})
     mean_over = lambda t, has: (t * has[:, None, None]).sum(0) / max(has.sum(), 1.0)
     c_share, u_share = mean_over(cap, has_c), mean_over(unit, has_u)
-    count = lambda name, side, j: sum(r["taus"][j][side].count(name) for r in per_video.values())
+    count = lambda name, side, j: sum(r["cells"][j][side].count(name) for r in per_video.values())
     return {
-        "taus": [{"tau_s": tau, "captions": dict(zip(EDGE_CAPTION_TYPES, map(float, c_share[j]))),
-                  "units": dict(zip(EDGE_UNIT_TYPES, map(float, u_share[j]))),
-                  "caption_counts": {name: count(name, "captions", j) for name in EDGE_CAPTION_TYPES},
-                  "unit_counts": {name: count(name, "units", j) for name in EDGE_UNIT_TYPES},
-                  "cut_positions": positions[j]} for j, tau in enumerate(taus)],
-        "captions_avg": dict(zip(EDGE_CAPTION_TYPES, map(float, c_share.mean(0)))) if taus else {},
-        "units_avg": dict(zip(EDGE_UNIT_TYPES, map(float, u_share.mean(0)))) if taus else {},
+        "cells": [{"tau_s": tau, "tiou": th, "captions": dict(zip(EDGE_CAPTION_TYPES, map(float, c_share[j]))),
+                   "units": dict(zip(EDGE_UNIT_TYPES, map(float, u_share[j]))),
+                   "caption_counts": {name: count(name, "captions", j) for name in EDGE_CAPTION_TYPES},
+                   "unit_counts": {name: count(name, "units", j) for name in EDGE_UNIT_TYPES},
+                   "cut_positions": positions[j]} for j, (tau, th) in enumerate(grid)],
+        "captions_avg": dict(zip(EDGE_CAPTION_TYPES, map(float, c_share.mean(0)))) if grid else {},
+        "units_avg": dict(zip(EDGE_UNIT_TYPES, map(float, u_share.mean(0)))) if grid else {},
         "captions": int(sum(len(pred.get(v, [])) for v in vids)), "units": int(sum(sum(map(len, chunks.get(v, []))) for v in vids)),
         "per_video": per_video,
     }
 
 
-def cap_cut_captions(pred: dict, chunks: dict, gold: dict, taus, char_level: bool, hours: float, cover: float = 0.5) -> dict:
-    """The scored captions flagged `cap_cut` (closed part of an open span that the cap (inference.yaml buffer_cap_s) cut, the declared 
-    exception to P1 at inference), apart from the rest: their count, the count per hour of `hours` (the pose time of scored streams), 
-    reliable units they hold (at least `cover` of each), per tau the cap-cut captions that the edge chunk match pairs (matched among 
-    all captions, as the main score pairs them) and units of their runs, and `without` / `uncaptioned_without`: `edge_chunk_scores` 
-    and `uncaptioned_units` of `pred` with these captions removed (None when there are none: scores of all captions then hold)."""
+def cap_cut_captions(pred: dict, chunks: dict, gold: dict, taus, thresholds, char_level: bool, hours: float,
+                     cover: float = 0.5) -> dict:
+    """The scored captions flagged `cap_cut` (closed part of an open span that the cap (inference.yaml buffer_cap_s) cut, the declared
+    exception to P1 at inference), apart from the rest: their count, the count per hour of `hours` (the pose time of scored streams),
+    reliable units they hold (at least `cover` of each), per cell (tau, t) of the grid of `edge_chunk_scores` the cap-cut captions that
+    count (matched among all captions, as the main score pairs them) and the units of their runs, and `without` /
+    `uncaptioned_without`: the grid `edge_chunk_scores` and `uncaptioned_units` of `pred` with these captions removed (None when there
+    are none: the scores of all captions then hold)."""
     vids = sorted(v for v in set(pred) | set(chunks) if pred.get(v) or chunks.get(v))
-    _, matches = edge_chunk_table(pred, chunks, taus, vids)
+    _, matches = edge_chunk_table(pred, chunks, taus, thresholds, vids)
     cut = {v: [i for i, e in enumerate(pred.get(v, [])) if e.cap_cut] for v in vids}
     captions = sum(map(len, cut.values()))
     rest = {v: [e for e in evs if not e.cap_cut] for v, evs in pred.items()}
     return {"captions": captions, "per_hour": captions / hours,
             "units_held": sum(holds(pred[v][i], g, cover) for v in vids for i in cut[v] for g in gold.get(v, [])),
-            "taus": [{
-                "tau_s": float(tau), "matched": sum(i in matches[j][v] for v in vids for i in cut[v]),
+            "cells": [{
+                "tau_s": float(tau), "tiou": float(th), "matched": sum(i in matches[j][v] for v in vids for i in cut[v]),
                 "matched_units": sum(matches[j][v][i][1] for v in vids for i in cut[v] if i in matches[j][v])
-            } for j, tau in enumerate(taus)],
-            "without": edge_chunk_scores(rest, chunks, taus, char_level) if captions else None,
+            } for j, (tau, th) in enumerate(product(taus, thresholds))],
+            "without": edge_chunk_scores(rest, chunks, taus, thresholds, char_level) if captions else None,
             "uncaptioned_without": uncaptioned_units(rest, gold) if captions else None}
+
+def edge_boundary_hits(pred: dict, edges: dict, taus) -> list[dict]:
+    """Does a caption put an edge at each gold boundary? `edges` = {video: [(side, time, class)]}, the start and the end of each
+    reliable unit with the class of its boundary (`evaluation.predictions.gold_edges`); the caption edges of a side are the starts, or
+    the ends, of the scored captions `pred`. Per video and side, gold and caption edges pair 1 to 1, greedily by the smallest time
+    difference (ties by the gold time, then the caption time), only within tau (inclusive, as the edge test of `_cell_pairs`). A
+    pair within a smaller tau is a pair at a larger one, so 1 greedy pass at the largest tau serves every tau. Each edge counts
+    alone: a merge that the edge chunk match accepts misses its inner abutting edges. 1 row per side, tau and class (sorted), then
+    the class `all`, pooled over the videos: `gold_edges`, `hit_edges` (paired) and `hit_rate`; the `all` row adds `caption_edges`,
+    `paired_caption_edges` (its hit edges, 1 to 1) and `edge_precision`."""
+    taus = [float(t) for t in taus]
+    found, captions = {"start": [], "end": []}, {"start": 0, "end": 0}   # per side: (class, time to its paired caption edge, or inf)
+    for vid in sorted(set(pred) | set(edges)):
+        for side in found:
+            gold = [(t, c) for s, t, c in edges.get(vid, []) if s == side]
+            g = np.array([t for t, _ in gold], dtype=float)
+            p = np.array([getattr(e, f"{side}_s") for e in pred.get(vid, [])], dtype=float)
+            d = np.abs(g[:, None] - p[None, :])
+            gi, pi = np.nonzero(d <= max(taus))
+            order = np.lexsort((p[pi], g[gi], d[gi, pi]))   # the smallest difference first, ties by the gold time, then the caption time
+            pair, used = np.full(len(g), np.inf), set()
+            for a, b in zip(gi[order].tolist(), pi[order].tolist()):
+                if pair[a] == np.inf and b not in used: pair[a] = d[a, b]; used.add(b)
+            found[side] += [(c, x) for (_, c), x in zip(gold, pair.tolist())]
+            captions[side] += len(p)
+    rows = []
+    for side, edge in found.items():
+        for tau in taus:
+            for c in [*sorted({c for c, _ in edge}), "all"]:
+                diff = [x for k, x in edge if c in (k, "all")]
+                hit = sum(x <= tau for x in diff)
+                rows.append({"side": side, "tau_s": tau, "class": c, "gold_edges": len(diff), "hit_edges": hit, "hit_rate": hit / len(diff) if diff else 0.0,
+                             **({"caption_edges": captions[side], "paired_caption_edges": hit,
+                                 "edge_precision": hit / captions[side] if captions[side] else 0.0} if c == "all" else {})})
+    return rows
 
 # ---------------------------------------------------------------- display replay scores (eval.py --online --stability)
 

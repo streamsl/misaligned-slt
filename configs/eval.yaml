@@ -12,14 +12,18 @@ boundary_sweep:
     batch_size: 64 # sweep windows are translated in length-sorted batches (padding masked → identical text and confidence).
     # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction +
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
-# The scores of every row (eval.py), of the segmenter evaluation and of the stage-2 and segmenter dev monitors.
+# The scores of every row (eval.py, the no-text rows of the segmenters too) and of the stage-2 and segmenter dev monitors.
 scoring:
-    tiou_thresholds: [0.5, 0.7, 0.9] # tIoU scores (metrics.evaluate_predicted_events): sentence tIoU F1 and the DVC of densevid_eval
-    # The main scores (metrics.edge_chunk_scores) all read 1 pairing, the edge chunk match: a caption may hold any run of consecutive
-    # reliable units inside 1 chunk, and it matches that run only when both its edges are within tau of the run's edges. The stage-2
-    # monitor and the segmenter monitor (val_video_f1) read chunk_gap_s and edge_taus_s too.
+    # The main scores (metrics.edge_chunk_scores) all read 1 pairing, the edge chunk match: per video, the captions and the runs of
+    # consecutive reliable units inside 1 chunk pair 1 to 1 by tIoU. A pair counts in the cell (tau, t) when its tIoU >= t AND both its
+    # edges are within tau of the run's edges: tau is an extra limit on the edges of a pair that passed the tIoU test. Each score (the
+    # F1, and the DVC and the SODA-style F1 of the pairs that count) has 1 value per cell of edge_taus_s x tiou_thresholds, 1 per tau
+    # and 1 per threshold (each the mean over the other axis) and 1 over all cells; an avg F1 is the F1 of the mean precision and
+    # recall. The main score is the F1 at tau avg and tIoU avg. A row also shows the tIoU test alone ("no limit"), for reference and
+    # in no average. The stage-2 monitor and the segmenter monitor (val_video_f1) read chunk_gap_s, edge_taus_s and tiou_thresholds too.
+    tiou_thresholds: [0.5, 0.7, 0.9] # the tIoU axis of the main grid, and the thresholds of the densevid scores
+                                     # (metrics.evaluate_predicted_events: sentence tIoU F1 and the DVC of densevid_eval)
     chunk_gap_s: 0.5                     # a chunk = units of 1 stream with caption gaps of at most this; 
                                          # = δ, kept here so that a δ change leaves the score as it is
-    edge_taus_s: [0.5, 1.0, 2.0]         # every main score (edge chunk F1, its DVC, its SODA-style F1) 
-                                         # is averaged over these: chunk gap, stride, about 1/3 median sentence
+    edge_taus_s: [0.5, 1.0, 2.0]         # the edge-limit axis of the main grid: chunk gap, stride, about 1/3 median sentence
     chunk_gap_rows_s: [0.25, 0.75, 1.0]  # report.py results only: main localization again at these chunk gaps (no row/monitor reads it)

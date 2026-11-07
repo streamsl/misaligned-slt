@@ -34,7 +34,7 @@ class OPUTOutput:
     row_valid_count: torch.Tensor | None = None
 
 
-def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float = 0.0, t_high: float = 1.0) -> torch.Tensor:
+def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float, t_high: float) -> torch.Tensor:
     # Sample one OPUT/DMax noise level per sequence and broadcast over tokens.
     low, high = float(t_low), float(t_high)
     if high < low: raise ValueError("t_high must be >= t_low")
@@ -45,8 +45,8 @@ def sample_mask_ratio(shape: tuple[int, int], device: torch.device, t_low: float
 
 def oput_two_pass_loss(
     clean_ids: torch.Tensor, valid_mask: torch.Tensor, decode_fn: Callable[[torch.Tensor], torch.Tensor],
-    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor], mask_token_id: int, t_low: float = 0.3, t_high: float = 0.8,
-    *, label_smoothing: float,
+    rollout_decode_fn: Callable[[torch.Tensor], torch.Tensor], mask_token_id: int,
+    *, t_low: float, t_high: float, label_smoothing: float,
 ) -> OPUTOutput:
     """DMax-style OPUT over a fixed conditioning closure.
 
@@ -109,8 +109,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
     '''
     def oput_forward(
         self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, labels: torch.Tensor,
-        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], t_low: float = 0.3, t_high: float = 0.8, 
-        omega_bias: torch.Tensor | None = None, *, label_smoothing: float,
+        rollout_encode_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]],
+        omega_bias: torch.Tensor | None = None, *, t_low: float, t_high: float, label_smoothing: float,
     ) -> dict[str, torch.Tensor]:
         '''OPUT translation loss under fixed conditioning `enc_hidden`/`enc_mask`.
 
@@ -214,8 +214,8 @@ class OPUTBlockDiffusionDecoder(BlockDiffusionDecoder):
 
     @torch.no_grad()
     def generate(
-        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, max_length: int = 128, threshold: float = 0.5,
-        spd_top_k: int = 1, spd_renormalize: bool = True, omega_bias: torch.Tensor | None = None,
+        self, enc_hidden: torch.Tensor, enc_mask: torch.Tensor, max_length: int, threshold: float,
+        spd_top_k: int, spd_renormalize: bool, omega_bias: torch.Tensor | None = None,
     ) -> DecodeResult:
         # `omega_bias` is fixed conditioning: identical across every pass of this decode.
         ids = torch.full((enc_hidden.shape[0], int(max_length)), int(self.mask_token_id), dtype=torch.long, device=enc_hidden.device)

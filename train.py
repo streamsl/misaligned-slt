@@ -1,10 +1,10 @@
 from __future__ import annotations
 from collections import Counter
 from pathlib import Path
-import argparse
-import json
+import argparse, json, random
 
 import torch
+import numpy as np
 from data.windowing import BIO
 from data.batch import collate_windows
 from data.loader import load_language_records
@@ -53,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--resume", action="store_true",
                         help="continue from <checkpoint.dir>/latest.pt (full optimizer/scheduler state, epoch granularity)")
+    parser.add_argument("--dev-split", default="dev", choices=["dev", "test"],
+                        help="The split that chooses the epoch of train-slt, train-bio or train-moryossef. test: an explicit look at test, so its "
+                             "scores are not held-out scores. The run writes to the normal checkpoint folder, and no file or row name shows the choice")
     parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--slt-config", default="configs/dlm.yaml")
     parser.add_argument("--inference-config", default="configs/inference.yaml")
@@ -65,12 +68,19 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; without them this is a no-op and the run is a single process.
     dist_device = dist.init_distributed()
+    if args.dev_split != "dev" and dist.is_main(): print(
+        f"WARNING: this run chooses its epoch on the {args.dev_split} split, so its {args.dev_split} scores are not held-out scores.", flush=True)
+    seed = int(load_yaml({
+        "train-bio": args.bio_config, "train-moryossef": args.moryossef_config
+    }.get(args.stage, args.slt_config)).get("seed", 42))
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+
     if args.stage == "smoke-data": result = smoke_data(args)
     elif args.stage == "train-bio":
         from train.bio_pretrain import build_bio_s1, train_bio_s1_epochs
         model, train_loader, dev_loader, cfg = build_bio_s1(
             data_config=args.data_config, config=args.bio_config,
-            inference_config=args.inference_config, language=args.language,
+            inference_config=args.inference_config, language=args.language, dev_split=args.dev_split,
         )
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 40))
@@ -80,10 +90,10 @@ if __name__ == "__main__":
         ) if dist.is_main() else None
         result = {"stage": args.stage, "device": str(device), "checkpoint": str(path), "epochs": epochs, "log_rows": log_rows}
     elif args.stage == "train-moryossef":
-        # Faithful Moryossef external segmenter for the RQ2 cascade: its own landmarks and UNet, independent of the FSM head. 
+        # Faithful Moryossef external segmenter for the cascade rows: its own landmarks and UNet, independent of the FSM head. 
         # Standalone on whole-video chunks → checkpoints/moryossef, never bio_head_init.
         from moryossef26.trainer import build_moryossef, build_moryossef_loaders, train_moryossef_epochs
-        train_loader, dev_loader, cfg = build_moryossef_loaders(args.data_config, args.moryossef_config, language=args.language)
+        train_loader, dev_loader, cfg = build_moryossef_loaders(args.data_config, args.moryossef_config, language=args.language, dev_split=args.dev_split)
         model = build_moryossef(args.moryossef_config)
         device = dist_device or pick_device(args.device)
         epochs = int(args.epochs or cfg.get("epochs", 50))
@@ -95,19 +105,21 @@ if __name__ == "__main__":
     elif args.stage == "train-slt":
         from train.helpers import build_optimizer
         from train.slt import build_slt_components, train_slt_epochs
-        # --language re-points ${language} in checkpoint.dir for training and the save below.
+        # --language re-points ${language} in checkpoint.dir for training and the save below. The one-stream arm fits its stitch on
+        # the run's device while it builds.
+        device = dist_device or pick_device(args.device)
         components = build_slt_components(
             data_config=args.data_config, slt_config=args.slt_config, inference_config=args.inference_config,
-            include_dev=True, language=args.language, bio_config=args.bio_config
+            include_dev=True, language=args.language, bio_config=args.bio_config, resume=args.resume, device=device, dev_split=args.dev_split,
         )
         slt_cfg = components.slt_cfg  # Carry corpus-measured values that a 2nd load_yaml would leave unresolved.
         epochs = int(args.epochs or slt_cfg.get("epochs", 1))
         components.checkpoint_meta["epochs"] = epochs   # the effective horizon, --epochs included
-        device = dist_device or pick_device(args.device)
         optimizer = build_optimizer(slt_cfg, components.model.parameters())   # one group: every stage-2 module at learning_rate
         log_rows = train_slt_epochs(
-            components.model, components.train_loader, optimizer, device=device, epochs=epochs, slt_cfg=slt_cfg, 
-            dev_loader=components.dev_loader, resume=args.resume, checkpoint_meta=components.checkpoint_meta,
+            components.model, components.train_loader, optimizer, device=device, epochs=epochs, 
+            slt_cfg=slt_cfg, inference_cfg=components.inference_cfg, dev_loader=components.dev_loader, 
+            resume=args.resume, checkpoint_meta=components.checkpoint_meta, monitor_records=components.monitor_records, 
         )
         path = save_model_checkpoint(
             components.model, checkpoint_dir(slt_cfg, default="checkpoints/slt"), meta=components.checkpoint_meta,

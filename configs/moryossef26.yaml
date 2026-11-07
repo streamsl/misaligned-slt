@@ -1,20 +1,28 @@
-# Faithful Moryossef 2026 external segmenter for the RQ2 cascade. It is not the in-system FSM head (that is train-bio / 
-# bio_pretrain.yaml), and is NOT reusable as one: it reads the RELEASED model's own input contract — their 50 landmarks 
-# (8 body + two hands, no face), their shoulder-and-standardise normalisation, velocity after — where the in-system head 
-# reads Uni-Sign features. The two arms share no input representation, which keeps cascade baseline independent of the 
-# method (docs/membership_gate.md §4, shared components table). Everything else is S1's: pool, chunk tiling, augmentation, 
-# labels, dev monitor and best-epoch floor (moryossef26/trainer.py builds data/chunks.py ChunkDataset with `release`).
+# Moryossef 2026 external segmenter (the released architecture and weights) for the cascade rows. It is not the in-system FSM
+# head (that is train-bio / bio_pretrain.yaml), and is NOT reusable as one: it reads RELEASED model's own input contract —
+# their 50 landmarks (8 body + 2 hands, no face), their shoulder-and-standardise normalisation, velocity after — where the
+# in-system head reads Uni-Sign features. 2 arms share no input representation, which keeps cascade baseline independent.
+# A baseline: its method rules are the release's, and none of our fixes belongs here: the unweighted NLL, the input contract,
+# argmax, contiguous chunks, the optimizer, the schedule, no gradient clip and shuffled batches.
+# What differs, and why. Our data: no sign head (no sign labels), so the release's Dice term sits on the sentence head, a table fitted on DWPose (2-D, so z is 0), confidence at most 0.3
+# as missing, and the fps range as a share of the record's rate. Shared with S1, so that both read the same data (moryossef26/trainer.py
+# builds data/chunks.py ChunkDataset with `release`): pool, chunk tiling, labels, dev monitor and best-epoch floor. Compute limits, not
+# the release's: batch_size, epochs and patience. Left out: the release's 5 % tempo stretch, which also shifts its labels.
 seed: 42
 language: asf # default YouTube-SL-25 language; --language overrides it.
 checkpoint:
-    # ${corpus} = pool key (multi_<pool>) when pretrain_languages is set, else the language — same
+    # ${corpus} = pool key (multi_<pool>) when pretrain.languages is set, else the language — same
     # rule as bio_pretrain.yaml, so both segmentation arms name checkpoints by what trained them.
     dir: checkpoints/moryossef/${corpus}
     save_best: true
-    monitor: val_phrase_tiou_f1  # complete-span F1@0.5 over fixed dev chunks, S1's monitor (train.helpers.evaluate_bio_chunks)
+    monitor: val_offline_f1  # S1's monitor: the no-text row's main score (the F1 of the tIoU match at tIoU avg, no edge limit) on whole dev streams (train.helpers.evaluate_segmenter)
     mode: max
     restore_best: true
+    eval_every_epochs: 1
     from_pretrained: checkpoints/moryossef26.safetensors
+# The decode of val_offline_f1 and of this segmenter's rows (the checkpoint stamps it as monitor_decode): argmax, the most likely tag of
+# each frame, as published and as S1 (offline and online by default; viterbi and duration are --decode rows).
+segmenter_decode: argmax
 wandb:
     enabled: false
     project: misaligned-slt
@@ -31,44 +39,52 @@ attn_nhead: 8
 attn_ff_mult: 2
 attn_dropout: 0.1
 
-# BIO loss = Dice(1.5) + class-weighted cross-entropy. Moryossef's own ablations run THIS UNet-CNN unweighted: it 
-# detects B natively via its skip connections (Moryossef 2026 release, dist/2026/EXPERIMENTS.md, finding 8), and
-# class-weighting it over-segments and collapses tIoU-F1. That evidence is measured WITH the joint sign head, which
-# this corpus cannot supply, and on YouTube-SL-25, the unweighted CNN never predicts B. `balanced` (corpus-measured,
-# same rule S1 uses) keeps baseline matched to the method instead of comparing against a collapsed head; `null` is 
-# the faithful unweighted variant.
-dice_loss_weight: 1.5
-bio_class_weights: balanced
+# The release's loss on its sentence head: unweighted NLL. Weighting this UNet-CNN hurts it in the release's own tests (dist/2026/EXPERIMENTS.md, findings 7 and 17).
+# dice_loss_weight is the release's value; the release applies it to its sign head, and with no sign head here it applies to the sentence head.
+# It may rarely output B here; the release's decode reads no B either (metrics.py likeliest_probs_to_segments).
+bio:
+  dice_loss_weight: 1.5
+  class_weights: null
 
 # Chunk training: each epoch tiles every record from a random phase with chunks of (num_frames - 1) / fps s, 
 # fps the highest record rate, so a chunk loads at most num_frames frames (data/chunks.py; S1 tiles the same 
 # way with U(L_min, C) lengths).
-num_frames: 1024 # chunk length in frames; also the RoPE window for overlap-stitched whole-video inference
-batch_size: 32
+num_frames: 1024 # chunk length in frames; also the contiguous chunk of whole-video inference, and the clip of the fitted table
+batch_size: 128
 grad_accum_steps: 1  # Effective batch = batch_size * grad_accum_steps, at batch_size activation memory
-augmentation:        # TRAIN chunks only; same block as bio_pretrain.yaml (poses/augmentation.py has the recipe).
-    fps: { min_fps: 15.0, max_fps: 30.0 }
+# DataLoader worker processes, S1's value (dlm.yaml): throughput only, since every chunk draws from an rng of its index. With 0, the main
+# process reads and transforms every chunk between GPU steps.
+num_workers: 4
+augmentation:        # TRAIN chunks only. The keys of dlm.yaml's block, with the release's fps range as a share of the record's rate.
+    enabled: true
+    fps: { min_factor: 0.5, max_factor: 1.0 }
     frame_dropout: 0.15
     body_part_dropout: 0.1
 
-learning_rate: 2.0e-4
-weight_decay: 1.0e-4
+learning_rate: 1.0e-3  # the release's default, the peak of the schedule
+weight_decay: 0.01
 epochs: 100
-eval_every_epochs: 1
 early_stopping:
     enabled: true
     patience: 20
     min_delta: 0.0
-scheduler:
-    type: cosine
-    warmup_epochs: 4
+scheduler:             # the release's OneCycleLR, per step
+    type: onecycle
+    pct_start: 0.1
+    div_factor: 10
+    final_div_factor: 100
 mixed_precision: auto
-max_grad_norm: 1.0
+max_grad_norm: .inf    # the release has no gradient clip; the loop still logs the norm
 
-# Matched to configs/bio_pretrain.yaml: the baseline segmenter trains on the SAME language pool as S1, so the RQ2
-# cascade rows compare methods rather than the amount of segmentation data each arm saw. Set both to null together
-# for the monolingual recipe.
-pretrain_languages: [ase, asf, bfi]
-# Same pool rule as bio_pretrain.yaml: τ sets each language's share in records (clean segments), τ=1 proportional,
-# τ=0 uniform; the best-epoch floor (one full rotation) is computed and printed at run time.
-pretrain_temperature: 0.0
+# Matched to configs/bio_pretrain.yaml: baseline segmenter trains on SAME language pool as S1, so the cascade rows compare 
+# methods rather than the amount of segmentation data each arm saw. Set both to null together for the monolingual recipe.
+pretrain:
+    languages: [ase, asf, bfi, bobsl_auto]
+    # Same pool rule as bio_pretrain.yaml: the dev corpora that choose the checkpoint, and τ and the weights over each corpus's
+    # hours (share ∝ weight · hours^τ, τ=0 equal); the best-epoch floor (one full rotation) is computed and printed at run time.
+    dev_languages: [ase, asf, bfi]
+    weights: {bfi: 0.5, bobsl_auto: 0.5}
+    temperature: 0.0
+    # The train set's input types, as bio_pretrain.yaml pretrain.inputs: plain chunks only, the release's chunk-only training
+    # (data/chunks.py ChunkDataset refuses windows and restart chunks under the release's input contract). --resume refuses a change.
+    inputs: [chunks]

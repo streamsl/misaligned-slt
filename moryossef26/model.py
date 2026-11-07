@@ -6,7 +6,9 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.bio_head import ClassifierHead, RoPETransformerEncoderLayer, chunked_rope_encode
+from backbones.stgcn_block import masked_batch_norm
+from models.bio_head import ClassifierHead, RoPETransformerEncoderLayer
+from train import distributed as dist
 
 ConvDef = namedtuple("ConvDef", ["in_channels", "out_channels", "kernel_size", "stride"])
 _FC_KEY = "frame_cnn.0.fc.weight"
@@ -18,6 +20,14 @@ class Unsqueeze(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.unsqueeze(self.dim)
+
+
+class BatchNorm1d(nn.BatchNorm1d):
+    # The release's BatchNorm1d; under torchrun, in a training step, its statistics are those of global batch (every position,
+    # padding included, as the release counts it on 1 process; backbones.stgcn_block.masked_batch_norm). Same state-dict keys.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not (self.training and dist.in_step()): return super().forward(x)
+        return masked_batch_norm(self, x[..., None], None)[..., 0]
 
 
 class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryossef 2026.
@@ -32,7 +42,7 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
                     in_channels=conv.in_channels, out_channels=conv.out_channels,
                     kernel_size=conv.kernel_size, stride=conv.stride, padding=conv.kernel_size // 2,
                 ),
-                nn.BatchNorm1d(conv.out_channels),
+                BatchNorm1d(conv.out_channels),
                 nn.SiLU(),
             ))
 
@@ -44,7 +54,7 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
                     in_channels=conv.out_channels, out_channels=conv.in_channels,
                     kernel_size=conv.kernel_size, stride=conv.stride, padding=conv.kernel_size // 2,
                 ),
-                nn.BatchNorm1d(conv.in_channels),
+                BatchNorm1d(conv.in_channels),
                 nn.SiLU(),
             ))
         self.fc = nn.Linear(input_size, output_size)
@@ -73,15 +83,12 @@ class PoseEncoderUNetBlock(nn.Module): # Temporal UNet block, copied from Moryos
 
 
 class MoryossefSegmenter(nn.Module):
-    """CNN-medium-attn segmenter with a phrase BIO head.
+    """External segmenter for the cascade rows, not the in-system BIO head. CNN-medium-attn segmenter with a phrase BIO head.
 
-    The external segmenter for the RQ2 cascade, not the in-system BIO head. Raw keypoints through a UNet are a different input space 
-    from the in-system Uni-Sign features. (docs/membership_gate.md §4, shared components table).
-
-    Moryossef 2026's sign (sub-sentence) head needs sign-level annotations; our corpora carry only sentence boundaries, so it's omitted.
-    1 declared deviation remains: the reference runs contiguous `num_frames` chunks and zero-pads the last one, while longer input here
-    is overlap-stitched like S1's whole-video pass (models.bio_head.overlap_windows: each frame keeps `num_frames` window where it is 
-    most interior), and a shorter one is 1 unpadded pass. Every training chunk and every online buffer (<= 40 s) is that 1 pass.
+    Raw keypoints via UNet are different input space from in-system Uni-Sign features. Moryossef 2026's sign (sub-sentence) 
+    head needs sign-level annotations. Our corpora carry only sentence boundaries, so it's omitted. Long input runs as in
+    the release: contiguous `num_frames` chunks, the last one zero-padded, which it attends to. A shorter input is 1 unpadded
+    pass: every training chunk, and an online buffer of at most (num_frames - 1) / fps s.
     """
     def __init__(
         self, pose_dims: tuple[int, int] = (50, 6), hidden_dim: int = 384, encoder_depth: int = 4, num_classes: int = 4,
@@ -113,11 +120,22 @@ class MoryossefSegmenter(nn.Module):
     def encode(self, pose_data: torch.Tensor, timestamps_s: torch.Tensor | None = None) -> torch.Tensor:
         feats = self.frame_cnn(pose_data)
         x = self.input_norm(feats.float()).to(feats.dtype)  # fp32 RMSNorm under autocast (see bio_head note)
+        batch, frames = x.shape[:2]
         if timestamps_s is None: # No timestamps → assume 50fps (1/50s per frame → *50 → 1 unit/frame).
-            timestamps_s = torch.arange(x.shape[1], device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
-        # Training-size chunks so eval context matches the train distribution. Chunking lives INSIDE the model;
-        # the inference wrapper just calls forward (moryossef26/infer.py).
-        return chunked_rope_encode(self.encoder_attn, x, timestamps_s, self.num_frames)
+            timestamps_s = torch.arange(frames, device=x.device, dtype=torch.float32) / RoPETransformerEncoderLayer.REFERENCE_FPS
+        if timestamps_s.dim() == 1: timestamps_s = timestamps_s.unsqueeze(0).expand(batch, -1)
+        timestamps_s = timestamps_s.to(x.device)
+        # Training-size chunks so eval context matches the train distribution. Chunking lives INSIDE the model; the inference wrapper
+        # just calls forward (moryossef26/infer.py). The release runs all chunks as 1 batch. 1 at a time gives its values with less memory.
+        chunks = []
+        for start in range(0, frames, self.num_frames):
+            chunk, times = x[:, start:start + self.num_frames], timestamps_s[:, start:start + self.num_frames]
+            if frames > self.num_frames:
+                pad = self.num_frames - chunk.shape[1]
+                chunk, times = F.pad(chunk, (0, 0, 0, pad)), F.pad(times, (0, pad))
+            for layer in self.encoder_attn: chunk = layer(chunk, times)
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1)[:, :frames]
 
     def forward(
         self, pose_data: torch.Tensor, frame_mask: torch.Tensor | None = None, timestamps_s: torch.Tensor | None = None
@@ -125,7 +143,8 @@ class MoryossefSegmenter(nn.Module):
         # frame_mask is accepted and ignored so the wrapper can call this and BioS1Model with 1 signature. No attention pad mask — 
         # faithful to Moryossef 2026 (README:66: his mask "changes training distribution in a way that does not match inference").
         # Cost: fps_aug, frame_dropout and clipped chunks at video ends vary lengths within batch, so part of a training batch is 0
-        # padding that the model attends to and that enters BatchNorm; inference has none. In-system RoPE head DOES key-mask padding.
+        # padding that the model attends to and that enters BatchNorm; inference pads only the last chunk of a long stream, after the
+        # UNet. In-system RoPE head DOES key-mask padding.
         encoded = self.encode(pose_data, timestamps_s=timestamps_s)
         return {"phrase": self.phrase_bio_head(encoded)}
 
@@ -136,8 +155,8 @@ def load_moryossef_pretrained(model: "MoryossefSegmenter", checkpoint: str | Pat
     The arm reads released input contract (moryossef26.dataset.to_release_coords: their 50 landmarks, their standardisation, velocity 
     after), so every tensor including keypoint-indexed `frame_cnn.0.fc` loads by shape. 2 renames and 1 drop: `sentence_bio_head.*` 
     → `phrase_bio_head.*`, `sign_bio_head.*` dropped (no sign-level supervision on our corpora), `inv_freq` skipped (see below). 
-    This is a warm start, NOT a zero-shot evaluation — `train-moryossef` fine-tunes afterwards. For the untrained measurement, see 
-    `eval.py --segmenter-init released`, which reads same coordinates and is a negative control, not a published zero-shot number: 
+    This is a warm start, NOT a zero-shot evaluation — `train-moryossef` fine-tunes afterwards. For the untrained measurement, see
+    `eval.py --segmenter-init released`, which reads same coordinates and is a negative control, not a published zero-shot number:
     the release was trained on MediaPipe poses this project doesn't store. Returns a {loaded, renamed, dropped_sign} summary."""
     from safetensors.torch import load_file
     raw = load_file(str(checkpoint))

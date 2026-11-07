@@ -14,28 +14,19 @@ from moryossef26.dataset import pose_aspect, release_velocity, to_release_coords
 
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
-from infer.duration_decode import DurationDecoder
-from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
+from infer.commit_gate import candidate_spans
+from metrics import Segment, frame_scores
+from utils import seconds_to_frames
 
 
-def bio_tags_to_segments(tags, timestamps_s) -> list[Segment]:
-    """BIO argmax tags → time-domain phrase Segments (shared span-decode rule).
-
-    Spans = contiguous signing runs (Moryossef's `likeliest_probs_to_segments` never needs a predicted `B`), split
-    at interior `B`s to keep adjacent sentences separate. End = onset of the next frame, extrapolated one step past
-    sequence end for open spans.
-    """
-    if not isinstance(tags, torch.Tensor): tags = torch.as_tensor(tags)
+def span_segments(tags, timestamps_s, fps: float, min_span_s: float) -> list[Segment]:
+    """Decoded BIO tags of 1 whole stream → time-domain phrase Segments by the span rule of every offline row (the --offline row's):
+    the FSM's complete spans of at least Λ_min (`min_span_s`, utils.lambda_min_s; infer.commit_gate.candidate_spans), each whole, with
+    no buffer cap. So the offline no-text rows of the segmenters (eval.py --offline --text none), the cascades on their spans and the
+    segmenters' val_offline_f1 score the spans of a standard offline row. End = the terminator frame's onset."""
     times = [float(t) for t in (timestamps_s.tolist() if isinstance(timestamps_s, torch.Tensor) else timestamps_s)]
-    if not times: return []
-
-    step = (times[-1] - times[-2]) if len(times) > 1 else 0.04  # assume 25fps when a single frame
-    segments: list[Segment] = []
-    for seg in signing_runs_with_b_splits(tags):
-        end_idx = int(seg["end"]) + 1
-        end_t = times[end_idx] if end_idx < len(times) else times[-1] + step
-        segments.append(Segment(times[int(seg["start"])], end_t))
-    return segments
+    spans = candidate_spans(torch.as_tensor(tags).cpu(), seconds_to_frames(min_span_s, fps))
+    return [Segment(times[start], times[end]) for start, end in spans]
 
 
 def _phrase_logits(
@@ -51,8 +42,8 @@ def _phrase_logits(
 
 
 def whole_video_logits(model, record: VideoRecord, device: torch.device, velocity: bool, rope_chunk_s: float | None):
-    """Phrase logits and timestamps. Both arms overlap-stitch their trained RoPE context 
-    (models.bio_head.overlap_windows); S1 also normalizes per chunk.
+    """Phrase logits and timestamps. S1 overlap-stitches its trained RoPE context (models.bio_head.overlap_windows)
+    and normalizes per chunk. The Moryossef arm normalizes the whole stream once, and its model runs contiguous chunks.
 
     The Moryossef arm reads the RELEASED model's own input contract (moryossef26.dataset.to_release_coords):
     their 50 landmarks, their shoulder/standardise normalisation, no face, velocity after — the same representation
@@ -74,9 +65,10 @@ def whole_video_logits(model, record: VideoRecord, device: torch.device, velocit
 @torch.no_grad()
 def predict_phrase_segments(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
-    rope_chunk_s: float | None = None, duration=None
+    rope_chunk_s: float | None = None, decoder=None, *, min_span_s: float,
 ) -> dict[str, list[Segment]]:
-    # 1 decode/stream: spans keyed by record id on the stream's own clock (eval.to_source maps them to the source video).
+    # 1 decode/stream: spans keyed by record id on the stream's own clock (evaluation.predictions.to_source maps them to the source
+    # video). `decoder`: None, the most likely tag of each frame (argmax); an infer.duration_decode.DurationDecoder, the best legal path.
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -85,58 +77,43 @@ def predict_phrase_segments(
         if logits is None:
             predictions[record.video_id] = []
             continue
-        if duration is not None: tags = DurationDecoder(duration).decode(
+        if decoder is not None: tags = decoder.decode(
             logits, torch.tensor([logits.shape[1]], device=logits.device), 
             timestamps_s=torch.as_tensor(timestamps, device=logits.device)[None]
         )[0]
         else: tags = logits.argmax(dim=-1)[0].detach().cpu()
-        predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
+        predictions[record.video_id] = span_segments(tags, timestamps, float(record.pose.fps), min_span_s)
     return predictions
-
-
-def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: tuple[float, ...]) -> dict[str, float]:
-    # 1 video's segment metrics, under the shared key convention.
-    seg_keys = ("phrase_tiou_f1", "phrase_seg_precision", "phrase_seg_recall")
-    row: dict[str, float] = {}
-    per_key: dict[str, list[float]] = {k: [] for k in seg_keys}
-    for t in tiou_thresholds:
-        seg = moryossef_segment_metrics(logits, labels, prefix="phrase", tiou_threshold=float(t))
-        row.setdefault("phrase_frame_f1", seg["phrase_frame_f1"])
-        # Moryossef 2023's "%" metric: predicted/gold segment-count ratio, threshold-independent (counts come from the 
-        # decode, not the matching). Reads over-/under-segmentation at a glance and is the cross-paper comparable pair 
-        # to their (F1, %); the 1-to-1 tIoU F1 above stays the headline — count ratios alone are gameable (a right count 
-        # with wrong placements scores 1.0).
-        row.setdefault("phrase_segment_count_ratio", float(seg["phrase_n_pred"]) / max(1.0, float(seg["phrase_n_gold"])))
-        for k in seg_keys:
-            row[f"{k}@{t:g}"] = seg[k]
-            per_key[k].append(seg[k])
-    for k in seg_keys: row[f"{k}_avg"] = float(sum(per_key[k]) / len(per_key[k]))
-    return row
 
 
 @torch.no_grad()
 def evaluate_moryossef_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
-    tiou_thresholds: tuple[float, ...] = (0.5,), return_segments: bool = False, duration=None,
+    tiou_thresholds: tuple[float, ...] = (0.5,), return_segments: bool = False, decoder=None, min_span_s: float | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, list[Segment]]]:
     """Moryossef evaluate.py-style STANDALONE eval: whole streams, GT phrase BIO from caption spans, frame-F1 and
     1-to-1 tIoU segment P/R/F1 averaged over streams. A stream is a record: a whole video, or one clean segment of 
     a cut video (data.loader.split_clean_segments), so this mean is per stream, not per source video. Phrase only, 
-    no sign head; for `--segmenter-arch s1` it scores the pretrained in-system BIO head before joint fine-tuning.
+    no sign head; for `--spans s1` it scores the pretrained in-system BIO head before joint fine-tuning.
 
     `rope_chunk_s` (S1 only): trained context in SECONDS (= buffer_cap_s) → frames per stream.
     Gold follows both arms' training label rule (TRUSTED_GAP_S): long uncaptioned stretches → UNK (excluded), not O,
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
-    `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
+    `tiou_thresholds`: eval.yaml scoring.tiou_thresholds → the thresholds of the rows' tIoU columns and densevid scores.
 
-    The current window monitor pools complete-span counts at 1 threshold. Whole-video scoring uses different context, 
-    units and aggregation. Compare checkpoints under both protocols before attributing a gap to training; a protocol 
-    difference does not rule out a model or implementation failure.
+    `decoder`: None, the most likely tag of each frame (argmax); an infer.duration_decode.DurationDecoder, the best legal BIO path (with
+    no prior: viterbi; with the duration prior: the duration decode), decoded on the CPU. Each stream's scores are metrics.frame_scores:
+    the bio_* frame scores read the raw argmax, the phrase_* scores the decoded tags.
+
+    The segmenters' checkpoint monitor (`val_offline_f1`, evaluation.segmenter_eval.segmenter_dev_scores) decodes the
+    same whole-video pass under its config's segmenter_decode and scores it with the row scores of `eval.py --offline --text none`
+    (evaluation.offline.run_offline, which saves this function's metrics as the row's `frame` block, the key set of the online rows'
+    block too). The dev-chunk numbers it also logs use other context, units and aggregation and are diagnostics only.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []
     # `return_segments`: the SAME decoded tags, as time-domain spans (keyed by record id, stream clock) BEFORE 
-    # the UNK ignore-region masking — the caller feeds them to the RQ2 scoring path, whose quarantine rule 
+    # the UNK ignore-region masking — the caller feeds them to the scoring path of the rows, whose quarantine rule 
     # (drop majority-quarantined events) replaces the frame-level mask. 1 decode, 2 protocols.
     segments_by_video: dict[str, list[Segment]] = {}
 
@@ -149,34 +126,24 @@ def evaluate_moryossef_whole_video(
         )
         logits = logits.detach().cpu()
         raw_logits = logits
-        if duration is not None:
-            tags = DurationDecoder(duration).decode(
-                logits, torch.tensor([logits.shape[1]]), timestamps_s=torch.as_tensor(timestamps)[None]
-            )[0]
+        if decoder is not None:
+            tags = decoder.decode(logits, torch.tensor([logits.shape[1]]), timestamps_s=torch.as_tensor(timestamps)[None])[0]
             logits = torch.nn.functional.one_hot(tags.long(), num_classes=logits.shape[-1]).float().unsqueeze(0)
         if return_segments:
-            raw_tags = logits[0].argmax(dim=-1)
-            segments_by_video[record.video_id] = bio_tags_to_segments(raw_tags, timestamps.tolist())
+            raw_tags = logits[0].argmax(dim=-1)   # the offline span rule (`min_span_s` floor, no buffer cap) on the decoded tags
+            segments_by_video[record.video_id] = span_segments(raw_tags, timestamps, float(record.pose.fps), min_span_s)
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
         # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right 
         # nor wrong — force the pred to UNK there too, else phantom segments in no-GT regions deflate precision.
         unk_mask = labels[0] == BIO["UNK"]
         # A stream with no gold signing (all UNK, or O/UNK only: a clean segment with no reliable unit) gets no row: its F1
-        # is undefined, and a 0 or 1 there would move the mean. Its spans are returned above and still reach rq2_protocol.
+        # is undefined, and a 0 or 1 there would move the mean. Its spans are returned above and still reach the row scores
+        # (main.edge_chunk, densevid).
         if not ((labels[0] == BIO["B"]) | (labels[0] == BIO["I"])).any(): continue
         if unk_mask.any():
             logits = logits.clone()
             logits[0, unk_mask] = 0.0
             logits[0, unk_mask, BIO["UNK"]] = 10.0
-        # prefix "bio" (trainer convention): bio_f1 is BINARY signing-vs-not F1; under "phrase" it would sit next
-        # to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
-        row = dict(bio_frame_metrics(raw_logits, labels, prefix="bio"))
-        # Moryossef 2023's IoU (binary signing-vs-not, per video then averaged) = PR/(P+R−PR), algebraically F1/(2−F1). 
-        # Reported for the cross-paper (F1, IoU, %) triple; weak alone — on dense corpora 1 all-signing span scores 
-        # high IoU while resolving no boundaries, so the 1-to-1 tIoU F1 stays the headline.
-        _p, _r = row["bio_precision"], row["bio_recall"]
-        row["bio_iou"] = (_p * _r / (_p + _r - _p * _r)) if (_p + _r - _p * _r) > 0 else 0.0
-        row.update(_segment_rows(logits, labels, tiou_thresholds))
-        rows.append(row)
+        rows.append(frame_scores(raw_logits, logits, labels, tiou_thresholds))
     metrics = {} if not rows else {k: float(sum(r[k] for r in rows) / len(rows)) for k in rows[0].keys()}
     return (metrics, segments_by_video) if return_segments else metrics

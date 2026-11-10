@@ -1,9 +1,11 @@
 """Window primitives: BIO labels from GT boundaries, plus the complete-span count of the sampler's Mode-3 draws.
 UNK is the padding/ignore class — padding is never labelled O."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
+
 import numpy as np
+from utils import UNIT_SEPARATOR
 
 BIO = {"UNK": 0, "O": 1, "B": 2, "I": 3}
 # Names the labelling rule; `annotation_fingerprint` adds the content hash. Both travel with every checkpoint and
@@ -11,6 +13,7 @@ BIO = {"UNK": 0, "O": 1, "B": 2, "I": 3}
 ANNOTATION_PROTOCOL = "caption_units"
 ModeName = Literal["mode1", "mode2", "mode3", "mode4"]
 Mode2Subcase = Literal["right", "left", "both"]
+InputName = Literal["chunks", "windows", "restart_chunks"]   # data.chunks INPUT_TYPES
 
 # Uncaptioned stretches longer than this carry no trustworthy non-signing evidence (see make_bio_labels). 
 TRUSTED_GAP_S = 8.0 # 1 constant for every labeller and for the class-weight counts.
@@ -38,6 +41,8 @@ class WindowSpec:
     mode: ModeName
     anchor_index: int | None = None
     subcase: Mode2Subcase | None = None
+    # A designed window, or (a stage-2 arm's train row, data/sampler.py spec_for) a restart chunk or a chunk at its anchor.
+    input: InputName = "windows"
 
 @dataclass
 class WindowSample:
@@ -46,7 +51,9 @@ class WindowSample:
     timestamps_s: np.ndarray
     bio_labels: np.ndarray
     translation_target: SentenceSpan | None
-    fps: float   # the record's pose rate: the window's frame grid, on which Λ_min and δ become frame counts (train/slt.py)
+    # The rate of the window's frame grid, on which Λ_min and δ become frame counts (train/slt.py): the record's fps, 
+    # or the realized rate of the kept frames of an augmented train window (data/sampler.py materialize).
+    fps: float
     # χ (membership gate, docs/membership_gate.md §2.4 (committed prefix) / §2.5 (log eps floor)): frames of LEFT-TRUNCATED
     # predecessors — a sentence whose B precedes the window edge is one the FSM already committed (the left edge mimics the
     # post-commit cut). Sampler bookkeeping, not a model belief; at inference the FSM supplies it from its commit log.
@@ -54,7 +61,34 @@ class WindowSample:
     # Every complete, reliable, >= Lambda_min sentence inside the window (time order): the multi-sentence target pool 
     # of a Mode-1/3 window; empty for the other modes (P1: no text for a sentence the window does not show whole).
     candidate_sentences: tuple[SentenceSpan, ...] = ()
+    # The record's next unit starts more than δ after the text target's last unit (or there is none): the only rows on which the
+    # text loss may train the segmentation branch, through where the span from that last unit's onset ends (models.streaming_slt).
+    target_pause_after: bool = False
+    # Window-relative times of the text target's B frame and terminator frame (data/sampler.py materialize); None without a target.
+    target_span_s: tuple[float, float] | None = None
+    # Window-relative time of the B frame of the target's LAST unit (its first unit's for a 1-unit target); None without a target.
+    target_last_start_s: float | None = None
 
+
+def joined_target(run) -> SentenceSpan:
+    # 1 unit is its own target; a run is one span from its first onset to its last end, its texts joined by UNIT_SEPARATOR.
+    if len(run) == 1: return run[0]
+    return replace(run[0], end_s=run[-1].end_s, text=f" {UNIT_SEPARATOR} ".join(u.text for u in run))
+
+def join_runs(units, sentences, gap_s: float, max_span_s: float | None = None) -> list[tuple[SentenceSpan, ...]]:
+    """Group time-ordered complete units into runs that one text target may cover: each next unit starts at most `gap_s` (δ on
+    the record's frame grid) after the previous one ends, no other unit of `sentences` (reliable or not) lies between them, and
+    the whole run spans at most `max_span_s` (when given). Most caption boundaries inside a run show no pause in the poses, so
+    only the text can place them; a run never crosses a longer gap, which a pause marks and which may hold uncaptioned signing."""
+    runs: list[list[SentenceSpan]] = []
+    for unit in units:
+        if runs:
+            prev, first = runs[-1][-1], runs[-1][0]
+            between = any(u is not prev and u is not unit and u.start_s < unit.start_s and u.end_s > prev.end_s for u in sentences)
+            fits = max_span_s is None or unit.end_s - first.start_s <= max_span_s
+            if unit.start_s - prev.end_s <= gap_s and not between and fits: runs[-1].append(unit); continue
+        runs.append([unit])
+    return [tuple(r) for r in runs]
 
 def untrusted_o_intervals(spans: tuple[SentenceSpan, ...], duration_s: float, trusted_gap_s: float) -> list[tuple[float, float]]:
     # Uncaptioned stretches (incl. video head/tail) LONGER than trusted_gap_s.

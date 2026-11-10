@@ -48,7 +48,7 @@ import torch.nn.functional as F
 # Attention-mask builders + canvas-tail supervision
 # ════════════════════════════════════════════════════════════════════════════
 
-def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, block_size=None, max_tokens=32):
+def supervise_trailing_eos(x0, valid_mask, pad_index, eos_index, block_size=None, *, max_tokens):
     '''Mark padding up to the next block boundary as supervised EOS targets.
 
     Both reference implementations supervise the canvas tail beyond the sentence end:
@@ -180,7 +180,7 @@ class BlockDiffusionDecoder(nn.Module): # Backbone-agnostic BD3LM decoder
     '''
     def _init_block_diffusion(
         self, *, d_model: int, vocab_size: int, embed_source_weight: torch.Tensor, lm_source_weight: torch.Tensor,
-        pad_index: int, eos_index: int, bos_index: int, block_size: int = 4,
+        pad_index: int, eos_index: int, bos_index: int, block_size: int,
     ) -> None:
         self.d_model = d_model
         self.block_size = block_size

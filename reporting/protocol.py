@@ -1,53 +1,45 @@
 """Why a DVC BLEU-4 column and a corpus BLEU-4 differ on the same captions, shown on real videos.
 
-Both are corpus BLEU-4. The RQ1 number adds the n-gram counts of every pair into one sum (metrics.compute_text_metrics);
+Both are corpus BLEU-4. A pooled number adds the n-gram counts of every pair into one sum (metrics.text_scores);
 DVC scores each video from its own pairs (metrics.densevid_text_metrics, per_video=True) and then takes the plain mean over videos.
+A per-video DVC number has no smoothing (as COCO BLEU), as `bleu_from_counts`; a pooled corpus number keeps sacrebleu's `exp`
+smoothing. The pretrimmed translator on the true cuts is row 1 of the result table (eval.py --offline --spans gold --text pretrimmed).
 This module recomputes both with the shared scorers and returns per-pair views (tIoU, matched n-grams) for the figures.
 """
 from __future__ import annotations
 import random
 import numpy as np
 
-from eval import densevid_pairs
-from reporting.outcomes import video_bootstrap_ci
-from metrics import (_DENSEVID_GARBAGE_SEED, bleu_from_counts, bleu_pair_counts, compute_text_metrics, densevid_text_metrics,
-                     garbage_reference, match_segments, temporal_iou)
+from evaluation.predictions import PredictionEvent, scoreable_predictions
+from metrics import (DENSEVID_GARBAGE_SEED, bleu_from_counts, bleu_pair_counts, densevid_pairs, densevid_text_metrics, evaluate_predicted_events,
+                     garbage_reference, match_segments, temporal_iou, text_scores)
 
 
-def corpus_bleu4(hyps, refs, char_level: bool) -> float:
-    return compute_text_metrics(list(hyps), list(refs), char_level=char_level)["translation_bleu4"] if hyps else 0.0
-
-
-def oracle_pairs(gold: dict, rq1_rows: list[dict]) -> dict[str, list[tuple[str, str]]]:
-    """(hypothesis, reference) per video for the clean translator on gold-span crops, from an RQ1 (0,0) file."""
+def oracle_pairs(gold: dict, row: dict) -> dict[str, list[tuple[str, str]]]:
+    """(hypothesis, reference) per video for the pretrimmed translator on the true cuts, from the events of row 1 of the result table
+    (eval.py --offline --spans gold --text pretrimmed): each event keeps the time of its gold span."""
     key = lambda v, s, e: (v, round(float(s), 3), round(float(e), 3))
-    by_gold = {key(r["video_id"], r["gt_start_s"], r["gt_end_s"]): r["prediction"]
-               for r in rq1_rows if r["grid_head"] == 0.0 and r["grid_tail"] == 0.0}
+    by_gold = {key(v, e.start_s, e.end_s): e.text for v, evs in row.items() for e in evs if e.text is not None}
     out = {}
     for vid, evs in gold.items():
         missing = [g for g in evs if key(vid, g.start_s, g.end_s) not in by_gold]
-        if missing: raise ValueError(f"Clean RQ1 is missing {len(missing)} gold-caption predictions for {vid}; use a full zero-offset run")
+        if missing: raise ValueError(f"Row 1 (the true cuts, the pretrimmed translator) has no caption for {len(missing)} gold units of {vid}; "
+                                     f"run it again under the current annotations (a row made on other labels gives this error)")
         pairs = [(by_gold[key(vid, g.start_s, g.end_s)], g.text) for g in evs]
         if pairs: out[vid] = pairs
     return out
 
 
 def oracle_row(gold: dict, oracle: dict, records, thresholds, char_level: bool) -> dict:
-    """Perfect cuts as an RQ2 row: the gold spans are the predictions, so every event locates its own sentence, and the
+    """Perfect cuts as a row: the gold spans are the predictions, so every event locates its own sentence, and the
     same annotation-ignore policy is applied. Correct short predictions remain scoreable. This is a DVC-comparable GT-boundary reference, not a bound on caption quality."""
-    from eval import PredictionEvent, evaluate_predicted_events, scoreable_predictions
     events = {v: [PredictionEvent(video_id=v, start_s=g.start_s, end_s=g.end_s, text=h)
                   for g, (h, _) in zip(gold[v], oracle[v])] for v in oracle}
     kept = scoreable_predictions(events, records, tag="oracle row")
     res = evaluate_predicted_events(kept, gold, list(thresholds), char_level=char_level, densevid=True)
-    rows = {float(r["tiou_threshold"]): r for r in res["thresholds"]}
-    t0 = float(list(thresholds)[0])
-    pv = densevid_text_metrics({v: densevid_pairs(kept.get(v, []), ge, t0) for v, ge in gold.items() if ge},
-                               char_level=char_level, bleurt_checkpoint=None, per_video=True)
-    return {"dvc": {t: r["text_metrics"]["densevid_bleu4"] for t, r in rows.items()},
-            "ci": video_bootstrap_ci([r["bleu4"] for r in pv.values()]),
-            "soda": {t: r["text_metrics"]["soda_bleu4"] for t, r in rows.items()},
-            "f1": {t: r["segmentation"]["f1"] for t, r in rows.items()},
+    rows = {r["tiou"]: r for r in res["by_tiou"]}   # the densevid scores per threshold
+    return {"dvc": {t: r["dvc"]["bleu4"] for t, r in rows.items()},
+            "f1": {t: r["f1"] for t, r in rows.items()},
             "scored": {t: r["scored_pairs"] for t, r in rows.items()},
             "n_gold": sum(len(v) for v in gold.values()), "n_kept": sum(len(v) for v in kept.values())}
 
@@ -70,7 +62,7 @@ def decompose(gold: dict, systems: dict, thresholds, char_level: bool, oracle: d
         hyps = [h for p in oracle.values() for h, _ in p]; refs = [r for p in oracle.values() for _, r in p]
         per_video = {v: r["bleu4"] for v, r in densevid_text_metrics(oracle, char_level=char_level, bleurt_checkpoint=None, per_video=True).items()}
         sizes = {v: len(p) for v, p in oracle.items()}
-        out["oracle"] = {"corpus_bleu4": corpus_bleu4(hyps, refs, char_level), "n": len(hyps), "per_video": per_video, "sizes": sizes,
+        out["oracle"] = {"corpus_bleu4": text_scores(hyps, refs, char_level, keys=("bleu4",))["bleu4"], "n": len(hyps), "per_video": per_video, "sizes": sizes,
                          "per_video_mean": float(np.mean(list(per_video.values()))),
                          "size_weighted_mean": float(np.average([per_video[v] for v in sizes], weights=[sizes[v] for v in sizes])),
                          "hyp_of": {(v, i): h for v, p in oracle.items() for i, (h, _) in enumerate(p)}}
@@ -79,19 +71,18 @@ def decompose(gold: dict, systems: dict, thresholds, char_level: bool, oracle: d
         for tau in thresholds:
             pairs = {v: densevid_pairs(pred.get(v, []), ge, tau) for v, ge in gold.items() if ge}
             per_video = {v: r["bleu4"] for v, r in densevid_text_metrics(pairs, char_level=char_level, bleurt_checkpoint=None, per_video=True).items()}
-            rng = random.Random(_DENSEVID_GARBAGE_SEED)
+            rng = random.Random(DENSEVID_GARBAGE_SEED)
             all_h, all_r = [], []
             for v in sorted(pairs):
                 for h, r in pairs[v]: all_h.append(h); all_r.append(r if r is not None else garbage_reference(rng))
             loc = located_pairs(pred, gold, tau)
             row = {"dvc_mean": float(np.mean(list(per_video.values()))) if per_video else 0.0, "per_video": per_video,
-                   "dvc_ci": video_bootstrap_ci(per_video.values()),
                    "n_pairs": len(all_h), "n_garbage": sum(1 for p in pairs.values() for _, r in p if r is None), "n_located": len(loc),
-                   "all_pairs_corpus_bleu4": corpus_bleu4(all_h, all_r, char_level),
-                   "located_corpus_bleu4": corpus_bleu4([h for _, _, h, _ in loc], [r for _, _, _, r in loc], char_level)}
+                   "all_pairs_corpus_bleu4": text_scores(all_h, all_r, char_level, keys=("bleu4",))["bleu4"],
+                   "located_corpus_bleu4": text_scores([h for _, _, h, _ in loc], [r for _, _, _, r in loc], char_level, keys=("bleu4",))["bleu4"]}
             if out["oracle"]:
                 o = [(out["oracle"]["hyp_of"][(v, i)], r) for v, i, _, r in loc]
-                row["oracle_same_gold_corpus_bleu4"] = corpus_bleu4([h for h, _ in o], [r for _, r in o], char_level)
+                row["oracle_same_gold_corpus_bleu4"] = text_scores([h for h, _ in o], [r for _, r in o], char_level, keys=("bleu4",))["bleu4"]
             rows[float(tau)] = row
         out["systems"][label] = rows
     return out
@@ -130,7 +121,7 @@ def case_view(gold: dict, systems: dict, vid: str, tau: float, char_level: bool,
     for label, pred in systems.items():
         all_ev = pred.get(vid, [])
         idx = [i for i, e in enumerate(all_ev) if e.end_s > t0 and e.start_s < t1]   # whole-video event numbers inside the window
-        rng = random.Random(_DENSEVID_GARBAGE_SEED)
+        rng = random.Random(DENSEVID_GARBAGE_SEED)
         rows, covers, unpaired = [], {}, {}
         for pi in idx:
             e = all_ev[pi]
@@ -164,7 +155,7 @@ def two_video_example(gold: dict, systems: dict, oracle: dict, oracle_scores: di
     for vid in (small, big):
         pairs = oracle[vid]; cnt = bleu_pair_counts([h for h, _ in pairs], [r for _, r in pairs], char_level)
         out["oracle"][vid] = {"n": len(pairs), "counts": cnt, "video_bleu": bleu_from_counts(cnt)}
-        dp = densevid_pairs(pred.get(vid, []), gold[vid], tau); rng = random.Random(_DENSEVID_GARBAGE_SEED)
+        dp = densevid_pairs(pred.get(vid, []), gold[vid], tau); rng = random.Random(DENSEVID_GARBAGE_SEED)
         hyps = [h for h, _ in dp]; refs = [r if r is not None else garbage_reference(rng) for _, r in dp]
         cnt = bleu_pair_counts(hyps, refs, char_level) if dp else []
         out["dvc"][vid] = {"n": len(dp), "n_garbage": sum(1 for _, r in dp if r is None), "counts": cnt, "video_bleu": bleu_from_counts(cnt)}

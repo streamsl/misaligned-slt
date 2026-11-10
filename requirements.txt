@@ -5,6 +5,7 @@ torch>=2.1
 # cache_position. transformers 5.x changes these and SILENTLY degrades output (baseline BLEU4 ~21 -> ~0.01, no error).
 # Verified on 4.57.3. (models/unisign.py warns loudly at import if a non-4.x transformers is detected.)
 transformers>=4.40,<5
+sentencepiece>=0.1.99 # T5Tokenizer, the mT5 tokenizer of every translator (models/unisign.py)
 numpy>=1.24
 scipy>=1.10           # stable log-CDFs for duration and residual-life factors
 pyyaml>=6.0
@@ -14,11 +15,18 @@ einops>=0.7
 huggingface_hub>=0.23
 tqdm>=4.66            # HF-style global training progress bar
 
+# eval.py (imported by the stage-2 and segmenter dev monitors too) and report.py
+pandas>=2.0
+ipython>=8.0          # eval.py's notebook display of results
+matplotlib>=3.7       # report.py figures (reporting/figures.py, reporting/debug.py)
+imageio>=2.30         # report.py predict writes its debug video (reporting/debug.py)
+
 # Metrics (lazy-loaded; eval degrades gracefully if a backend is missing)
 evaluate>=0.4
 sacrebleu>=2.4
 rouge>=1.0            # pltrdy ROUGE-L — the package Uni-Sign reports with (metrics._rouge_l)
 rouge_score>=0.1      # fallback ROUGE if `rouge` is absent
 nltk>=3.8             # meteor
-pycocoevalcap>=1.2    # CIDEr-D, the official COCO scorer densevid_eval uses (metrics._cider_corpus)
-# BLEURT: pip install git+https://github.com/google-research/bleurt.git ; set BLEURT_CHECKPOINT_PATH
+pycocoevalcap>=1.2    # CIDEr-D (the COCO scorer) of every TEXT_KEYS table (metrics._cider_corpus via text_scores)
+# BLEURT: pip install git+https://github.com/google-research/bleurt.git ; metrics.py reads the checkpoint at /tmp/BLEURT-20
+# On a CUDA machine TensorFlow also needs ptxas and libdevice: nvidia-cuda-nvcc-cu12 next to TensorFlow (README, BLEURT setup)

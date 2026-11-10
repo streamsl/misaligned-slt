@@ -1,5 +1,111 @@
 import torch
 import torch.nn as nn
+from train import distributed as dist
+
+
+class _MaskedBatchNorm(torch.autograd.Function):
+    # Train-mode BatchNorm2d whose fp32 (fp64 for an fp64 x) batch statistics come from the positions that w 
+    # (N, 1, T, 1) marks; every position is normalized with them. The backward is the closed form, so autograd 
+    # keeps only x, as BatchNorm itself does. `sync` (torchrun, in a training step): the count, the sum and centred
+    # sum of squares, and in the backward the 2 gradient sums, are summed over ranks, so the statistics and input
+    # gradient are those of the global batch. Weight and bias gradients stay this rank's part (train.distributed).
+    @staticmethod
+    def forward(ctx, x, w, weight, bias, eps, sync=False):
+        xf, w3 = x.to(torch.promote_types(x.dtype, torch.float32)), w[..., 0]
+        count = w3.sum() * x.shape[-1]
+        total = (xf.sum(3) * w3).sum((0, 2))
+        if sync:   # one call for both sums
+            summed = dist.all_sum(torch.cat((total, count[None])))
+            total, count = summed[:-1], summed[-1]
+        mean = total / count
+        centered = xf - mean[:, None, None]
+        squares = (torch.linalg.vector_norm(centered, dim=3).square() * w3).sum((0, 2))
+        var = (dist.all_sum(squares) if sync else squares) / count
+        invstd = torch.rsqrt(var + eps)
+        y = torch.addcmul(bias[:, None, None], centered, (invstd * weight)[:, None, None])
+        ctx.save_for_backward(x, w, weight, mean, invstd, count)
+        ctx.sync = sync
+        ctx.mark_non_differentiable(mean, var, count)
+        return y.to(x.dtype), mean, var, count
+
+    @staticmethod
+    def backward(ctx, grad_y, *_):
+        # dx = scale * (dy - w / count * (sum dy + xhat * sum(dy * xhat))), the sums over every position (all of 
+        # them are normalized) and scale = weight * invstd; written as scale * dy - w * (alpha + beta * x) with 
+        # per-channel alpha, beta.
+        x, w, weight, mean, invstd, count = ctx.saved_tensors
+        gy, xf = grad_y.to(mean.dtype), x.to(mean.dtype)
+        grad_bias, sum_dy_x = gy.sum((0, 2, 3)), (gy * xf).sum((0, 2, 3))
+        grad_weight = invstd * (sum_dy_x - mean * grad_bias)
+        sum_dy, sum_dy_xhat = grad_bias, grad_weight
+        if ctx.sync:   # dx reads the sums over the global batch
+            sum_dy, sum_dy_x = dist.all_sum(torch.stack((grad_bias, sum_dy_x))).unbind()
+            sum_dy_xhat = invstd * (sum_dy_x - mean * sum_dy)
+        scale = invstd * weight
+        beta = scale * invstd * sum_dy_xhat / count
+        alpha = scale * sum_dy / count - beta * mean
+        grad_x = torch.addcmul(
+            gy * scale[:, None, None], torch.addcmul(alpha[:, None, None], xf, beta[:, None, None]), w, value=-1
+        )
+        return grad_x.to(x.dtype), None, grad_weight, grad_bias, None, None
+
+
+class _PlaceFrames(torch.autograd.Function):
+    # y (N, C, R, V) at the `frames` of dim 2 of a (N, C, length, V) zero tensor. Backward keeps only `frames`: 
+    # index_copy's backward keeps y, a second full copy per BatchNorm call.
+    @staticmethod
+    def forward(ctx, y, frames, length):
+        ctx.save_for_backward(frames)
+        return y.new_zeros(*y.shape[:2], length, y.shape[3]).index_copy_(2, frames, y)
+
+    @staticmethod
+    def backward(ctx, grad):
+        frames, = ctx.saved_tensors
+        return grad.index_select(2, frames), None, None
+
+
+def masked_batch_norm(
+    bn: nn.BatchNorm2d, x: torch.Tensor, frame_mask: torch.Tensor, real_frames: torch.Tensor = None
+) -> torch.Tensor:
+    """`bn(x)` on (N, C, T, V), except that train-mode batch statistics come from the REAL frames only.
+
+    With `frame_mask` (N, T; True = real frame) and `bn` in train mode, batch mean and biased variance are taken over 
+    every real (n, t) and all joints v, every position is normalized with them, and running statistics move as torch 
+    moves them (momentum, or cumulative average when momentum is None; unbiased variance). So the amount of padding 
+    in a batch doesn't change a real frame's features or the running statistics. In eval mode or without mask it is 
+    `bn(x)` unchanged (bit-identical). The caller passes None for a batch without padded frame and checks if a masked 
+    batch holds a real frame (`UniSignPoseEncoder.forward`, once per forward), so no call here waits on the device.
+
+    `real_frames` (the indices of the frames that `frame_mask` marks real in EVERY row; the encoder's rows end to end) 
+    runs `bn` itself on those frames: the same statistics, running statistics and gradients through the native kernel. 
+    Other frames output 0; no reader uses them, so their gradient is 0, as in the closed form.
+
+    Under torchrun, in a training step (`train.distributed.in_step`), every train-mode call (mask or none, `real_frames`
+    or not) runs the closed form with its sums over all ranks: the statistics, running statistics and gradients of 1
+    process on the global batch, up to float rounding. No mask then marks every frame real.
+    """
+    sync = bn.training and dist.in_step()
+    if not bn.training or (frame_mask is None and not sync): return bn(x)
+    if real_frames is not None and not sync: 
+        return _PlaceFrames.apply(bn(x.index_select(2, real_frames)), real_frames, x.shape[2])
+    if frame_mask is None: frame_mask = torch.ones(x.shape[0], x.shape[2], dtype=torch.bool, device=x.device)
+    w = frame_mask[:, None, :, None].to(torch.promote_types(x.dtype, torch.float32))
+    y, mean, var, count = _MaskedBatchNorm.apply(x, w, bn.weight, bn.bias, bn.eps, sync)
+    if bn.track_running_stats:
+        with torch.no_grad():
+            bn.num_batches_tracked.add_(1)
+            f = 1.0 / float(bn.num_batches_tracked) if bn.momentum is None else bn.momentum
+            bn.running_mean.mul_(1 - f).add_(mean, alpha=f)
+            bn.running_var.mul_(1 - f).add_(var * (count / (count - 1)), alpha=f)
+    return y
+
+
+def _run(layers, x, frame_mask, real_frames=None):
+    # Calls a Sequential's layers in order so that its BatchNorm reads the mask. State-dict keys stay the Sequential's.
+    if not isinstance(layers, nn.Sequential): return layers(x)
+    for layer in layers:
+        x = masked_batch_norm(layer, x, frame_mask, real_frames) if isinstance(layer, nn.BatchNorm2d) else layer(x)
+    return x
 
 
 class GCN_unit(nn.Module):
@@ -24,13 +130,14 @@ class GCN_unit(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, x, frame_mask=None):
-        # Temporally kernel-1 (the t_* args are commented out below), so no frame can reach another: nothing to mask.
+    def forward(self, x, frame_mask=None, real_frames=None):
+        # Temporally kernel-1 (the t_* args are commented out below), so no frame can reach another through the conv;
+        # the mask only keeps padded frames out of the train-mode BatchNorm statistics.
         x = self.conv(x)
         n, kc, t, v = x.size()
         x = x.view(n, self.kernel_size, kc // self.kernel_size, t, v)
         x = torch.einsum('nkctv,kvw->nctw', (x, self.A)).contiguous()
-        return self.act(self.bn(x))
+        return self.act(masked_batch_norm(self.bn, x, frame_mask, real_frames))
 
 
 class STGCN_block(nn.Module):
@@ -62,22 +169,23 @@ class STGCN_block(nn.Module):
         )
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, x, frame_mask=None):
+    def forward(self, x, frame_mask=None, real_frames=None):
         """`frame_mask` (N, T) marks REAL frames. Padded frames are zeroed before the temporal conv.
 
-        The temporal conv has kernel 5 / padding 2, so without this a real frame within 2 steps of the pad reads
-        whatever the collator wrote there (repeat-last, i.e. a frozen pose that looks like sustained signing) and
-        its output depends on the batch it landed in. Zeroing reproduces exactly what Conv2d's own zero padding
-        would contribute at the end of an exact-length sequence, so a padded batch matches an unpadded one.
+        Temporal conv has kernel 5 / padding 2, so without this a real frame within 2 steps of the pad reads whatever 
+        the collator wrote there (repeat-last, i.e. a frozen pose that looks like sustained signing) and its output 
+        depends on the batch it landed in. Zeroing reproduces exactly what Conv2d's own 0 padding would contribute at 
+        the end of an exact-length sequence, so a padded batch matches an unpadded one. In train mode every BatchNorm 
+        (gcn.bn, tcn[1], residual[1]) takes its batch statistics from the real frames only (`masked_batch_norm`).
         """
         m = None if frame_mask is None else frame_mask[:, None, :, None].to(x.dtype)
         if m is not None: x = x * m
-        res = self.residual(x)
-        x = self.gcn(x, frame_mask)
+        res = _run(self.residual, x, frame_mask, real_frames)
+        x = self.gcn(x, frame_mask, real_frames)
         # Re-zero AFTER the gcn: its BatchNorm and bias make padded positions non-zero again, and it is the tcn
         # (kernel 5) that would then mix them into real frames.
         if m is not None: x = x * m
-        x = self.tcn(x) + res
+        x = _run(self.tcn, x, frame_mask, real_frames) + res
         return self.act(x)
 
 
@@ -90,9 +198,9 @@ class STGCNChain(nn.Sequential):
                 self.add_module(f'layer{i}_{j}', STGCN_block(last_dim, channel, kernel_sizes, A.clone(), adaptive))
                 last_dim = channel
 
-    def forward(self, x, frame_mask=None):
+    def forward(self, x, frame_mask=None, real_frames=None):
         # nn.Sequential.forward takes one argument and would silently drop the mask, so forward it per block.
-        for block in self: x = block(x, frame_mask)
+        for block in self: x = block(x, frame_mask, real_frames)
         return x
 
 

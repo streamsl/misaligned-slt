@@ -6,10 +6,9 @@ from data.windowing import BIO
 
 
 def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
-    """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn), 
-    not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero pads leak into the last real frames' 
-    features before the LM attention mask drops them, making a row depend on its batchmates' lengths. Repeating keeps 
-    the receptive-field edge batch-invariant."""
+    """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn),
+    not zeros. With the frame mask, pose encoder never lets the pad reach a real frame's features or the train-mode
+    BatchNorm statistics (backbones/unisign.py, backbones/stgcn_block.py masked_batch_norm)."""
     if pad <= 0: return poses
     if poses.shape[0]: return torch.cat([poses, poses[-1:].expand(pad, *poses.shape[1:])])
     return torch.nn.functional.pad(poses, (0,) * (2 * (poses.ndim - 1)) + (0, pad))
@@ -29,7 +28,7 @@ def collate_windows(batch: list[dict]) -> dict[str, torch.Tensor | list]:
     pose_shape = prepared[0][1].shape[1:]
     poses, frame_masks, timestamps  = [], [], []
     bio_labels, specs, targets = [], [], []
-    commit_masks, candidates = [], []
+    commit_masks, candidates, target_spans, last_starts, pause_after = [], [], [], [], []
 
     for item, poses_i, ts_i, mask_i, labels_i in prepared:
         n = poses_i.shape[0]
@@ -44,19 +43,22 @@ def collate_windows(batch: list[dict]) -> dict[str, torch.Tensor | list]:
         bio_labels.append(torch.cat([labels_i, torch.full((pad,), BIO["UNK"], dtype=torch.long)]))
         specs.append(item["spec"])
         targets.append(item.get("translation_target"))
+        target_spans.append(item.get("target_span_s"))
+        last_starts.append(item.get("target_last_start_s"))
+        pause_after.append(bool(item.get("target_pause_after", False)))
         candidates.append(list(item.get("candidate_sentences") or []))
 
     return {
         "poses": torch.stack(poses).reshape(len(batch), max_len, *pose_shape),
         "frame_mask": torch.stack(frame_masks), "timestamps_s": torch.stack(timestamps),
         "bio_labels": torch.stack(bio_labels), "specs": specs, "commit_mask": torch.stack(commit_masks),
-        "translation_targets": targets, "candidate_sentences": candidates,
-        "fps": [item.get("fps") for item in batch],   # per row: a stage-2 window's pose rate; S1 chunks carry none
+        "translation_targets": targets, "target_spans_s": target_spans, "target_last_starts_s": last_starts, "target_pause_after": pause_after,
+        "candidate_sentences": candidates, "fps": [item.get("fps") for item in batch],
     }
 
 
 class WindowCollator:# Collate windows and optionally tokenize the text target of each window.
-    def __init__(self, tokenizer=None, max_text_tokens: int = 128, block_size: int = 1):
+    def __init__(self, tokenizer, max_text_tokens: int, block_size: int = 1):
         self.tokenizer = tokenizer
         self.max_text_tokens = int(max_text_tokens)
         # The canvas is sized to the batch; DLM's canvas geometry must stay equivalent to a full-width canvas.
@@ -71,7 +73,7 @@ class WindowCollator:# Collate windows and optionally tokenize the text target o
     def _tokenize_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
         if self.tokenizer is None: raise ValueError("WindowCollator tokenization requested without a tokenizer")
         # TRAINING forward runs over whole canvas (block decode's block-local forwards are inference only), so padding to 
-        # max_text_tokens costs compute on padding: captions are ~15 tokens against a 320 canvas. Dynamic padding sizes it 
+        # max_text_tokens costs compute on padding: captions are ~15 tokens, far below the canvas. Dynamic padding sizes it 
         # to the batch instead. EOS tail needs no reservation here — target builder (models/block_diffusion.py _prepare_x0) 
         # pads its own canvas to block boundary. Block alignment matters — BD3LM attends bidirectionally WITHIN a block, 
         # so a canvas ending mid-block changes last positions' logits. With alignment the result matches the full canvas.

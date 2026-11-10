@@ -2,9 +2,9 @@
 .claude/
 .vscode/
 .ipynb_checkpoints/
-auslan-daily/
-bobsl/
-how2sign/
+auslan-daily-abc
+bobsl
+how2sign
 youtube-sl-25/
 *.pyc
 __pycache__/

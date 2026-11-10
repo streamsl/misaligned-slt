@@ -29,6 +29,19 @@ from models.front_end import SLTFrontEnd
 __all__ = ["MT5BlockDiffusionDecoder", "UniSignFrontEndBase", "UniSignMT5FrontEnd", "PROMPT_LANG_BY_TARGET"]
 PROMPT_LANG_BY_TARGET = {"en_XX": "English"}
 
+def _length_groups(lengths: list[int], prompt: int) -> list[list[int]]:
+    """Row indices sorted by length and cut into at most 3 runs (each run is 1 encoder call), the cut with the least 
+    total attention cost: a run costs rows x (prompt + its longest row)^2, as it is padded only to its own longest row."""
+    order = sorted(range(len(lengths)), key=lengths.__getitem__)
+    size = [prompt + lengths[i] for i in order]
+    n = len(order)
+    cost = lambda a, z: (z - a) * size[z - 1] ** 2 if z > a else 0
+    i, j = min(
+        ((i, j) for i in range(n + 1) for j in range(i, n + 1)), 
+        key=lambda c: cost(0, c[0]) + cost(c[0], c[1]) + cost(c[1], n)
+    )
+    return [order[a:z] for a, z in ((0, i), (i, j), (j, n)) if z > a]
+
 # ════════════════════════════════════════════════════════════════════════════
 # mT5 block-diffusion decoder
 # ════════════════════════════════════════════════════════════════════════════
@@ -36,7 +49,7 @@ PROMPT_LANG_BY_TARGET = {"en_XX": "English"}
 class MT5BlockDiffusionDecoder(OPUTBlockDiffusionDecoder):
     '''BD3LM/OPUT decoder on the pretrained mT5 decoder. Owns only the decoder canvas (vocab+1 embedding / LM head);
     the caller (UniSignMT5FrontEnd) owns the mT5 encoder over [prompt|pose].'''
-    def __init__(self, mt5_model, pad_index: int, decoder_start_id: int, eos_id: int, block_size: int = 4, **kw):
+    def __init__(self, mt5_model, pad_index: int, decoder_start_id: int, eos_id: int, block_size: int, **kw):
         super().__init__()
         self.mt5 = mt5_model  # MT5ForConditionalGeneration (encoder used by the front end; we use .decoder + .lm_head)
         self.decoder = mt5_model.decoder  # T5Stack
@@ -162,7 +175,8 @@ def released_layout_state(sd: dict) -> dict:
     Accepts either layout, so ONE artifact serves every consumer:
       - released `*_pose_only_slt.pth` -> as-is;
       - trainer `model.pt` -> re-keyed from front_end.pose_encoder.* / front_end.mt5.*; other keys (bio_head,
-        dlm_decoder) dropped as training-arm state, not the transferable front end.
+        dlm_decoder) dropped as training-arm state, not the transferable front end. A DLM floor's canvas (dlm_decoder.embed_tokens.*,
+        dlm_decoder.lm_head.*) is loaded by MisalignedSLTModel itself, after it builds the DLM decoder.
     """
     if not any(k.startswith("front_end.") for k in sd): return sd
     out = {}
@@ -173,8 +187,8 @@ def released_layout_state(sd: dict) -> dict:
 
 
 class UniSignFrontEndBase(SLTFrontEnd):
-    # Shared Uni-Sign front end: UniSignPoseEncoder -> verbatim task prompt + pose tokens -> LM encoder.
-    # The LM binding (UniSignMT5FrontEnd) supplies `_prompt_token_embeds`, `_run_lm_encoder`, `make_dlm_decoder`, `_load_lm_pretrained`.
+    # Shared Uni-Sign front end: UniSignPoseEncoder -> verbatim task prompt + pose tokens -> LM encoder. The LM binding 
+    # (UniSignMT5FrontEnd) supplies `_prompt_token_embeds`, `_run_lm_encoder`, `make_dlm_decoder`, `_load_lm_pretrained`.
     prompt_lang: str = "Chinese"
 
     # ── LM-specific hooks ─────────────────────────────────────────────────────
@@ -203,11 +217,34 @@ class UniSignFrontEndBase(SLTFrontEnd):
         return self._prompt_len
 
     def encode_memory(self, bio_tap, bio_mask, omega_bias=None):
-        # Prepend the LM-embedded task/language prompt to the pose tokens (Uni_Sign forward). `omega_bias` (B,1,1,M), the
-        # membership prior the decoder's cross-attention also reads, biases the encoder's self-attention keys in every layer:
-        # at a hard first-span membership the pose frames outside the span are removed from the encoder's context, so the
-        # translator computes what it computes on the cropped span, up to the ε leak, when the span starts right after the
-        # prompt; at a later start the prompt<->span relative positions differ from the crop's (docs/membership_gate.md §2.5).
+        # Prepend the LM-embedded task/language prompt to pose tokens (Uni_Sign forward). `omega_bias` (B,1,1,M), the membership 
+        # prior the decoder's cross-attention also reads, biases the encoder's self-attention keys in every layer: at a hard 
+        # first-span membership the pose frames outside the span are removed from encoder's context. A gated caller first cuts 
+        # the columns before Ω's support and encodes the support again as a crop (models.streaming_slt support_crop), so the 
+        # span starts right after the prompt and the translator computes what it computes on the cropped span, up to ε leak.
+        # In train mode, rows are encoded in groups of similar length, each padded only to its own longest row: the encoder 
+        # attends within a row and masks padded keys, so every row's outputs are those of padded batch up to float rounding 
+        # (its dropout draws differ, because the tensor shapes differ). Eval mode encodes the batch as 1 call, as before.
+        b, t = bio_mask.shape
+        frames = torch.arange(1, t + 1, device=bio_mask.device)
+        ends = torch.where(bio_mask.bool(), frames, 0).max(1).values.tolist() if b > 1 and self.training else None
+        groups = _length_groups(ends, self.prompt_length()) if ends else [list(range(b))]
+        if len(groups) == 1: return self._encode_rows(bio_tap, bio_mask, omega_bias)
+        width = self.prompt_length() + t
+        hidden, masks, order = [], [], []
+        for rows in groups:
+            idx = torch.as_tensor(rows, device=bio_tap.device)
+            n = max(ends[i] for i in rows)
+            h, m = self._encode_rows(
+                bio_tap[idx, :n], bio_mask[idx, :n], None if omega_bias is None else omega_bias[idx][..., :width - t + n]
+            )
+            hidden.append(F.pad(h, (0, 0, 0, width - h.shape[1])))
+            masks.append(F.pad(m, (0, width - m.shape[1])))
+            order += rows
+        inverse = torch.as_tensor(order, device=bio_tap.device).argsort()
+        return torch.cat(hidden)[inverse], torch.cat(masks)[inverse]
+
+    def _encode_rows(self, bio_tap, bio_mask, omega_bias=None):
         device = bio_tap.device
         b = bio_tap.shape[0]
         prefix = self.tokenizer(
@@ -222,13 +259,14 @@ class UniSignFrontEndBase(SLTFrontEnd):
         enc_out = self._run_lm_encoder(inputs_embeds, attention_mask, key_bias=omega_bias)
         return enc_out.last_hidden_state, attention_mask
 
-    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float = 0.2, omega_bias=None, row_stats: bool = False):
-        # External label-smoothed CE. The supplied Ω gates AR cross-attention through the same live membership used by DLM; 
-        # whether gradients are tracked is controlled by the caller.
+    def ar_loss(self, enc_hidden, enc_mask, labels, label_smoothing: float, omega_bias=None, row_stats: bool = False):
+        # External label-smoothed CE. The supplied Ω gates AR cross-attention through the same live membership used by DLM.
+        # Whether gradients are tracked is controlled by the caller. The decoder input is the shifted labels, as HF builds 
+        # it from `labels`. Passing `labels` itself would also make HF compute its own unused full-vocabulary CE.
         with self.ar_omega_context(omega_bias):
             out = self.lm_model(
-                encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-                attention_mask=enc_mask, labels=labels, return_dict=True,
+                encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden), attention_mask=enc_mask, 
+                decoder_input_ids=self.lm_model._shift_right(labels), return_dict=True,
             )
         flat = F.cross_entropy(
             out.logits.reshape(-1, out.logits.shape[-1]), labels.reshape(-1).to(out.logits.device),
@@ -243,7 +281,7 @@ class UniSignFrontEndBase(SLTFrontEnd):
     def load_pretrained(self, ckpt_path, strict: bool = True) -> dict[str, int]:
         """Load a released `*_pose_only_slt.pth` or trainer `model.pt` (normalized by `released_layout_state`):
         pose keys -> `pose_encoder`, `mt5_model.*` -> the mT5 LM. Call BEFORE building the DLM
-        decoder — it copies the loaded LM into the vocab+1 canvas."""
+        decoder — it copies the loaded LM into the vocab+1 canvas (a DLM floor's own canvas then replaces the copy)."""
         blob = torch.load(str(ckpt_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
         sd = released_layout_state(sd)
@@ -262,10 +300,9 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
     _ATTENTION_TILE_ELEMENTS = 64 * 1024 * 1024
 
     def __init__(
-        self, mt5_name: str = "google/mt5-base", prompt_lang: str = "Chinese", tokenizer=None,
+        self, mt5_name: str, prompt_lang: str, tokenizer=None,
         pose_hidden_dim: int = 256, init_mt5_weights: bool = False,
     ):
-        # `init_mt5_weights=False` builds from config only — correct when a Uni-Sign checkpoint overwrites every mT5 tensor anyway.
         super().__init__()
         self.prompt_lang = str(prompt_lang)
         if init_mt5_weights: self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_name)
